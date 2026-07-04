@@ -1,0 +1,19 @@
+name: runner-probe
+
+# Temporary: confirms GitHub-hosted runners are available for this new repo.
+# Removed once the real CI lanes are in place.
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/runner-probe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "runner online on $(uname -a)"
