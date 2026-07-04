@@ -1,0 +1,20 @@
+# Lightweight dependency tier for the robot CI smoke lane.
+#
+# The full eliza-robot stack pins multi-GB scientific wheels (mujoco, mujoco-mjx,
+# jax, brax, torch via stable-baselines3, opencv, onnxruntime, sentence-transformers)
+# plus the locally-vendored alberta-framework. Installing and exercising that whole
+# matrix on a hosted runner is neither fast nor reliable, so CI installs only the
+# pure-Python / small-wheel tier that the import-safe modules and their tests need:
+# schema, profiles, bridge transport/protocol, trajectory DB, datasets, and policy
+# dispatch. Everything requiring jax/mujoco/brax/torch is exercised on GPU hosts,
+# not here (see tests/PRE_EXISTING_TEST_STATUS.md and robot/CLAUDE.md).
+#
+# Version floors mirror robot/pyproject.toml so the CI tier stays a strict subset
+# of the real dependency set.
+pydantic>=2
+pyyaml
+numpy<3
+websockets>=12
+Pillow>=10
+pytest>=8
+pytest-asyncio>=0.23

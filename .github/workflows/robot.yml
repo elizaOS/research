@@ -1,0 +1,67 @@
+name: robot
+
+on:
+  push:
+    branches: [develop, main]
+    paths:
+      - "robot/**"
+      - ".github/workflows/robot.yml"
+  pull_request:
+    paths:
+      - "robot/**"
+      - ".github/workflows/robot.yml"
+
+concurrency:
+  group: robot-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  robot-smoke:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: robot
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      # The full eliza-robot dependency set is a multi-GB wheel matrix
+      # (mujoco/mujoco-mjx/jax/brax/torch/opencv/onnxruntime/sentence-transformers)
+      # plus a locally-vendored alberta-framework and the robot/vendor/asimov-1
+      # submodule. That tier runs on GPU hosts. This lane installs only the
+      # small-wheel subset that the import-safe modules and their tests need.
+      - name: Install CI-light dependency tier
+        run: uv pip install --system -r requirements-ci.txt
+
+      # Parse-level check: the whole Python tree byte-compiles with zero heavy
+      # deps. compileall never imports, so heavy-dep modules are still covered.
+      - name: Byte-compile smoke (whole tree parses)
+        run: python -m compileall -q eliza_robot/ scripts/ tests/
+
+      # Import-level check: the dependency-light module surface actually loads.
+      - name: Import smoke (import-safe modules load)
+        run: python scripts/ci_import_smoke.py
+
+      # Behavior-level check: the light-tier test suites (schema, profiles,
+      # bridge transport/protocol, trajectory DB, datasets, policy dispatch).
+      # The three ignored bridge tests pull jax/mujoco via rl.alberta / sim.mujoco
+      # and belong to the GPU lane.
+      - name: Pytest (light-tier suites)
+        run: >-
+          python -m pytest -p no:cacheprovider
+          tests/test_profiles.py
+          tests/schema
+          tests/trajectory_db
+          tests/datasets
+          tests/policy
+          tests/bridge
+          --ignore=tests/bridge/test_camera_snapshot.py
+          --ignore=tests/bridge/test_camera_snapshot_mujoco.py
+          --ignore=tests/bridge/test_policy_start_e2e.py

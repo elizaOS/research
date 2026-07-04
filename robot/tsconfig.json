@@ -1,20 +1,24 @@
 {
-  "extends": "../../../tsconfig.json",
   "compilerOptions": {
-    "outDir": "./dist",
-    "rootDir": "./src",
+    "target": "ES2022",
+    "module": "ESNext",
     "moduleResolution": "bundler",
-    "types": ["node", "bun"],
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "strictNullChecks": true,
     "noEmit": true,
-    "composite": false,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
     "declaration": false,
     "declarationMap": false,
-    "skipLibCheck": true,
-    "paths": {
-      "@elizaos/core": ["../../core/src/index.node.ts"],
-      "@elizaos/logger": ["../../logger/src/index.ts"],
-      "@elizaos/logger/*": ["../../logger/src/*"]
-    }
+    "composite": false,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noImplicitReturns": false,
+    "types": ["node", "bun"]
   },
   "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist", "**/__tests__/**", "**/*.test.ts"]

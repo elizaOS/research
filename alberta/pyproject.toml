@@ -123,6 +123,16 @@ extend-exclude = [
     "output",
     "outputs",
     "site",
+    # These three test modules import from the vendored-out ``benchmarks/`` tree
+    # (via the ``bsuite`` extra or a bare ``import benchmarks.*``), which the
+    # standalone research repo does not ship (see VENDORING.md and the
+    # ``collect_ignore`` in tests/conftest.py). Their only lint findings are
+    # import-ordering (I001) around those unresolvable ``benchmarks.*`` imports,
+    # so linting them standalone is noise; exclude them here to match the
+    # collection scoping.
+    "tests/test_bsuite_agents.py",
+    "tests/test_bsuite_helpers.py",
+    "tests/test_horde_actor_critic.py",
 ]
 
 [tool.ruff.lint]

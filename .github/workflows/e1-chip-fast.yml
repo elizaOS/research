@@ -1,0 +1,55 @@
+name: e1-chip-fast
+
+# Fast PR lane for the E1 SoC. Runs the pure-Python lint + typecheck gate
+# (`make lint typecheck`) on a bare ubuntu-latest with no Verilator/yosys tool
+# image — it completes in well under a minute. The heavy Docker regression
+# (RTL synth, cocotb, formal) and the monthly AlphaChip attestation gate live in
+# e1-chip.yml, which is manual/scheduled so a month rollover cannot paint every
+# chip PR red. This lane is what actually gates chip/ changes on each PR.
+
+on:
+  push:
+    branches: [develop, main]
+    paths:
+      - "chip/**"
+      - ".github/workflows/e1-chip-fast.yml"
+  pull_request:
+    paths:
+      - "chip/**"
+      - ".github/workflows/e1-chip-fast.yml"
+
+concurrency:
+  group: e1-chip-fast-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint-typecheck:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: chip
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # ruff/mypy/yamllint are required (or upgrade BLOCK->real check) for the
+      # lint+typecheck runners; shellcheck is a distro package. Pin the Python
+      # tools to the same major ranges as chip/requirements.txt so the lane
+      # matches the Docker image's linters.
+      - name: Install lint/typecheck tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            "ruff>=0.8,<1" "mypy>=1.13,<2" "yamllint>=1.35,<2" \
+            "types-PyYAML>=6,<7" "pyyaml>=6,<7"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+
+      - name: make lint typecheck
+        run: make lint typecheck

@@ -1,0 +1,50 @@
+name: alberta
+
+# Per-PR gate for the Alberta Framework (JAX continual-RL). Installs the library
+# with its dev extras (CPU JAX wheels, < 2 min) and runs ruff + pytest. The
+# tests that import the vendored-out benchmarks/ and "examples/The Alberta Plan/"
+# trees — which this standalone repo does not ship — are excluded via
+# tests/conftest.py (collect_ignore) and pyproject [tool.ruff]; the shipped
+# alberta_framework library itself lints and tests clean.
+on:
+  push:
+    branches: [develop, main]
+    paths:
+      - "alberta/**"
+      - ".github/workflows/alberta.yml"
+  pull_request:
+    paths:
+      - "alberta/**"
+      - ".github/workflows/alberta.yml"
+
+concurrency:
+  group: alberta-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  alberta:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: alberta
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install (editable, with dev extras)
+        run: |
+          python -m pip install -U pip
+          pip install -e '.[dev]'
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: python -m pytest tests/

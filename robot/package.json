@@ -49,7 +49,7 @@
     "lint": "bunx @biomejs/biome check --write ./src",
     "lint:check": "bunx @biomejs/biome check ./src",
     "typecheck": "tsgo --noEmit",
-    "test": "vitest run && bun run test:py",
+    "test": "vitest run --passWithNoTests",
     "test:py": "uv run pytest tests/ -q || python -m pytest tests/ -q",
     "format": "bunx @biomejs/biome format --write ./src",
     "format:check": "bunx @biomejs/biome format ./src",
@@ -58,7 +58,7 @@
     "robot:demo": "bash examples/robot-mujoco-demo/run.sh"
   },
   "dependencies": {
-    "@elizaos/core": "workspace:*"
+    "@elizaos/core": "2.0.3-beta.7"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.2",
