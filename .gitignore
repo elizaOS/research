@@ -1,0 +1,30 @@
+# --- Node / TypeScript ---
+node_modules/
+dist/
+*.tsbuildinfo
+.turbo/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- Build / tool outputs ---
+build/
+out/
+.tools/
+
+# --- OS / editor ---
+.DS_Store
+*.swp
+
+# --- Regenerable research artifacts (golden copies are tracked; these dirs are
+#     regenerated locally by build/sim tooling and must never be committed) ---
+/robot/vendor/mujoco_menagerie/
+/robot/.tools/
+/chip/mechanical/e1-phone/out/e1-phone-exploded-frames/
