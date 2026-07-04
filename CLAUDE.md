@@ -26,7 +26,9 @@ robot/          @elizaos/robot — Python robotics stack (MuJoCo/Brax/MJX, bridg
 alberta/        Alberta Framework — JAX continual-RL (The Alberta Plan); trains robot policies
 plugin-ainex/   @elizaos/plugin-ainex — elizaOS plugin driving the Hiwonder AiNex humanoid via the robot bridge
 docs/           chip/ track, robot.mdx embodiment doc, tee-native/ security design notes
-.github/workflows/e1-chip.yml   chip regression CI (Verilator/yosys tool image, cocotb + formal gates)
+.github/workflows/  CI: typescript · alberta · robot (light lane) · e1-chip-fast
+                    (per-PR make lint typecheck) · e1-chip (heavy Docker regression,
+                    workflow_dispatch + monthly cron)
 ```
 
 ## Toolchains (per track — see each directory's docs)

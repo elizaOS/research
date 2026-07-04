@@ -28,10 +28,12 @@ This repo is mounted as a **git submodule** inside `elizaOS/eliza` at
 E1 chip device tree from `packages/research/chip/` via that submodule, so the
 chip design stays reachable to the OS build without living in the runtime repo.
 
-To work on this content from an eliza checkout:
+To work on this content from an eliza checkout (it is marked `update = none` in
+eliza's `.gitmodules`, so routine `--recursive` checkouts skip its large payload;
+`--checkout` opts in):
 
 ```bash
-git submodule update --init packages/research
+git submodule update --init --checkout packages/research
 ```
 
 Or clone it standalone:
