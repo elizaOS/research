@@ -1,0 +1,4 @@
+[submodule "robot/vendor/asimov-1"]
+	path = robot/vendor/asimov-1
+	url = https://github.com/asimovinc/asimov-1.git
+	branch = main
