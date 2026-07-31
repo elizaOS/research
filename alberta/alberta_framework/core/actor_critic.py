@@ -351,12 +351,12 @@ class ActorCriticAgent:
         critic_trace_bias = critic_decay * state.critic_trace_bias + 1.0
 
         actor_steps: tuple[Array, ...] = (
-            cfg.actor_step_size * td_error * actor_trace_weights,
-            cfg.actor_step_size * td_error * actor_trace_bias,
+            cfg.actor_step_size * actor_trace_weights,
+            cfg.actor_step_size * actor_trace_bias,
         )
         critic_steps: tuple[Array, ...] = (
-            cfg.critic_step_size * td_error * critic_trace_weights,
-            cfg.critic_step_size * td_error * critic_trace_bias,
+            cfg.critic_step_size * critic_trace_weights,
+            cfg.critic_step_size * critic_trace_bias,
         )
         actor_metric = jnp.array(1.0, dtype=jnp.float32)
         critic_metric = jnp.array(1.0, dtype=jnp.float32)
@@ -371,6 +371,8 @@ class ActorCriticAgent:
                 td_error,
                 (state.critic_weights, state.critic_bias),
             )
+        actor_steps = tuple(td_error * step for step in actor_steps)
+        critic_steps = tuple(td_error * step for step in critic_steps)
 
         carry_traces = discount != 0.0
         stored_actor_trace_weights = jnp.where(
@@ -891,13 +893,13 @@ class ContinuousActorCriticAgent:
         critic_trace_bias = critic_decay * state.critic_trace_bias + 1.0
 
         actor_steps: tuple[Array, ...] = (
-            cfg.actor_step_size * td_error * mean_trace_weights,
-            cfg.actor_step_size * td_error * mean_trace_bias,
-            cfg.actor_step_size * td_error * log_sigma_trace,
+            cfg.actor_step_size * mean_trace_weights,
+            cfg.actor_step_size * mean_trace_bias,
+            cfg.actor_step_size * log_sigma_trace,
         )
         critic_steps: tuple[Array, ...] = (
-            cfg.critic_step_size * td_error * critic_trace_weights,
-            cfg.critic_step_size * td_error * critic_trace_bias,
+            cfg.critic_step_size * critic_trace_weights,
+            cfg.critic_step_size * critic_trace_bias,
         )
         actor_metric = jnp.array(1.0, dtype=jnp.float32)
         critic_metric = jnp.array(1.0, dtype=jnp.float32)
@@ -912,6 +914,8 @@ class ContinuousActorCriticAgent:
                 td_error,
                 (state.critic_weights, state.critic_bias),
             )
+        actor_steps = tuple(td_error * step for step in actor_steps)
+        critic_steps = tuple(td_error * step for step in critic_steps)
 
         carry_traces = discount != 0.0
         stored_mean_trace_weights = jnp.where(

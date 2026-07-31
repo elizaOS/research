@@ -67,6 +67,8 @@ class Step12IAConfig:
         base_avg_reward_step_size: Cortex base average-reward step-size.
         option_step_size: Cortex intra-option Q step-size.
         option_gamma: Cortex option discount.
+        option_planning_backups_per_step: Fixed cortex option-model planning
+            backup budget per real transition. ``0`` disables planning.
         epsilon_base: Cortex exploration rate.
         utility_ema_decay: Cortex option utility EMA decay.
     """
@@ -80,6 +82,7 @@ class Step12IAConfig:
     base_avg_reward_step_size: float = 0.01
     option_step_size: float = 0.05
     option_gamma: float = 0.99
+    option_planning_backups_per_step: int = 0
     epsilon_base: float = 0.1
     utility_ema_decay: float = 0.99
 
@@ -96,6 +99,7 @@ class Step12IAConfig:
             "base_avg_reward_step_size": self.base_avg_reward_step_size,
             "option_step_size": self.option_step_size,
             "option_gamma": self.option_gamma,
+            "option_planning_backups_per_step": self.option_planning_backups_per_step,
             "epsilon_base": self.epsilon_base,
             "utility_ema_decay": self.utility_ema_decay,
         }
@@ -122,6 +126,7 @@ class Step12IAConfig:
             base_avg_reward_step_size=self.base_avg_reward_step_size,
             option_step_size=self.option_step_size,
             option_gamma=self.option_gamma,
+            option_planning_backups_per_step=self.option_planning_backups_per_step,
             epsilon_base=self.epsilon_base,
         )
         cortex = OaKConfig(stomp=stomp, utility_ema_decay=self.utility_ema_decay)

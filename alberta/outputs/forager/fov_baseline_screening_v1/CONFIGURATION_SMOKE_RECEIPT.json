@@ -1,0 +1,121 @@
+{
+  "schema_version": "alberta.forager_fov_baseline_configuration_smoke.v1",
+  "status": "passed_development_only",
+  "scientific_promotion_allowed": false,
+  "completed_at_utc": "2026-07-31T11:33:12Z",
+  "protocol": {
+    "path": "PROTOCOL.json",
+    "sha256": "b94c906f9d3c1f2abf226d7049bd9305700d7f5a81012b07b36cc10d458d3174"
+  },
+  "scope": {
+    "purpose": "Instantiate each frozen upstream agent, network, replay buffer, and optimizer and complete one real environment transition.",
+    "index": 0,
+    "max_environment_steps": 1,
+    "environment": "ForagaxTwoBiomeLarge-v1",
+    "aperture_size": 9,
+    "entrypoint": "/opt/continual-foragax-agents/src/continuing_main.py"
+  },
+  "runtime": {
+    "candidate_oci_manifest_digest": "sha256:42ae49b6087bf1b6daa574aee0ac6d9362ea6dea185e6e898c23e913cf832aa0",
+    "candidate_oci_config_digest": "sha256:1c27db3803c4e07def58569bee426fd00ca3f5908968dafc98154d35ae9ace07",
+    "candidate_image_reference": "alberta-foragax-runtime:official-v4-9710f60",
+    "upstream_commit": "9710f60fa30da5badc451ad7ce3ff296d5070830",
+    "source_archive_sha256": "1f6976de38f34a697c947891de26ad3373b294195fe82094e9d1d5b8ddfd43b6",
+    "dependency_lock_sha256": "46c2990caf152b84bcb3ac39de5173304cdbf5edd61a68f3d0000b843dabbacd",
+    "backend": "cpu",
+    "docker_default_runtime": "runc",
+    "container_user": "65532:65532",
+    "network": "none",
+    "root_filesystem": "read_only",
+    "capabilities": "all_dropped",
+    "no_new_privileges": true,
+    "pids_limit": 512,
+    "derived_config_mount": {
+      "source": "configs",
+      "destination": "/opt/alberta-configs",
+      "read_only": true
+    },
+    "environment_overrides": {
+      "JAX_PLATFORM_NAME": "cpu",
+      "JAX_PLATFORMS": "cpu",
+      "JAX_SKIP_CUDA_CONSTRAINTS_CHECK": "1",
+      "NVIDIA_VISIBLE_DEVICES": "void",
+      "PYTHONHASHSEED": "0"
+    },
+    "per_container_assertions": {
+      "jax_default_backend": "cpu",
+      "nvidia_device_glob": [],
+      "python_isolated_flag": true,
+      "python_bytecode_disabled": true
+    }
+  },
+  "results": [
+    {
+      "config": "configs/DQN-common-control.json",
+      "sha256": "5b26fe24f08218c86024b6e179545d3baa4005c603fc9dec11a8f4dfde413dbe",
+      "exit_status": 0
+    },
+    {
+      "config": "configs/DQN_CReLU-common-control.json",
+      "sha256": "0f1f76f7097bc00309dc7bba08b0951836a3220c7c1326c61c31e066961af15f",
+      "exit_status": 0
+    },
+    {
+      "config": "configs/DQN_L2-common-control.json",
+      "sha256": "9360a2453b99dfab2843c1f0aea63a6b0881dc895461344f38fc6bdaa6d889b8",
+      "exit_status": 0
+    },
+    {
+      "config": "configs/DQN_L2_Init-common-control.json",
+      "sha256": "30ca0275d46c478e768f9827def707185d0b66f9ab9c62cacf1bca554c5ed4a9",
+      "exit_status": 0
+    },
+    {
+      "config": "configs/DQN_LN-common-control.json",
+      "sha256": "0f25fde6f7d8818d833a529b35f80ebc14f90087ea3d2560c43ff2b417ec09d4",
+      "exit_status": 0
+    },
+    {
+      "config": "configs/DQN_Reset_Head-common-control.json",
+      "sha256": "66f8e849fe48f950f4b14524aaa7bdea986b4e9878be100a5db0d623f8028e57",
+      "exit_status": 0
+    },
+    {
+      "config": "configs/DQN_SWR-common-control.json",
+      "sha256": "e6ed76e75d6084ca8334c3379d981f2b2fdc03a5362ddc98ac1d975c658d1d41",
+      "exit_status": 0
+    },
+    {
+      "config": "configs/DQN_Shrink_and_Perturb-common-control.json",
+      "sha256": "897181ae86913fc9523f0a58193bc64757da01dd7f50ff590b241cb8edfe6654",
+      "exit_status": 0
+    },
+    {
+      "config": "configs/DQN_causal_history-common-control.json",
+      "sha256": "44ee6e89d0e4a09819638d87d86a8cc5bd22656f710e747acf3ab7f83566f17d",
+      "exit_status": 0
+    },
+    {
+      "config": "configs/DQN_causal_history_reward_trace-common-control.json",
+      "sha256": "d7264ec043d952ae9b781a335718370e3b9437f1f765712bd4c7ce03e38056ea",
+      "exit_status": 0
+    },
+    {
+      "config": "configs/DQN_reward_trace-common-control.json",
+      "sha256": "b39fdc1e95594fd10d600d35d0103ba19cf4ff8e0b792cdff7c38c2f59459eb8",
+      "exit_status": 0
+    }
+  ],
+  "summary": {
+    "configurations_expected": 11,
+    "configurations_passed": 11,
+    "configurations_failed": 0
+  },
+  "nonqualification_reasons": [
+    "The derived configurations were supplied through a read-only host bind rather than the sealed v4 launcher, which correctly accepts only immutable source-tree configurations.",
+    "The candidate image encoded a wall-clock Created timestamp instead of the required SOURCE_DATE_EPOCH timestamp.",
+    "The candidate image inherited NVIDIA_VISIBLE_DEVICES=all by default; the smoke overrode it to void, but the image default itself was not acceptable.",
+    "The candidate digest was retired before production qualification and is not an official runtime profile.",
+    "A single CPU transition checks construction and dispatch but is not a learning benchmark."
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "comparison": {
+    "canonicalization": "utf8-json-sort-keys-compact-no-nan",
+    "current_replay_reduced_sha256": "a21d6162e86730894ed5bdf535bfa45c01aa3fd241f791794edcc4d03d36bf09",
+    "exact_match": true,
+    "excluded_paths": [
+      "$.operational_metadata",
+      "$.scientific_payload.source_provenance.source_sha256.alberta_framework/evaluation/ftl_decision_artifact.py",
+      "$.scientific_digest.sha256"
+    ],
+    "historical_reduced_sha256": "a21d6162e86730894ed5bdf535bfa45c01aa3fd241f791794edcc4d03d36bf09",
+    "included_scope": "the complete artifact after removing operational metadata, the changed artifact-builder source hash, and only its scientific-digest derivative; each original scientific digest and strict validator result is checked independently",
+    "original_digests_independently_validated": true
+  },
+  "current_source_replay": {
+    "bytes_sha256": "876e35815289ff07d7e4bc28ed9a8d589de90bd6886d5418af82c16e60974670",
+    "command": [
+      "python",
+      "-m",
+      "alberta_framework.evaluation.ftl_decision_cli",
+      "--output",
+      "outputs/ftl_decision/reproductions/nonpromoting_consumed_seed_replay.json"
+    ],
+    "path": "outputs/ftl_decision/reproductions/nonpromoting_consumed_seed_replay.json",
+    "role": "nonpromoting_consumed_seed_replay",
+    "scientific_payload_sha256": "cc4896421895a9074051b9b7fd9eeadcf4cff483d1c2f6bdb00d2f4cbab0368f",
+    "seed_role": "consumed_original_promoted_held_out_evidence_30_59"
+  },
+  "historical_artifact": {
+    "bytes_sha256": "9f45a307e23c250fff9870c081daa22857894fcd0d7bed03efd2b270be577e4d",
+    "path": "outputs/ftl_decision/evidence.v1.json",
+    "result": "accepted-at-generation",
+    "scientific_payload_sha256": "4c0c50273358c2c409a63d19ae52831ef1f6bad4645cfdf252c23b62425e0148"
+  },
+  "interpretation": {
+    "compatibility_result": "current pinned sources reproduce every deterministic v1 scientific field exactly on the already-consumed v1 seed schedule after normalizing only the changed artifact-builder source hash",
+    "historical_result": "the immutable original v1 artifact remains the promoting held-out result; its acceptance is reconstructed from primitive rows rather than trusted from the stored acceptance flag",
+    "promotion_result": "none from the replay; it is a source-compatibility check and cannot become fresh held-out evidence"
+  },
+  "limitations": [
+    "Seeds 30-59 were consumed by the original promoted v1 experiment.",
+    "The replay cannot support retuning, a stronger claim, or promotion of a changed protocol.",
+    "No archive containing the exact historical artifact-builder source is available; the chain establishes deterministic scientific compatibility, not full historical source recoverability.",
+    "The world-model, evaluator, and CLI source hashes must remain exactly equal to the original artifact; drift in any of them invalidates the chain.",
+    "SHA-256 identifiers establish integrity and reproducibility context, not authorship or authenticity.",
+    "A changed FTL protocol or new current-code promotion requires preregistration and untouched seeds."
+  ],
+  "schema_version": "alberta.ftl_consumed_seed_source_compatibility.v1"
+}

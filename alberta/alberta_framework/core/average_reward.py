@@ -1,4 +1,4 @@
-# mypy: disable-error-code="attr-defined,call-arg"
+# mypy: disable-error-code="attr-defined,call-arg,name-defined"
 """Average-reward prediction and control primitives.
 
 This module covers the first production slice for Alberta Plan Steps 5 and 6:
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 import time
 from typing import Any, cast
 
@@ -25,6 +26,14 @@ from jaxtyping import Float, Int
 
 from alberta_framework.core.multi_head_learner import MultiHeadMLPLearner, MultiHeadMLPState
 from alberta_framework.core.optimizers import Autostep, AutostepParamState, optimizer_from_config
+
+_INT32_MAX = 2**31 - 1
+
+
+def _saturating_int32_increment(value: Array) -> Array:
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    counter = jnp.asarray(value, dtype=jnp.int32)
+    return jnp.minimum(jnp.maximum(counter, 0), maximum - 1) + 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -297,6 +306,19 @@ class AverageRewardHordeActorCriticConfig:
 
 
 @chex.dataclass(frozen=True)
+class DiscretePolicySample:
+    """Auditable target/behavior probabilities for one sampled action."""
+
+    action: Int[Array, ""]
+    target_policy: Float[Array, " n_actions"]
+    behavior_policy: Float[Array, " n_actions"]
+    target_probability: Float[Array, ""]
+    behavior_probability: Float[Array, ""]
+    target_log_probability: Float[Array, ""]
+    behavior_log_probability: Float[Array, ""]
+
+
+@chex.dataclass(frozen=True)
 class AverageRewardHordeActorCriticState:
     """State for the average-reward Horde actor-critic."""
 
@@ -307,6 +329,7 @@ class AverageRewardHordeActorCriticState:
     actor_opt_b: AutostepParamState
     last_observation: Float[Array, " observation_dim"]
     last_action: Int[Array, ""]
+    last_policy_sample: DiscretePolicySample
     rng_key: Array
     step_count: Int[Array, ""]
     birth_timestamp: float = 0.0
@@ -319,7 +342,15 @@ class AverageRewardHordeActorCriticUpdateResult:
 
     state: AverageRewardHordeActorCriticState
     action: Int[Array, ""]
+    # Actual epsilon-mixture policy that sampled ``action``.
     policy: Float[Array, " n_actions"]
+    # Softmax target component before fixed uniform exploration is mixed in.
+    target_policy: Float[Array, " n_actions"]
+    behavior_action_probability: Float[Array, ""]
+    target_action_probability: Float[Array, ""]
+    # Multiplier converting grad log(target) to grad log(behavior) on the
+    # transition that was just learned from.
+    actor_score_scale: Float[Array, ""]
     td_error: Float[Array, ""]
     average_reward: Float[Array, ""]
     critic_prediction: Float[Array, ""]
@@ -331,7 +362,12 @@ class AverageRewardHordeActorCriticArrayResult:
 
     state: AverageRewardHordeActorCriticState
     actions: Int[Array, " num_steps"]
+    # Actual epsilon-mixture behavior policies.
     policies: Float[Array, "num_steps n_actions"]
+    target_policies: Float[Array, "num_steps n_actions"]
+    behavior_action_probabilities: Float[Array, " num_steps"]
+    target_action_probabilities: Float[Array, " num_steps"]
+    actor_score_scales: Float[Array, " num_steps"]
     td_errors: Float[Array, " num_steps"]
     average_rewards: Float[Array, " num_steps"]
 
@@ -340,7 +376,18 @@ class AverageRewardHordeActorCriticAgent:
     """Average-reward actor-critic using a nonlinear Horde critic.
 
     The critic is a one-head :class:`AverageRewardHordeLearner`.  The actor is a
-    softmax policy over the critic trunk's learned nonlinear feature vector.
+    softmax target policy over the critic trunk's learned nonlinear feature
+    vector.  The acting policy is the explicit epsilon mixture
+    ``b(a|s) = (1-epsilon) pi(a|s) + epsilon / |A|``.  Actor gradients optimize
+    that behavior policy exactly:
+
+    ``grad log b = ((1-epsilon) pi(a|s) / b(a|s)) grad log pi``.
+
+    This distinction matters at large exploration rates: treating actions
+    sampled from the mixture as if they came directly from ``pi`` biases the
+    score gradient.  In particular, ``epsilon=1`` makes the behavior independent
+    of actor parameters, so its actor gradient must be exactly zero.
+
     The actor deliberately keeps no eligibility trace in this first production
     slice; every transition still updates the actor, critic, and reward-rate
     baseline.
@@ -354,8 +401,7 @@ class AverageRewardHordeActorCriticAgent:
         """Initialize the agent."""
         self._config = config
         self._actor_optimizer = (
-            actor_optimizer if actor_optimizer is not None
-            else Autostep(initial_step_size=0.05)
+            actor_optimizer if actor_optimizer is not None else Autostep(initial_step_size=0.05)
         )
         self._critic = AverageRewardHordeLearner(
             n_demons=1,
@@ -417,10 +463,22 @@ class AverageRewardHordeActorCriticAgent:
         key, critic_key = jr.split(key)
         critic_state = self._critic.init(observation_dim, critic_key)
         actor_dim = self._config.hidden_sizes[-1] if self._config.hidden_sizes else observation_dim
-        actor_opt_w = self._actor_optimizer.init_for_shape(
-            (self._config.n_actions, actor_dim)
-        )
+        actor_opt_w = self._actor_optimizer.init_for_shape((self._config.n_actions, actor_dim))
         actor_opt_b = self._actor_optimizer.init_for_shape((self._config.n_actions,))
+        initial_policy = jnp.full(
+            (self._config.n_actions,),
+            1.0 / self._config.n_actions,
+            dtype=jnp.float32,
+        )
+        initial_sample = DiscretePolicySample(
+            action=jnp.array(-1, dtype=jnp.int32),
+            target_policy=initial_policy,
+            behavior_policy=initial_policy,
+            target_probability=jnp.array(0.0, dtype=jnp.float32),
+            behavior_probability=jnp.array(0.0, dtype=jnp.float32),
+            target_log_probability=jnp.array(-jnp.inf, dtype=jnp.float32),
+            behavior_log_probability=jnp.array(-jnp.inf, dtype=jnp.float32),
+        )
         return AverageRewardHordeActorCriticState(
             critic_state=critic_state,
             actor_weights=jnp.zeros((self._config.n_actions, actor_dim), dtype=jnp.float32),
@@ -429,6 +487,7 @@ class AverageRewardHordeActorCriticAgent:
             actor_opt_b=actor_opt_b,
             last_observation=jnp.zeros((observation_dim,), dtype=jnp.float32),
             last_action=jnp.array(-1, dtype=jnp.int32),
+            last_policy_sample=initial_sample,
             rng_key=key,
             step_count=jnp.array(0, dtype=jnp.int32),
             birth_timestamp=time.time(),
@@ -455,11 +514,56 @@ class AverageRewardHordeActorCriticAgent:
         state: AverageRewardHordeActorCriticState,
         observation: Array,
     ) -> Float[Array, " n_actions"]:
-        """Compute softmax action probabilities."""
+        """Compute softmax target-policy probabilities."""
         features = self._actor_features(state, observation)
         logits = state.actor_weights @ features + state.actor_bias
         logits = jnp.clip(logits, -self._config.logit_clip, self._config.logit_clip)
         return jax.nn.softmax(logits / self._config.temperature)
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def behavior_policy(
+        self,
+        state: AverageRewardHordeActorCriticState,
+        observation: Array,
+    ) -> Float[Array, " n_actions"]:
+        """Return the epsilon-mixture policy used to sample actions."""
+
+        target = self.policy(state, observation)
+        uniform = jnp.asarray(
+            1.0 / self._config.n_actions,
+            dtype=jnp.float32,
+        )
+        return jnp.asarray(
+            (1.0 - self._config.epsilon) * target + self._config.epsilon * uniform,
+            dtype=jnp.float32,
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def sample_policy(
+        self,
+        state: AverageRewardHordeActorCriticState,
+        observation: Array,
+    ) -> tuple[DiscretePolicySample, Array]:
+        """Sample and log the exact target/behavior policy contract."""
+
+        key, sample_key = jr.split(state.rng_key)
+        target = self.policy(state, observation)
+        behavior = self.behavior_policy(state, observation)
+        action = jr.categorical(
+            sample_key,
+            jnp.log(jnp.maximum(behavior, 1e-8)),
+        ).astype(jnp.int32)
+        target_probability = target[action]
+        behavior_probability = behavior[action]
+        return DiscretePolicySample(
+            action=action,
+            target_policy=target,
+            behavior_policy=behavior,
+            target_probability=target_probability,
+            behavior_probability=behavior_probability,
+            target_log_probability=jnp.log(jnp.maximum(target_probability, 1e-8)),
+            behavior_log_probability=jnp.log(jnp.maximum(behavior_probability, 1e-8)),
+        ), key
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def select_action(
@@ -467,15 +571,10 @@ class AverageRewardHordeActorCriticAgent:
         state: AverageRewardHordeActorCriticState,
         observation: Array,
     ) -> tuple[Int[Array, ""], Array]:
-        """Sample an epsilon-soft policy action."""
-        key, sample_key, explore_key, random_key = jr.split(state.rng_key, 4)
-        policy = self.policy(state, observation)
-        sampled = jr.categorical(sample_key, jnp.log(policy + 1e-8)).astype(jnp.int32)
-        random_action = jr.randint(random_key, (), 0, self._config.n_actions).astype(
-            jnp.int32
-        )
-        explore = jr.uniform(explore_key) < self._config.epsilon
-        return jax.lax.select(explore, random_action, sampled), key
+        """Sample an epsilon-soft action (compatibility convenience API)."""
+
+        sample, key = self.sample_policy(state, observation)
+        return sample.action, key
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def start(
@@ -484,12 +583,13 @@ class AverageRewardHordeActorCriticAgent:
         observation: Array,
     ) -> tuple[AverageRewardHordeActorCriticState, Int[Array, ""]]:
         """Select and store the first action."""
-        action, key = self.select_action(state, observation)
+        sample, key = self.sample_policy(state, observation)
         return state.replace(
             last_observation=observation,
-            last_action=action,
+            last_action=sample.action,
+            last_policy_sample=sample,
             rng_key=key,
-        ), action
+        ), sample.action
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def update(
@@ -500,8 +600,8 @@ class AverageRewardHordeActorCriticAgent:
     ) -> AverageRewardHordeActorCriticUpdateResult:
         """Apply one average-reward actor-critic update."""
         old_features = self._actor_features(state, state.last_observation)
-        old_policy = self.policy(state, state.last_observation)
-        next_action, key = self.select_action(state, next_observation)
+        old_sample = state.last_policy_sample
+        next_sample, key = self.sample_policy(state, next_observation)
         critic_result = self._critic.update(
             state.critic_state,
             state.last_observation,
@@ -519,8 +619,16 @@ class AverageRewardHordeActorCriticAgent:
             self._config.n_actions,
             dtype=jnp.float32,
         )
-        grad_log_policy = (action_mask - old_policy)[:, None] * old_features[None, :]
-        bias_grad = action_mask - old_policy
+        actor_score_scale = (
+            (1.0 - self._config.epsilon)
+            * old_sample.target_probability
+            / jnp.maximum(old_sample.behavior_probability, 1e-8)
+        )
+        score = (
+            actor_score_scale * (action_mask - old_sample.target_policy) / self._config.temperature
+        )
+        grad_log_policy = score[:, None] * old_features[None, :]
+        bias_grad = score
         raw_w, new_opt_w = self._actor_optimizer.update_from_gradient(
             state.actor_opt_w, grad_log_policy, error=actor_td_error
         )
@@ -546,14 +654,19 @@ class AverageRewardHordeActorCriticAgent:
             actor_opt_w=new_opt_w,
             actor_opt_b=new_opt_b,
             last_observation=next_observation,
-            last_action=next_action,
+            last_action=next_sample.action,
+            last_policy_sample=next_sample,
             rng_key=key,
-            step_count=state.step_count + 1,
+            step_count=_saturating_int32_increment(state.step_count),
         )
         return AverageRewardHordeActorCriticUpdateResult(
             state=new_state,
-            action=next_action,
-            policy=self.policy(new_state, next_observation),
+            action=next_sample.action,
+            policy=next_sample.behavior_policy,
+            target_policy=next_sample.target_policy,
+            behavior_action_probability=next_sample.behavior_probability,
+            target_action_probability=next_sample.target_probability,
+            actor_score_scale=actor_score_scale,
             td_error=td_error,
             average_reward=critic_result.average_rewards[0],
             critic_prediction=critic_result.predictions[0],
@@ -675,13 +788,12 @@ class AverageRewardHordeLearner:
         td_errors = result.errors
         safe_td_errors = jnp.where(active, td_errors, 0.0)
         new_average_rewards = (
-            state.average_rewards
-            + self._average_reward_step_size * safe_td_errors
+            state.average_rewards + self._average_reward_step_size * safe_td_errors
         )
         new_state = state.replace(
             learner_state=result.state,
             average_rewards=new_average_rewards,
-            step_count=state.step_count + 1,
+            step_count=_saturating_int32_increment(state.step_count),
         )
         return AverageRewardHordeUpdateResult(
             state=new_state,
@@ -786,19 +898,14 @@ class DifferentialGTDLearner:
         traces = rho_s * (lamda * state.eligibility_traces + observation)
         bias_trace = rho_s * (lamda * state.bias_eligibility_trace + 1.0)
         secondary_dot_trace = (
-            jnp.dot(state.secondary_weights, traces)
-            + state.secondary_bias * bias_trace
+            jnp.dot(state.secondary_weights, traces) + state.secondary_bias * bias_trace
         )
-        secondary_dot_obs = (
-            jnp.dot(state.secondary_weights, observation) + state.secondary_bias
-        )
+        secondary_dot_obs = jnp.dot(state.secondary_weights, observation) + state.secondary_bias
 
         primary_weight_step = alpha * (
             td_error * traces - (1.0 - lamda) * secondary_dot_trace * next_observation
         )
-        primary_bias_step = alpha * (
-            td_error * bias_trace - (1.0 - lamda) * secondary_dot_trace
-        )
+        primary_bias_step = alpha * (td_error * bias_trace - (1.0 - lamda) * secondary_dot_trace)
         secondary_weight_step = beta * (td_error * traces - secondary_dot_obs * observation)
         secondary_bias_step = beta * (td_error * bias_trace - secondary_dot_obs)
         new_average_reward = state.average_reward + eta * rho_s * td_error
@@ -811,7 +918,7 @@ class DifferentialGTDLearner:
             eligibility_traces=traces,
             bias_eligibility_trace=bias_trace,
             average_reward=new_average_reward,
-            step_count=state.step_count + 1,
+            step_count=_saturating_int32_increment(state.step_count),
         )
         metrics = jnp.array(
             [
@@ -937,7 +1044,7 @@ class DifferentialTDLearner:
             eligibility_traces=traces,
             bias_eligibility_trace=bias_trace,
             average_reward=state.average_reward + beta * td_error,
-            step_count=state.step_count + 1,
+            step_count=_saturating_int32_increment(state.step_count),
         )
         metrics = jnp.array(
             [
@@ -1022,12 +1129,10 @@ def run_differential_gtd_from_arrays(
             result.metrics,
         )
 
-    final_state, (predictions, td_errors, average_rewards, rho_clipped, metrics) = (
-        jax.lax.scan(
-            _scan_fn,
-            state,
-            (observations, rewards, next_observations, rhos),
-        )
+    final_state, (predictions, td_errors, average_rewards, rho_clipped, metrics) = jax.lax.scan(
+        _scan_fn,
+        state,
+        (observations, rewards, next_observations, rhos),
     )
     elapsed = time.time() - start
     final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)
@@ -1090,27 +1195,46 @@ def run_average_reward_horde_actor_critic_from_arrays(
     def _scan_fn(
         carry: AverageRewardHordeActorCriticState,
         inputs: tuple[Array, Array],
-    ) -> tuple[AverageRewardHordeActorCriticState, tuple[Array, Array, Array, Array]]:
+    ) -> tuple[
+        AverageRewardHordeActorCriticState,
+        tuple[Array, Array, Array, Array, Array, Array, Array, Array],
+    ]:
         reward, next_observation = inputs
         result = agent.update(carry, reward, next_observation)
         return result.state, (
             result.action,
             result.policy,
+            result.target_policy,
+            result.behavior_action_probability,
+            result.target_action_probability,
+            result.actor_score_scale,
             result.td_error,
             result.average_reward,
         )
 
-    final_state, (actions, policies, td_errors, average_rewards) = jax.lax.scan(
-        _scan_fn,
-        state,
-        (rewards, next_observations),
-    )
+    (
+        final_state,
+        (
+            actions,
+            policies,
+            target_policies,
+            behavior_action_probabilities,
+            target_action_probabilities,
+            actor_score_scales,
+            td_errors,
+            average_rewards,
+        ),
+    ) = jax.lax.scan(_scan_fn, state, (rewards, next_observations))
     elapsed = time.time() - start
     final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)
     return AverageRewardHordeActorCriticArrayResult(
         state=final_state,
         actions=actions,
         policies=policies,
+        target_policies=target_policies,
+        behavior_action_probabilities=behavior_action_probabilities,
+        target_action_probabilities=target_action_probabilities,
+        actor_score_scales=actor_score_scales,
         td_errors=td_errors,
         average_rewards=average_rewards,
     )
@@ -1118,7 +1242,14 @@ def run_average_reward_horde_actor_critic_from_arrays(
 
 @dataclasses.dataclass(frozen=True)
 class DifferentialSARSAConfig:
-    """Configuration for linear differential SARSA control."""
+    """Configuration for linear differential SARSA control.
+
+    ``use_bias`` controls the per-action bias term.  The bias is an always-on
+    shared parameter: in context-gated representations (where per-task weight
+    blocks are otherwise mutually exclusive) it becomes the one pathway
+    through which learning in one task overwrites another's policy, so
+    continual-memory experiments disable it.
+    """
 
     n_actions: int
     q_step_size: float = 0.05
@@ -1127,23 +1258,34 @@ class DifferentialSARSAConfig:
     epsilon_start: float = 0.1
     epsilon_end: float = 0.01
     epsilon_decay_steps: int = 0
+    use_bias: bool = True
 
     def __post_init__(self) -> None:
         """Validate scalar hyperparameters."""
-        if self.n_actions < 1:
+        if (
+            isinstance(self.n_actions, bool)
+            or not isinstance(self.n_actions, int)
+            or self.n_actions < 1
+        ):
             raise ValueError("n_actions must be positive")
-        if self.q_step_size < 0.0:
-            raise ValueError("q_step_size must be non-negative")
-        if self.average_reward_step_size < 0.0:
-            raise ValueError("average_reward_step_size must be non-negative")
-        if not 0.0 <= self.trace_decay <= 1.0:
-            raise ValueError("trace_decay must be in [0, 1]")
-        if not 0.0 <= self.epsilon_start <= 1.0:
-            raise ValueError("epsilon_start must be in [0, 1]")
-        if not 0.0 <= self.epsilon_end <= 1.0:
-            raise ValueError("epsilon_end must be in [0, 1]")
-        if self.epsilon_decay_steps < 0:
+        if not math.isfinite(self.q_step_size) or self.q_step_size < 0.0:
+            raise ValueError("q_step_size must be finite and non-negative")
+        if not math.isfinite(self.average_reward_step_size) or self.average_reward_step_size < 0.0:
+            raise ValueError("average_reward_step_size must be finite and non-negative")
+        if not math.isfinite(self.trace_decay) or not 0.0 <= self.trace_decay <= 1.0:
+            raise ValueError("trace_decay must be finite and lie in [0, 1]")
+        if not math.isfinite(self.epsilon_start) or not 0.0 <= self.epsilon_start <= 1.0:
+            raise ValueError("epsilon_start must be finite and lie in [0, 1]")
+        if not math.isfinite(self.epsilon_end) or not 0.0 <= self.epsilon_end <= 1.0:
+            raise ValueError("epsilon_end must be finite and lie in [0, 1]")
+        if (
+            isinstance(self.epsilon_decay_steps, bool)
+            or not isinstance(self.epsilon_decay_steps, int)
+            or self.epsilon_decay_steps < 0
+        ):
             raise ValueError("epsilon_decay_steps must be non-negative")
+        if not isinstance(self.use_bias, bool):
+            raise ValueError("use_bias must be boolean")
 
     def to_config(self) -> dict[str, Any]:
         """Serialize this config to a dictionary."""
@@ -1156,6 +1298,7 @@ class DifferentialSARSAConfig:
             "epsilon_start": self.epsilon_start,
             "epsilon_end": self.epsilon_end,
             "epsilon_decay_steps": self.epsilon_decay_steps,
+            "use_bias": self.use_bias,
         }
 
     @classmethod
@@ -1163,6 +1306,7 @@ class DifferentialSARSAConfig:
         """Reconstruct a config from :meth:`to_config` output."""
         config = dict(config)
         config.pop("type", None)
+        config.setdefault("use_bias", True)
         return cls(**config)
 
 
@@ -1211,9 +1355,12 @@ class DifferentialSARSAAgent:
     """Linear epsilon-greedy differential SARSA control agent.
 
     The update is the continuing-control counterpart of SARSA:
-    `delta_t = R_{t+1} - rbar_t + Q(S_{t+1}, A_{t+1}) - Q(S_t, A_t)`.
+    `delta_t = R_{t+1} - rbar_t
+    + gamma_{t+1} Q(S_{t+1}, A_{t+1}) - Q(S_t, A_t)`.
     The same scalar TD error updates the reward-rate estimate and all Q
-    parameters through an action-indexed accumulating trace.
+    parameters through an action-indexed accumulating trace whose prior value
+    continues by `gamma_{t+1} lambda`. The compatibility default
+    `gamma_{t+1}=1` retains the original continuing-stream behavior.
     """
 
     def __init__(self, config: DifferentialSARSAConfig):
@@ -1287,9 +1434,7 @@ class DifferentialSARSAAgent:
         q_values = self.q_values(state, observation)
         greedy_noise = jr.gumbel(noise_key, shape=q_values.shape) * 1e-6
         greedy_action = jnp.argmax(q_values + greedy_noise).astype(jnp.int32)
-        random_action = jr.randint(random_key, (), 0, self._config.n_actions).astype(
-            jnp.int32
-        )
+        random_action = jr.randint(random_key, (), 0, self._config.n_actions).astype(jnp.int32)
         explore = jr.uniform(explore_key) < state.epsilon
         return jax.lax.select(explore, random_action, greedy_action), key
 
@@ -1308,18 +1453,52 @@ class DifferentialSARSAAgent:
         ), action
 
     @functools.partial(jax.jit, static_argnums=(0,))
+    def start_with_action(
+        self,
+        state: DifferentialSARSAState,
+        observation: Array,
+        action: Array,
+    ) -> tuple[DifferentialSARSAState, Int[Array, ""]]:
+        """Store an externally scored first action without sampling internally.
+
+        This is the causal start surface for planners that combine the current
+        Q-values with pre-action model scores and own the exploration RNG.
+        It does not advance the agent RNG, update parameters, increment the
+        continuing step counter, or reinterpret the supplied action.
+
+        The caller is responsible for supplying a scalar action ID in
+        ``[0, n_actions)``; integrated protocols must validate that invariant
+        in their own fail-closed diagnostics.
+        """
+        observation_f = jnp.asarray(observation, dtype=jnp.float32)
+        action_i = jnp.asarray(action, dtype=jnp.int32)
+        return (
+            state.replace(
+                last_observation=observation_f,
+                last_action=action_i,
+            ),
+            action_i,
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
     def td_error(
         self,
         state: DifferentialSARSAState,
         reward: Array,
         next_observation: Array,
         next_action: Array,
+        *,
+        discount: Array | float = 1.0,
     ) -> Float[Array, ""]:
-        """Compute differential SARSA TD error without changing state."""
+        """Compute a discounted differential SARSA TD error without updating."""
         reward_s = jnp.squeeze(jnp.asarray(reward, dtype=jnp.float32))
+        discount_s = jnp.squeeze(jnp.asarray(discount, dtype=jnp.float32))
         q_prev = self.q_values(state, state.last_observation)[state.last_action]
         q_next = self.q_values(state, next_observation)[next_action]
-        return cast(Array, reward_s - state.average_reward + q_next - q_prev)
+        return cast(
+            Array,
+            reward_s - state.average_reward + discount_s * q_next - q_prev,
+        )
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def update(
@@ -1328,6 +1507,8 @@ class DifferentialSARSAAgent:
         reward: Array,
         next_observation: Array,
         next_action: Array | None = None,
+        *,
+        discount: Array | float = 1.0,
     ) -> DifferentialSARSAUpdateResult:
         """Apply one differential SARSA update.
 
@@ -1337,6 +1518,8 @@ class DifferentialSARSAAgent:
             next_observation: New observation.
             next_action: Optional preselected next action. When omitted, the
                 current policy samples one and stores it for the following step.
+            discount: Continuation discount for this transition. The default
+                ``1.0`` preserves the original continuing-task behavior.
         """
         cfg = self._config
         if next_action is None:
@@ -1349,12 +1532,13 @@ class DifferentialSARSAAgent:
         beta = jnp.asarray(cfg.average_reward_step_size, dtype=jnp.float32)
         lamda = jnp.asarray(cfg.trace_decay, dtype=jnp.float32)
         reward_s = jnp.squeeze(jnp.asarray(reward, dtype=jnp.float32))
+        discount_s = jnp.squeeze(jnp.asarray(discount, dtype=jnp.float32))
 
         q_prev_all = self.q_values(state, state.last_observation)
         q_next_all = self.q_values(state, next_observation)
         q_prev = q_prev_all[state.last_action]
         q_next = q_next_all[selected_next_action]
-        td_error = reward_s - state.average_reward + q_next - q_prev
+        td_error = reward_s - state.average_reward + discount_s * q_next - q_prev
 
         action_mask = jax.nn.one_hot(
             state.last_action,
@@ -1362,18 +1546,19 @@ class DifferentialSARSAAgent:
             dtype=jnp.float32,
         )
         grad_weights = action_mask[:, None] * state.last_observation[None, :]
-        grad_bias = action_mask
-        traces = lamda * state.q_trace_weights + grad_weights
-        bias_traces = lamda * state.q_trace_bias + grad_bias
-        new_step_count = state.step_count + 1
+        # With use_bias=False the bias gradient is zeroed, so q_bias stays at
+        # its zero init and the Q-function is purely feature-driven.
+        grad_bias = action_mask * jnp.float32(cfg.use_bias)
+        trace_continuation = discount_s * lamda
+        traces = trace_continuation * state.q_trace_weights + grad_weights
+        bias_traces = trace_continuation * state.q_trace_bias + grad_bias
+        new_step_count = _saturating_int32_increment(state.step_count)
         new_epsilon = jax.lax.cond(
             cfg.epsilon_decay_steps > 0,
             lambda: jnp.maximum(
                 cfg.epsilon_end,
                 cfg.epsilon_start
-                - (cfg.epsilon_start - cfg.epsilon_end)
-                * new_step_count
-                / cfg.epsilon_decay_steps,
+                - (cfg.epsilon_start - cfg.epsilon_end) * new_step_count / cfg.epsilon_decay_steps,
             ),
             lambda: state.epsilon,
         )
@@ -1405,21 +1590,31 @@ def run_differential_sarsa_from_arrays(
     state: DifferentialSARSAState,
     rewards: Float[Array, " num_steps"],
     next_observations: Float[Array, "num_steps feature_dim"],
+    discounts: Float[Array, " num_steps"] | None = None,
 ) -> DifferentialSARSAArrayResult:
     """Run differential SARSA over continuing transition arrays.
 
     The input state must already be primed with ``agent.start`` so it contains
     the first observation and action. Rewards are therefore aligned with
     transitions from the stored `(S_t, A_t)` to each ``next_observations[t]``.
+    When ``discounts`` is omitted, every transition uses ``1.0`` for backward
+    compatibility with the original continuing-task runner.
     """
     start = time.time()
+    if discounts is None:
+        discounts = jnp.ones_like(rewards, dtype=jnp.float32)
 
     def _scan_fn(
         carry: DifferentialSARSAState,
-        inputs: tuple[Array, Array],
+        inputs: tuple[Array, Array, Array],
     ) -> tuple[DifferentialSARSAState, tuple[Array, Array, Array, Array]]:
-        reward, next_observation = inputs
-        result = agent.update(carry, reward, next_observation)
+        reward, next_observation, discount = inputs
+        result = agent.update(
+            carry,
+            reward,
+            next_observation,
+            discount=discount,
+        )
         return result.state, (
             result.q_values,
             result.td_error,
@@ -1430,7 +1625,7 @@ def run_differential_sarsa_from_arrays(
     final_state, (q_values, td_errors, average_rewards, actions) = jax.lax.scan(
         _scan_fn,
         state,
-        (rewards, next_observations),
+        (rewards, next_observations, discounts),
     )
     elapsed = time.time() - start
     final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)

@@ -1,0 +1,331 @@
+{
+  "schema_version": "alberta.scale_robust_pair_feature_calibration_summary.v2",
+  "status": "development_only_threshold_calibration_not_promoted_evidence",
+  "captured_at_utc": "2026-07-31T04:32:06.265Z",
+  "protocol": {
+    "development_seeds": [
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "fresh_evidence_schedule": {
+      "namespace_ascii": "alberta-scale-robust-v2-fresh-evidence-2026-07-30:",
+      "derivation": "int.from_bytes(SHA256(namespace_ascii + ascii(index)).digest()[:4], 'big'), index=0..29",
+      "seeds": [
+        2476612463,
+        1530459451,
+        3117203318,
+        1536318901,
+        2212445791,
+        409707519,
+        85437679,
+        2333405102,
+        308844560,
+        1012174348,
+        157165507,
+        2644321438,
+        3712695078,
+        1472213755,
+        4073988609,
+        1231719225,
+        453256333,
+        1972643767,
+        226233076,
+        192990423,
+        1417189072,
+        2415162767,
+        4048779818,
+        2042867307,
+        3039992193,
+        1940572846,
+        1556070712,
+        874158329,
+        3662884740,
+        3052189747
+      ],
+      "status_at_freeze": "not_run"
+    },
+    "historical_exposure": {
+      "seeds": {
+        "first": 30,
+        "last": 45
+      },
+      "protocol": "older primary-only scale-robust confirmation",
+      "consequence": "Numeric seeds 30-59 are not the v2 evidence schedule and must not be described as untouched."
+    },
+    "learner_init_seed": 123,
+    "seed_key_derivation": "jax.random.key(seed_id)",
+    "run_kind": "direct_key_development_calibration"
+  },
+  "capture": {
+    "available": [
+      "condition-level median gate inputs",
+      "primary-arm extrema used by per-seed gates",
+      "per-seed paired differences for the revised representation gates",
+      "deterministic paired-bootstrap summaries"
+    ],
+    "primitive_condition_rows": null,
+    "primitive_condition_rows_status": "not_emitted_by_the_calibration_console_capture_and_not_reconstructed",
+    "source_hashes_at_run": null,
+    "source_hashes_at_run_status": "not_emitted_by_the_calibration_console_capture",
+    "interpretation": "This record preserves only values present in the completed development capture. It is threshold provenance, not promoted evidence, and it is not sufficient to recreate omitted primitive rows."
+  },
+  "observed_primary_gate_inputs": {
+    "median": {
+      "end_segment_5_unique_relevant_c_context_pairs": 7.0,
+      "end_segment_5_unique_relevant_d_context_pairs": 8.0,
+      "end_segment_7_unique_relevant_c_context_pairs": 8.0,
+      "end_segment_7_unique_relevant_d_context_pairs": 8.0,
+      "final_c_early_mse": 1.475532596188759,
+      "final_c_tail_mse": 0.04008326997442174,
+      "final_unique_relevant_c_context_pairs": 8.0,
+      "final_unique_relevant_d_context_pairs": 8.0,
+      "first_c_early_mse": 8.48637648544355,
+      "first_c_tail_mse": 0.5888706859088354,
+      "first_d_early_mse": 8.081695187198566,
+      "first_d_tail_mse": 0.6689417933209145,
+      "nonlinear_mse": 0.03923357754239511,
+      "recurrent_c_early_mse": 0.6722738427838881,
+      "recurrent_c_tail_mse": 0.5315627127359597,
+      "recurrent_d_early_mse": 0.5761304291200395,
+      "recurrent_d_tail_mse": 0.09463534440626029,
+      "savings_c": 13.38753041100404,
+      "savings_c_final": 5.383657373079997,
+      "savings_d": 13.706160980628638,
+      "scaled_cumulative_mse": 24.006952644098433,
+      "scaled_early_mse": 68.87079768210765,
+      "scaled_tail_mse": 4.339159679259516
+    },
+    "extrema": {
+      "maximum_final_c_tail_mse": 0.0516844184606432,
+      "maximum_scaled_cumulative_mse": 40.70576439872977,
+      "maximum_scaled_early_mse": 98.58745595124091,
+      "maximum_scaled_tail_mse": 36.55594134700811,
+      "minimum_unique_relevant_c_context_pairs_end_segment_5": 6.0,
+      "minimum_unique_relevant_c_context_pairs_end_segment_7": 7.0,
+      "minimum_unique_relevant_c_context_pairs_final": 8.0,
+      "minimum_unique_relevant_d_context_pairs_end_segment_5": 7.0,
+      "minimum_unique_relevant_d_context_pairs_end_segment_7": 7.0,
+      "minimum_unique_relevant_d_context_pairs_final": 7.0
+    },
+    "total_nonfinite_steps": 0
+  },
+  "structural_comparison_gate_inputs": {
+    "primary_minus_legacy_final_unique_relevant_c_context_pairs": {
+      "per_seed_differences": [
+        {
+          "seed": 8,
+          "difference": 8.0
+        },
+        {
+          "seed": 9,
+          "difference": 8.0
+        },
+        {
+          "seed": 10,
+          "difference": 8.0
+        },
+        {
+          "seed": 11,
+          "difference": 8.0
+        },
+        {
+          "seed": 12,
+          "difference": 8.0
+        },
+        {
+          "seed": 13,
+          "difference": 8.0
+        },
+        {
+          "seed": 14,
+          "difference": 8.0
+        },
+        {
+          "seed": 15,
+          "difference": 8.0
+        }
+      ],
+      "minimum_difference": 8.0,
+      "paired_mean_interval": {
+        "estimate": 8.0,
+        "lower": 8.0,
+        "upper": 8.0,
+        "confidence_level": 0.95,
+        "resamples": 5000,
+        "seed": 2026073004,
+        "method": "paired-percentile-bootstrap"
+      }
+    },
+    "primary_minus_legacy_final_unique_relevant_d_context_pairs": {
+      "per_seed_differences": [
+        {
+          "seed": 8,
+          "difference": 8.0
+        },
+        {
+          "seed": 9,
+          "difference": 8.0
+        },
+        {
+          "seed": 10,
+          "difference": 8.0
+        },
+        {
+          "seed": 11,
+          "difference": 8.0
+        },
+        {
+          "seed": 12,
+          "difference": 7.0
+        },
+        {
+          "seed": 13,
+          "difference": 7.0
+        },
+        {
+          "seed": 14,
+          "difference": 7.0
+        },
+        {
+          "seed": 15,
+          "difference": 8.0
+        }
+      ],
+      "minimum_difference": 7.0,
+      "paired_mean_interval": {
+        "estimate": 7.625,
+        "lower": 7.25,
+        "upper": 7.875,
+        "confidence_level": 0.95,
+        "resamples": 5000,
+        "seed": 2026073004,
+        "method": "paired-percentile-bootstrap"
+      }
+    },
+    "primary_minus_no_retention_end_segment_7_unique_relevant_c_context_pairs": {
+      "per_seed_differences": [
+        {
+          "seed": 8,
+          "difference": 0.0
+        },
+        {
+          "seed": 9,
+          "difference": 0.0
+        },
+        {
+          "seed": 10,
+          "difference": 2.0
+        },
+        {
+          "seed": 11,
+          "difference": 1.0
+        },
+        {
+          "seed": 12,
+          "difference": 3.0
+        },
+        {
+          "seed": 13,
+          "difference": 0.0
+        },
+        {
+          "seed": 14,
+          "difference": 2.0
+        },
+        {
+          "seed": 15,
+          "difference": 1.0
+        }
+      ],
+      "minimum_difference": 0.0,
+      "paired_mean_interval": {
+        "estimate": 1.125,
+        "lower": 0.375,
+        "upper": 1.875,
+        "confidence_level": 0.95,
+        "resamples": 5000,
+        "seed": 2026073004,
+        "method": "paired-percentile-bootstrap"
+      }
+    },
+    "primary_minus_no_retention_end_segment_7_unique_relevant_d_context_pairs": {
+      "per_seed_differences": [
+        {
+          "seed": 8,
+          "difference": 4.0
+        },
+        {
+          "seed": 9,
+          "difference": 4.0
+        },
+        {
+          "seed": 10,
+          "difference": 4.0
+        },
+        {
+          "seed": 11,
+          "difference": 3.0
+        },
+        {
+          "seed": 12,
+          "difference": 1.0
+        },
+        {
+          "seed": 13,
+          "difference": 3.0
+        },
+        {
+          "seed": 14,
+          "difference": 1.0
+        },
+        {
+          "seed": 15,
+          "difference": 3.0
+        }
+      ],
+      "minimum_difference": 1.0,
+      "paired_mean_interval": {
+        "estimate": 2.875,
+        "lower": 2.0,
+        "upper": 3.625,
+        "confidence_level": 0.95,
+        "resamples": 5000,
+        "seed": 2026073004,
+        "method": "paired-percentile-bootstrap"
+      }
+    }
+  },
+  "frozen_thresholds_from_this_calibration": {
+    "maximum_median_first_d_early_mse": 15.0,
+    "maximum_median_first_d_tail_mse": 2.0,
+    "maximum_median_recurrent_d_early_mse": 2.0,
+    "maximum_median_recurrent_d_tail_mse": 2.0,
+    "maximum_median_scaled_early_mse": 100.0,
+    "maximum_per_seed_scaled_early_mse": 200.0,
+    "maximum_median_scaled_cumulative_mse": 50.0,
+    "maximum_per_seed_scaled_cumulative_mse": 100.0,
+    "minimum_unique_relevant_context_pairs_per_task_at_each_snapshot": 4,
+    "minimum_all_seed_primary_minus_legacy_final_unique_context_pairs_per_task": 4.0,
+    "minimum_paired_mean_primary_minus_legacy_final_unique_context_pairs_ci_lower_per_task": 4.0,
+    "minimum_all_seed_primary_minus_no_retention_end_segment_7_unique_context_pairs_per_task": 0.0,
+    "minimum_paired_mean_primary_minus_no_retention_end_segment_7_unique_context_pairs_ci_lower_per_task": {
+      "threshold": 0.0,
+      "comparator": "strictly_greater_than"
+    }
+  },
+  "claim_limits": [
+    "The fresh namespace-derived v2 evidence schedule has not been run; this calibration record is not a promoted result.",
+    "Numeric seeds 30-45 were exposed by an older primary-only confirmation, so numeric seeds 30-59 are excluded from v2 evidence.",
+    "One fixed learner initialization key is used, so this does not establish initialization robustness.",
+    "The primary-versus-legacy comparison changes normalization, update bounding, and counted memory, so it does not isolate one component causally.",
+    "The resident exhaustive degree-two archive and supplied task cue do not demonstrate general or open-ended feature discovery.",
+    "The retention ablation establishes structural active-bank persistence only; it does not establish that retention improves prediction performance.",
+    "Median error gates do not rule out every minority-seed error failure."
+  ]
+}

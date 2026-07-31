@@ -267,9 +267,13 @@ def mann_whitney_comparison(
             "scipy is required for Mann-Whitney test. Install with: pip install scipy"
         )
 
-    # Compute rank-biserial correlation as effect size
+    # Compute rank-biserial correlation as effect size (Kerby 2014):
+    # r = 2*U1/(n_a*n_b) - 1, where scipy's statistic is U1 (pairs favoring a).
+    # Positive means a > b, matching the cohens_d sign convention used by the
+    # parametric tests in this module. (A previous version computed
+    # 1 - 2*U1/(n_a*n_b), which inverted the direction of the effect.)
     n_a, n_b = len(a), len(b)
-    r = 1 - (2 * stat_val) / (n_a * n_b)
+    r = (2 * stat_val) / (n_a * n_b) - 1
 
     return SignificanceResult(
         test_name="Mann-Whitney U",

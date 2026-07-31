@@ -669,6 +669,16 @@ def step7_update(
             corrected_state,
             carry_state,
         )
+        # Always thread the advanced RNG key: even when the planning output is
+        # rejected (pre-warmup gate), reverting to the old key would freeze the
+        # stream and make every rejected iteration re-sample identical
+        # anchors/actions.
+        next_state = cast(
+            DifferentialSARSAState,
+            next_state.replace(  # type: ignore[attr-defined]
+                rng_key=corrected_state.rng_key
+            ),
+        )
         propagated_queue_priorities = _propagate_predecessor_priorities(
             memory_next_observations,
             popped_queue_priorities,

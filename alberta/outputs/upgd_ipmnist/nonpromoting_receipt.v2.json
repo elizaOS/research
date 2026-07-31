@@ -1,0 +1,387 @@
+{
+  "schema_version": "alberta.upgd_ipmnist_nonpromoting_receipt.v2",
+  "receipt_role": "versioned_provenance_successor",
+  "predecessor_receipt": {
+    "path": "outputs/upgd_ipmnist/nonpromoting_receipt.v1.json",
+    "size_bytes": 13290,
+    "sha256": "c32595829f93ac86b96c6eefc722291bf365dbf724982a70f207d193bbcfc26e",
+    "preserved_byte_for_byte": true
+  },
+  "status": "complete_structural_validation",
+  "evidence_class": "development_replication_diagnostic",
+  "development_only": true,
+  "scientific_promotion_allowed": false,
+  "canonical_reconciled_artifact": {
+    "path_base": "repository_root",
+    "path": "outputs/upgd_ipmnist/results.reconciled_nonpromoting.v2.json",
+    "size_bytes": 97565,
+    "sha256": "c7efe780d240048085ee80884bc3f3682922baf1a4e45496d44d087bffee09ba",
+    "strict_validator_valid": true,
+    "strict_validator_errors": []
+  },
+  "prior_reconciliation": {
+    "path_base": "repository_root",
+    "path": "outputs/upgd_ipmnist/results.reconciled_nonpromoting.v1.json",
+    "size_bytes": 97586,
+    "sha256": "98e697f76e952979cddccb9af6f248eb338f02511b1e20837fce42be50ebe848",
+    "strict_validator_valid_on_origin_host": true,
+    "superseded_reason": "The artifact retained the external absolute OpenML cache path; v2 binds a repository-local post-hoc cache copy so strict validation is portable."
+  },
+  "preserved_finalizer_artifact": {
+    "path_base": "repository_root",
+    "path": "outputs/upgd_ipmnist/results.v1.json",
+    "size_bytes": 97998,
+    "sha256": "5750c8f1784b99a5719d177c1d36cbf330d473881d9529dcdf3efb946a242ea0",
+    "strict_validator_valid": false,
+    "strict_validator_errors": [
+      "artifact note does not preserve the 10-vs-20-seed limitation"
+    ],
+    "preserved_without_overwrite": true
+  },
+  "protocol_scope": {
+    "benchmark": "upgd_input_permuted_mnist",
+    "network_and_task_shape_match_selected_publication_configuration": true,
+    "complete_published_protocol_exact": false,
+    "legacy_artifact_protocol_marker": {
+      "field": "protocol.is_protocol_exact",
+      "recorded_value": true,
+      "interpretation": "legacy selected-configuration shape marker only",
+      "does_not_override_complete_published_protocol_exact": true
+    },
+    "n_tasks": 200,
+    "task_length": 5000,
+    "steps_per_seed": 1000000,
+    "input_dim": 784,
+    "hidden_sizes": [
+      300,
+      150
+    ],
+    "n_classes": 10,
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ],
+    "published_seed_count": 20,
+    "recorded_seed_count": 10,
+    "deviations": [
+      "The replication uses 10 rather than 20 seeds.",
+      "Permutation and example streams are seeded while the upstream streams are unseeded.",
+      "Task blocks use exact [t*L, (t+1)*L) boundaries while upstream logging is shifted one step.",
+      "Bias corrections stay in float32 while upstream mixes float64 scalars.",
+      "The v1 shards do not bind worker source, the full import closure, commands, environment, or dataset bytes."
+    ]
+  },
+  "partial_shards": [
+    {
+      "learner": "adamw",
+      "seed": 0,
+      "path": "outputs/upgd_ipmnist/partials/adamw_seed0.json",
+      "size_bytes": 16146,
+      "sha256": "e43f46689d9c656cc705fd65e782ff0a4b2a9001f52bbd0001f3ca8e2ba0d86e"
+    },
+    {
+      "learner": "adamw",
+      "seed": 1,
+      "path": "outputs/upgd_ipmnist/partials/adamw_seed1.json",
+      "size_bytes": 16171,
+      "sha256": "9b9991002a55a80f9b87568d15eb7984e155374e48e6a3cbf80fe11e938e5b62"
+    },
+    {
+      "learner": "adamw",
+      "seed": 2,
+      "path": "outputs/upgd_ipmnist/partials/adamw_seed2.json",
+      "size_bytes": 16169,
+      "sha256": "f887a80077a5076e35778c7565e7ea67ad6a62549025d769916f41eada792aa0"
+    },
+    {
+      "learner": "adamw",
+      "seed": 3,
+      "path": "outputs/upgd_ipmnist/partials/adamw_seed3.json",
+      "size_bytes": 16152,
+      "sha256": "d50fabf59bb3ad2903cae157a40294d0386214f6c2efe993801adee27e52d358"
+    },
+    {
+      "learner": "adamw",
+      "seed": 4,
+      "path": "outputs/upgd_ipmnist/partials/adamw_seed4.json",
+      "size_bytes": 16156,
+      "sha256": "b07adff48bd0d46f2311248ab1e02b53d99579e3d1ba7e7514a0364167cd8206"
+    },
+    {
+      "learner": "adamw",
+      "seed": 5,
+      "path": "outputs/upgd_ipmnist/partials/adamw_seed5.json",
+      "size_bytes": 16160,
+      "sha256": "8b1ff01248327ff7f8ecd42361bbc258df26ea49207692be3ee840470008b22d"
+    },
+    {
+      "learner": "adamw",
+      "seed": 6,
+      "path": "outputs/upgd_ipmnist/partials/adamw_seed6.json",
+      "size_bytes": 16170,
+      "sha256": "f7934e1a92ed54fcd0ebfe2e33ea5d1d17e278b0f5a43cbd4d9fc80c8929e8ce"
+    },
+    {
+      "learner": "adamw",
+      "seed": 7,
+      "path": "outputs/upgd_ipmnist/partials/adamw_seed7.json",
+      "size_bytes": 16167,
+      "sha256": "d1ac72a025888d2851cbbb81ea35bffddbbf656caafc929c4ca4d21d13cdaad6"
+    },
+    {
+      "learner": "adamw",
+      "seed": 8,
+      "path": "outputs/upgd_ipmnist/partials/adamw_seed8.json",
+      "size_bytes": 16137,
+      "sha256": "effe84c1ec5b00a961c812cf760d9c58f5114a40bfa15642ec8d5436c5984f17"
+    },
+    {
+      "learner": "adamw",
+      "seed": 9,
+      "path": "outputs/upgd_ipmnist/partials/adamw_seed9.json",
+      "size_bytes": 16168,
+      "sha256": "24515752b7e9ee5920108890b286d793cf9ccdead3a89bc2f97bc2542d6315d1"
+    },
+    {
+      "learner": "upgd_w",
+      "seed": 0,
+      "path": "outputs/upgd_ipmnist/partials/upgd_w_seed0.json",
+      "size_bytes": 16141,
+      "sha256": "2cd432c5d993c4007c6b516f2502eff8a559a0ec54a392df700e2e76fa3cf861"
+    },
+    {
+      "learner": "upgd_w",
+      "seed": 1,
+      "path": "outputs/upgd_ipmnist/partials/upgd_w_seed1.json",
+      "size_bytes": 16112,
+      "sha256": "a509b6946d39738310ecde94f3cba79aa7ddfe18ccc22c5143829dd252684573"
+    },
+    {
+      "learner": "upgd_w",
+      "seed": 2,
+      "path": "outputs/upgd_ipmnist/partials/upgd_w_seed2.json",
+      "size_bytes": 16109,
+      "sha256": "0b882828ded48db5e9303507bed9bf59436f0cdefbf3edc7df8940f2170a1c67"
+    },
+    {
+      "learner": "upgd_w",
+      "seed": 3,
+      "path": "outputs/upgd_ipmnist/partials/upgd_w_seed3.json",
+      "size_bytes": 16142,
+      "sha256": "55d1d0da1b41b07312be036ccb3870f8df4ddf184c85cd7fe96eb3e4c4602747"
+    },
+    {
+      "learner": "upgd_w",
+      "seed": 4,
+      "path": "outputs/upgd_ipmnist/partials/upgd_w_seed4.json",
+      "size_bytes": 16115,
+      "sha256": "095dbed454afda1ad83300025b23a64fd3807db3646f52da47381c3f2a83359e"
+    },
+    {
+      "learner": "upgd_w",
+      "seed": 5,
+      "path": "outputs/upgd_ipmnist/partials/upgd_w_seed5.json",
+      "size_bytes": 16146,
+      "sha256": "35ffa9f747a4f31f329579fe68961107f77d2edb62c40d1f9e07f49bb37e6c77"
+    },
+    {
+      "learner": "upgd_w",
+      "seed": 6,
+      "path": "outputs/upgd_ipmnist/partials/upgd_w_seed6.json",
+      "size_bytes": 16146,
+      "sha256": "df16036d0904420fe5a2548589b91cce53f4f43617cb9593115fdb2abfaca662"
+    },
+    {
+      "learner": "upgd_w",
+      "seed": 7,
+      "path": "outputs/upgd_ipmnist/partials/upgd_w_seed7.json",
+      "size_bytes": 16118,
+      "sha256": "d82217cc988a61a9e6a449ab11f05d58026dbf379a50252b10bfbe1a6d709c81"
+    },
+    {
+      "learner": "upgd_w",
+      "seed": 8,
+      "path": "outputs/upgd_ipmnist/partials/upgd_w_seed8.json",
+      "size_bytes": 16148,
+      "sha256": "8c94683a093a76102ee4b8b79cd81717887f6ca06da7e8dd226a564987e1d931"
+    },
+    {
+      "learner": "upgd_w",
+      "seed": 9,
+      "path": "outputs/upgd_ipmnist/partials/upgd_w_seed9.json",
+      "size_bytes": 16145,
+      "sha256": "74192654b8df48f83cd57b4b24cd47284aaaf01e8db3eb935e377d0a392de4c5"
+    }
+  ],
+  "strict_validation": {
+    "implementation": "alberta_framework.evaluation.upgd_ipmnist_nonpromoting.validate_completed_upgd_ipmnist_run",
+    "active_validator_path": "alberta_framework/evaluation/upgd_ipmnist_nonpromoting.py",
+    "validator_path": "outputs/upgd_ipmnist/strict_validator_snapshot.v1.py",
+    "validator_size_bytes": 39617,
+    "validator_sha256": "ec9d7db598dd88fc9fc22a3a6b8b474dc207ccbc5ec6574fff3ff094c21bf353",
+    "valid": true,
+    "errors": [],
+    "development_only": true,
+    "scientific_promotion_allowed": false,
+    "observed_learner_seed_pairs": 20,
+    "canonical_sorted_shard_hash_map_sha256": "36915090be30c3f12c2c73d142dbe999d134974a4c136e3b0e66bd4740a01d11"
+  },
+  "post_hoc_reconstructed_provenance": {
+    "execution_attestation": false,
+    "full_import_closure_snapshotted": false,
+    "launch_runner_sha256": "e201ec75cb545e22ac868d9e86160cf92b0a59e7a523b6d71bbe3249b21d3a50",
+    "merge_runner_sha256": "36d4b18200662a857849b5b1855263a32c549005b4d16e249d62c07696e33d05",
+    "worker_source_partition": [
+      {
+        "runner_sha256": "e201ec75cb545e22ac868d9e86160cf92b0a59e7a523b6d71bbe3249b21d3a50",
+        "learners_and_seeds": {
+          "upgd_w": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "adamw": [
+            0,
+            1,
+            2,
+            3
+          ]
+        }
+      },
+      {
+        "runner_sha256": "36d4b18200662a857849b5b1855263a32c549005b4d16e249d62c07696e33d05",
+        "learners_and_seeds": {
+          "upgd_w": [],
+          "adamw": [
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ]
+        }
+      }
+    ],
+    "runbook": {
+      "path": "outputs/upgd_ipmnist/RUNBOOK.v2.md",
+      "sha256": "c9366236ea9acad401a309fdb3e9d3a5ab6e4e74f070649ebcac2c29d2d9a349"
+    },
+    "reconstructed_source_bundle": {
+      "path": "outputs/upgd_ipmnist/reconstructed_source.v1",
+      "manifest_path": "outputs/upgd_ipmnist/reconstructed_source.v1/MANIFEST.json",
+      "manifest_size_bytes": 2997,
+      "manifest_sha256": "1a40a3ccb350feabfc45494a7250e8e57fbea3c25a62040b4114d375ba590d61",
+      "numeric_file_count": 6,
+      "numeric_file_size_bytes": 202928,
+      "scope": "post_hoc_reconstructed_numeric_source_subset",
+      "execution_attestation": false,
+      "full_import_closure_snapshotted": false
+    },
+    "operational_log_archive": {
+      "path": "outputs/upgd_ipmnist/provenance_logs.v1.tar",
+      "format": "deterministic_gnu_tar",
+      "file_count": 23,
+      "size_bytes": 61440,
+      "sha256": "6e8658e1c112c7852f767464f6608254f8660d2fe6e98b0c9a59f967ddd0e1b4",
+      "execution_attestation": false
+    },
+    "numeric_source_hash_map_canonicalization": "UTF-8 JSON with sorted keys and separators (',', ':')",
+    "numeric_source_hash_map_sha256": "5ee43baa11ddd8037219e666a3fc9fdd8f4c8beccad1e16342fdc9c60566dc6f",
+    "numeric_source_path_base": "outputs/upgd_ipmnist/reconstructed_source.v1",
+    "numeric_source_sha256": {
+      "alberta_framework/core/baseline_optimizers.py": "d98ea5865b2a832067454708ea0748edaa2a067a8faa5379db3221ebd7022879",
+      "alberta_framework/core/canonical_upgd.py": "d4b975a811eed452ed14898c2326d22eedf3c40a79252672d283ead7b2ccd790",
+      "alberta_framework/core/normalizers.py": "6e58ae701ace21dcf6cedcdba874ba46535daf213a1cc345c29759f04e6bfcb6",
+      "alberta_framework/core/optimizers.py": "559661689c96d00e5fa32ba819252ead282f35afabb3d8b58b5c084e560cbde3",
+      "alberta_framework/core/types.py": "b5ebe8ebb1bacecd438da21d5003546b758d76db9be55fb56b3666d6f59a8d70"
+    },
+    "mnist_cache": {
+      "path": "outputs/upgd_ipmnist/reconstructed_openml_cache/openml/openml.org/data/v1/download/52667/mnist_784.arff.gz",
+      "size_bytes": 15469256,
+      "sha256": "fe4410d8dbb50f6db6482b187557c5cb8bccfbcec74eeb6abc47c858f4ffab78",
+      "binding_scope": "post_hoc_reconstruction_only"
+    },
+    "merge_environment": {
+      "jax": "0.11.0",
+      "numpy": "2.5.1",
+      "python": "3.12.3",
+      "platform": "Linux-7.0.0-28-generic-x86_64-with-glibc2.39",
+      "device": "cpu:0"
+    }
+  },
+  "learner_summaries": {
+    "upgd_w": {
+      "n": 10,
+      "average_online_accuracy_mean": 0.7791470803916454,
+      "average_online_accuracy_stderr": 0.000055690729820870456,
+      "first_quarter_accuracy_mean": 0.7774191806316375,
+      "last_quarter_accuracy_mean": 0.779775180220604,
+      "accuracy_drift_last_minus_first": 0.002355999588966484,
+      "average_plasticity_mean": 0.4967120944112539
+    },
+    "adamw": {
+      "n": 10,
+      "average_online_accuracy_mean": 0.7190002817213534,
+      "average_online_accuracy_stderr": 0.0005943125024635892,
+      "first_quarter_accuracy_mean": 0.7597851804494857,
+      "last_quarter_accuracy_mean": 0.6918167824745177,
+      "accuracy_drift_last_minus_first": -0.06796839797496801,
+      "average_plasticity_mean": 0.30222325172275305
+    }
+  },
+  "paired_development_summary": {
+    "direction": "upgd_w_minus_adamw",
+    "per_seed_average_online_accuracy_differences": [
+      0.05690699785947795,
+      0.058469998240470944,
+      0.06264900058507916,
+      0.059581000208854595,
+      0.058942997455596946,
+      0.06319199830293654,
+      0.059829996824264486,
+      0.06062399893999093,
+      0.06112399995327,
+      0.06014799833297724
+    ],
+    "mean_difference": 0.06014679867029188,
+    "sample_standard_deviation": 0.0018825070977402044,
+    "wins": 10,
+    "ties": 0,
+    "losses": 0,
+    "inferential_statistics_admissible": false
+  },
+  "publication_orientation": {
+    "reference_kind": "figure_readoff",
+    "published_approximate_upgd_w": 0.78,
+    "observed_upgd_w": 0.7791470803916454,
+    "gap_upgd_w": -0.0008529196083546511,
+    "published_approximate_adamw": 0.68,
+    "observed_adamw": 0.7190002817213534,
+    "gap_adamw": 0.03900028172135339,
+    "adamw_reproduction_gap_flagged": true
+  },
+  "limitations": [
+    "The v1 shards and artifact schema contain no worker-source, full-import-closure, command, environment, or data digests, so post-hoc matching cannot attest execution provenance.",
+    "The reconstructed source bundle preserves the audited post-hoc numerical subset so live code can evolve, but it is not an execution-time source capture or a complete import closure.",
+    "The run used 10 rather than the publication's 20 seeds and intentionally changed stream seeding, task-boundary logging, and numeric details.",
+    "The publication values are approximate figure read-offs, not exact seed-level acceptance targets.",
+    "The AdamW result differs from its approximate figure read-off by about +0.039 and is an explicit reproduction gap.",
+    "This receipt validates a completed development replication diagnostic only; it cannot support scientific promotion, a SOTA claim, or Alberta Plan completion."
+  ]
+}

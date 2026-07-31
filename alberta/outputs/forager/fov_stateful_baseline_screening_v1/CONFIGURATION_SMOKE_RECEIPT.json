@@ -1,0 +1,911 @@
+{
+  "schema_version": "alberta.forager_stateful_smoke_receipt.v1",
+  "status": "passed",
+  "created_at_utc": "2026-07-31T12:28:33Z",
+  "scope": "open-development configuration construction and exactly one upstream transition per seed lane",
+  "protocol_sha256": "df80dfafbd3bfc8eca7f1e6eccadc0ba93da4a3ec8f12ebe2befd430a21915e8",
+  "image_reference": "alberta-forager-runtime:dev2-9710f60",
+  "image_id": "sha256:e8a9789cee5e1e607256a92f035013416479141ee3cd1d489af1b0738cb854c3",
+  "source_repository": "https://github.com/steventango/continual-foragax-agents",
+  "source_commit": "9710f60fa30da5badc451ad7ce3ff296d5070830",
+  "source_tree_sha1": "a5ad878ac4be0567c43dfd9177471c4b5a910bfa",
+  "full_reward_execution_performed": false,
+  "gpu_execution_performed": false,
+  "save_or_video_stub_used": false,
+  "collector_summaries_used": false,
+  "indices": [
+    2000001,
+    2000002
+  ],
+  "indices_argument": "2000001:2000003",
+  "transitions_per_lane": 1,
+  "container_contract": {
+    "remove_after_exit": true,
+    "network": "none",
+    "root_filesystem": "read_only",
+    "user": "65532:65532",
+    "capabilities": "all_dropped",
+    "no_new_privileges": true,
+    "pids_limit": 512,
+    "tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=2g",
+    "environment": {
+      "JAX_PLATFORM_NAME": "cpu",
+      "JAX_PLATFORMS": "cpu",
+      "NUMBA_DISABLE_JIT": "1",
+      "NVIDIA_VISIBLE_DEVICES": "void",
+      "CUDA_VISIBLE_DEVICES": ""
+    },
+    "protocol_mount": "read_only at /protocol",
+    "image_entrypoint": "/opt/foragax-agents/.venv/bin/python -I",
+    "invocation": "/protocol/smoke_one_transition.py --config /protocol/<configuration>"
+  },
+  "source_validation": {
+    "audit_checkout": {
+      "root": "/tmp/forager-audit.XPpQoQ/continual-foragax-agents",
+      "git_head": "9710f60fa30da5badc451ad7ce3ff296d5070830",
+      "git_tree_sha1": "a5ad878ac4be0567c43dfd9177471c4b5a910bfa",
+      "templates_and_selected_sources_match_protocol": true,
+      "validator_status": "passed"
+    },
+    "development_image_copy": {
+      "root": "/opt/foragax-agents",
+      "templates_and_selected_sources_match_protocol": true,
+      "exact_installed_continual_foragax_version": "0.55.0",
+      "validator_status": "passed"
+    }
+  },
+  "artifact_hashes": [
+    {
+      "path": "PROTOCOL.json",
+      "sha256": "df80dfafbd3bfc8eca7f1e6eccadc0ba93da4a3ec8f12ebe2befd430a21915e8"
+    },
+    {
+      "path": "README.md",
+      "sha256": "a07886b9d0477c346e7be3887884fc83d57acd85a3db07e08af721efb497c9eb"
+    },
+    {
+      "path": "score_raw_rewards.py",
+      "sha256": "5ceaf510ae05b8bd34cac147b739032bffe5f536a130405afb178312fc66659a"
+    },
+    {
+      "path": "smoke_one_transition.py",
+      "sha256": "cb0cac5deb7b7a7ce648cc57adf572a4244a91f259f4091c6165920ae774b2ac"
+    },
+    {
+      "path": "validate_protocol.py",
+      "sha256": "81409ba158ea97a72098e51c4de4411258cb593d4cff3695b470525795f4fc83"
+    },
+    {
+      "path": "configs/DQN-PT-architecture-control.json",
+      "sha256": "03de6f643ed6e0205b68f7667c4a88261168e463ace933be48de66314463948e"
+    },
+    {
+      "path": "configs/DQN-ReDo-architecture-control.json",
+      "sha256": "67caa232a1eb7430fd104a835d3ab79eef6b518308b8a2ab6e39ce00046ccbea"
+    },
+    {
+      "path": "configs/DQN_ReDo_PostLNScore.json",
+      "sha256": "bfa3a27de72c3a02eb2cfe96e71ea442d6d86650d5e48fc80a992eacc5634f7d"
+    },
+    {
+      "path": "configs/DRQN-current-XFinal.json",
+      "sha256": "8064a479b6b049da1320c97f5bab43bf2b2eeda714b3d597ebd03c38a0c35ee1"
+    },
+    {
+      "path": "configs/DRQN-paper-v1.json",
+      "sha256": "428cad1dfeb3083fa8e0133fef3b655ab8b8d68cbc3c3852d28fb5cb9750412f"
+    },
+    {
+      "path": "configs/PPO-RTU_LN_128_1_relu.json",
+      "sha256": "a81b81d75cf5cff197fac14e61924707d385d46436e63856f56e083fca59a30e"
+    },
+    {
+      "path": "configs/PPO_2048_relu.json",
+      "sha256": "71f3be260eb47fce74875720adf75790ff8a8a84734ad3428e60a80edba1c29c"
+    },
+    {
+      "path": "configs/PT_DQN.json",
+      "sha256": "787463f74e6c888fe1046bce29f4a9eda8c5aafe0c20fcf67a930a59bbb8f5de"
+    }
+  ],
+  "aggregate_assertions": {
+    "configuration_count": 8,
+    "all_exit_codes_zero": true,
+    "all_result_statuses_passed": true,
+    "all_exactly_one_permutation": true,
+    "all_exact_task": true,
+    "all_exact_seed_pair": true,
+    "all_exactly_one_transition_per_lane": true,
+    "all_saved_real_upstream_npz_archives": true,
+    "no_save_or_video_monkeypatch": true,
+    "dqn_entrypoint": "src/continuing_main.py",
+    "ppo_entrypoint": "src/rtu_ppo.py",
+    "ppo_full_schedules_validated_before_smoke_override": true,
+    "first_transition_rewards_have_no_performance_interpretation": true
+  },
+  "smoke_results": [
+    {
+      "configuration": "configs/DQN-PT-architecture-control.json",
+      "completed_at_utc": "2026-07-31T12:15:37Z",
+      "exit_code": 0,
+      "wall_seconds": 25,
+      "stdout": {
+        "sha256": "c48e652eafb128f69d9a301620a9deb880f27ce3906e142f7ed0c042841fc3bf",
+        "size_bytes": 20855,
+        "smoke_result_marker_count": 1
+      },
+      "stderr": {
+        "sha256": "cadeae14263c02610647a3d2b9be219ebc63a266c55ef421ffcd48525e988bf0",
+        "size_bytes": 1380
+      },
+      "stderr_classification": "nonfatal unavailable-CUDA plugin discovery and read-only Matplotlib cache fallback; PPO records also contain upstream progress bars",
+      "rewards_interpreted_as_performance": false,
+      "parsed_result": {
+        "loaded_config": {
+          "agent": "DQN",
+          "config_sha256": "03de6f643ed6e0205b68f7667c4a88261168e463ace933be48de66314463948e",
+          "configured_total_steps": 102400,
+          "effective_seeds": [
+            2000001,
+            2000002
+          ],
+          "environment": {
+            "aperture_size": 9,
+            "env_id": "ForagaxTwoBiomeLarge-v1",
+            "observation_type": "color"
+          },
+          "nested_seed_offset": 0,
+          "num_permutations": 1,
+          "num_updates": null,
+          "requested_indices": [
+            2000001,
+            2000002
+          ],
+          "rollout_steps": null,
+          "stored_seeds": [
+            2000001,
+            2000002
+          ]
+        },
+        "runtime": {
+          "continual_foragax_version": "0.55.0",
+          "cuda_visible_devices": "",
+          "gid": 65532,
+          "jax_default_backend": "cpu",
+          "jax_devices": [
+            "TFRT_CPU_0"
+          ],
+          "jax_platform_name": "cpu",
+          "jax_platforms": "cpu",
+          "network_interfaces": [
+            "lo"
+          ],
+          "nonroot": true,
+          "nvidia_device_glob": [],
+          "nvidia_visible_devices": "void",
+          "root_filesystem_read_only": true,
+          "uid": 65532
+        },
+        "schema_version": "alberta.forager_stateful_one_transition_smoke.v1",
+        "status": "passed",
+        "transition": {
+          "agent_class": "algorithms.nn.DQN.DQN",
+          "entrypoint": "src/continuing_main.py",
+          "lanes": [
+            {
+              "reward": 0.0,
+              "reward_archive_relative_to_tmp": "stateful-dqn-smoke-output/results/protocol/configs/DQN/data/2000001.npz",
+              "seed": 2000001,
+              "transition_count": 1
+            },
+            {
+              "reward": 0.0,
+              "reward_archive_relative_to_tmp": "stateful-dqn-smoke-output/results/protocol/configs/DQN/data/2000002.npz",
+              "seed": 2000002,
+              "transition_count": 1
+            }
+          ],
+          "smoke_scheduler_overrides": {
+            "max_steps_per_lane": 1
+          }
+        }
+      }
+    },
+    {
+      "configuration": "configs/DQN-ReDo-architecture-control.json",
+      "completed_at_utc": "2026-07-31T12:20:10Z",
+      "exit_code": 0,
+      "wall_seconds": 26,
+      "stdout": {
+        "sha256": "71e60d252b9db3f25866f783ce30bde2ee9a0704048688f0ceae7b4d528ec35e",
+        "size_bytes": 22599,
+        "smoke_result_marker_count": 1
+      },
+      "stderr": {
+        "sha256": "50934ef2d3f3fbe681edde6b1b9583c3de4b34304ee2c1b17526caa285fc0a5e",
+        "size_bytes": 1380
+      },
+      "stderr_classification": "nonfatal unavailable-CUDA plugin discovery and read-only Matplotlib cache fallback; PPO records also contain upstream progress bars",
+      "rewards_interpreted_as_performance": false,
+      "parsed_result": {
+        "loaded_config": {
+          "agent": "DQN",
+          "config_sha256": "67caa232a1eb7430fd104a835d3ab79eef6b518308b8a2ab6e39ce00046ccbea",
+          "configured_total_steps": 102400,
+          "effective_seeds": [
+            2000001,
+            2000002
+          ],
+          "environment": {
+            "aperture_size": 9,
+            "env_id": "ForagaxTwoBiomeLarge-v1",
+            "observation_type": "color"
+          },
+          "nested_seed_offset": 0,
+          "num_permutations": 1,
+          "num_updates": null,
+          "requested_indices": [
+            2000001,
+            2000002
+          ],
+          "rollout_steps": null,
+          "stored_seeds": [
+            2000001,
+            2000002
+          ]
+        },
+        "runtime": {
+          "continual_foragax_version": "0.55.0",
+          "cuda_visible_devices": "",
+          "gid": 65532,
+          "jax_default_backend": "cpu",
+          "jax_devices": [
+            "TFRT_CPU_0"
+          ],
+          "jax_platform_name": "cpu",
+          "jax_platforms": "cpu",
+          "network_interfaces": [
+            "lo"
+          ],
+          "nonroot": true,
+          "nvidia_device_glob": [],
+          "nvidia_visible_devices": "void",
+          "root_filesystem_read_only": true,
+          "uid": 65532
+        },
+        "schema_version": "alberta.forager_stateful_one_transition_smoke.v1",
+        "status": "passed",
+        "transition": {
+          "agent_class": "algorithms.nn.DQN.DQN",
+          "entrypoint": "src/continuing_main.py",
+          "lanes": [
+            {
+              "reward": 0.0,
+              "reward_archive_relative_to_tmp": "stateful-dqn-smoke-output/results/protocol/configs/DQN/data/2000001.npz",
+              "seed": 2000001,
+              "transition_count": 1
+            },
+            {
+              "reward": 0.0,
+              "reward_archive_relative_to_tmp": "stateful-dqn-smoke-output/results/protocol/configs/DQN/data/2000002.npz",
+              "seed": 2000002,
+              "transition_count": 1
+            }
+          ],
+          "smoke_scheduler_overrides": {
+            "max_steps_per_lane": 1
+          }
+        }
+      }
+    },
+    {
+      "configuration": "configs/DQN_ReDo_PostLNScore.json",
+      "completed_at_utc": "2026-07-31T12:20:33Z",
+      "exit_code": 0,
+      "wall_seconds": 22,
+      "stdout": {
+        "sha256": "41675b5058d9652adcbf26d949d24503bed5ebe1fad3d48bd531de161327a62b",
+        "size_bytes": 22660,
+        "smoke_result_marker_count": 1
+      },
+      "stderr": {
+        "sha256": "de4f235f6ba74098c01ec20a021589715f9aefe7c9281f57bd2721248492f425",
+        "size_bytes": 1380
+      },
+      "stderr_classification": "nonfatal unavailable-CUDA plugin discovery and read-only Matplotlib cache fallback; PPO records also contain upstream progress bars",
+      "rewards_interpreted_as_performance": false,
+      "parsed_result": {
+        "loaded_config": {
+          "agent": "DQN_ReDo_PostLNScore",
+          "config_sha256": "bfa3a27de72c3a02eb2cfe96e71ea442d6d86650d5e48fc80a992eacc5634f7d",
+          "configured_total_steps": 102400,
+          "effective_seeds": [
+            2000001,
+            2000002
+          ],
+          "environment": {
+            "aperture_size": 9,
+            "env_id": "ForagaxTwoBiomeLarge-v1",
+            "observation_type": "color"
+          },
+          "nested_seed_offset": 0,
+          "num_permutations": 1,
+          "num_updates": null,
+          "requested_indices": [
+            2000001,
+            2000002
+          ],
+          "rollout_steps": null,
+          "stored_seeds": [
+            2000001,
+            2000002
+          ]
+        },
+        "runtime": {
+          "continual_foragax_version": "0.55.0",
+          "cuda_visible_devices": "",
+          "gid": 65532,
+          "jax_default_backend": "cpu",
+          "jax_devices": [
+            "TFRT_CPU_0"
+          ],
+          "jax_platform_name": "cpu",
+          "jax_platforms": "cpu",
+          "network_interfaces": [
+            "lo"
+          ],
+          "nonroot": true,
+          "nvidia_device_glob": [],
+          "nvidia_visible_devices": "void",
+          "root_filesystem_read_only": true,
+          "uid": 65532
+        },
+        "schema_version": "alberta.forager_stateful_one_transition_smoke.v1",
+        "status": "passed",
+        "transition": {
+          "agent_class": "algorithms.nn.DQN_ReDo.DQN_ReDo",
+          "entrypoint": "src/continuing_main.py",
+          "lanes": [
+            {
+              "reward": 0.0,
+              "reward_archive_relative_to_tmp": "stateful-dqn-smoke-output/results/protocol/configs/DQN_ReDo_PostLNScore/data/2000001.npz",
+              "seed": 2000001,
+              "transition_count": 1
+            },
+            {
+              "reward": 0.0,
+              "reward_archive_relative_to_tmp": "stateful-dqn-smoke-output/results/protocol/configs/DQN_ReDo_PostLNScore/data/2000002.npz",
+              "seed": 2000002,
+              "transition_count": 1
+            }
+          ],
+          "smoke_scheduler_overrides": {
+            "max_steps_per_lane": 1
+          }
+        }
+      }
+    },
+    {
+      "configuration": "configs/DRQN-current-XFinal.json",
+      "completed_at_utc": "2026-07-31T12:16:29Z",
+      "exit_code": 0,
+      "wall_seconds": 27,
+      "stdout": {
+        "sha256": "50436110378b561ce0825c51be0f936fe2de99fde7e4bf650c48701624aae479",
+        "size_bytes": 50732,
+        "smoke_result_marker_count": 1
+      },
+      "stderr": {
+        "sha256": "2a6b907faf900729c48e1cc4a49c8de1af4c6355d1ba5ceb5ba952387e66f4fc",
+        "size_bytes": 1380
+      },
+      "stderr_classification": "nonfatal unavailable-CUDA plugin discovery and read-only Matplotlib cache fallback; PPO records also contain upstream progress bars",
+      "rewards_interpreted_as_performance": false,
+      "parsed_result": {
+        "loaded_config": {
+          "agent": "DRQN",
+          "config_sha256": "8064a479b6b049da1320c97f5bab43bf2b2eeda714b3d597ebd03c38a0c35ee1",
+          "configured_total_steps": 102400,
+          "effective_seeds": [
+            2000001,
+            2000002
+          ],
+          "environment": {
+            "aperture_size": 9,
+            "env_id": "ForagaxTwoBiomeLarge-v1",
+            "observation_type": "color"
+          },
+          "nested_seed_offset": 0,
+          "num_permutations": 1,
+          "num_updates": null,
+          "requested_indices": [
+            2000001,
+            2000002
+          ],
+          "rollout_steps": null,
+          "stored_seeds": [
+            2000001,
+            2000002
+          ]
+        },
+        "runtime": {
+          "continual_foragax_version": "0.55.0",
+          "cuda_visible_devices": "",
+          "gid": 65532,
+          "jax_default_backend": "cpu",
+          "jax_devices": [
+            "TFRT_CPU_0"
+          ],
+          "jax_platform_name": "cpu",
+          "jax_platforms": "cpu",
+          "network_interfaces": [
+            "lo"
+          ],
+          "nonroot": true,
+          "nvidia_device_glob": [],
+          "nvidia_visible_devices": "void",
+          "root_filesystem_read_only": true,
+          "uid": 65532
+        },
+        "schema_version": "alberta.forager_stateful_one_transition_smoke.v1",
+        "status": "passed",
+        "transition": {
+          "agent_class": "algorithms.nn.DRQN.DRQN",
+          "entrypoint": "src/continuing_main.py",
+          "lanes": [
+            {
+              "reward": 0.0,
+              "reward_archive_relative_to_tmp": "stateful-dqn-smoke-output/results/protocol/configs/DRQN/data/2000001.npz",
+              "seed": 2000001,
+              "transition_count": 1
+            },
+            {
+              "reward": 0.0,
+              "reward_archive_relative_to_tmp": "stateful-dqn-smoke-output/results/protocol/configs/DRQN/data/2000002.npz",
+              "seed": 2000002,
+              "transition_count": 1
+            }
+          ],
+          "smoke_scheduler_overrides": {
+            "max_steps_per_lane": 1
+          }
+        }
+      }
+    },
+    {
+      "configuration": "configs/DRQN-paper-v1.json",
+      "completed_at_utc": "2026-07-31T12:16:58Z",
+      "exit_code": 0,
+      "wall_seconds": 29,
+      "stdout": {
+        "sha256": "636b3a3008244aba16722453ea4e50bd5e0afb04448b9c5ba9ff1f96cbd3bd74",
+        "size_bytes": 50732,
+        "smoke_result_marker_count": 1
+      },
+      "stderr": {
+        "sha256": "5835486ac7981c806a9b7e2335f4bb80f557ef2dca6388f55cf4836a8e4c42eb",
+        "size_bytes": 1380
+      },
+      "stderr_classification": "nonfatal unavailable-CUDA plugin discovery and read-only Matplotlib cache fallback; PPO records also contain upstream progress bars",
+      "rewards_interpreted_as_performance": false,
+      "parsed_result": {
+        "loaded_config": {
+          "agent": "DRQN",
+          "config_sha256": "428cad1dfeb3083fa8e0133fef3b655ab8b8d68cbc3c3852d28fb5cb9750412f",
+          "configured_total_steps": 102400,
+          "effective_seeds": [
+            2000001,
+            2000002
+          ],
+          "environment": {
+            "aperture_size": 9,
+            "env_id": "ForagaxTwoBiomeLarge-v1",
+            "observation_type": "color"
+          },
+          "nested_seed_offset": 0,
+          "num_permutations": 1,
+          "num_updates": null,
+          "requested_indices": [
+            2000001,
+            2000002
+          ],
+          "rollout_steps": null,
+          "stored_seeds": [
+            2000001,
+            2000002
+          ]
+        },
+        "runtime": {
+          "continual_foragax_version": "0.55.0",
+          "cuda_visible_devices": "",
+          "gid": 65532,
+          "jax_default_backend": "cpu",
+          "jax_devices": [
+            "TFRT_CPU_0"
+          ],
+          "jax_platform_name": "cpu",
+          "jax_platforms": "cpu",
+          "network_interfaces": [
+            "lo"
+          ],
+          "nonroot": true,
+          "nvidia_device_glob": [],
+          "nvidia_visible_devices": "void",
+          "root_filesystem_read_only": true,
+          "uid": 65532
+        },
+        "schema_version": "alberta.forager_stateful_one_transition_smoke.v1",
+        "status": "passed",
+        "transition": {
+          "agent_class": "algorithms.nn.DRQN.DRQN",
+          "entrypoint": "src/continuing_main.py",
+          "lanes": [
+            {
+              "reward": 0.0,
+              "reward_archive_relative_to_tmp": "stateful-dqn-smoke-output/results/protocol/configs/DRQN/data/2000001.npz",
+              "seed": 2000001,
+              "transition_count": 1
+            },
+            {
+              "reward": 0.0,
+              "reward_archive_relative_to_tmp": "stateful-dqn-smoke-output/results/protocol/configs/DRQN/data/2000002.npz",
+              "seed": 2000002,
+              "transition_count": 1
+            }
+          ],
+          "smoke_scheduler_overrides": {
+            "max_steps_per_lane": 1
+          }
+        }
+      }
+    },
+    {
+      "configuration": "configs/PPO-RTU_LN_128_1_relu.json",
+      "completed_at_utc": "2026-07-31T12:21:07Z",
+      "exit_code": 0,
+      "wall_seconds": 35,
+      "stdout": {
+        "sha256": "87a6412957f77dbd48a6c982f3280e6666584529dab0b4868d8db4e233001e47",
+        "size_bytes": 1940,
+        "smoke_result_marker_count": 1
+      },
+      "stderr": {
+        "sha256": "9cdf221b3c0167ebe710d57888382dc7b0fb9342632cb92f933f29331a708a38",
+        "size_bytes": 1568
+      },
+      "stderr_classification": "nonfatal unavailable-CUDA plugin discovery and read-only Matplotlib cache fallback; PPO records also contain upstream progress bars",
+      "rewards_interpreted_as_performance": false,
+      "parsed_result": {
+        "loaded_config": {
+          "agent": "PPO-RTU_LN_128_1_relu",
+          "config_sha256": "a81b81d75cf5cff197fac14e61924707d385d46436e63856f56e083fca59a30e",
+          "configured_total_steps": 102400,
+          "effective_seeds": [
+            2000001,
+            2000002
+          ],
+          "environment": {
+            "aperture_size": 9,
+            "env_id": "ForagaxTwoBiomeLarge-v1",
+            "observation_type": "color"
+          },
+          "nested_seed_offset": 0,
+          "num_permutations": 1,
+          "num_updates": 800,
+          "requested_indices": [
+            2000001,
+            2000002
+          ],
+          "rollout_steps": 128,
+          "stored_seeds": [
+            2000001,
+            2000002
+          ]
+        },
+        "runtime": {
+          "continual_foragax_version": "0.55.0",
+          "cuda_visible_devices": "",
+          "gid": 65532,
+          "jax_default_backend": "cpu",
+          "jax_devices": [
+            "TFRT_CPU_0"
+          ],
+          "jax_platform_name": "cpu",
+          "jax_platforms": "cpu",
+          "network_interfaces": [
+            "lo"
+          ],
+          "nonroot": true,
+          "nvidia_device_glob": [],
+          "nvidia_visible_devices": "void",
+          "root_filesystem_read_only": true,
+          "uid": 65532
+        },
+        "schema_version": "alberta.forager_stateful_one_transition_smoke.v1",
+        "status": "passed",
+        "transition": {
+          "agent_class": "algorithms.PPORegistry.getAgent(config.agent)",
+          "entrypoint": "src/rtu_ppo.py",
+          "lanes": [
+            {
+              "reward": 0.0,
+              "reward_archive_relative_to_tmp": "stateful-ppo-smoke-output/results/protocol/configs/PPO-RTU_LN_128_1_relu/data/2000001.npz",
+              "seed": 2000001,
+              "transition_count": 1
+            },
+            {
+              "reward": 0.0,
+              "reward_archive_relative_to_tmp": "stateful-ppo-smoke-output/results/protocol/configs/PPO-RTU_LN_128_1_relu/data/2000002.npz",
+              "seed": 2000002,
+              "transition_count": 1
+            }
+          ],
+          "optimizer_state": {
+            "array_leaves": 90,
+            "bytes": 3616560,
+            "elements": 904140
+          },
+          "primary_parameters": {
+            "array_leaves": 44,
+            "bytes": 1808276,
+            "elements": 452069
+          },
+          "smoke_scheduler_overrides": {
+            "allocate_frames": false,
+            "diagnostics": false,
+            "num_mini_batch": 1,
+            "num_updates": 1,
+            "reason": "exercise exactly one transition; architecture and optimizer hyperparameters are unchanged",
+            "rollout_steps": 1
+          }
+        }
+      }
+    },
+    {
+      "configuration": "configs/PPO_2048_relu.json",
+      "completed_at_utc": "2026-07-31T12:21:36Z",
+      "exit_code": 0,
+      "wall_seconds": 29,
+      "stdout": {
+        "sha256": "174388fd8dc75a604b9904a1d9f54752833cbc1f82fdf48264c33be958600843",
+        "size_bytes": 1916,
+        "smoke_result_marker_count": 1
+      },
+      "stderr": {
+        "sha256": "ca5dc754895945c317d899f141a8e9c111f4f34f6b2c1abf69aa624e7c650d09",
+        "size_bytes": 1570
+      },
+      "stderr_classification": "nonfatal unavailable-CUDA plugin discovery and read-only Matplotlib cache fallback; PPO records also contain upstream progress bars",
+      "rewards_interpreted_as_performance": false,
+      "parsed_result": {
+        "loaded_config": {
+          "agent": "PPO_2048_relu",
+          "config_sha256": "71f3be260eb47fce74875720adf75790ff8a8a84734ad3428e60a80edba1c29c",
+          "configured_total_steps": 102400,
+          "effective_seeds": [
+            2000001,
+            2000002
+          ],
+          "environment": {
+            "aperture_size": 9,
+            "env_id": "ForagaxTwoBiomeLarge-v1",
+            "observation_type": "color"
+          },
+          "nested_seed_offset": 0,
+          "num_permutations": 1,
+          "num_updates": 50,
+          "requested_indices": [
+            2000001,
+            2000002
+          ],
+          "rollout_steps": 2048,
+          "stored_seeds": [
+            2000001,
+            2000002
+          ]
+        },
+        "runtime": {
+          "continual_foragax_version": "0.55.0",
+          "cuda_visible_devices": "",
+          "gid": 65532,
+          "jax_default_backend": "cpu",
+          "jax_devices": [
+            "TFRT_CPU_0"
+          ],
+          "jax_platform_name": "cpu",
+          "jax_platforms": "cpu",
+          "network_interfaces": [
+            "lo"
+          ],
+          "nonroot": true,
+          "nvidia_device_glob": [],
+          "nvidia_visible_devices": "void",
+          "root_filesystem_read_only": true,
+          "uid": 65532
+        },
+        "schema_version": "alberta.forager_stateful_one_transition_smoke.v1",
+        "status": "passed",
+        "transition": {
+          "agent_class": "algorithms.PPORegistry.getAgent(config.agent)",
+          "entrypoint": "src/rtu_ppo.py",
+          "lanes": [
+            {
+              "reward": 0.0,
+              "reward_archive_relative_to_tmp": "stateful-ppo-smoke-output/results/protocol/configs/PPO_2048_relu/data/2000001.npz",
+              "seed": 2000001,
+              "transition_count": 1
+            },
+            {
+              "reward": 0.0,
+              "reward_archive_relative_to_tmp": "stateful-ppo-smoke-output/results/protocol/configs/PPO_2048_relu/data/2000002.npz",
+              "seed": 2000002,
+              "transition_count": 1
+            }
+          ],
+          "optimizer_state": {
+            "array_leaves": 50,
+            "bytes": 2443056,
+            "elements": 610764
+          },
+          "primary_parameters": {
+            "array_leaves": 24,
+            "bytes": 1221524,
+            "elements": 305381
+          },
+          "smoke_scheduler_overrides": {
+            "allocate_frames": false,
+            "diagnostics": false,
+            "num_mini_batch": 1,
+            "num_updates": 1,
+            "reason": "exercise exactly one transition; architecture and optimizer hyperparameters are unchanged",
+            "rollout_steps": 1
+          }
+        }
+      }
+    },
+    {
+      "configuration": "configs/PT_DQN.json",
+      "completed_at_utc": "2026-07-31T12:16:02Z",
+      "exit_code": 0,
+      "wall_seconds": 25,
+      "stdout": {
+        "sha256": "429121a979c7a8496cdeb861ce98310fcc013966fc92dfb84c0d758c697e4a42",
+        "size_bytes": 40298,
+        "smoke_result_marker_count": 1
+      },
+      "stderr": {
+        "sha256": "07dd0eff9bdc3d3c19169b0492ea43524e48d6ba9120103110262bf62359f5cf",
+        "size_bytes": 1380
+      },
+      "stderr_classification": "nonfatal unavailable-CUDA plugin discovery and read-only Matplotlib cache fallback; PPO records also contain upstream progress bars",
+      "rewards_interpreted_as_performance": false,
+      "parsed_result": {
+        "loaded_config": {
+          "agent": "PT_DQN",
+          "config_sha256": "787463f74e6c888fe1046bce29f4a9eda8c5aafe0c20fcf67a930a59bbb8f5de",
+          "configured_total_steps": 102400,
+          "effective_seeds": [
+            2000001,
+            2000002
+          ],
+          "environment": {
+            "aperture_size": 9,
+            "env_id": "ForagaxTwoBiomeLarge-v1",
+            "observation_type": "color"
+          },
+          "nested_seed_offset": 0,
+          "num_permutations": 1,
+          "num_updates": null,
+          "requested_indices": [
+            2000001,
+            2000002
+          ],
+          "rollout_steps": null,
+          "stored_seeds": [
+            2000001,
+            2000002
+          ]
+        },
+        "runtime": {
+          "continual_foragax_version": "0.55.0",
+          "cuda_visible_devices": "",
+          "gid": 65532,
+          "jax_default_backend": "cpu",
+          "jax_devices": [
+            "TFRT_CPU_0"
+          ],
+          "jax_platform_name": "cpu",
+          "jax_platforms": "cpu",
+          "network_interfaces": [
+            "lo"
+          ],
+          "nonroot": true,
+          "nvidia_device_glob": [],
+          "nvidia_visible_devices": "void",
+          "root_filesystem_read_only": true,
+          "uid": 65532
+        },
+        "schema_version": "alberta.forager_stateful_one_transition_smoke.v1",
+        "status": "passed",
+        "transition": {
+          "agent_class": "algorithms.nn.PT_DQN.PT_DQN",
+          "entrypoint": "src/continuing_main.py",
+          "lanes": [
+            {
+              "reward": 0.0,
+              "reward_archive_relative_to_tmp": "stateful-dqn-smoke-output/results/protocol/configs/PT_DQN/data/2000001.npz",
+              "seed": 2000001,
+              "transition_count": 1
+            },
+            {
+              "reward": 0.0,
+              "reward_archive_relative_to_tmp": "stateful-dqn-smoke-output/results/protocol/configs/PT_DQN/data/2000002.npz",
+              "seed": 2000002,
+              "transition_count": 1
+            }
+          ],
+          "smoke_scheduler_overrides": {
+            "max_steps_per_lane": 1
+          }
+        }
+      }
+    }
+  ],
+  "metric_implementation_checks": {
+    "status": "passed",
+    "valid_cases": [
+      {
+        "name": "102400 zeros",
+        "reward_sum_float64": 0.0,
+        "score": 0.0,
+        "final_unadjusted_ema": 0.0,
+        "sample_count": 1024,
+        "tail_start_index": 921,
+        "tail_sample_count": 103
+      },
+      {
+        "name": "only reward index 102399 is one",
+        "reward_sum_float64": 1.0,
+        "score": 0.0,
+        "final_unadjusted_ema": 0.0010000000000000009,
+        "explanation": "The final reward updates the final EMA but occurs after sampled index 102300, so it is absent from the frozen sampled-tail score."
+      }
+    ],
+    "invalid_shape_case": {
+      "shape": [
+        102399
+      ],
+      "rejected": true,
+      "expected_error": "raw reward array must have exact shape (102400,)"
+    },
+    "collector_summaries_used": false
+  },
+  "audit_history": [
+    {
+      "finding": "An early PT-DQN draft used a later XN35 architecture and optimizer rather than the published-v1-compatible X34 fixed template.",
+      "disposition": "Rejected before freeze and before reward execution. PT-DQN now uses alpha 0.0003 and width-32 two-layer ForagerNet; its DQN control removes only PT fields. Both were re-smoked."
+    },
+    {
+      "finding": "A single undifferentiated DRQN draft omitted the material difference between paper-v1/X33 and current-XFinal settings.",
+      "disposition": "Split into DRQN-paper-v1 and DRQN-current-XFinal. Both exact fixed templates are hash-bound and both were smoked."
+    },
+    {
+      "finding": "The first harness draft failed after a successful DQN transition because a typed JAX PRNG key could not be interpreted as a NumPy dtype.",
+      "disposition": "Tree statistics now unwrap typed keys with jax.random.key_data; no upstream source was patched."
+    },
+    {
+      "finding": "The first one-index PPO harness completed a transition and update, then upstream save attempted an empty video and raised IndexError.",
+      "disposition": "The final harness uses the exact two indices, for which smoke frame allocation is false, and exercises the real upstream save path without a save or video stub."
+    },
+    {
+      "finding": "Two local launch attempts for the corrected batch failed before a candidate transition: one repeated the image Python entrypoint and one omitted NUMBA_DISABLE_JIT on a read-only source tree.",
+      "disposition": "The final uniform command uses the image entrypoint directly and NUMBA_DISABLE_JIT=1. Only the eight successful final records are receipted."
+    }
+  ],
+  "nonqualification": [
+    "This receipt demonstrates loading, dispatch, construction, one transition per lane, and saving only.",
+    "The logged reward values are first-transition smoke artifacts and are not screening scores.",
+    "No full 102400-transition reward run, GPU run, comparison, ranking, or selection was performed.",
+    "This open-development receipt cannot promote scientific evidence or support an official, causal, superiority, or SOTA claim."
+  ]
+}

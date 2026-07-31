@@ -42,6 +42,7 @@ from alberta_framework.core.options import (
     STOMPAgent,
     STOMPArrayResult,
     STOMPConfig,
+    STOMPStartResult,
     STOMPState,
     STOMPUpdateResult,
     SubtaskSpec,
@@ -69,6 +70,8 @@ class Step10STOMPConfig:
         option_gamma: Discount within option execution.
         option_model_decay: EMA decay for option outcome model updates.
         option_model_step_size: Step-size for next-state delta predictor.
+        option_planning_backups_per_step: Fixed Dyna option-model backup
+            budget after each real transition. ``0`` disables planning.
         epsilon_base: Exploration rate for extended action selection.
         epsilon_option: Exploration rate for intra-option action selection.
         option_target_epsilon: Optional target-policy epsilon for clipped
@@ -90,6 +93,7 @@ class Step10STOMPConfig:
     option_gamma: float = 0.99
     option_model_decay: float = 0.95
     option_model_step_size: float = 0.1
+    option_planning_backups_per_step: int = 0
     epsilon_base: float = 0.1
     epsilon_option: float = 0.1
     option_target_epsilon: float | None = None
@@ -111,6 +115,7 @@ class Step10STOMPConfig:
             "option_gamma": self.option_gamma,
             "option_model_decay": self.option_model_decay,
             "option_model_step_size": self.option_model_step_size,
+            "option_planning_backups_per_step": self.option_planning_backups_per_step,
             "epsilon_base": self.epsilon_base,
             "epsilon_option": self.epsilon_option,
             "option_target_epsilon": self.option_target_epsilon,
@@ -142,6 +147,7 @@ class Step10STOMPConfig:
             option_gamma=self.option_gamma,
             option_model_decay=self.option_model_decay,
             option_model_step_size=self.option_model_step_size,
+            option_planning_backups_per_step=self.option_planning_backups_per_step,
             epsilon_base=self.epsilon_base,
             epsilon_option=self.epsilon_option,
             option_target_epsilon=self.option_target_epsilon,
@@ -216,10 +222,28 @@ def init_step10_state(
     Returns:
         Primed :class:`STOMPState` with ``base_last_obs`` set.
     """
-    init_key, start_key = jr.split(key)
+    return init_step10_state_and_action(
+        agent,
+        key=key,
+        initial_observation=initial_observation,
+    ).state
+
+
+def init_step10_state_and_action(
+    agent: STOMPAgent,
+    *,
+    key: Array,
+    initial_observation: Array,
+) -> STOMPStartResult:
+    """Initialize Step 10 and return the first primitive action to dispatch.
+
+    The returned action must be executed before passing its reward and next
+    observation to :func:`step10_update`.
+    """
+    init_key, _ = jr.split(key)
     state = agent.init(init_key)
     obs = jnp.asarray(initial_observation, dtype=jnp.float32)
-    return cast(STOMPState, agent.start(state, obs))
+    return agent.start_with_action(state, obs)
 
 
 def step10_update(
@@ -332,6 +356,7 @@ __all__ = [
     "Step10SmokeResult",
     "Step10STOMPConfig",
     "init_step10_state",
+    "init_step10_state_and_action",
     "make_step10_stomp_agent",
     "run_step10_scan",
     "run_step10_smoke",

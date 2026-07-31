@@ -67,6 +67,8 @@ class Step11OaKConfig:
         option_gamma: Discount within option execution.
         option_model_decay: EMA decay for option outcome model updates.
         option_model_step_size: Step-size for next-state delta predictor.
+        option_planning_backups_per_step: Fixed option-model planning backup
+            budget per real transition. ``0`` disables planning.
         epsilon_base: Exploration rate for extended action selection.
         epsilon_option: Exploration rate for intra-option selection.
         utility_ema_decay: EMA decay for per-option utility tracking.
@@ -85,6 +87,7 @@ class Step11OaKConfig:
     option_gamma: float = 0.99
     option_model_decay: float = 0.95
     option_model_step_size: float = 0.1
+    option_planning_backups_per_step: int = 0
     epsilon_base: float = 0.1
     epsilon_option: float = 0.1
     utility_ema_decay: float = 0.99
@@ -106,6 +109,7 @@ class Step11OaKConfig:
             "option_gamma": self.option_gamma,
             "option_model_decay": self.option_model_decay,
             "option_model_step_size": self.option_model_step_size,
+            "option_planning_backups_per_step": self.option_planning_backups_per_step,
             "epsilon_base": self.epsilon_base,
             "epsilon_option": self.epsilon_option,
             "utility_ema_decay": self.utility_ema_decay,
@@ -136,6 +140,7 @@ class Step11OaKConfig:
             option_gamma=self.option_gamma,
             option_model_decay=self.option_model_decay,
             option_model_step_size=self.option_model_step_size,
+            option_planning_backups_per_step=self.option_planning_backups_per_step,
             epsilon_base=self.epsilon_base,
             epsilon_option=self.epsilon_option,
         )

@@ -1,0 +1,17 @@
+# Local virtualenv and caches
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+
+# Benchmark-run bulk that is NOT evidence: frozen source duplicates used for
+# concurrent-edit-proof matrix execution, failed-run diagnostic retries, and
+# live-run markers/logs. The promoted/receipt artifacts themselves ARE tracked.
+outputs/forager/frozen_src_*/
+outputs/forager/*failed_source_drift*/
+outputs/forager/relearning_logs/
+outputs/forager/**/*.running
+outputs/upgd_ipmnist/reconstructed_openml_cache/
+outputs/**/logs/

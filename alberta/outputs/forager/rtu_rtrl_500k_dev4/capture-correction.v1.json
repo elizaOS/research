@@ -1,0 +1,49 @@
+{
+  "schema_version": "alberta.forager_rtu_rtrl_capture_correction.v1",
+  "status": "complete",
+  "evidence_class": "development",
+  "scientific_promotion_allowed": false,
+  "receipt_binding": {
+    "path_base": "repository_root",
+    "path": "outputs/forager/rtu_rtrl_500k_dev4/receipt.v1.json",
+    "size_bytes": 7587,
+    "sha256": "d1c86f0fb4dd7e9e59797e99b39bd8e4bc9c8114e95cfa8b2232360a6b65926c",
+    "schema_version": "alberta.forager_rtu_rtrl_development_receipt.v1"
+  },
+  "raw_capture_binding": {
+    "session_record_lines": [
+      9867,
+      9868,
+      9895
+    ],
+    "combined_jsonl_lines_sha256": "c0f107cd533091cd20d8899fa49532fff84ac4cc0239b7401bd026934a8519e6"
+  },
+  "corrected_field": {
+    "receipt_field_prefix": "execution.capture.canonical_seven_output_lines",
+    "recorded_value": {
+      "bytes": 3262,
+      "sha256": "0e9df9cb0724a70d23f5ea48e52e05a1304cf76c4fa91e353be88d9ce9cac71c"
+    },
+    "recorded_value_issue": "The original selector also serialized two absent command-output values as four-byte null sentinels, so the recorded bytes are reproducible but are not exactly the seven output lines named by the field.",
+    "canonical_output_line_prefixes": [
+      "RUNTIME ",
+      "RESULT ",
+      "SUMMARY ",
+      "RTU_500K_DEV_WALL="
+    ],
+    "canonical_output_line_count": 7,
+    "canonical_output_lines_bytes": 3254,
+    "canonical_output_lines_sha256": "0468cc3e32b00b6d13bf2603402ea447b7b38acc26224aba012df659bff52e51",
+    "excluded_serialization_artifacts": {
+      "value": "null",
+      "count": 2,
+      "total_bytes": 8
+    }
+  },
+  "limitations": [
+    "This addendum corrects one capture-field label and digest; it does not add raw reward traces or source closure.",
+    "The bound v1 receipt remains byte-for-byte unchanged.",
+    "Session-record hashes are integrity identifiers, not origin authentication.",
+    "This addendum cannot support scientific promotion, a SOTA claim, or Alberta Plan completion."
+  ]
+}

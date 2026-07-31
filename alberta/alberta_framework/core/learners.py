@@ -916,9 +916,11 @@ class MLPLearner:
         """Re-initialise weights for dormant hidden neurons.
 
         For each hidden layer, neurons whose utility EMA is below *threshold*
-        receive fresh sparse-initialised incoming weights and zero eligibility
-        traces and optimizer states.  Out-going weights from dormant neurons
-        to downstream layers are also zeroed so the reset does not inject a
+        receive fresh sparse-initialised incoming weights, zero eligibility
+        traces, and optimizer state slices re-initialised from the optimizer's
+        ``init_for_shape`` values (shared scalar leaves such as meta step-sizes
+        are left untouched).  Out-going weights from dormant neurons to
+        downstream layers are also zeroed so the reset does not inject a
         sudden large signal.
 
         This is a Python-level operation (not JIT-compiled) because the
@@ -958,16 +960,25 @@ class MLPLearner:
             # Zero traces for incoming weights/biases of reset neurons
             new_traces[2 * layer_i] = jnp.where(dormant_mask[:, None], 0.0, new_traces[2 * layer_i])
             new_traces[2 * layer_i + 1] = jnp.where(dormant_mask, 0.0, new_traces[2 * layer_i + 1])
-            # Zero optimizer states (per-parameter EMA/traces inside optimizer)
-            def _zero_by_mask(x: Array, m: Array = dormant_mask) -> Array:
+            # Re-initialise optimizer state slices for reset neurons from the
+            # optimizer's own init_for_shape values, not zeros: IDBD stores
+            # *log* step-sizes (zero would mean exp(0)=1.0) and Autostep
+            # step-sizes adapt multiplicatively (zero would stick at zero).
+            # Scalar leaves (shared values like meta_step_size) stay untouched.
+            fresh_w_opt = self._optimizer.init_for_shape((h_out, h_in))
+            fresh_b_opt = self._optimizer.init_for_shape((h_out,))
+
+            def _reset_by_mask(x: Array, fresh: Array, m: Array = dormant_mask) -> Array:
+                if x.ndim == 0:
+                    return x
                 sel = m[:, None] if x.ndim == 2 else m
-                return jnp.where(sel, jnp.zeros_like(x), x)
+                return jnp.where(sel, fresh, x)
+
             new_opt_states[2 * layer_i] = jax.tree_util.tree_map(
-                _zero_by_mask, new_opt_states[2 * layer_i]
+                _reset_by_mask, new_opt_states[2 * layer_i], fresh_w_opt
             )
             new_opt_states[2 * layer_i + 1] = jax.tree_util.tree_map(
-                lambda x, m=dormant_mask: jnp.where(m, jnp.zeros_like(x), x),
-                new_opt_states[2 * layer_i + 1],
+                _reset_by_mask, new_opt_states[2 * layer_i + 1], fresh_b_opt
             )
             # Zero outgoing weights from the next layer that feed into this neuron
             if layer_i + 1 < len(new_weights):

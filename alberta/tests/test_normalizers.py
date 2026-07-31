@@ -16,6 +16,8 @@ from alberta_framework import (
     normalizer_from_config,
 )
 
+pytestmark = pytest.mark.slow
+
 
 class TestEMANormalizer:
     """Tests for the EMANormalizer class."""

@@ -1,4 +1,4 @@
-"""Command line helpers for production Step 1/2 smoke and evidence checks."""
+"""Command-line helpers for Step 1/2 smoke and legacy artifact availability."""
 
 from __future__ import annotations
 
@@ -95,13 +95,15 @@ def step2_smoke_main(argv: Sequence[str] | None = None) -> int:
 
 
 def evidence_gate_main(argv: Sequence[str] | None = None) -> int:
-    """Check that promoted Step 1/2 evidence artifacts are present.
+    """Check whether the legacy Step 1/2 artifact set is locally available.
 
-    This intentionally checks file presence and minimal parseability only.  The
-    scientific threshold assertions live in ``tests/test_step1_replication.py``
-    and ``tests/test_step2_canonical.py``.
+    This command predates the versioned held-out evaluators. It checks only
+    file presence and minimal JSON parseability, so success is not scientific
+    validation and cannot promote a Step 1/2 completion claim.
     """
-    parser = argparse.ArgumentParser(description="Check Step 1/2 evidence artifacts.")
+    parser = argparse.ArgumentParser(
+        description="Check legacy Step 1/2 artifact availability (not scientific validity)."
+    )
     parser.add_argument("--root", type=Path, default=REPO_ROOT)
     parser.add_argument("--step", choices=("1", "2", "all"), default="all")
     args = parser.parse_args(argv)
@@ -148,6 +150,8 @@ def evidence_gate_main(argv: Sequence[str] | None = None) -> int:
     payload: dict[str, object] = {
         "root": str(args.root),
         "step": args.step,
+        "check_kind": "legacy-artifact-availability",
+        "scientific_validation": False,
         "required_count": len(required),
         "missing": missing,
         "invalid_json": invalid_json,

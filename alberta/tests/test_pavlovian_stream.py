@@ -15,6 +15,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import pytest
 
 from alberta_framework.streams.pavlovian import (
     ClassicalConditioningStream,
@@ -26,6 +27,8 @@ from alberta_framework.streams.pavlovian import (
     partial_reinforcement_scenario,
     reacquisition_scenario,
 )
+
+pytestmark = pytest.mark.slow
 
 # ---------------------------------------------------------------------------
 # Helpers

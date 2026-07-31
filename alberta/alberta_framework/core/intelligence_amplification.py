@@ -43,7 +43,7 @@ import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int
 
 from alberta_framework.core.oak import OaKAgent, OaKConfig, OaKState, _default_stomp_config
 
@@ -124,9 +124,7 @@ class ExoCerebellumAgent:
     def init(self) -> ExoCerebellumState:
         """Initialise with zero prediction weights."""
         return ExoCerebellumState(
-            weights=jnp.zeros(
-                (self._config.n_demons, self._config.obs_dim), dtype=jnp.float32
-            ),
+            weights=jnp.zeros((self._config.n_demons, self._config.obs_dim), dtype=jnp.float32),
             step_count=jnp.array(0, dtype=jnp.int32),
         )
 
@@ -196,6 +194,29 @@ ExoCortexConfig = OaKConfig
 ExoCortexState = OaKState
 
 
+def _checked_partner_action(
+    action: Array,
+    *,
+    n_primitive_actions: int,
+) -> tuple[Int[Array, ""], Bool[Array, ""]]:
+    """Validate one primitive action eagerly and poison invalid traced input."""
+    raw = jnp.asarray(action)
+    if raw.shape != ():
+        raise ValueError("partner_action must be scalar")
+    if not jnp.issubdtype(raw.dtype, jnp.integer):
+        raise ValueError("partner_action must have an integer dtype")
+    executed = jnp.asarray(raw, dtype=jnp.int32)
+    valid = (executed >= 0) & (executed < n_primitive_actions)
+    if not isinstance(executed, jax.core.Tracer) and not bool(valid):
+        raise ValueError(
+            f"partner_action must be in [0, {n_primitive_actions})"
+        )
+    return (
+        jnp.where(valid, executed, jnp.array(0, dtype=jnp.int32)),
+        valid,
+    )
+
+
 class ExoCortexAgent:
     """Exo-cortex: an OaKAgent that provides action recommendations.
 
@@ -236,12 +257,66 @@ class ExoCortexAgent:
         state: ExoCortexState,
         partner_reward: Array,
         partner_next_obs: Array,
+        partner_action: Array | None = None,
+        *,
+        discount: Array | None = None,
     ) -> tuple[ExoCortexState, Int[Array, ""], Float[Array, ""]]:
         """Update cortex from partner experience and return recommendation.
 
+        When ``partner_action`` is provided, the Q-update credits the primitive
+        action the partner actually *executed* (the ``effective_action`` from
+        :func:`update_recommendation_protocol`) rather than the action the
+        cortex's own epsilon-greedy selection happened to pick — off-policy
+        learning about the recommendation policy from the partner's behaviour
+        stream.  Each partner step is treated as a primitive (duration-1)
+        transition, since the partner — not the cortex — controls execution.
+        No importance-sampling correction is needed: the differential
+        Q-learning target bootstraps through ``max`` and is off-policy by
+        construction. This executed-action path intentionally exits any
+        exo-cortex option and updates the base learner only.
+
+        When ``partner_action`` is ``None`` the legacy behaviour (crediting
+        the cortex's own selected action, including its option lifecycle) is
+        preserved.
+
+        ``discount`` is the environment's effective continuation multiplier
+        for this transition. Supplying it reaches whichever base/intra-option
+        path owns the cortex transition. With an explicit ``partner_action``,
+        that is the primitive base learner described above. Omitting the
+        discount preserves OaK's historical primitive/``option_gamma``
+        behaviour.
+
         Returns ``(new_state, recommendation, td_error)``.
         """
-        result = self._oak.update(state, partner_reward, partner_next_obs)
+        routed_discount = discount
+        if partner_action is not None:
+            n_prim = self._oak.config.n_primitive_actions
+            executed, action_valid = _checked_partner_action(
+                partner_action,
+                n_primitive_actions=n_prim,
+            )
+            supplied_discount = (
+                jnp.array(1.0, dtype=jnp.float32)
+                if discount is None
+                else jnp.asarray(discount, dtype=jnp.float32).reshape(())
+            )
+            routed_discount = jnp.where(
+                action_valid,
+                supplied_discount,
+                jnp.array(jnp.nan, dtype=jnp.float32),
+            )
+            stomp_state = state.stomp_state.replace(
+                base_last_action=executed,
+                option_last_intra_action=executed,
+                executing_option=jnp.array(-1, dtype=jnp.int32),
+            )
+            state = cast(ExoCortexState, state.replace(stomp_state=stomp_state))
+        result = self._oak.update(
+            state,
+            partner_reward,
+            partner_next_obs,
+            routed_discount,
+        )
         recommendation = self.recommend(result.state, partner_next_obs)
         return result.state, recommendation, result.td_error
 
@@ -260,9 +335,7 @@ class IAConfig:
         cortex: Exo-cortex (OaK) configuration.
     """
 
-    cerebellum: ExoCerebellumConfig = dataclasses.field(
-        default_factory=ExoCerebellumConfig
-    )
+    cerebellum: ExoCerebellumConfig = dataclasses.field(default_factory=ExoCerebellumConfig)
     cortex: ExoCortexConfig = dataclasses.field(default_factory=_default_oak_config)
 
     def __post_init__(self) -> None:
@@ -404,17 +477,50 @@ def update_recommendation_protocol(
     state: RecommendationProtocolState,
     recommendation: Array,
     partner_action: Array,
+    accept_recommendation: Array | None = None,
 ) -> RecommendationProtocolResult:
-    """Record whether a partner accepted or rejected a recommendation.
+    """Apply a partner-controlled recommendation before environment execution.
 
-    A recommendation is accepted when the partner's executed action equals the
-    recommendation.  The effective action is the recommendation on acceptance
-    and the partner action on rejection, giving callers a single action stream
-    for replay or downstream logging.
+    ``partner_action`` is the partner's proposed fallback action, not an action
+    that has already been executed.  ``accept_recommendation`` is a scalar
+    boolean decision made by the partner from information available at action
+    selection time.  When it is true, the recommendation is the effective
+    action even when it differs from the fallback; when false, the fallback is
+    preserved.  The protocol therefore selects one of two already-bounded
+    action candidates and has no access to reward, next observation, or other
+    post-transition information.
+
+    For compatibility, omitting ``accept_recommendation`` retains the original
+    agreement-accounting behaviour: matching candidates count as accepted and
+    differing candidates count as rejected.  That legacy path cannot intervene
+    and should not be used by new closed-loop integrations.
+
+    Feed ``effective_action`` into the environment and then back into
+    :meth:`IAAgent.update` as ``partner_action`` so the exo-cortex credits the
+    action that was actually executed.
+
+    Args:
+        config: Acceptance statistics configuration.
+        state: Current protocol counters.
+        recommendation: IA action recommendation, produced before acting.
+        partner_action: Partner's proposed fallback action, produced before
+            acting.
+        accept_recommendation: Partner's explicit pre-action accept/reject
+            decision.  ``None`` enables the legacy agreement-only path.
+
+    Returns:
+        Updated counters and the action selected for environment execution.
     """
     rec = jnp.asarray(recommendation, dtype=jnp.int32)
     action = jnp.asarray(partner_action, dtype=jnp.int32)
-    accepted = rec == action
+    if rec.ndim != 0 or action.ndim != 0:
+        raise ValueError("recommendation and partner_action must be scalar")
+    if accept_recommendation is None:
+        accepted = rec == action
+    else:
+        accepted = jnp.asarray(accept_recommendation)
+        if accepted.ndim != 0 or accepted.dtype != jnp.bool_:
+            raise TypeError("accept_recommendation must be a scalar boolean")
     accepted_i = accepted.astype(jnp.int32)
     rejected_i = (~accepted).astype(jnp.int32)
     accepted_f = accepted.astype(jnp.float32)
@@ -442,7 +548,8 @@ class IAAgent:
 
     1. Computes cerebellum predictions from ``partner_obs``.
     2. Updates the cerebellum weights from ``(partner_obs, partner_next_obs)``.
-    3. Updates the cortex OaK Q-function from ``(partner_reward, partner_next_obs)``.
+    3. Updates the cortex OaK Q-function from ``(partner_reward, partner_next_obs)``,
+       crediting the partner's executed action when it is provided.
     4. Computes a greedy cortex action recommendation from ``partner_next_obs``.
     5. Returns the augmented observation ``[partner_obs, predictions]``.
     """
@@ -487,6 +594,9 @@ class IAAgent:
         partner_obs: Array,
         partner_reward: Array,
         partner_next_obs: Array,
+        partner_action: Array | None = None,
+        *,
+        discount: Array | None = None,
     ) -> IAUpdateResult:
         """Process one IA step from partner experience.
 
@@ -495,6 +605,14 @@ class IAAgent:
             partner_obs: Partner's current observation ``s_t``.
             partner_reward: Partner's received reward ``r_{t+1}``.
             partner_next_obs: Partner's next observation ``s_{t+1}``.
+            partner_action: Primitive action the partner actually executed at
+                ``s_t`` (the ``effective_action`` from
+                :func:`update_recommendation_protocol`).  When provided, the
+                exo-cortex Q-update credits this executed action; when
+                ``None``, the cortex's own selected action is credited.
+            discount: Optional effective continuation multiplier for the
+                partner transition. ``None`` preserves the legacy OaK update
+                semantics.
 
         Returns:
             :class:`IAUpdateResult` with augmented observation and diagnostics.
@@ -508,9 +626,14 @@ class IAAgent:
             state.cerebellum_state, obs, next_obs
         )
 
-        # Cortex: update Q from (reward, next_obs), get recommendation
+        # Cortex: update Q from (reward, next_obs) crediting the partner's
+        # executed action when known, get recommendation
         new_cortex_state, recommendation, td_error = self._cortex.update(
-            state.cortex_state, reward, next_obs
+            state.cortex_state,
+            reward,
+            next_obs,
+            partner_action=partner_action,
+            discount=discount,
         )
 
         # Augmented observation for the partner
@@ -537,6 +660,9 @@ class IAAgent:
         partner_obs: Array,
         partner_rewards: Array,
         partner_next_obs: Array,
+        partner_actions: Array | None = None,
+        *,
+        discounts: Array | None = None,
     ) -> IAArrayResult:
         """Run the IA agent over pre-collected partner transition arrays.
 
@@ -545,17 +671,31 @@ class IAAgent:
             partner_obs: Shape ``(T, obs_dim)`` partner observations.
             partner_rewards: Shape ``(T,)`` partner rewards.
             partner_next_obs: Shape ``(T, obs_dim)`` partner next observations.
+            partner_actions: Optional shape ``(T,)`` int32 primitive actions
+                the partner executed; when provided, each cortex Q-update
+                credits the executed action (see :meth:`update`).
+            discounts: Optional shape ``(T,)`` effective continuation
+                multipliers. ``None`` preserves legacy update semantics.
 
         Returns:
             :class:`IAArrayResult` with per-step diagnostics.
         """
+        use_actions = partner_actions is not None
+        use_discounts = discounts is not None
 
         def step_fn(
             carry: IAState,
-            inputs: tuple[Array, Array, Array],
+            inputs: tuple[Array, ...],
         ) -> tuple[IAState, tuple[Array, ...]]:
-            obs, reward, next_ob = inputs
-            result = self.update(carry, obs, reward, next_ob)
+            obs, reward, next_ob, action, transition_discount = inputs
+            result = self.update(
+                carry,
+                obs,
+                reward,
+                next_ob,
+                partner_action=action if use_actions else None,
+                discount=transition_discount if use_discounts else None,
+            )
             return result.state, (
                 result.predictions,
                 result.cerebellum_errors,
@@ -564,17 +704,35 @@ class IAAgent:
                 result.cortex_td_error,
             )
 
-        final_state, (
-            predictions,
-            cerebellum_errors,
-            recommendations,
-            augmented_obs,
-            cortex_td_errors,
-        ) = jax.lax.scan(
-            step_fn,
-            state,
-            (partner_obs, partner_rewards, partner_next_obs),
+        num_steps = jnp.asarray(partner_rewards).shape[0]
+        scan_actions = (
+            jnp.asarray(partner_actions, dtype=jnp.int32)
+            if partner_actions is not None
+            else jnp.zeros((num_steps,), dtype=jnp.int32)
         )
+        scan_discounts = (
+            jnp.asarray(discounts, dtype=jnp.float32)
+            if discounts is not None
+            else jnp.ones((num_steps,), dtype=jnp.float32)
+        )
+        xs: tuple[Array, ...] = (
+            partner_obs,
+            partner_rewards,
+            partner_next_obs,
+            scan_actions,
+            scan_discounts,
+        )
+
+        (
+            final_state,
+            (
+                predictions,
+                cerebellum_errors,
+                recommendations,
+                augmented_obs,
+                cortex_td_errors,
+            ),
+        ) = jax.lax.scan(step_fn, state, xs)
 
         return IAArrayResult(
             state=final_state,

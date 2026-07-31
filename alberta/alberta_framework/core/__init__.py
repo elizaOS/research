@@ -49,6 +49,7 @@ from alberta_framework.core.average_reward import (
     DifferentialTDLearner,
     DifferentialTDState,
     DifferentialTDUpdateResult,
+    DiscretePolicySample,
     run_average_reward_horde_actor_critic_from_arrays,
     run_average_reward_horde_from_arrays,
     run_differential_gtd_from_arrays,
@@ -59,6 +60,8 @@ from alberta_framework.core.behavior_model import (
     BehaviorModel,
     BehaviorModelArrayResult,
     BehaviorModelConfig,
+    BehaviorModelInputGradient,
+    BehaviorModelResourceBudget,
     BehaviorModelSampleResult,
     BehaviorModelState,
     BehaviorModelUpdateResult,
@@ -68,6 +71,37 @@ from alberta_framework.core.behavior_model import (
     floor_and_renormalize_probabilities,
     run_behavior_model_from_arrays,
     selected_action_probabilities,
+)
+from alberta_framework.core.canonical_upgd import (
+    CanonicalUPGD,
+    CanonicalUPGDConfig,
+    CanonicalUPGDState,
+    CanonicalUPGDUpdate,
+)
+from alberta_framework.core.context_inference import (
+    ContextInference,
+    ContextInferenceConfig,
+    ContextInferenceState,
+)
+from alberta_framework.core.delight import (
+    DelightfulPolicyGradientConfig,
+    DelightfulPolicyGradientDiagnostics,
+    DelightfulPolicyGradientResult,
+    DelightOutcomeStratification,
+    DelightStratumDiagnostics,
+    GradientCandidateSemantics,
+    GradientJoyApplicationResult,
+    GradientJoyAssessment,
+    GradientJoyConfig,
+    GradientJoyDiagnostics,
+    GradientJoyEvidence,
+    LearningValue,
+    LearningValueAvailability,
+    PolicyGradientMode,
+    apply_gradient_joy_update,
+    assess_gradient_joy,
+    discrete_delightful_policy_gradient,
+    stratify_delight_outcomes,
 )
 from alberta_framework.core.dreaming import (
     ActionConditionedDreamWorld,
@@ -102,6 +136,32 @@ from alberta_framework.core.dreaming import (
     score_dream_candidates,
     slice_imagined_transition,
 )
+from alberta_framework.core.experiential_memory import (
+    ExperientialMemory,
+    ExperientialMemoryAccounting,
+    ExperientialMemoryConfig,
+    ExperientialMemoryEntries,
+    ExperientialMemoryEntry,
+    ExperientialMemoryRetrieval,
+    ExperientialMemoryState,
+    ExperientialMemoryStepResult,
+    ExperientialMemoryWriteResult,
+)
+from alberta_framework.core.feature_bank_router import (
+    CONFIG_SCHEMA_VERSION as FEATURE_BANK_ROUTER_CONFIG_SCHEMA_VERSION,
+)
+from alberta_framework.core.feature_bank_router import (
+    INACTIVE_DESCRIPTOR as FEATURE_BANK_INACTIVE_DESCRIPTOR,
+)
+from alberta_framework.core.feature_bank_router import (
+    FeatureBankRouteDiagnostics,
+    FeatureBankRouter,
+    FeatureBankRouterConfig,
+    FeatureBankRouteResult,
+    FeatureBankRouterResourceBudget,
+    FeatureBankRouterState,
+    PairDescriptorValidation,
+)
 from alberta_framework.core.horde import (
     BatchedHordeResult,
     HordeLearner,
@@ -132,6 +192,15 @@ from alberta_framework.core.horde_actor_critic import (
     run_horde_actor_critic_from_arrays,
     run_nonlinear_horde_actor_critic_from_arrays,
 )
+from alberta_framework.core.integrated_hidden_partner import (
+    INTEGRATED_HIDDEN_PARTNER_SCHEMA_VERSION,
+    IntegratedHiddenPartnerAgent,
+    IntegratedHiddenPartnerConfig,
+    IntegratedHiddenPartnerResourceBudget,
+    IntegratedHiddenPartnerState,
+    IntegratedStartResult,
+    IntegratedUpdateResult,
+)
 from alberta_framework.core.intelligence_amplification import (
     ExoCerebellumAgent,
     ExoCerebellumConfig,
@@ -148,6 +217,15 @@ from alberta_framework.core.intelligence_amplification import (
     init_recommendation_protocol_state,
     update_recommendation_protocol,
 )
+from alberta_framework.core.joint_partner_world import (
+    BoundedJointOutcomeConfig,
+    BoundedJointOutcomeModel,
+    BoundedJointOutcomeState,
+    JointOutcomePrediction,
+    JointOutcomeResourceBudget,
+    JointOutcomeUpdateResult,
+    PartnerMarginalDecision,
+)
 from alberta_framework.core.latent_world_model import (
     LatentWorldModel,
     LatentWorldModelConfig,
@@ -158,6 +236,14 @@ from alberta_framework.core.latent_world_model import (
     run_latent_world_model_learning_loop,
 )
 from alberta_framework.core.learners import LinearLearner, TDLinearLearner, TDUpdateResult
+from alberta_framework.core.learning_signals import (
+    LearningSignalAvailability,
+    LearningSignalEstimator,
+    LearningSignalEstimatorConfig,
+    LearningSignalEstimatorState,
+    LearningSignalResourceBudget,
+    TypedLearningSignals,
+)
 from alberta_framework.core.off_policy_horde import (
     NonlinearSharedGTDHordeLearner,
     NonlinearSharedGTDHordeLearningResult,
@@ -194,15 +280,34 @@ from alberta_framework.core.optimizers import (
     bounder_from_config,
     optimizer_from_config,
 )
+from alberta_framework.core.option_value_duration import (
+    OptionValueDurationArrayResult,
+    OptionValueDurationConfig,
+    OptionValueDurationLearner,
+    OptionValueDurationPrediction,
+    OptionValueDurationState,
+    OptionValueDurationUpdateResult,
+    run_option_value_duration_from_arrays,
+)
 from alberta_framework.core.prototype_agent import (
+    PROTOTYPE_CHECKPOINT_SCHEMA,
     GRUPerceptionConfig,
     GRUPerceptionState,
     PrototypeAgent,
     PrototypeAgentConfig,
     PrototypeAgentState,
     PrototypeArrayResult,
+    PrototypeTransition,
     PrototypeUpdateResult,
     feature_to_subtask_specs,
+    load_prototype_checkpoint,
+    save_prototype_checkpoint,
+)
+from alberta_framework.core.recurrent_trace_actor_critic import (
+    RecurrentTraceActorCriticAgent,
+    RecurrentTraceActorCriticConfig,
+    RecurrentTraceActorCriticState,
+    RecurrentTraceActorCriticUpdateResult,
 )
 from alberta_framework.core.resource_manager import (
     finite_candidate_hedge_regret_bound,
@@ -222,6 +327,32 @@ from alberta_framework.core.sigreg import (
     sigreg_diagnostics,
     sliced_sigreg_loss,
 )
+from alberta_framework.core.stacked_horde import (
+    StackedHordeConfig,
+    StackedHordeState,
+    StackedHordeUpdateResult,
+    StackedLinearHorde,
+    nexting_spec,
+    run_stacked_horde_scan,
+)
+from alberta_framework.core.state_builder import (
+    STATE_BUILDER_CHECKPOINT_SCHEMA,
+    FixedTraceStateBuilder,
+    FixedTraceStateBuilderConfig,
+    IdentityStateBuilder,
+    IdentityStateBuilderConfig,
+    IdentityStateBuilderState,
+    OnlineGatedStateBuilder,
+    OnlineGatedStateBuilderConfig,
+    OnlineGatedStateBuilderState,
+    StateBuilder,
+    StateBuilderBudget,
+    StateBuilderLearningDiagnostics,
+    load_state_builder_checkpoint,
+    save_state_builder_checkpoint,
+    state_builder_from_config,
+)
+from alberta_framework.core.swift_td import SwiftTD, SwiftTDState, SwiftTDUpdate
 from alberta_framework.core.types import (
     AutoTDIDBDState,
     DemonType,
@@ -289,9 +420,22 @@ __all__ = [
     "TimeStep",
     "bounder_from_config",
     "optimizer_from_config",
+    "CanonicalUPGD",
+    "CanonicalUPGDConfig",
+    "CanonicalUPGDState",
+    "CanonicalUPGDUpdate",
     # TD learning
     "AutoTDIDBD",
     "AutoTDIDBDState",
+    "StackedHordeConfig",
+    "StackedHordeState",
+    "StackedHordeUpdateResult",
+    "StackedLinearHorde",
+    "SwiftTD",
+    "SwiftTDState",
+    "SwiftTDUpdate",
+    "nexting_spec",
+    "run_stacked_horde_scan",
     "TDIDBD",
     "TDIDBDState",
     "TDLearnerState",
@@ -363,6 +507,10 @@ __all__ = [
     "ContinuousActorCriticConfig",
     "ContinuousActorCriticState",
     "ContinuousActorCriticUpdateResult",
+    "RecurrentTraceActorCriticAgent",
+    "RecurrentTraceActorCriticConfig",
+    "RecurrentTraceActorCriticState",
+    "RecurrentTraceActorCriticUpdateResult",
     "HordeActorCriticAgent",
     "HordeActorCriticArrayResult",
     "HordeActorCriticConfig",
@@ -389,6 +537,8 @@ __all__ = [
     "BehaviorModel",
     "BehaviorModelArrayResult",
     "BehaviorModelConfig",
+    "BehaviorModelInputGradient",
+    "BehaviorModelResourceBudget",
     "BehaviorModelSampleResult",
     "BehaviorModelState",
     "BehaviorModelUpdateResult",
@@ -398,6 +548,25 @@ __all__ = [
     "floor_and_renormalize_probabilities",
     "run_behavior_model_from_arrays",
     "selected_action_probabilities",
+    # Typed learning value / gradient joy / Delightful Policy Gradient
+    "DelightOutcomeStratification",
+    "DelightStratumDiagnostics",
+    "DelightfulPolicyGradientConfig",
+    "DelightfulPolicyGradientDiagnostics",
+    "DelightfulPolicyGradientResult",
+    "GradientCandidateSemantics",
+    "GradientJoyApplicationResult",
+    "GradientJoyAssessment",
+    "GradientJoyConfig",
+    "GradientJoyDiagnostics",
+    "GradientJoyEvidence",
+    "LearningValue",
+    "LearningValueAvailability",
+    "PolicyGradientMode",
+    "apply_gradient_joy_update",
+    "assess_gradient_joy",
+    "discrete_delightful_policy_gradient",
+    "stratify_delight_outcomes",
     # Dreaming / self-simulation
     "ActionConditionedDreamWorld",
     "BehaviorModelDreamPolicy",
@@ -430,6 +599,34 @@ __all__ = [
     "init_dream_rollout_state",
     "score_dream_candidates",
     "slice_imagined_transition",
+    # Bounded experiential memory
+    "ExperientialMemory",
+    "ExperientialMemoryAccounting",
+    "ExperientialMemoryConfig",
+    "ExperientialMemoryEntries",
+    "ExperientialMemoryEntry",
+    "ExperientialMemoryRetrieval",
+    "ExperientialMemoryState",
+    "ExperientialMemoryStepResult",
+    "ExperientialMemoryWriteResult",
+    # Atomic dynamic feature-bank routing
+    "FEATURE_BANK_INACTIVE_DESCRIPTOR",
+    "FEATURE_BANK_ROUTER_CONFIG_SCHEMA_VERSION",
+    "FeatureBankRouteDiagnostics",
+    "FeatureBankRouteResult",
+    "FeatureBankRouter",
+    "FeatureBankRouterConfig",
+    "FeatureBankRouterResourceBudget",
+    "FeatureBankRouterState",
+    "PairDescriptorValidation",
+    # L0 bounded hidden-partner integration mechanism
+    "INTEGRATED_HIDDEN_PARTNER_SCHEMA_VERSION",
+    "IntegratedHiddenPartnerAgent",
+    "IntegratedHiddenPartnerConfig",
+    "IntegratedHiddenPartnerResourceBudget",
+    "IntegratedHiddenPartnerState",
+    "IntegratedStartResult",
+    "IntegratedUpdateResult",
     # Average reward (Steps 5/6)
     "AverageRewardHordeLearner",
     "AverageRewardHordeActorCriticAgent",
@@ -445,6 +642,7 @@ __all__ = [
     "DifferentialGTDLearner",
     "DifferentialGTDState",
     "DifferentialGTDUpdateResult",
+    "DiscretePolicySample",
     "DifferentialSARSAAgent",
     "DifferentialSARSAArrayResult",
     "DifferentialSARSAConfig",
@@ -460,6 +658,41 @@ __all__ = [
     "run_differential_gtd_from_arrays",
     "run_differential_sarsa_from_arrays",
     "run_differential_td_from_arrays",
+    "OptionValueDurationArrayResult",
+    "OptionValueDurationConfig",
+    "OptionValueDurationLearner",
+    "OptionValueDurationPrediction",
+    "OptionValueDurationState",
+    "OptionValueDurationUpdateResult",
+    "run_option_value_duration_from_arrays",
+    # Latent context inference (hidden-regime identification from rewards)
+    "ContextInference",
+    "ContextInferenceConfig",
+    "ContextInferenceState",
+    # Joint partner/world planning
+    "BoundedJointOutcomeConfig",
+    "BoundedJointOutcomeModel",
+    "BoundedJointOutcomeState",
+    "JointOutcomePrediction",
+    "JointOutcomeResourceBudget",
+    "JointOutcomeUpdateResult",
+    "PartnerMarginalDecision",
+    # Causal state construction
+    "STATE_BUILDER_CHECKPOINT_SCHEMA",
+    "FixedTraceStateBuilder",
+    "FixedTraceStateBuilderConfig",
+    "IdentityStateBuilder",
+    "IdentityStateBuilderConfig",
+    "IdentityStateBuilderState",
+    "OnlineGatedStateBuilder",
+    "OnlineGatedStateBuilderConfig",
+    "OnlineGatedStateBuilderState",
+    "StateBuilder",
+    "StateBuilderBudget",
+    "StateBuilderLearningDiagnostics",
+    "load_state_builder_checkpoint",
+    "save_state_builder_checkpoint",
+    "state_builder_from_config",
     # Working memory / predictive state
     "WorkingMemoryConfig",
     "WorkingMemoryDiagnostics",
@@ -473,6 +706,13 @@ __all__ = [
     "LatentWorldModelState",
     "LatentWorldModelUpdateResult",
     "run_latent_world_model_learning_loop",
+    # Typed predict-before-update learning signals
+    "LearningSignalAvailability",
+    "LearningSignalEstimator",
+    "LearningSignalEstimatorConfig",
+    "LearningSignalEstimatorState",
+    "LearningSignalResourceBudget",
+    "TypedLearningSignals",
     # Intelligence Amplification (Step 12)
     "ExoCerebellumAgent",
     "ExoCerebellumConfig",
@@ -488,13 +728,17 @@ __all__ = [
     "RecommendationProtocolState",
     "init_recommendation_protocol_state",
     "update_recommendation_protocol",
-    # PrototypeAgent — all 12 Alberta Plan steps integrated
+    # PrototypeAgent — experimental composition surface spanning Steps 1–12
+    "PROTOTYPE_CHECKPOINT_SCHEMA",
     "GRUPerceptionConfig",
     "GRUPerceptionState",
     "PrototypeAgent",
     "PrototypeAgentConfig",
     "PrototypeAgentState",
     "PrototypeArrayResult",
+    "PrototypeTransition",
     "PrototypeUpdateResult",
     "feature_to_subtask_specs",
+    "load_prototype_checkpoint",
+    "save_prototype_checkpoint",
 ]

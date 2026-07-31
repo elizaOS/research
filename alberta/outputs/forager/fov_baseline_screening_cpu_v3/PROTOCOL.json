@@ -1,0 +1,68 @@
+{
+  "schema_version": "alberta.forager_fov_baseline_screening_cpu.v3",
+  "status": "configuration_frozen_execution_pending",
+  "evidence_class": "open_development",
+  "scientific_promotion_allowed": false,
+  "sota_claim_allowed": false,
+  "base_protocol": {
+    "repository_path": "outputs/forager/fov_baseline_screening_v1",
+    "schema_version": "alberta.forager_fov_baseline_screening.v1",
+    "sha256": "b94c906f9d3c1f2abf226d7049bd9305700d7f5a81012b07b36cc10d458d3174"
+  },
+  "supersedes_protocol": {
+    "repository_path": "outputs/forager/fov_baseline_screening_cpu_v2",
+    "schema_version": "alberta.forager_fov_baseline_screening_cpu.v2",
+    "sha256": "d384a44dcf8161e8d7c521ea3fda7720118cff93047bbb1261d84f158388e606"
+  },
+  "runtime": {
+    "backend": "cpu",
+    "development_image_reference": "alberta-forager-runtime:dev2-9710f60",
+    "development_image_id": "sha256:e8a9789cee5e1e607256a92f035013416479141ee3cd1d489af1b0738cb854c3",
+    "qualified_production_image": false,
+    "environment": {
+      "CUDA_VISIBLE_DEVICES": "",
+      "JAX_PLATFORM_NAME": "cpu",
+      "JAX_PLATFORMS": "cpu",
+      "MPLCONFIGDIR": "/tmp/alberta-matplotlib-cache",
+      "NUMBA_CACHE_DIR": "/tmp/alberta-numba-cache",
+      "NVIDIA_VISIBLE_DEVICES": "void",
+      "PYTHONHASHSEED": "0",
+      "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+    },
+    "sandbox": {
+      "capabilities": "all_dropped",
+      "container_user": "65532:65532",
+      "host_devices": [],
+      "network": "none",
+      "no_new_privileges": true,
+      "pids_limit": 512,
+      "root_filesystem": "read_only",
+      "tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=8g,mode=1777"
+    }
+  },
+  "preflight": {
+    "mode": "exact_entrypoint_help_before_experiment_construction",
+    "arguments": [
+      "--help"
+    ],
+    "entrypoints_from_frozen_configurations": true,
+    "environment_or_transition_construction_allowed": false,
+    "required_cache_directories": {
+      "MPLCONFIGDIR": "/tmp/alberta-matplotlib-cache",
+      "NUMBA_CACHE_DIR": "/tmp/alberta-numba-cache"
+    }
+  },
+  "scoring": {
+    "implementation_path": "alberta_framework/benchmarks/_foragax_open_screen_scorer_v3.py",
+    "implementation_sha256": "ea4648d8733af3ab5a05c05543eddcc9a1d0415c6cba3935ed4b3c6d9e2506e4",
+    "runtime": "exact_development_image",
+    "arithmetic": "EMA_DECAY * ema + (1.0 - EMA_DECAY) * reward"
+  },
+  "limitations": [
+    "This CPU protocol inherits only the exact candidates, seeds, horizon, metric, and selection rule from its hash-bound v1 base protocol; it does not inherit the v1 CUDA runtime declaration.",
+    "The sealed CPU v2 predecessor remains an immutable failed execution record and none of its outcomes are reused by this screen.",
+    "The seeds are open, consumed development seeds and cannot promote scientific evidence.",
+    "The exact image is an unqualified development image.",
+    "Two seeds and a short prefix cannot support superiority, SOTA, or official claims."
+  ]
+}

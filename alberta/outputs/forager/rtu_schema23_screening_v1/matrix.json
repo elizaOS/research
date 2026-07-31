@@ -1,0 +1,336 @@
+{
+  "schema_version": "2.3",
+  "preset": "field_of_view",
+  "stage": "tuning",
+  "steps": 500000,
+  "seeds": [
+    2100001,
+    2100002,
+    2100003,
+    2100004
+  ],
+  "jax_chunk_size": 25000,
+  "seed_batch_size": 4,
+  "mode": "vmap",
+  "source_execution_mode": "content_verified_snapshot_subprocess_unsealed",
+  "metric_evidence_mode": "raw_reward_npz_v2",
+  "selection_rule": {
+    "metric": "fov_last_10pct_ema_auc",
+    "direction": "maximize",
+    "statistic": "conservative_ci_endpoint",
+    "confidence": 0.95,
+    "bootstrap_resamples": 10000,
+    "bootstrap_seed": 2100000,
+    "tie_break": "variant_id_ascending"
+  },
+  "variants": {
+    "rtu_h08": {
+      "kind": "alberta_rtu_rtrl",
+      "selection_group": "rtu_width_taylor",
+      "config": {
+        "core": {
+          "n_actions": 4,
+          "hidden_size": 8,
+          "encoder_width": 8,
+          "output_width": 8,
+          "gamma": 0.99,
+          "actor_lamda": 0.8,
+          "critic_lamda": 0.8,
+          "actor_alpha": 1.0,
+          "critic_alpha": 1.0,
+          "actor_kappa": 3.0,
+          "critic_kappa": 2.0,
+          "entropy_coefficient": 0.095,
+          "temperature": 1.0,
+          "sparsity": 0.9,
+          "r_min": 0.0,
+          "r_max": 1.0,
+          "max_phase": 6.28,
+          "rtu_epsilon": 1e-08,
+          "layer_norm_epsilon": 1e-05,
+          "leaky_relu_slope": 0.01,
+          "normalize_observations": true,
+          "normalize_rewards": true,
+          "normalization_epsilon": 1e-08,
+          "rtrl_taylor_correction": false
+        },
+        "freeze_after_steps": null,
+        "features": {
+          "include_channel_means": true,
+          "include_hint": true,
+          "include_last_action": true,
+          "include_last_reward": true,
+          "reward_trace_decays": [
+            0.9,
+            0.99,
+            0.999
+          ],
+          "reward_scale": 14.0
+        }
+      }
+    },
+    "rtu_h08_taylor": {
+      "kind": "alberta_rtu_rtrl",
+      "selection_group": "rtu_width_taylor",
+      "config": {
+        "core": {
+          "n_actions": 4,
+          "hidden_size": 8,
+          "encoder_width": 8,
+          "output_width": 8,
+          "gamma": 0.99,
+          "actor_lamda": 0.8,
+          "critic_lamda": 0.8,
+          "actor_alpha": 1.0,
+          "critic_alpha": 1.0,
+          "actor_kappa": 3.0,
+          "critic_kappa": 2.0,
+          "entropy_coefficient": 0.095,
+          "temperature": 1.0,
+          "sparsity": 0.9,
+          "r_min": 0.0,
+          "r_max": 1.0,
+          "max_phase": 6.28,
+          "rtu_epsilon": 1e-08,
+          "layer_norm_epsilon": 1e-05,
+          "leaky_relu_slope": 0.01,
+          "normalize_observations": true,
+          "normalize_rewards": true,
+          "normalization_epsilon": 1e-08,
+          "rtrl_taylor_correction": true
+        },
+        "freeze_after_steps": null,
+        "features": {
+          "include_channel_means": true,
+          "include_hint": true,
+          "include_last_action": true,
+          "include_last_reward": true,
+          "reward_trace_decays": [
+            0.9,
+            0.99,
+            0.999
+          ],
+          "reward_scale": 14.0
+        }
+      }
+    },
+    "rtu_h16": {
+      "kind": "alberta_rtu_rtrl",
+      "selection_group": "rtu_width_taylor",
+      "config": {
+        "core": {
+          "n_actions": 4,
+          "hidden_size": 16,
+          "encoder_width": 8,
+          "output_width": 8,
+          "gamma": 0.99,
+          "actor_lamda": 0.8,
+          "critic_lamda": 0.8,
+          "actor_alpha": 1.0,
+          "critic_alpha": 1.0,
+          "actor_kappa": 3.0,
+          "critic_kappa": 2.0,
+          "entropy_coefficient": 0.095,
+          "temperature": 1.0,
+          "sparsity": 0.9,
+          "r_min": 0.0,
+          "r_max": 1.0,
+          "max_phase": 6.28,
+          "rtu_epsilon": 1e-08,
+          "layer_norm_epsilon": 1e-05,
+          "leaky_relu_slope": 0.01,
+          "normalize_observations": true,
+          "normalize_rewards": true,
+          "normalization_epsilon": 1e-08,
+          "rtrl_taylor_correction": false
+        },
+        "freeze_after_steps": null,
+        "features": {
+          "include_channel_means": true,
+          "include_hint": true,
+          "include_last_action": true,
+          "include_last_reward": true,
+          "reward_trace_decays": [
+            0.9,
+            0.99,
+            0.999
+          ],
+          "reward_scale": 14.0
+        }
+      }
+    },
+    "rtu_h16_taylor": {
+      "kind": "alberta_rtu_rtrl",
+      "selection_group": "rtu_width_taylor",
+      "config": {
+        "core": {
+          "n_actions": 4,
+          "hidden_size": 16,
+          "encoder_width": 8,
+          "output_width": 8,
+          "gamma": 0.99,
+          "actor_lamda": 0.8,
+          "critic_lamda": 0.8,
+          "actor_alpha": 1.0,
+          "critic_alpha": 1.0,
+          "actor_kappa": 3.0,
+          "critic_kappa": 2.0,
+          "entropy_coefficient": 0.095,
+          "temperature": 1.0,
+          "sparsity": 0.9,
+          "r_min": 0.0,
+          "r_max": 1.0,
+          "max_phase": 6.28,
+          "rtu_epsilon": 1e-08,
+          "layer_norm_epsilon": 1e-05,
+          "leaky_relu_slope": 0.01,
+          "normalize_observations": true,
+          "normalize_rewards": true,
+          "normalization_epsilon": 1e-08,
+          "rtrl_taylor_correction": true
+        },
+        "freeze_after_steps": null,
+        "features": {
+          "include_channel_means": true,
+          "include_hint": true,
+          "include_last_action": true,
+          "include_last_reward": true,
+          "reward_trace_decays": [
+            0.9,
+            0.99,
+            0.999
+          ],
+          "reward_scale": 14.0
+        }
+      }
+    },
+    "rtu_h32": {
+      "kind": "alberta_rtu_rtrl",
+      "selection_group": "rtu_width_taylor",
+      "config": {
+        "core": {
+          "n_actions": 4,
+          "hidden_size": 32,
+          "encoder_width": 8,
+          "output_width": 8,
+          "gamma": 0.99,
+          "actor_lamda": 0.8,
+          "critic_lamda": 0.8,
+          "actor_alpha": 1.0,
+          "critic_alpha": 1.0,
+          "actor_kappa": 3.0,
+          "critic_kappa": 2.0,
+          "entropy_coefficient": 0.095,
+          "temperature": 1.0,
+          "sparsity": 0.9,
+          "r_min": 0.0,
+          "r_max": 1.0,
+          "max_phase": 6.28,
+          "rtu_epsilon": 1e-08,
+          "layer_norm_epsilon": 1e-05,
+          "leaky_relu_slope": 0.01,
+          "normalize_observations": true,
+          "normalize_rewards": true,
+          "normalization_epsilon": 1e-08,
+          "rtrl_taylor_correction": false
+        },
+        "freeze_after_steps": null,
+        "features": {
+          "include_channel_means": true,
+          "include_hint": true,
+          "include_last_action": true,
+          "include_last_reward": true,
+          "reward_trace_decays": [
+            0.9,
+            0.99,
+            0.999
+          ],
+          "reward_scale": 14.0
+        }
+      }
+    },
+    "rtu_h32_taylor": {
+      "kind": "alberta_rtu_rtrl",
+      "selection_group": "rtu_width_taylor",
+      "config": {
+        "core": {
+          "n_actions": 4,
+          "hidden_size": 32,
+          "encoder_width": 8,
+          "output_width": 8,
+          "gamma": 0.99,
+          "actor_lamda": 0.8,
+          "critic_lamda": 0.8,
+          "actor_alpha": 1.0,
+          "critic_alpha": 1.0,
+          "actor_kappa": 3.0,
+          "critic_kappa": 2.0,
+          "entropy_coefficient": 0.095,
+          "temperature": 1.0,
+          "sparsity": 0.9,
+          "r_min": 0.0,
+          "r_max": 1.0,
+          "max_phase": 6.28,
+          "rtu_epsilon": 1e-08,
+          "layer_norm_epsilon": 1e-05,
+          "leaky_relu_slope": 0.01,
+          "normalize_observations": true,
+          "normalize_rewards": true,
+          "normalization_epsilon": 1e-08,
+          "rtrl_taylor_correction": true
+        },
+        "freeze_after_steps": null,
+        "features": {
+          "include_channel_means": true,
+          "include_hint": true,
+          "include_last_action": true,
+          "include_last_reward": true,
+          "reward_trace_decays": [
+            0.9,
+            0.99,
+            0.999
+          ],
+          "reward_scale": 14.0
+        }
+      }
+    }
+  },
+  "tuning_seeds": [
+    2100001,
+    2100002,
+    2100003,
+    2100004
+  ],
+  "evaluation_seeds": [
+    2200001,
+    2200002,
+    2200003,
+    2200004,
+    2200005,
+    2200006,
+    2200007,
+    2200008,
+    2200009,
+    2200010,
+    2200011,
+    2200012,
+    2200013,
+    2200014,
+    2200015,
+    2200016,
+    2200017,
+    2200018,
+    2200019,
+    2200020,
+    2200021,
+    2200022,
+    2200023,
+    2200024,
+    2200025,
+    2200026,
+    2200027,
+    2200028,
+    2200029,
+    2200030
+  ]
+}

@@ -805,6 +805,170 @@ class TestTrunkTraceGuard:
 
 
 # =============================================================================
+# SARSA(lambda) eligibility trace tests
+# =============================================================================
+
+
+class TestSARSALambdaTraces:
+    """Tests for SARSA(lambda) eligibility-trace decay on control heads.
+
+    Control demons carry the real discount so head traces decay by
+    ``config.gamma * lamda`` — with the TD target still computed
+    externally (no internal bootstrap).
+    """
+
+    def test_control_head_trace_decay_factor(self):
+        """Active control head's trace decays by gamma*lamda, not 0."""
+        gamma, lamda = 0.9, 0.8
+        agent = _make_agent(
+            n_actions=2,
+            hidden_sizes=(),
+            gamma=gamma,
+            epsilon_start=0.0,
+            lamda=lamda,
+        )
+        state = agent.init(feature_dim=3, key=jr.key(0))
+        obs1 = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
+        obs2 = jnp.array([-1.0, 0.5, 2.0], dtype=jnp.float32)
+        obs3 = jnp.array([0.2, -0.4, 1.0], dtype=jnp.float32)
+        state = state.replace(  # type: ignore[attr-defined]
+            last_action=jnp.array(0, dtype=jnp.int32),
+            last_observation=obs1,
+        )
+
+        stay = jnp.array(0, dtype=jnp.int32)
+        result = agent.update(state, jnp.array(0.5), obs2, jnp.array(0.0), stay)
+        result = agent.update(result.state, jnp.array(0.3), obs3, jnp.array(0.0), stay)
+
+        # Linear model: grad of Q(s, 0) wrt head-0 weights is s itself, so
+        # after two visits e_2 = (gamma * lamda) * s_1 + s_2.
+        gl = gamma * lamda
+        w_trace, b_trace = result.state.learner_state.head_traces[0]
+        chex.assert_trees_all_close(
+            w_trace, (gl * obs1 + obs2).reshape(1, -1), rtol=1e-5
+        )
+        chex.assert_trees_all_close(
+            b_trace, jnp.array([gl + 1.0], dtype=jnp.float32), rtol=1e-5
+        )
+
+    def test_lambda_changes_multistep_updates(self):
+        """lamda in {0.0, 0.9} produce different weights on a 3-step corridor."""
+
+        def run(lamda: float):
+            agent = _make_agent(
+                n_actions=1,
+                hidden_sizes=(),
+                gamma=0.9,
+                epsilon_start=0.0,
+                lamda=lamda,
+            )
+            state = agent.init(feature_dim=3, key=jr.key(7))
+            # Deterministic corridor s0 -> s1 -> s2 -> terminal, reward at end
+            obs = jnp.eye(3, dtype=jnp.float32)
+            next_obs = jnp.roll(obs, -1, axis=0)
+            rewards = jnp.array([0.0, 0.0, 1.0], dtype=jnp.float32)
+            terminated = jnp.array([0.0, 0.0, 1.0], dtype=jnp.float32)
+            state = state.replace(  # type: ignore[attr-defined]
+                last_action=jnp.array(0, dtype=jnp.int32),
+                last_observation=obs[0],
+            )
+            result = run_sarsa_from_arrays(
+                agent, state, obs, rewards, terminated, next_obs
+            )
+            return result.state.learner_state.head_params.weights[0]
+
+        w_one_step = run(0.0)
+        w_trace = run(0.9)
+        assert not jnp.allclose(w_one_step, w_trace), (
+            "SARSA(lambda) must assign multi-step credit differently from "
+            "one-step SARSA, but lamda had no effect on the updates"
+        )
+
+    def test_inactive_control_head_trace_decays(self):
+        """A head not matching the taken action decays its trace each step."""
+        gamma, lamda = 0.9, 0.8
+        agent = _make_agent(
+            n_actions=2,
+            hidden_sizes=(),
+            gamma=gamma,
+            epsilon_start=0.0,
+            lamda=lamda,
+        )
+        state = agent.init(feature_dim=3, key=jr.key(3))
+        obs1 = jnp.array([1.0, -2.0, 0.5], dtype=jnp.float32)
+        obs2 = jnp.array([0.3, 1.0, -1.0], dtype=jnp.float32)
+        obs3 = jnp.array([-0.5, 0.2, 2.0], dtype=jnp.float32)
+        state = state.replace(  # type: ignore[attr-defined]
+            last_action=jnp.array(0, dtype=jnp.int32),
+            last_observation=obs1,
+        )
+
+        switch = jnp.array(1, dtype=jnp.int32)
+        # Step 1: head 0 active (trace = obs1); next action switches to 1
+        result = agent.update(state, jnp.array(0.0), obs2, jnp.array(0.0), switch)
+        # Step 2: head 1 active; head 0 must decay by gamma*lamda, not freeze
+        result = agent.update(result.state, jnp.array(0.0), obs3, jnp.array(0.0), switch)
+
+        gl = gamma * lamda
+        w_trace, b_trace = result.state.learner_state.head_traces[0]
+        chex.assert_trees_all_close(w_trace, (gl * obs1).reshape(1, -1), rtol=1e-5)
+        chex.assert_trees_all_close(
+            b_trace, jnp.array([gl], dtype=jnp.float32), rtol=1e-5
+        )
+
+    def test_traces_reset_at_episode_boundary(self):
+        """Control-head traces are cleared after a terminated transition."""
+        agent = _make_agent(
+            n_actions=2,
+            hidden_sizes=(),
+            gamma=0.9,
+            epsilon_start=0.0,
+            lamda=0.8,
+        )
+        state = agent.init(feature_dim=3, key=jr.key(1))
+        obs1 = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
+        obs2 = jnp.array([-1.0, 0.5, 2.0], dtype=jnp.float32)
+        obs3 = jnp.zeros(3, dtype=jnp.float32)
+        state = state.replace(  # type: ignore[attr-defined]
+            last_action=jnp.array(0, dtype=jnp.int32),
+            last_observation=obs1,
+        )
+
+        stay = jnp.array(0, dtype=jnp.int32)
+        # Build up a trace, then hit an episode boundary
+        result = agent.update(state, jnp.array(0.0), obs2, jnp.array(0.0), stay)
+        result = agent.update(result.state, jnp.array(1.0), obs3, jnp.array(1.0), stay)
+
+        for i in range(2):
+            w_trace, b_trace = result.state.learner_state.head_traces[i]
+            assert jnp.allclose(w_trace, 0.0), f"head {i} w-trace not reset"
+            assert jnp.allclose(b_trace, 0.0), f"head {i} b-trace not reset"
+
+    def test_external_target_semantics_intact(self):
+        """With lamda>0, the TD target is still r + gamma*Q(s',a') (no
+        double-counted internal bootstrap)."""
+        agent = _make_agent(
+            n_actions=2, hidden_sizes=(), gamma=0.9, epsilon_start=0.0, lamda=0.8
+        )
+        state = agent.init(feature_dim=3, key=jr.key(5))
+        obs1 = jnp.array([1.0, -1.0, 0.5], dtype=jnp.float32)
+        obs2 = jnp.array([0.5, 2.0, -0.3], dtype=jnp.float32)
+        state = state.replace(  # type: ignore[attr-defined]
+            last_action=jnp.array(0, dtype=jnp.int32),
+            last_observation=obs1,
+        )
+
+        next_action = jnp.array(1, dtype=jnp.int32)
+        reward = jnp.array(1.0, dtype=jnp.float32)
+        q_next = agent.horde.predict(state.learner_state, obs2)[:2]
+        q_old = agent.horde.predict(state.learner_state, obs1)[0]
+        expected_td = reward + 0.9 * q_next[next_action] - q_old
+
+        result = agent.update(state, reward, obs2, jnp.array(0.0), next_action)
+        chex.assert_trees_all_close(result.td_error, expected_td, rtol=1e-5)
+
+
+# =============================================================================
 # Continuing pseudo-boundary test
 # =============================================================================
 

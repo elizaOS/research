@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 from typing import Any, cast
 
 import chex
@@ -148,12 +149,28 @@ class OptionModelsState:
     the option from a state, decomposed into:
 
     * expected cumulative pseudo-reward (EMA over completed option runs),
+    * expected discounted environment return,
+    * expected primitive-step duration,
+    * expected discounted baseline mass ``Σ_{k=0}^{T-1} γ^k``,
     * expected option discount ``γ^T`` where ``T`` is the option duration,
     * a linear predictor for the expected next-state delta.
+
+    Checkpoint schema note:
+        These fields are part of the JAX PyTree. Generic Orbax restores require
+        an exact template match; the repository does not currently provide a
+        versioned STOMP-state migration loader for checkpoints written before
+        the environment-return, duration, and baseline-mass fields were added.
 
     Attributes:
         cumreward_ema: Shape ``(n_options,)``.  EMA of observed cumulative
             pseudo-reward per option execution.
+        env_return_ema: Shape ``(n_options,)``. EMA of the discounted real
+            environment return observed per option execution.
+        duration_ema: Shape ``(n_options,)``. EMA of primitive-step duration.
+        baseline_mass_ema: Shape ``(n_options,)``. EMA of the discounted
+            baseline mass ``Σ_{k=0}^{T-1} γ^k``. This is the coefficient on
+            the average-reward baseline in the discounted differential
+            semi-MDP target and equals duration when ``γ = 1``.
         discount_ema: Shape ``(n_options,)``.  EMA of ``γ^T`` observed at
             option termination.
         next_state_weights: Shape ``(n_options, obs_dim, obs_dim)``.  Linear
@@ -163,6 +180,9 @@ class OptionModelsState:
     """
 
     cumreward_ema: Float[Array, " n_options"]
+    env_return_ema: Float[Array, " n_options"]
+    duration_ema: Float[Array, " n_options"]
+    baseline_mass_ema: Float[Array, " n_options"]
     discount_ema: Float[Array, " n_options"]
     next_state_weights: Float[Array, "n_options obs_dim obs_dim"]
     n_completions: Int[Array, " n_options"]
@@ -189,6 +209,8 @@ class STOMPState:
         base_average_reward: Scalar continuing reward rate for base agent.
         base_last_obs: Most recent observation seen by the base agent.
         base_last_action: Last extended action index taken (0..K+N-1).
+        last_primitive_action: Primitive action most recently selected for
+            dispatch to the environment.
         rng_key: JAX PRNG key.
         option_policies: Batched intra-option policies.
         option_models: Batched option outcome models.
@@ -197,6 +219,11 @@ class STOMPState:
         option_last_intra_action: Primitive action taken on the previous
             intra-option step (for option Q-update).
         option_cumreward: Accumulated pseudo-reward in the current option.
+        option_env_cumreward: Discounted environment return accumulated in
+            the current option; grounds the base extended-Q update in task
+            reward on option termination.
+        option_baseline_mass: Discounted baseline mass
+            ``Σ_{k=0}^{T-1} γ^k`` accumulated in the current option.
         option_discount: Accumulated discount ``∏ γ`` in current option.
         option_steps: Number of primitive steps taken inside current option.
         step_count: Total primitive steps taken by the agent.
@@ -206,6 +233,7 @@ class STOMPState:
     base_average_reward: Float[Array, ""]
     base_last_obs: Float[Array, " obs_dim"]
     base_last_action: Int[Array, ""]
+    last_primitive_action: Int[Array, ""]
     rng_key: Array
     option_policies: IntraOptionPoliciesState
     option_models: OptionModelsState
@@ -213,6 +241,8 @@ class STOMPState:
     option_start_obs: Float[Array, " obs_dim"]
     option_last_intra_action: Int[Array, ""]
     option_cumreward: Float[Array, ""]
+    option_env_cumreward: Float[Array, ""]
+    option_baseline_mass: Float[Array, ""]
     option_discount: Float[Array, ""]
     option_steps: Int[Array, ""]
     step_count: Int[Array, ""]
@@ -221,6 +251,14 @@ class STOMPState:
 # ---------------------------------------------------------------------------
 # Update-result types
 # ---------------------------------------------------------------------------
+
+
+@chex.dataclass(frozen=True)
+class STOMPStartResult:
+    """Primed STOMP state and the first primitive action to dispatch."""
+
+    state: STOMPState
+    primitive_action: Int[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -235,6 +273,8 @@ class STOMPUpdateResult:
     option_terminated: Array
     pseudo_reward: Float[Array, ""]
     option_importance_ratio: Float[Array, ""]
+    planning_backups: Int[Array, ""]
+    planning_td_error: Float[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -249,6 +289,8 @@ class STOMPArrayResult:
     option_terminations: Array
     pseudo_rewards: Float[Array, " num_steps"]
     option_importance_ratios: Float[Array, " num_steps"]
+    planning_backups: Int[Array, " num_steps"]
+    planning_td_errors: Float[Array, " num_steps"]
 
 
 # ---------------------------------------------------------------------------
@@ -412,24 +454,26 @@ def _differential_semidp_q_update(
     avg_reward_step_size: float,
     trace_decay: float,
     n_actions: int,
-    duration: Array,
+    baseline_mass: Array,
     discount: Array,
 ) -> tuple[Array, Array, Array, Array]:
-    """Differential Q-update supporting semi-MDP option returns.
+    """Discounted differential Q-update for semi-MDP option returns.
 
     Extends :func:`_differential_q_update` to correctly account for
-    multi-step option duration and cumulative discount:
+    a discounted multi-step return and its matching baseline mass:
 
     .. code-block::
 
-        td = R_o - avg_r * T_o + γ_o * V(s') - Q(s, o)
+        td = R_o^γ - avg_r * Σ(k=0..T_o-1) γ^k
+             + γ^T_o * V(s') - Q(s, o)
 
-    For primitive steps pass ``duration=1, discount=1`` to recover the
+    For primitive steps pass ``baseline_mass=1, discount=1`` to recover the
     standard single-step update exactly.
 
     Args:
-        duration: Effective number of primitive steps the option ran (T_o).
-            ``1`` for primitive actions.
+        baseline_mass: Discounted baseline coefficient
+            ``Σ(k=0..T_o-1) γ^k``. ``1`` for primitive actions. When
+            ``γ = 1`` this equals the raw option duration ``T_o``.
         discount: Cumulative per-step discount across the option (γ^{T_o}).
             ``1.0`` for primitive actions.
 
@@ -439,13 +483,18 @@ def _differential_semidp_q_update(
     alpha = jnp.asarray(step_size, dtype=jnp.float32)
     beta = jnp.asarray(avg_reward_step_size, dtype=jnp.float32)
     lam = jnp.asarray(trace_decay, dtype=jnp.float32)
-    t_o = jnp.asarray(duration, dtype=jnp.float32)
+    baseline_coefficient = jnp.asarray(baseline_mass, dtype=jnp.float32)
     gamma_o = jnp.asarray(discount, dtype=jnp.float32)
 
     q_prev = q_weights[last_action] @ last_obs
     q_next = jnp.max(_q_values_for_obs(q_weights, next_obs))
-    # Semi-MDP Bellman target: deduct avg_r for t_o steps, scale V(s') by γ_o
-    td_error = reward - average_reward * t_o + gamma_o * q_next - q_prev
+    # The discounted reward and baseline must use the same γ powers.
+    td_error = (
+        reward
+        - average_reward * baseline_coefficient
+        + gamma_o * q_next
+        - q_prev
+    )
 
     action_mask = jax.nn.one_hot(last_action, n_actions, dtype=jnp.float32)
     new_traces = lam * traces + action_mask[:, None] * last_obs[None, :]
@@ -459,7 +508,10 @@ def _update_option_model(
     models: OptionModelsState,
     option_idx: Array,
     start_obs: Array,
-    cumreward: Array,
+    pseudo_return: Array,
+    env_return: Array,
+    duration: Array,
+    baseline_mass: Array,
     discount: Array,
     end_obs: Array,
     *,
@@ -470,7 +522,12 @@ def _update_option_model(
     decay = jnp.asarray(model_decay, dtype=jnp.float32)
     lr = jnp.asarray(model_step_size, dtype=jnp.float32)
 
-    new_cumreward = decay * models.cumreward_ema + (1.0 - decay) * cumreward
+    new_cumreward = decay * models.cumreward_ema + (1.0 - decay) * pseudo_return
+    new_env_return = decay * models.env_return_ema + (1.0 - decay) * env_return
+    new_duration = decay * models.duration_ema + (1.0 - decay) * duration
+    new_baseline_mass = (
+        decay * models.baseline_mass_ema + (1.0 - decay) * baseline_mass
+    )
     new_discount = decay * models.discount_ema + (1.0 - decay) * discount
 
     predicted_delta = models.next_state_weights[option_idx] @ start_obs
@@ -486,6 +543,11 @@ def _update_option_model(
 
     return OptionModelsState(
         cumreward_ema=jnp.where(mask, new_cumreward, models.cumreward_ema),
+        env_return_ema=jnp.where(mask, new_env_return, models.env_return_ema),
+        duration_ema=jnp.where(mask, new_duration, models.duration_ema),
+        baseline_mass_ema=jnp.where(
+            mask, new_baseline_mass, models.baseline_mass_ema
+        ),
         discount_ema=jnp.where(mask, new_discount, models.discount_ema),
         next_state_weights=new_ns_weights,
         n_completions=new_completions,
@@ -500,6 +562,7 @@ def _update_intra_option_policy(
     pseudo_reward: Array,
     next_obs: Array,
     terminated: Array,
+    discount: Array,
     *,
     step_size: float,
     avg_reward_step_size: float,
@@ -507,19 +570,28 @@ def _update_intra_option_policy(
     n_primitive_actions: int,
     importance_ratio: Array,
 ) -> tuple[IntraOptionPoliciesState, Array]:
-    """Update the intra-option Q-function for one option."""
+    """Update one intra-option Q-function with a transition discount.
+
+    ``terminated`` is the option's own termination decision (goal, duration,
+    or environmental termination).  It always zeros the bootstrap.  Otherwise
+    the supplied transition discount controls both bootstrapping and trace
+    carry, so fractional continuation is not silently promoted to one.
+    """
     q_i = option_policies.q_weights[option_idx]
     traces_i = option_policies.traces[option_idx]
     avg_r_i = option_policies.average_rewards[option_idx]
-    terminal_discount = jnp.where(terminated, 0.0, 1.0).astype(jnp.float32)
+    transition_discount = jnp.asarray(discount, dtype=jnp.float32)
+    bootstrap_discount = jnp.where(terminated, 0.0, transition_discount).astype(
+        jnp.float32
+    )
 
     q_prev = q_i[last_intra_action] @ last_obs
-    q_next = jnp.max(_q_values_for_obs(q_i, next_obs)) * terminal_discount
+    q_next = jnp.max(_q_values_for_obs(q_i, next_obs)) * bootstrap_discount
     td_error = pseudo_reward - avg_r_i + q_next - q_prev
 
     alpha = jnp.asarray(step_size, dtype=jnp.float32)
     beta = jnp.asarray(avg_reward_step_size, dtype=jnp.float32)
-    lam = jnp.asarray(trace_decay, dtype=jnp.float32) * terminal_discount
+    lam = jnp.asarray(trace_decay, dtype=jnp.float32) * bootstrap_discount
     rho = jnp.asarray(importance_ratio, dtype=jnp.float32)
 
     action_mask = jax.nn.one_hot(last_intra_action, n_primitive_actions, dtype=jnp.float32)
@@ -563,6 +635,10 @@ class STOMPConfig:
         option_gamma: Discount within option execution.
         option_model_decay: EMA decay for option outcome model updates.
         option_model_step_size: Step-size for next-state delta predictor.
+        option_planning_backups_per_step: Fixed number of Dyna-style option
+            model backups after each real transition. ``0`` disables planning
+            and preserves the model-free update path. This is a static JIT
+            configuration value.
         epsilon_base: Exploration rate for the base extended action selection.
         epsilon_option: Exploration rate for intra-option action selection.
     """
@@ -580,6 +656,7 @@ class STOMPConfig:
     option_gamma: float = 0.99
     option_model_decay: float = 0.95
     option_model_step_size: float = 0.1
+    option_planning_backups_per_step: int = 0
     epsilon_base: float = 0.1
     epsilon_option: float = 0.1
     option_target_epsilon: float | None = None
@@ -597,12 +674,20 @@ class STOMPConfig:
                     f"SubtaskSpec.feature_index={spec.feature_index} >= "
                     f"observation_dim={self.observation_dim}"
                 )
+        if not math.isfinite(self.option_gamma) or not 0.0 <= self.option_gamma <= 1.0:
+            raise ValueError("option_gamma must be finite and in [0, 1]")
         if self.option_target_epsilon is not None and not (
             0.0 <= self.option_target_epsilon <= 1.0
         ):
             raise ValueError("option_target_epsilon must be in [0, 1] when provided")
         if self.option_importance_clip <= 0.0:
             raise ValueError("option_importance_clip must be positive")
+        if (
+            isinstance(self.option_planning_backups_per_step, bool)
+            or not isinstance(self.option_planning_backups_per_step, int)
+            or self.option_planning_backups_per_step < 0
+        ):
+            raise ValueError("option_planning_backups_per_step must be a nonnegative integer")
 
     @property
     def n_options(self) -> int:
@@ -633,6 +718,7 @@ class STOMPConfig:
             "option_gamma": self.option_gamma,
             "option_model_decay": self.option_model_decay,
             "option_model_step_size": self.option_model_step_size,
+            "option_planning_backups_per_step": self.option_planning_backups_per_step,
             "epsilon_base": self.epsilon_base,
             "epsilon_option": self.epsilon_option,
             "option_target_epsilon": self.option_target_epsilon,
@@ -727,6 +813,7 @@ class STOMPAgent:
             base_average_reward=jnp.array(0.0, dtype=jnp.float32),
             base_last_obs=obs_zero,
             base_last_action=jnp.array(0, dtype=jnp.int32),
+            last_primitive_action=jnp.array(0, dtype=jnp.int32),
             rng_key=policy_key,
             option_policies=IntraOptionPoliciesState(
                 q_weights=option_q_weights,
@@ -735,6 +822,9 @@ class STOMPAgent:
             ),
             option_models=OptionModelsState(
                 cumreward_ema=jnp.zeros(n_opt, dtype=jnp.float32),
+                env_return_ema=jnp.zeros(n_opt, dtype=jnp.float32),
+                duration_ema=jnp.zeros(n_opt, dtype=jnp.float32),
+                baseline_mass_ema=jnp.zeros(n_opt, dtype=jnp.float32),
                 discount_ema=jnp.ones(n_opt, dtype=jnp.float32),
                 next_state_weights=jnp.zeros((n_opt, obs_dim, obs_dim), dtype=jnp.float32),
                 n_completions=jnp.zeros(n_opt, dtype=jnp.int32),
@@ -743,6 +833,8 @@ class STOMPAgent:
             option_start_obs=obs_zero,
             option_last_intra_action=jnp.array(0, dtype=jnp.int32),
             option_cumreward=jnp.array(0.0, dtype=jnp.float32),
+            option_env_cumreward=jnp.array(0.0, dtype=jnp.float32),
+            option_baseline_mass=jnp.array(0.0, dtype=jnp.float32),
             option_discount=jnp.array(1.0, dtype=jnp.float32),
             option_steps=jnp.array(0, dtype=jnp.int32),
             step_count=jnp.array(0, dtype=jnp.int32),
@@ -750,30 +842,187 @@ class STOMPAgent:
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def start(self, state: STOMPState, initial_observation: Array) -> STOMPState:
-        """Prime the agent with an initial observation before the first update."""
+        """Prime state and select the first primitive action for dispatch.
+
+        Use :meth:`start_with_action` when the caller needs the action
+        explicitly. The state also records it in ``last_primitive_action``.
+        """
+        cfg = self._config
         obs = jnp.asarray(initial_observation, dtype=jnp.float32).reshape(
-            (self._config.observation_dim,)
+            (cfg.observation_dim,)
         )
         key = state.rng_key
         q_vals = self._base_learner.predict(state.base_learner_state, obs)
-        action, key = _select_action_epsilon_greedy_from_q(
-            q_vals, key, self._config.epsilon_base, self._config.n_total_actions
+        extended_action, key = _select_action_epsilon_greedy_from_q(
+            q_vals, key, cfg.epsilon_base, cfg.n_total_actions
+        )
+        is_starting_option = extended_action >= jnp.asarray(
+            cfg.n_primitive_actions, dtype=jnp.int32
+        )
+        selected_option = jnp.clip(
+            extended_action - cfg.n_primitive_actions,
+            0,
+            cfg.n_options - 1,
+        )
+        intra_action, key = _select_action_epsilon_greedy(
+            state.option_policies.q_weights[selected_option],
+            obs,
+            key,
+            cfg.epsilon_option,
+            cfg.n_primitive_actions,
+        )
+        primitive_action = jnp.where(
+            is_starting_option,
+            intra_action,
+            extended_action,
         )
         return cast(
             STOMPState,
             state.replace(
                 base_last_obs=obs,
-                base_last_action=action,
+                base_last_action=extended_action,
+                last_primitive_action=primitive_action,
                 rng_key=key,
+                executing_option=jnp.where(
+                    is_starting_option,
+                    selected_option,
+                    jnp.array(-1, dtype=jnp.int32),
+                ),
+                option_start_obs=jnp.where(
+                    is_starting_option,
+                    obs,
+                    state.option_start_obs,
+                ),
+                option_last_intra_action=jnp.where(
+                    is_starting_option,
+                    intra_action,
+                    state.option_last_intra_action,
+                ),
+                option_cumreward=jnp.array(0.0, dtype=jnp.float32),
+                option_env_cumreward=jnp.array(0.0, dtype=jnp.float32),
+                option_baseline_mass=jnp.array(0.0, dtype=jnp.float32),
+                option_discount=jnp.array(1.0, dtype=jnp.float32),
+                option_steps=jnp.array(0, dtype=jnp.int32),
             ),
         )
 
-    @functools.partial(jax.jit, static_argnums=(0,))
+    def start_with_action(
+        self,
+        state: STOMPState,
+        initial_observation: Array,
+    ) -> STOMPStartResult:
+        """Prime the agent and return the first primitive action to execute."""
+        primed = self.start(state, initial_observation)
+        return STOMPStartResult(
+            state=primed,
+            primitive_action=primed.last_primitive_action,
+        )
+
+    @staticmethod
+    def current_primitive_action(state: STOMPState) -> Int[Array, ""]:
+        """Return the primitive action currently selected for dispatch."""
+        return state.last_primitive_action
+
+    def _apply_option_model_planning(
+        self,
+        learner_state: MultiHeadMLPState,
+        models: OptionModelsState,
+        anchor_observation: Array,
+        average_reward: Array,
+        selection_offset: Array,
+    ) -> tuple[MultiHeadMLPState, Array, Array]:
+        """Apply a fixed number of Dyna backups from completed option models.
+
+        Every imagined backup starts from ``anchor_observation``, which is a
+        state encountered on the current real transition. Completed models are
+        selected round-robin with a deterministic offset, so the compute
+        budget is static and no extra policy RNG is consumed.
+
+        The returned diagnostics are ``(applied_count, mean_td_error)``.
+        Average reward is intentionally not part of the carry: imagined
+        outcomes must not update the real experience reward-rate estimate.
+        """
+        cfg = self._config
+        completed_mask = models.n_completions > 0
+        n_completed = jnp.sum(completed_mask.astype(jnp.int32))
+        completed_indices = jnp.nonzero(
+            completed_mask,
+            size=cfg.n_options,
+            fill_value=0,
+        )[0]
+        backup_count = cfg.option_planning_backups_per_step
+
+        def apply_backups(_: None) -> tuple[MultiHeadMLPState, Array, Array]:
+            def backup_body(
+                backup_idx: int,
+                carry: tuple[MultiHeadMLPState, Array],
+            ) -> tuple[MultiHeadMLPState, Array]:
+                current_learner_state, td_sum = carry
+                completed_rank = jnp.mod(
+                    jnp.asarray(selection_offset, dtype=jnp.int32) + backup_idx,
+                    n_completed,
+                )
+                model_idx = completed_indices[completed_rank]
+                option_action = model_idx + cfg.n_primitive_actions
+
+                predicted_delta = models.next_state_weights[model_idx] @ anchor_observation
+                predicted_next = anchor_observation + predicted_delta
+                next_q = self._base_learner.predict(
+                    current_learner_state, predicted_next
+                )
+                target = (
+                    models.env_return_ema[model_idx]
+                    - average_reward * models.baseline_mass_ema[model_idx]
+                    + models.discount_ema[model_idx] * jnp.max(next_q)
+                )
+                targets = jnp.full(
+                    cfg.n_total_actions, jnp.nan, dtype=jnp.float32
+                ).at[option_action].set(target)
+                update_result = self._base_learner.update(
+                    current_learner_state,
+                    anchor_observation,
+                    targets,
+                )
+                td_error = update_result.errors[option_action]
+                return update_result.state, td_sum + td_error
+
+            planned_state, td_sum = jax.lax.fori_loop(
+                0,
+                backup_count,
+                backup_body,
+                (learner_state, jnp.array(0.0, dtype=jnp.float32)),
+            )
+            count = jnp.asarray(backup_count, dtype=jnp.int32)
+            mean_td = td_sum / jnp.asarray(backup_count, dtype=jnp.float32)
+            return planned_state, count, mean_td
+
+        def skip_backups(_: None) -> tuple[MultiHeadMLPState, Array, Array]:
+            return (
+                learner_state,
+                jnp.array(0, dtype=jnp.int32),
+                jnp.array(0.0, dtype=jnp.float32),
+            )
+
+        return jax.lax.cond(
+            n_completed > 0,
+            apply_backups,
+            skip_backups,
+            None,
+        )
+
+    @functools.partial(
+        jax.jit,
+        static_argnums=(0,),
+        static_argnames=("enable_planning",),
+    )
     def update(
         self,
         state: STOMPState,
         env_reward: Array,
         next_observation: Array,
+        discount: Array | None = None,
+        *,
+        enable_planning: bool = True,
     ) -> STOMPUpdateResult:
         """Process one real-time transition update.
 
@@ -781,11 +1030,21 @@ class STOMPAgent:
 
         1. Determines whether an option is currently executing.
         2. If executing: advances the intra-option policy and checks termination.
-           On termination, updates the option outcome model and base Q-function
-           using the accumulated option return.
+           On termination, updates the option outcome model (pseudo-reward
+           outcome) and the base Q-function using the environment reward
+           accumulated across the option.
         3. If not executing: updates the base Q-function and selects the next
            extended action (primitive or option).
-        4. Returns diagnostics for logging.
+        4. Optionally applies fixed-budget planning. Callers replaying an
+           imagined transition must pass ``enable_planning=False`` so option
+           models only plan from real observation anchors.
+        5. Returns diagnostics for logging.
+
+        ``discount`` is the effective continuation multiplier for this
+        transition.  Explicit callers should always supply it.  ``None`` is a
+        compatibility mode: primitive and intra-option bootstraps use one,
+        while option-return accumulation uses ``config.option_gamma`` exactly
+        as releases before the explicit transition contract did.
         """
         cfg = self._config
         spec = self._spec_arrays
@@ -793,6 +1052,30 @@ class STOMPAgent:
             (cfg.observation_dim,)
         )
         reward = jnp.asarray(env_reward, dtype=jnp.float32)
+        if discount is None:
+            primitive_discount = jnp.array(1.0, dtype=jnp.float32)
+            intra_option_discount = jnp.array(1.0, dtype=jnp.float32)
+            option_step_discount = jnp.asarray(cfg.option_gamma, dtype=jnp.float32)
+            environmental_termination = jnp.array(False)
+        else:
+            supplied_discount = jnp.asarray(discount, dtype=jnp.float32).reshape(())
+            valid_discount = (
+                jnp.isfinite(supplied_discount)
+                & (supplied_discount >= 0.0)
+                & (supplied_discount <= 1.0)
+            )
+            # Shape errors fail while tracing; value errors become non-finite
+            # rather than being silently clipped under JIT. PrototypeAgent's
+            # eager boundary raises a ValueError before reaching this path.
+            supplied_discount = jnp.where(
+                valid_discount,
+                supplied_discount,
+                jnp.array(jnp.nan, dtype=jnp.float32),
+            )
+            primitive_discount = supplied_discount
+            intra_option_discount = supplied_discount
+            option_step_discount = supplied_discount
+            environmental_termination = supplied_discount <= 0.0
 
         is_executing = state.executing_option >= 0
         option_idx = jnp.maximum(state.executing_option, jnp.array(0, dtype=jnp.int32))
@@ -815,27 +1098,56 @@ class STOMPAgent:
 
         # Option termination check
         new_option_steps = state.option_steps + 1
-        option_terminates = check_option_terminated(spec, option_idx, obs, new_option_steps)
-
-        # --- Intra-option policy update (only active when executing) ---
-        new_option_policies, option_td = _update_intra_option_policy(
-            state.option_policies,
-            option_idx,
-            state.base_last_obs,
-            state.option_last_intra_action,
-            pseudo_r,
-            obs,
-            option_terminates,
-            step_size=cfg.option_step_size,
-            avg_reward_step_size=cfg.option_avg_reward_step_size,
-            trace_decay=cfg.option_trace_decay,
-            n_primitive_actions=cfg.n_primitive_actions,
-            importance_ratio=option_importance_ratio,
+        option_terminates = (
+            check_option_terminated(spec, option_idx, obs, new_option_steps)
+            | environmental_termination
         )
 
-        # Accumulate option trajectory stats
+        # --- Intra-option policy update (only active when executing) ---
+        # Gated on is_executing: idle steps must not pollute option 0 (the
+        # clamped index) with spurious pseudo-reward updates.
+        def do_intra_update(_: None) -> tuple[IntraOptionPoliciesState, Array]:
+            return _update_intra_option_policy(
+                state.option_policies,
+                option_idx,
+                state.base_last_obs,
+                state.option_last_intra_action,
+                pseudo_r,
+                obs,
+                option_terminates,
+                intra_option_discount,
+                step_size=cfg.option_step_size,
+                avg_reward_step_size=cfg.option_avg_reward_step_size,
+                trace_decay=cfg.option_trace_decay,
+                n_primitive_actions=cfg.n_primitive_actions,
+                importance_ratio=option_importance_ratio,
+            )
+
+        def skip_intra_update(_: None) -> tuple[IntraOptionPoliciesState, Array]:
+            return state.option_policies, jnp.array(0.0, dtype=jnp.float32)
+
+        new_option_policies, option_td = jax.lax.cond(
+            is_executing, do_intra_update, skip_intra_update, None
+        )
+
+        # Accumulate option trajectory stats. Pseudo-reward feeds only the
+        # subtask learner/model. The base control learner receives the
+        # discounted environment return:
+        #     r_1 + d_1*r_2 + ... + (Π_{k<T} d_k)*r_T.
+        # Before this transition, ``option_discount`` is the product of all
+        # preceding transition discounts in the current option.
         new_option_cumreward = state.option_cumreward + pseudo_r
-        new_option_discount = state.option_discount * jnp.asarray(cfg.option_gamma, jnp.float32)
+        new_option_env_cumreward = jnp.where(
+            is_executing,
+            state.option_env_cumreward + state.option_discount * reward,
+            state.option_env_cumreward,
+        )
+        new_option_baseline_mass = jnp.where(
+            is_executing,
+            state.option_baseline_mass + state.option_discount,
+            state.option_baseline_mass,
+        )
+        new_option_discount = state.option_discount * option_step_discount
 
         # --- Option model update (only on termination while executing) ---
         should_update_model = is_executing & option_terminates
@@ -846,6 +1158,9 @@ class STOMPAgent:
                 option_idx,
                 state.option_start_obs,
                 new_option_cumreward,
+                new_option_env_cumreward,
+                jnp.asarray(new_option_steps, dtype=jnp.float32),
+                new_option_baseline_mass,
                 new_option_discount,
                 obs,
                 model_decay=cfg.option_model_decay,
@@ -860,38 +1175,67 @@ class STOMPAgent:
         )
 
         # --- Base Q-function update ---
-        # Use environment reward when primitive; use option pseudo-reward when option terminates.
+        # Always grounded in real environment reward: the one-step reward for
+        # primitive actions, the reward accumulated across the option on
+        # termination.  Pseudo-reward never enters here — option values must
+        # stay in task-reward units to support reward-maximizing planning.
         base_reward = jnp.where(
             is_executing & option_terminates,
-            new_option_cumreward,
+            new_option_env_cumreward,
             reward,
         )
-        # Semi-MDP corrections: duration=T_o, discount=γ_o for option termination;
-        # duration=1, discount=1.0 for primitive steps (recovers standard update).
-        base_duration = jnp.where(
+        # Discounted differential semi-MDP correction: the average-reward
+        # baseline is weighted by the same γ powers as the environment return.
+        # At unit discounts this mass equals raw duration T_o. Primitive
+        # transitions use mass=1 and the supplied one-step discount.
+        base_baseline_mass = jnp.where(
             is_executing & option_terminates,
-            jnp.asarray(new_option_steps, dtype=jnp.float32),
+            new_option_baseline_mass,
             jnp.array(1.0, dtype=jnp.float32),
         )
         base_discount = jnp.where(
             is_executing & option_terminates,
             new_option_discount,
-            jnp.array(1.0, dtype=jnp.float32),
+            primitive_discount,
         )
         # Only update base Q on: (a) primitive steps, or (b) option termination
         should_update_base = (~is_executing) | (is_executing & option_terminates)
         n_total = cfg.n_total_actions
         beta = jnp.asarray(cfg.base_avg_reward_step_size, dtype=jnp.float32)
+        # The base extended action was selected at the option's start state.
+        # Keep ``base_last_obs`` free to track consecutive primitive
+        # observations for the intra-option learner, but restore semi-MDP
+        # credit assignment at option termination by updating from the stored
+        # start observation. Primitive actions still update from their most
+        # recent observation.
+        base_update_obs = jnp.where(
+            is_executing & option_terminates,
+            state.option_start_obs,
+            state.base_last_obs,
+        )
 
         def do_base_update(_: None) -> tuple[MultiHeadMLPState, Array, Array]:
             next_q_vals = self._base_learner.predict(state.base_learner_state, obs)
             max_next_q = base_discount * jnp.max(next_q_vals)
-            td_target = base_reward - state.base_average_reward * base_duration + max_next_q
+            td_target = (
+                base_reward
+                - state.base_average_reward * base_baseline_mass
+                + max_next_q
+            )
             targets = jnp.full(n_total, jnp.nan, dtype=jnp.float32).at[
                 state.base_last_action
             ].set(td_target)
+            trace_adjusted_state = cast(
+                MultiHeadMLPState,
+                state.base_learner_state.replace(
+                    head_traces=jax.tree_util.tree_map(
+                        lambda trace: base_discount * trace,
+                        state.base_learner_state.head_traces,
+                    )
+                ),
+            )
             result = self._base_learner.update(
-                state.base_learner_state, state.base_last_obs, targets
+                trace_adjusted_state, base_update_obs, targets
             )
             td_err = result.errors[state.base_last_action]
             new_avg_reward = state.base_average_reward + beta * td_err
@@ -902,12 +1246,31 @@ class STOMPAgent:
                 state.base_learner_state, state.base_last_obs
             )
             next_q = self._base_learner.predict(state.base_learner_state, obs)
-            td = jnp.max(next_q) - prev_q[state.base_last_action]
+            td = primitive_discount * jnp.max(next_q) - prev_q[state.base_last_action]
             return state.base_learner_state, state.base_average_reward, td
 
         new_base_learner_state, new_avg_r, base_td = jax.lax.cond(
             should_update_base, do_base_update, skip_base_update, None
         )
+
+        # --- Fixed-budget option-model planning ---
+        # The zero-backup default is a Python-level static branch: it consumes
+        # no RNG and executes no additional learner operations.
+        if enable_planning and cfg.option_planning_backups_per_step > 0:
+            (
+                new_base_learner_state,
+                planning_backups,
+                planning_td_error,
+            ) = self._apply_option_model_planning(
+                new_base_learner_state,
+                new_option_models,
+                obs,
+                new_avg_r,
+                state.step_count,
+            )
+        else:
+            planning_backups = jnp.array(0, dtype=jnp.int32)
+            planning_td_error = jnp.array(0.0, dtype=jnp.float32)
 
         # --- Select next extended action ---
         # After primitive or option termination: select from extended action space.
@@ -919,15 +1282,27 @@ class STOMPAgent:
         extended_action, _ = _select_action_epsilon_greedy_from_q(
             ext_q_vals, ext_key, cfg.epsilon_base, cfg.n_total_actions
         )
+        next_select_extended = (~is_executing) | (is_executing & option_terminates)
+        selected_option = jnp.clip(
+            extended_action - cfg.n_primitive_actions,
+            0,
+            cfg.n_options - 1,
+        )
+        # A continuing option uses its current policy. If this transition
+        # starts a new option, sample from that selected option's policy
+        # rather than from the idle clamped index (option 0).
+        intra_policy_idx = jnp.where(
+            is_executing & (~option_terminates),
+            option_idx,
+            selected_option,
+        )
         intra_action, _ = _select_action_epsilon_greedy(
-            new_option_policies.q_weights[option_idx],
+            new_option_policies.q_weights[intra_policy_idx],
             obs,
             intra_key,
             cfg.epsilon_option,
             cfg.n_primitive_actions,
         )
-
-        next_select_extended = (~is_executing) | (is_executing & option_terminates)
 
         # The actual primitive action dispatched to the environment:
         # If primitive extended action: use extended_action directly.
@@ -938,7 +1313,7 @@ class STOMPAgent:
             jnp.where(
                 next_select_extended
                 & (extended_action >= jnp.asarray(cfg.n_primitive_actions, jnp.int32)),
-                extended_action - cfg.n_primitive_actions,
+                selected_option,
                 jnp.array(-1, dtype=jnp.int32),
             ),
         )
@@ -965,6 +1340,16 @@ class STOMPAgent:
             jnp.array(0.0, dtype=jnp.float32),
             new_option_cumreward,
         )
+        new_option_env_cumreward = jnp.where(
+            (is_executing & option_terminates) | is_starting_option,
+            jnp.array(0.0, dtype=jnp.float32),
+            new_option_env_cumreward,
+        )
+        new_option_baseline_mass = jnp.where(
+            (is_executing & option_terminates) | is_starting_option,
+            jnp.array(0.0, dtype=jnp.float32),
+            new_option_baseline_mass,
+        )
         new_option_discount = jnp.where(
             (is_executing & option_terminates) | is_starting_option,
             jnp.array(1.0, dtype=jnp.float32),
@@ -983,17 +1368,20 @@ class STOMPAgent:
             base_last_action=jnp.where(
                 next_select_extended, extended_action, state.base_last_action
             ),
+            last_primitive_action=primitive_action,
             rng_key=key,
             option_policies=new_option_policies,
             option_models=new_option_models,
             executing_option=new_executing_option,
             option_start_obs=new_option_start_obs,
             option_last_intra_action=jnp.where(
-                is_executing & (~option_terminates),
+                is_starting_option | (is_executing & (~option_terminates)),
                 intra_action,
                 state.option_last_intra_action,
             ),
             option_cumreward=new_option_cumreward,
+            option_env_cumreward=new_option_env_cumreward,
+            option_baseline_mass=new_option_baseline_mass,
             option_discount=new_option_discount,
             option_steps=new_option_steps,
             step_count=state.step_count + 1,
@@ -1007,6 +1395,8 @@ class STOMPAgent:
             option_terminated=is_executing & option_terminates,
             pseudo_reward=jnp.where(is_executing, pseudo_r, jnp.array(0.0, dtype=jnp.float32)),
             option_importance_ratio=option_importance_ratio,
+            planning_backups=planning_backups,
+            planning_td_error=planning_td_error,
         )
 
     def scan(
@@ -1014,15 +1404,25 @@ class STOMPAgent:
         state: STOMPState,
         env_rewards: Array,
         next_observations: Array,
+        discounts: Array | None = None,
     ) -> STOMPArrayResult:
-        """Run STOMP over pre-collected continuing transition arrays via scan."""
+        """Run STOMP over transition arrays via scan.
+
+        Supplying ``discounts`` selects the explicit transition contract.
+        Omitting it preserves the historical ``option_gamma`` behavior.
+        """
 
         def step_fn(
             carry: STOMPState,
-            inputs: tuple[Array, Array],
+            inputs: tuple[Array, Array, Array],
         ) -> tuple[STOMPState, tuple[Array, ...]]:
-            reward, next_obs = inputs
-            result = self.update(carry, reward, next_obs)
+            reward, next_obs, transition_discount = inputs
+            result = self.update(
+                carry,
+                reward,
+                next_obs,
+                transition_discount if discounts is not None else None,
+            )
             return result.state, (
                 result.td_error,
                 result.average_reward,
@@ -1031,7 +1431,14 @@ class STOMPAgent:
                 result.option_terminated,
                 result.pseudo_reward,
                 result.option_importance_ratio,
+                result.planning_backups,
+                result.planning_td_error,
             )
+
+        if discounts is None:
+            scan_discounts = jnp.ones_like(env_rewards, dtype=jnp.float32)
+        else:
+            scan_discounts = jnp.asarray(discounts, dtype=jnp.float32)
 
         final_state, (
             td_errors,
@@ -1041,7 +1448,13 @@ class STOMPAgent:
             option_terminations,
             pseudo_rewards,
             option_importance_ratios,
-        ) = jax.lax.scan(step_fn, state, (env_rewards, next_observations))
+            planning_backups,
+            planning_td_errors,
+        ) = jax.lax.scan(
+            step_fn,
+            state,
+            (env_rewards, next_observations, scan_discounts),
+        )
         return STOMPArrayResult(
             state=final_state,
             td_errors=td_errors,
@@ -1051,6 +1464,8 @@ class STOMPAgent:
             option_terminations=option_terminations,
             pseudo_rewards=pseudo_rewards,
             option_importance_ratios=option_importance_ratios,
+            planning_backups=planning_backups,
+            planning_td_errors=planning_td_errors,
         )
 
 
@@ -1126,6 +1541,7 @@ __all__ = [
     "STOMPArrayResult",
     "STOMPConfig",
     "STOMPSpecArrays",
+    "STOMPStartResult",
     "STOMPState",
     "STOMPUpdateResult",
     "SubtaskSpec",

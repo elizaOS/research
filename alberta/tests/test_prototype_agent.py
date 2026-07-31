@@ -1,8 +1,13 @@
-"""Tests for the PrototypeAgent integrating all 12 Alberta Plan steps."""
+"""Mechanism tests for the experimental PrototypeAgent composition surface.
+
+These tests establish routing, shape, update, and isolation invariants.  They
+do not establish an integrated Alberta Plan completion result.
+"""
 
 from __future__ import annotations
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import pytest
@@ -12,12 +17,15 @@ from alberta_framework.core.intelligence_amplification import IAConfig
 from alberta_framework.core.oak import OaKConfig
 from alberta_framework.core.options import STOMPConfig, SubtaskSpec
 from alberta_framework.core.prototype_agent import (
+    PROTOTYPE_CHECKPOINT_SCHEMA,
     PrototypeAgent,
     PrototypeAgentConfig,
     PrototypeAgentState,
     PrototypeArrayResult,
     PrototypeUpdateResult,
     feature_to_subtask_specs,
+    load_prototype_checkpoint,
+    save_prototype_checkpoint,
 )
 from alberta_framework.core.types import DemonType, GVFSpec, create_horde_spec
 from alberta_framework.core.world_model import ActionConditionedWorldModelConfig
@@ -41,6 +49,21 @@ _SPEC1 = SubtaskSpec(
 
 OBS_DIM = 4
 N_PRIM = 2
+
+
+def _materialize_typed_keys(tree):
+    """Convert typed PRNG leaves so Chex can compare complete agent states."""
+
+    def convert(value):
+        dtype = getattr(value, "dtype", None)
+        if dtype is not None and jax.dtypes.issubdtype(
+            dtype,
+            jax.dtypes.prng_key,
+        ):
+            return jr.key_data(value)
+        return value
+
+    return jax.tree.map(convert, tree)
 
 
 def _oak_cfg(
@@ -138,6 +161,42 @@ class TestPrototypeAgentConfigValidation:
         with pytest.raises(ValueError, match="world_model"):
             PrototypeAgentConfig(oak=_oak_cfg(), n_dreams_per_step=2, world_model=None)
 
+    def test_unknown_dream_next_observation_mode_rejected(self) -> None:
+        with pytest.raises(ValueError, match="dream_next_observation_mode"):
+            PrototypeAgentConfig(
+                oak=_oak_cfg(),
+                dream_next_observation_mode="unknown",  # type: ignore[arg-type]
+            )
+
+    def test_sample_one_hot_dreams_reject_gru_observations(self) -> None:
+        from alberta_framework.core.prototype_agent import GRUPerceptionConfig
+
+        with pytest.raises(ValueError, match="GRU-augmented"):
+            PrototypeAgentConfig(
+                oak=_oak_cfg(obs_dim=2),
+                gru_perception=GRUPerceptionConfig(
+                    observation_dim=1,
+                    hidden_dim=1,
+                ),
+                dream_next_observation_mode="sample_one_hot",
+            )
+
+    def test_world_model_observation_dim_must_match_oak(self) -> None:
+        with pytest.raises(ValueError, match="world_model.observation_dim"):
+            PrototypeAgentConfig(
+                oak=_oak_cfg(obs_dim=2),
+                world_model=_wm_cfg(obs_dim=3),
+                dream_next_observation_mode="sample_one_hot",
+            )
+
+    def test_world_model_action_count_must_match_oak(self) -> None:
+        with pytest.raises(ValueError, match="world_model.n_actions"):
+            PrototypeAgentConfig(
+                oak=_oak_cfg(n_prim=2),
+                world_model=_wm_cfg(n_actions=3),
+                dream_next_observation_mode="sample_one_hot",
+            )
+
     def test_ia_obs_dim_must_match_oak(self) -> None:
         from alberta_framework.core.intelligence_amplification import ExoCerebellumConfig
 
@@ -183,6 +242,29 @@ class TestPrototypeAgentConfigRoundtrip:
         assert restored.ia is not None
         assert restored.n_dreams_per_step == cfg.n_dreams_per_step
         assert restored.buffer_capacity == cfg.buffer_capacity
+
+    def test_legacy_dream_mode_preserves_serialized_config(self) -> None:
+        cfg = _full_config()
+        payload = cfg.to_config()
+        assert cfg.dream_next_observation_mode == "model_prediction"
+        assert "dream_next_observation_mode" not in payload
+        assert (
+            PrototypeAgentConfig.from_config(payload).dream_next_observation_mode
+            == "model_prediction"
+        )
+
+    def test_sample_one_hot_dream_mode_roundtrip(self) -> None:
+        cfg = PrototypeAgentConfig(
+            oak=_oak_cfg(),
+            world_model=_wm_cfg(),
+            dreaming=DreamingConfig(warmup_steps=0),
+            n_dreams_per_step=1,
+            dream_next_observation_mode="sample_one_hot",
+        )
+        payload = cfg.to_config()
+        assert payload["dream_next_observation_mode"] == "sample_one_hot"
+        restored = PrototypeAgentConfig.from_config(payload)
+        assert restored.dream_next_observation_mode == "sample_one_hot"
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +579,25 @@ class TestPrototypeAgentCurate:
             == int(state.world_model_state.step_count)
         )
 
+    def test_curate_preserves_dream_next_observation_mode(self) -> None:
+        cfg = PrototypeAgentConfig(
+            oak=_oak_cfg(),
+            world_model=_wm_cfg(),
+            dreaming=DreamingConfig(warmup_steps=1000),
+            n_dreams_per_step=0,
+            dream_next_observation_mode="sample_one_hot",
+        )
+        agent = PrototypeAgent(cfg)
+        state = agent.start(agent.init(jr.key(0)), jax.nn.one_hot(0, OBS_DIM))
+        for _ in range(20):
+            state = agent.update(
+                state,
+                jnp.array(0.0),
+                jax.nn.one_hot(1, OBS_DIM),
+            ).state
+        new_agent, _ = agent.curate(state, jr.key(2))
+        assert new_agent.config.dream_next_observation_mode == "sample_one_hot"
+
     def test_curated_agent_can_continue_learning(self) -> None:
         agent = PrototypeAgent(_minimal_config())
         state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
@@ -603,6 +704,113 @@ class TestPrototypeAgentSerializationRoundtrip:
         assert restored.config.n_dreams_per_step == agent.config.n_dreams_per_step
         assert restored.config.horde_spec is not None
         assert restored.config.ia is not None
+
+    def test_full_checkpoint_resume_has_identical_next_action_and_state(
+        self,
+        tmp_path,
+    ) -> None:
+        agent = PrototypeAgent(_full_config(n_dreams=1))
+        state = agent.start(agent.init(jr.key(41)), jnp.zeros(OBS_DIM))
+        transitions = (
+            (0.25, jnp.array([0.1, -0.2, 0.3, -0.4], dtype=jnp.float32)),
+            (-0.5, jnp.array([0.4, 0.3, -0.2, -0.1], dtype=jnp.float32)),
+            (1.0, jnp.array([-0.3, 0.2, 0.1, 0.5], dtype=jnp.float32)),
+        )
+        for reward, observation in transitions:
+            state = agent.update(state, reward, observation).state
+
+        checkpoint_path = tmp_path / "prototype"
+        save_prototype_checkpoint(agent, state, checkpoint_path)
+        restored_agent, restored_state = load_prototype_checkpoint(checkpoint_path)
+
+        assert restored_agent.to_config() == agent.to_config()
+        chex.assert_trees_all_close(
+            _materialize_typed_keys(restored_state),
+            _materialize_typed_keys(state),
+        )
+
+        reward = jnp.array(0.75, dtype=jnp.float32)
+        observation = jnp.array([0.2, 0.1, -0.5, 0.4], dtype=jnp.float32)
+        uninterrupted = agent.update(state, reward, observation)
+        resumed = restored_agent.update(restored_state, reward, observation)
+        chex.assert_trees_all_close(
+            _materialize_typed_keys(resumed),
+            _materialize_typed_keys(uninterrupted),
+        )
+
+    def test_sample_one_hot_checkpoint_resume_replays_identical_dream_draws(
+        self,
+        tmp_path,
+    ) -> None:
+        base = _full_config(n_dreams=1)
+        config = PrototypeAgentConfig.from_config(
+            {
+                **base.to_config(),
+                "dream_next_observation_mode": "sample_one_hot",
+            }
+        )
+        agent = PrototypeAgent(config)
+        state = agent.start(agent.init(jr.key(41)), jax.nn.one_hot(0, OBS_DIM))
+        transitions = (
+            (0.25, jax.nn.one_hot(1, OBS_DIM)),
+            (-0.5, jax.nn.one_hot(2, OBS_DIM)),
+            (1.0, jax.nn.one_hot(3, OBS_DIM)),
+        )
+        for reward, observation in transitions:
+            state = agent.update(state, reward, observation).state
+
+        checkpoint_path = tmp_path / "prototype-sample-one-hot"
+        save_prototype_checkpoint(agent, state, checkpoint_path)
+        restored_agent, restored_state = load_prototype_checkpoint(checkpoint_path)
+
+        assert (
+            restored_agent.config.dream_next_observation_mode
+            == "sample_one_hot"
+        )
+        chex.assert_trees_all_close(
+            _materialize_typed_keys(restored_state),
+            _materialize_typed_keys(state),
+        )
+        reward = jnp.array(0.75, dtype=jnp.float32)
+        observation = jax.nn.one_hot(1, OBS_DIM)
+        uninterrupted = agent.update(state, reward, observation)
+        resumed = restored_agent.update(restored_state, reward, observation)
+        chex.assert_trees_all_close(
+            _materialize_typed_keys(resumed),
+            _materialize_typed_keys(uninterrupted),
+        )
+
+    def test_checkpoint_loader_rejects_wrong_schema_or_config_digest(
+        self,
+        monkeypatch,
+        tmp_path,
+    ) -> None:
+        import alberta_framework.core.prototype_agent as prototype_module
+
+        config = PrototypeAgent(_minimal_config()).to_config()
+        monkeypatch.setattr(
+            prototype_module,
+            "load_checkpoint_metadata",
+            lambda _path: {
+                "schema": "alberta.prototype_agent.v0",
+                "agent_config": config,
+                "config_sha256": "unused",
+            },
+        )
+        with pytest.raises(ValueError, match="PrototypeAgent v1"):
+            load_prototype_checkpoint(tmp_path / "not-read")
+
+        monkeypatch.setattr(
+            prototype_module,
+            "load_checkpoint_metadata",
+            lambda _path: {
+                "schema": PROTOTYPE_CHECKPOINT_SCHEMA,
+                "agent_config": config,
+                "config_sha256": "tampered",
+            },
+        )
+        with pytest.raises(ValueError, match="digest"):
+            load_prototype_checkpoint(tmp_path / "not-read")
 
 
 # ---------------------------------------------------------------------------
@@ -869,11 +1077,18 @@ class TestAutoCurate:
         assert new_agent is agent
         assert new_state is state
 
-    def test_maybe_curate_fires_at_zero_step(self) -> None:
+    def test_maybe_curate_defers_at_zero_step(self) -> None:
+        """At step 0 the schedule aligns (0 % 10 == 0) but curation defers.
+
+        Evicting at birth would act on untrained utility estimates (and can
+        land mid-option right after ``start``), so ``curate`` returns the
+        agent unchanged; scheduled firing is covered by
+        ``test_maybe_curate_fires_every_n_steps``.
+        """
         agent, state = self._agent(auto_curate_every=10)
-        # step_count == 0 → 0 % 10 == 0 → fires
         new_agent, new_state = agent.maybe_curate(state, jr.key(2))
-        assert new_agent is not agent
+        assert new_agent is agent
+        assert new_state is state
 
     def test_maybe_curate_does_not_fire_at_non_aligned_step(self) -> None:
         agent, state = self._agent(auto_curate_every=10)

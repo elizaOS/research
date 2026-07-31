@@ -1,0 +1,337 @@
+{
+  "schema_version": "alberta.forager_unsealed_development_comparison_receipt.v1",
+  "artifact_type": "reconciled_unsealed_forager_development_comparison_receipt",
+  "status": "development_only_unsealed",
+  "evidence_class": "development",
+  "scientific_promotion_allowed": false,
+  "admissible_as_official_evidence": false,
+  "superseded_receipt": {
+    "path_base": "repository_root",
+    "path": "outputs/forager/dqn_fov_500k_dev_seeds2000001_2000004/DEVELOPMENT_MANIFEST.json",
+    "size_bytes": 6394,
+    "sha256": "634985cc8902ab957eaac5708296bf979b810290081144d782097f05ed51ff74",
+    "schema_version": "1.0",
+    "preserved_read_only": true,
+    "known_defects": [
+      "Its local EMA recomputation hard-coded decimal 0.001 instead of evaluating 1 - 0.999, producing bit-level metric errors.",
+      "It copied RTU scalars without binding the immutable RTU receipt.",
+      "It omitted material comparator-freezing, representation, resource, and paper-baseline limitations.",
+      "It used informal RTU algorithm and variant aliases and labeled a post-run test hash as execution source."
+    ]
+  },
+  "reason_codes": [
+    "post_output_comparator_binding",
+    "development_runtime_not_independently_qualified",
+    "runtime_envelope_mismatch",
+    "representation_resource_mismatch",
+    "rtu_raw_trace_absent",
+    "open_unpreregistered_n4",
+    "nonexact_paper_baseline"
+  ],
+  "reason_not_official": [
+    "The DQN configuration was created from an unattested host path only after the RTU output was available, so the comparator was not frozen independently before observation of the candidate result.",
+    "The DQN container is a development image, not an independently qualified content-addressed runtime envelope.",
+    "The RTU and DQN runs did not execute through the same runtime envelope.",
+    "The agents have materially different feature, parameter, replay, memory, and update-work contracts, so this is not a controlled recurrence or learning-rule ablation and speed is not comparable.",
+    "The RTU run retained captured scalar and sparse curve results but no raw reward trace.",
+    "Only four open development seeds were consumed and no preregistered sealed evaluation or admissible inferential test was performed.",
+    "The custom 500,000-step diagnostics-disabled current-agents DQN configuration is not an exact frozen paper baseline."
+  ],
+  "comparison_contract": {
+    "environment": {
+      "distribution": "continual-foragax",
+      "version": "0.55.0",
+      "env_id": "ForagaxTwoBiomeLarge-v1",
+      "observation_type": "color",
+      "aperture_size": 9,
+      "reward_delay": 0,
+      "random_shift_max_steps": 0
+    },
+    "steps_per_seed": 500000,
+    "seeds": [
+      2000001,
+      2000002,
+      2000003,
+      2000004
+    ],
+    "environment_rng_semantics": "dedicated_environment_split_chain_v1",
+    "primary_metric": {
+      "name": "fov_last_10pct_ema_auc",
+      "ema_decay": 0.999,
+      "ema_update_coefficient": "1 - ema_decay",
+      "ema_initial_value": 0.0,
+      "bias_correction": false,
+      "subsample_every_steps": 100,
+      "sample_first_reward": true,
+      "tail_sample_indices": {
+        "start_inclusive": 4500,
+        "stop_exclusive": 5000
+      }
+    },
+    "secondary_metric": {
+      "name": "final_window_mean_reward",
+      "window_steps": 50000
+    },
+    "seed_and_metric_matched": true,
+    "runtime_matched": false,
+    "representation_and_resource_matched": false,
+    "comparator_frozen_before_candidate_output": false
+  },
+  "dqn": {
+    "algorithm": "DQN",
+    "upstream_source_repository": "https://github.com/steventango/continual-foragax-agents",
+    "upstream_source_commit": "9710f60fa30da5badc451ad7ce3ff296d5070830",
+    "config": {
+      "path_base": "repository_root",
+      "path": "outputs/forager/dqn_fov_500k_dev_seeds2000001_2000004/config/DQN-foragax-fov-500k-no-diagnostics.json",
+      "size_bytes": 749,
+      "sha256": "1c6229cea7daad7b8cb2cd7adb7e48bcb04b8fc20d89bcea1e8999e3accd06db"
+    },
+    "runtime": {
+      "image_reference": "alberta-forager-runtime:dev2-9710f60",
+      "image_id": "sha256:e8a9789cee5e1e607256a92f035013416479141ee3cd1d489af1b0738cb854c3",
+      "source_archive_sha256": "1f6976de38f34a697c947891de26ad3373b294195fe82094e9d1d5b8ddfd43b6",
+      "independently_qualified": false,
+      "jax_backend": "cuda",
+      "jax_version": "0.9.0.1",
+      "wall_duration_seconds": 682.27
+    },
+    "execution_capture": {
+      "session": "/home/shaw/.codex/sessions/2026/07/30/rollout-2026-07-30T18-57-26-019fb5e3-ff7f-73e0-80f4-2976470f0f5d.jsonl",
+      "lines": [
+        9920,
+        9943,
+        9944,
+        10078
+      ],
+      "combined_lines_sha256": "e2155e8109b194a5b02dafb2c0577aa9c750eadf9436bb53a5c69fbdd8d3c37f",
+      "per_line_sha256": {
+        "9920": "c0bdb94e219e73532f22a7aea684f2da3f264459e3c56e6fb84d21d32477741c",
+        "9943": "85bde2b086e308905ea8880649293fd5f2381bdb1bcf0771b352a480420dbca0",
+        "9944": "f7ea0c025bcca34b1b5c147e5d0d9d24d3c829c642e994dbecee0928b3a0e4e6",
+        "10078": "dd5ae2d6d8950c4e6042b62e3226f8177f0eae26fd9fc801aa0dad48bba198cf"
+      },
+      "config_created_utc": "2026-07-31T10:41:17Z",
+      "launched_utc": "2026-07-31T10:42:16.984Z",
+      "completed_utc": "2026-07-31T10:53:39.471Z"
+    },
+    "resource_contract": {
+      "policy_input": "current 9x9x3 image only",
+      "policy_input_dimensions": 243,
+      "trainable_parameters_per_seed": 87876,
+      "replay_capacity": 10000,
+      "batch_size": 32,
+      "update_every_steps": 4
+    },
+    "results_database": {
+      "path_base": "repository_root",
+      "path": "outputs/forager/dqn_fov_500k_dev_seeds2000001_2000004/raw/results/E138-two-biome-large/foragax/ForagaxTwoBiomeLarge-v1/9/DQN/results.db",
+      "size_bytes": 8192,
+      "sha256": "7d72b44dfde65b6c604d469220b2ae3472045e13f06c446f95195d3f2d0e47f5",
+      "sqlite_integrity_check": "ok"
+    },
+    "runs": [
+      {
+        "seed": 2000001,
+        "npz_path": "outputs/forager/dqn_fov_500k_dev_seeds2000001_2000004/raw/results/E138-two-biome-large/foragax/ForagaxTwoBiomeLarge-v1/9/DQN/data/2000001.npz",
+        "npz_size_bytes": 1767149,
+        "npz_sha256": "577fdf09730230c75b805887bdec207196a0d754b8e3ff3e819f3891bb7a1607",
+        "reward_trace_sha256": "ac7684e04f4f0b4415ac508ec7c5743c8515d24bce9c11178791646c3dd3541a",
+        "reward_sum": 722031.0,
+        "fov_last_10pct_ema_auc": 1.2991400667806792,
+        "final_window_mean_reward": 1.31108
+      },
+      {
+        "seed": 2000002,
+        "npz_path": "outputs/forager/dqn_fov_500k_dev_seeds2000001_2000004/raw/results/E138-two-biome-large/foragax/ForagaxTwoBiomeLarge-v1/9/DQN/data/2000002.npz",
+        "npz_size_bytes": 1806292,
+        "npz_sha256": "d6896f04af93bb3d23810d176f4b2fa639a71491cf978a1bf1dc7d156adb9807",
+        "reward_trace_sha256": "4b53f039c89bbb5ddaa3b57f670cb6ad5a189e5e953acf99b349dc78d430da85",
+        "reward_sum": 652427.0,
+        "fov_last_10pct_ema_auc": 1.4477563996549392,
+        "final_window_mean_reward": 1.4491
+      },
+      {
+        "seed": 2000003,
+        "npz_path": "outputs/forager/dqn_fov_500k_dev_seeds2000001_2000004/raw/results/E138-two-biome-large/foragax/ForagaxTwoBiomeLarge-v1/9/DQN/data/2000003.npz",
+        "npz_size_bytes": 1812330,
+        "npz_sha256": "de6e66f57b44dee936001999d3dac71412f9b370c5781f436c3b02e88ff396d2",
+        "reward_trace_sha256": "2e85ed27371143b3ec8d04ed6c94349dfd9c6f1bd39572e8b55a467f37effed9",
+        "reward_sum": 575529.0,
+        "fov_last_10pct_ema_auc": 1.1241298593888631,
+        "final_window_mean_reward": 1.12092
+      },
+      {
+        "seed": 2000004,
+        "npz_path": "outputs/forager/dqn_fov_500k_dev_seeds2000001_2000004/raw/results/E138-two-biome-large/foragax/ForagaxTwoBiomeLarge-v1/9/DQN/data/2000004.npz",
+        "npz_size_bytes": 1813046,
+        "npz_sha256": "2d9d19ec7f25b10b5a132813c6cccf1d2c79c623e5362fdc6146afd1592a3976",
+        "reward_trace_sha256": "e3d75b2de683d2a7bb57754f6c7a01ffc9e8d56370e2ee18f68c2004f92c828d",
+        "reward_sum": 456738.0,
+        "fov_last_10pct_ema_auc": 1.0053428055565798,
+        "final_window_mean_reward": 1.00176
+      }
+    ],
+    "summary": {
+      "metric": "fov_last_10pct_ema_auc",
+      "n": 4,
+      "mean": 1.2190922828452653,
+      "std_sample": 0.19442361562596436,
+      "min": 1.0053428055565798,
+      "max": 1.4477563996549392
+    },
+    "metric_recomputation": {
+      "implementation": "alberta_framework.benchmarks.import_official_foragax_npz",
+      "forager_results_py_sha256": "411937bc53af7e8ad898f3305422b324d9a91859e9c4fa30e081035fea5ea7f7",
+      "forager_py_sha256": "aaf93892c86a8e32a9a1bc5658f270b156e0c26fef890645e5cda66e3a3edc35"
+    }
+  },
+  "alberta": {
+    "algorithm": "alberta_rtu_rtrl_ac",
+    "variant": "h8_default_continuous",
+    "raw_reward_traces_present": false,
+    "receipt_binding": {
+      "path_base": "repository_root",
+      "path": "outputs/forager/rtu_rtrl_500k_dev4/receipt.v1.json",
+      "size_bytes": 7587,
+      "sha256": "d1c86f0fb4dd7e9e59797e99b39bd8e4bc9c8114e95cfa8b2232360a6b65926c",
+      "schema_version": "alberta.forager_rtu_rtrl_development_receipt.v1"
+    },
+    "capture_correction_binding": {
+      "path_base": "repository_root",
+      "path": "outputs/forager/rtu_rtrl_500k_dev4/capture-correction.v1.json",
+      "size_bytes": 1971,
+      "sha256": "9d05801f80eaece22eade3e329d097bf1c4da7351f6234c0a38f5d71d3dd47fd",
+      "schema_version": "alberta.forager_rtu_rtrl_capture_correction.v1"
+    },
+    "source": {
+      "forager_py_sha256": "aaf93892c86a8e32a9a1bc5658f270b156e0c26fef890645e5cda66e3a3edc35",
+      "recurrent_trace_actor_critic_py_sha256": "bd21a3275c9cd158838dded6542baeac53272cea7e53eb3ebfdb191b0a9ae4d1",
+      "pre_run_quality_assurance_test_sha256": "ec61f220ecdb81d3f6e71d60cf589a63e1c9d32c2381757e7d25283557352372",
+      "post_run_quality_assurance_test_sha256": "c40230ff50b368ccd66d02d13199a1afe31782460b9a600112ee3334c0c77684",
+      "tests_imported_by_execution": false
+    },
+    "resolved_execution_config": {
+      "provenance": "reconstructed from the captured launch and execution-time source defaults",
+      "mode": "vmap",
+      "benchmark": {
+        "steps": 500000,
+        "record_every": 50000,
+        "final_window": 50000,
+        "jax_chunk_size": 25000,
+        "ewm_decay": 0.999
+      },
+      "core": {
+        "n_actions": 4,
+        "hidden_size": 8,
+        "encoder_width": 8,
+        "output_width": 8,
+        "gamma": 0.99,
+        "actor_lamda": 0.8,
+        "critic_lamda": 0.8,
+        "actor_alpha": 1.0,
+        "critic_alpha": 1.0,
+        "actor_kappa": 3.0,
+        "critic_kappa": 2.0,
+        "entropy_coefficient": 0.095,
+        "temperature": 1.0,
+        "sparsity": 0.9,
+        "r_min": 0.0,
+        "r_max": 1.0,
+        "max_phase": 6.28,
+        "rtu_epsilon": 1e-08,
+        "layer_norm_epsilon": 1e-05,
+        "leaky_relu_slope": 0.01,
+        "normalize_observations": true,
+        "normalize_rewards": true,
+        "normalization_epsilon": 1e-08
+      },
+      "freeze_after_steps": null,
+      "features": {
+        "include_channel_means": true,
+        "include_hint": true,
+        "include_last_action": true,
+        "include_last_reward": true,
+        "reward_trace_decays": [
+          0.9,
+          0.99,
+          0.999
+        ],
+        "reward_scale": 14.0,
+        "resolved_fov_feature_dimensions": 254
+      }
+    },
+    "resource_contract": {
+      "policy_input": "flattened image, channel means, previous action, scaled previous reward, and three reward traces",
+      "policy_input_dimensions": 254,
+      "replay_capacity": 0,
+      "update_semantics": "one streaming actor-critic update per transition"
+    },
+    "runtime": {
+      "independently_qualified": false,
+      "jax_backend": "cuda",
+      "jax_version": "0.9.0.1",
+      "execution_duration_seconds": 94.68280872597825,
+      "wall_duration_seconds": 148.78,
+      "aggregate_transitions_per_second": 21123.0,
+      "per_seed_effective_frames_per_second": 5280.789688517281,
+      "completed_utc": "2026-07-31T10:40:34.532Z"
+    },
+    "runs": [
+      {
+        "seed": 2000001,
+        "reward_sum": 955737.0,
+        "mean_reward": 1.911474,
+        "fov_last_10pct_ema_auc": 1.936068291473595,
+        "final_window_mean_reward": 1.9374
+      },
+      {
+        "seed": 2000002,
+        "reward_sum": 811799.0,
+        "mean_reward": 1.623598,
+        "fov_last_10pct_ema_auc": 1.6459307466376445,
+        "final_window_mean_reward": 1.6452
+      },
+      {
+        "seed": 2000003,
+        "reward_sum": 720917.0,
+        "mean_reward": 1.441834,
+        "fov_last_10pct_ema_auc": 1.4509478715313704,
+        "final_window_mean_reward": 1.45322
+      },
+      {
+        "seed": 2000004,
+        "reward_sum": 574171.0,
+        "mean_reward": 1.148342,
+        "fov_last_10pct_ema_auc": 1.16705215790774,
+        "final_window_mean_reward": 1.1682
+      }
+    ],
+    "summary": {
+      "metric": "fov_last_10pct_ema_auc",
+      "n": 4,
+      "mean": 1.5499997668875873,
+      "std_sample": 0.32388877090181417,
+      "min": 1.16705215790774,
+      "max": 1.936068291473595
+    }
+  },
+  "paired_development_summary": {
+    "direction": "alberta_minus_dqn",
+    "fov_last_10pct_ema_auc_differences": [
+      0.6369282246929158,
+      0.1981743469827053,
+      0.3268180121425073,
+      0.16170935235116013
+    ],
+    "mean_difference": 0.3309074840423221,
+    "sample_standard_deviation": 0.2159564083561187,
+    "wins": 4,
+    "ties": 0,
+    "losses": 0,
+    "inferential_statistics_admissible": false,
+    "speed_comparison_admissible": false,
+    "causal_attribution_admissible": false,
+    "interpretation": "Promising descriptive development screening only; it is not an official, inferential, causal, speed, or SOTA claim."
+  }
+}

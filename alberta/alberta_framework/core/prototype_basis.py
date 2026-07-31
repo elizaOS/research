@@ -350,14 +350,25 @@ class PrototypeBasisBlock:
         observation: Float[Array, " input_dim"],
         target: Float[Array, " output_dim"],
     ) -> PrototypeBasisUpdateResult:
-        """Perform one online LMS value update and one center update."""
+        """Perform one online LMS value update and one center update.
+
+        When the center update evicts and recycles a slot, that slot's
+        readout row is reset to zero so the new prototype does not inherit
+        weights learned for the evicted basis function.
+        """
         features = self.activations(state, observation)
         prediction = self.transform(params, features)
         error = prediction - target
         new_values = params.values - self._config.step_size * features[:, None] * error[None, :]
         new_bias = params.bias - self._config.step_size * error
+        new_state, center_metrics, slot, novel = self._update_centers_with_slot_impl(
+            state, observation
+        )
+        recycled = novel & (state.counts[slot] > 0.0)
+        new_values = new_values.at[slot].set(
+            jnp.where(recycled, jnp.zeros_like(new_values[slot]), new_values[slot])
+        )
         new_params = PrototypeBasisParams(values=new_values, bias=new_bias)
-        new_state, center_metrics = self.update_centers(state, observation)
         mse = jnp.mean(error * error)
         metrics = jnp.asarray(
             [

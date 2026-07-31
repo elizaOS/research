@@ -193,37 +193,23 @@ def _validate_config(config: UPGDMemoryConfig) -> None:
     if config.upgd_head_step_size_multiplier <= 0.0:
         raise ValueError("upgd_head_step_size_multiplier must be positive")
     if config.upgd_head_bias_step_size_multiplier < 0.0:
-        raise ValueError(
-            "upgd_head_bias_step_size_multiplier must be non-negative"
-        )
+        raise ValueError("upgd_head_bias_step_size_multiplier must be non-negative")
     if config.upgd_head_loss_pressure_gate_ratio < 0.0:
-        raise ValueError(
-            "upgd_head_loss_pressure_gate_ratio must be non-negative"
-        )
+        raise ValueError("upgd_head_loss_pressure_gate_ratio must be non-negative")
     if config.upgd_head_loss_pressure_multiplier < 0.0:
-        raise ValueError(
-            "upgd_head_loss_pressure_multiplier must be non-negative"
-        )
+        raise ValueError("upgd_head_loss_pressure_multiplier must be non-negative")
     if config.upgd_head_loss_pressure_warmup_steps < 0:
-        raise ValueError(
-            "upgd_head_loss_pressure_warmup_steps must be non-negative"
-        )
+        raise ValueError("upgd_head_loss_pressure_warmup_steps must be non-negative")
     if config.upgd_head_repetition_multiplier < 0.0:
         raise ValueError("upgd_head_repetition_multiplier must be non-negative")
     if not 0.0 <= config.upgd_head_repetition_decay < 1.0:
         raise ValueError("upgd_head_repetition_decay must be in [0, 1)")
     if config.upgd_head_repetition_delta_threshold < 0.0:
-        raise ValueError(
-            "upgd_head_repetition_delta_threshold must be non-negative"
-        )
+        raise ValueError("upgd_head_repetition_delta_threshold must be non-negative")
     if not 0.0 <= config.upgd_head_repetition_pressure_threshold < 1.0:
-        raise ValueError(
-            "upgd_head_repetition_pressure_threshold must be in [0, 1)"
-        )
+        raise ValueError("upgd_head_repetition_pressure_threshold must be in [0, 1)")
     if config.upgd_head_repetition_warmup_steps < 0:
-        raise ValueError(
-            "upgd_head_repetition_warmup_steps must be non-negative"
-        )
+        raise ValueError("upgd_head_repetition_warmup_steps must be non-negative")
     if config.slots_per_class < 1:
         raise ValueError("slots_per_class must be positive")
     if not 0.0 < config.memory_update_rate <= 1.0:
@@ -285,29 +271,15 @@ class UPGDMemoryLearner:
             track_unit_utilities=False,
             track_gradient_history=False,
             head_step_size_multiplier=config.upgd_head_step_size_multiplier,
-            head_bias_step_size_multiplier=(
-                config.upgd_head_bias_step_size_multiplier
-            ),
-            head_loss_pressure_gate_ratio=(
-                config.upgd_head_loss_pressure_gate_ratio
-            ),
-            head_loss_pressure_multiplier=(
-                config.upgd_head_loss_pressure_multiplier
-            ),
-            head_loss_pressure_warmup_steps=(
-                config.upgd_head_loss_pressure_warmup_steps
-            ),
+            head_bias_step_size_multiplier=(config.upgd_head_bias_step_size_multiplier),
+            head_loss_pressure_gate_ratio=(config.upgd_head_loss_pressure_gate_ratio),
+            head_loss_pressure_multiplier=(config.upgd_head_loss_pressure_multiplier),
+            head_loss_pressure_warmup_steps=(config.upgd_head_loss_pressure_warmup_steps),
             head_repetition_multiplier=config.upgd_head_repetition_multiplier,
             head_repetition_decay=config.upgd_head_repetition_decay,
-            head_repetition_delta_threshold=(
-                config.upgd_head_repetition_delta_threshold
-            ),
-            head_repetition_pressure_threshold=(
-                config.upgd_head_repetition_pressure_threshold
-            ),
-            head_repetition_warmup_steps=(
-                config.upgd_head_repetition_warmup_steps
-            ),
+            head_repetition_delta_threshold=(config.upgd_head_repetition_delta_threshold),
+            head_repetition_pressure_threshold=(config.upgd_head_repetition_pressure_threshold),
+            head_repetition_warmup_steps=(config.upgd_head_repetition_warmup_steps),
         )
         self._memory = PrototypeMemoryLearner(
             PrototypeMemoryConfig(
@@ -372,9 +344,7 @@ class UPGDMemoryLearner:
         upgd_prediction: Array,
         memory_prediction: Array,
     ) -> Array:
-        active_memory = (jnp.sum(state.memory_state.counts > 0.0) > 0).astype(
-            jnp.float32
-        )
+        active_memory = (jnp.sum(state.memory_state.counts > 0.0) > 0).astype(jnp.float32)
         confidence_delta = jnp.max(memory_prediction) - jnp.max(upgd_prediction)
         reliability_delta = state.upgd_loss_ema - state.memory_loss_ema
         logit = (
@@ -406,8 +376,7 @@ class UPGDMemoryLearner:
             dtype=jnp.float32,
         )
         trace_pressure = jnp.clip(
-            (state.upgd_state.target_repeat_ema - threshold)
-            / jnp.maximum(1.0 - threshold, 1e-6),
+            (state.upgd_state.target_repeat_ema - threshold) / jnp.maximum(1.0 - threshold, 1e-6),
             0.0,
             1.0,
         )
@@ -457,18 +426,18 @@ class UPGDMemoryLearner:
         upgd_loss = _active_mse(upgd_prediction, target)
         memory_loss = _active_mse(memory_prediction, target)
 
-        active = jnp.isfinite(target)
-        dloss_dgate = jnp.sum(
-            jnp.where(
-                active,
-                (prediction - safe_target) * (memory_prediction - upgd_prediction),
-                0.0,
+        def blend_loss(memory_logit: Array) -> Array:
+            probe_prediction, _probe_gate = self._blend_predictions(
+                state.replace(memory_logit=memory_logit),  # type: ignore[attr-defined]
+                upgd_prediction,
+                memory_prediction,
+                include_target_trace=True,
             )
-        ) / jnp.maximum(jnp.sum(active.astype(jnp.float32)), 1.0)
-        dloss_dlogit = dloss_dgate * gate * (1.0 - gate)
+            return _active_mse(probe_prediction, target)
+
+        dloss_dlogit = jax.grad(blend_loss)(state.memory_logit)
         next_memory_logit = state.memory_logit - (
-            jnp.asarray(self._config.memory_logit_step_size, dtype=jnp.float32)
-            * dloss_dlogit
+            jnp.asarray(self._config.memory_logit_step_size, dtype=jnp.float32) * dloss_dlogit
         )
         next_memory_logit = jnp.clip(next_memory_logit, -8.0, 8.0)
 
@@ -489,8 +458,7 @@ class UPGDMemoryLearner:
             dtype=jnp.float32,
         )
         next_log_threshold = state.novelty_log_threshold + (
-            jnp.asarray(self._config.novelty_adaptation_rate, dtype=jnp.float32)
-            * allocation_error
+            jnp.asarray(self._config.novelty_adaptation_rate, dtype=jnp.float32) * allocation_error
         )
         next_log_threshold = jnp.clip(
             next_log_threshold,
@@ -505,9 +473,7 @@ class UPGDMemoryLearner:
             novelty_log_threshold=next_log_threshold,
             upgd_loss_ema=decay * state.upgd_loss_ema + one_minus_decay * upgd_loss,
             memory_loss_ema=decay * state.memory_loss_ema + one_minus_decay * memory_loss,
-            blended_loss_ema=(
-                decay * state.blended_loss_ema + one_minus_decay * blended_loss
-            ),
+            blended_loss_ema=(decay * state.blended_loss_ema + one_minus_decay * blended_loss),
             allocation_ema=next_allocation_ema,
             step_count=state.step_count + 1,
         )

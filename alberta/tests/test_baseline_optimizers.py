@@ -181,6 +181,72 @@ class TestAdam:
             )
             assert float(state.t) == pytest.approx(expected_t)
 
+    def test_decoupled_weight_decay_zero_gradient_is_pure_decay(self):
+        """With zero gradient, ``param - step`` must equal ``(1 - lr*wd) * param``.
+
+        Zero gradient keeps both moments at zero, so the Adam step is zero
+        and the returned step reduces to the decoupled decay term
+        ``lr * wd * param`` (AdamW; Loshchilov & Hutter 2019 -- matching the
+        official UPGD repository's Adam, which applies
+        ``p.data.add_(p.data, alpha=-wd*lr)`` before the Adam step).
+        """
+        optimizer = Adam(step_size=0.01, weight_decay=0.1)
+        state = optimizer.init_for_shape((4,))
+        param = jnp.array([1.0, -2.0, 0.5, 0.0], dtype=jnp.float32)
+
+        step, _ = optimizer.update_from_gradient(
+            state, jnp.zeros(4), error=None, param=param
+        )
+        chex.assert_trees_all_close(param - step, (1.0 - 0.01 * 0.1) * param, atol=1e-7)
+
+    def test_weight_decay_zero_matches_plain_adam(self):
+        """``weight_decay=0.0`` must reproduce the plain Adam step exactly."""
+        plain = Adam(step_size=0.01)
+        decayed = Adam(step_size=0.01, weight_decay=0.0)
+        gradient = jnp.array([1.0, -2.0, 3.0], dtype=jnp.float32)
+        param = jnp.array([0.5, 0.5, 0.5], dtype=jnp.float32)
+
+        step_plain, _ = plain.update_from_gradient(
+            plain.init_for_shape((3,)), gradient, error=None
+        )
+        step_decayed, _ = decayed.update_from_gradient(
+            decayed.init_for_shape((3,)), gradient, error=None, param=param
+        )
+        chex.assert_trees_all_close(step_plain, step_decayed, atol=0.0)
+
+    def test_weight_decay_requires_param(self):
+        """Nonzero weight decay without ``param`` must fail loudly."""
+        optimizer = Adam(step_size=0.01, weight_decay=0.01)
+        state = optimizer.init_for_shape((3,))
+        with pytest.raises(ValueError, match="param"):
+            optimizer.update_from_gradient(state, jnp.ones(3), error=None)
+
+    def test_weight_decay_config_roundtrip(self):
+        """``weight_decay`` must survive the config roundtrip."""
+        from alberta_framework.core.optimizers import optimizer_from_config
+
+        original = Adam(step_size=0.005, weight_decay=0.02)
+        config = original.to_config()
+        assert config["weight_decay"] == pytest.approx(0.02)
+        recreated = optimizer_from_config(config)
+        assert isinstance(recreated, Adam)
+        assert recreated.to_config() == config
+
+    def test_legacy_config_without_weight_decay_still_loads(self):
+        """Configs serialized before weight decay existed must still load."""
+        from alberta_framework.core.optimizers import optimizer_from_config
+
+        legacy = {
+            "type": "Adam",
+            "step_size": 0.001,
+            "beta1": 0.9,
+            "beta2": 0.999,
+            "eps": 1e-8,
+        }
+        recreated = optimizer_from_config(legacy)
+        assert isinstance(recreated, Adam)
+        assert recreated.to_config()["weight_decay"] == pytest.approx(0.0)
+
 
 # =============================================================================
 # RMSprop

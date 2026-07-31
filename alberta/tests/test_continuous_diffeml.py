@@ -6,6 +6,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import pytest
 
 from alberta_framework.core import continuous_diffeml
 from alberta_framework.core.continuous_diffeml import (
@@ -28,6 +29,8 @@ from alberta_framework.core.continuous_diffeml import (
     train_continuous_diffeml,
     train_sparse_continuous_eml_circuit,
 )
+
+pytestmark = pytest.mark.slow
 
 
 def make_toy_regression() -> tuple[jax.Array, jax.Array]:

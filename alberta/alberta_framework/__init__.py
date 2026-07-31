@@ -5,20 +5,13 @@ learning research. Built on JAX for hardware acceleration, the framework emphasi
 temporal uniformity — every component updates at every time step, with no special
 training phases or batch processing.
 
-Completed Milestones
---------------------
-| Step | Focus | Status |
-|------|-------|--------|
-| 1 | Fixed-feature continual supervised learning | **Complete** |
-| 2 | Supervised nonlinear feature finding | **Complete** |
-| 3 | GVF predictions, Horde-style architecture | **Complete** |
-| 4 | Continual control (SARSA + actor-critic) | **Complete** |
-| 5–6 | Average-reward / off-policy nonlinear Horde | **Complete** |
-| 7–8 | Dyna planning + world model facade | **Complete** |
-| 9 | Guarded dreaming | **Complete** |
-| 10 | STOMP temporal abstraction | **Complete** |
-| 11 | OaK architecture | **Complete** |
-| 12 | Prototype-IA (exo-cerebellum + exo-cortex) | **Complete** |
+Research status
+---------------
+The package exposes implementation surfaces spanning all twelve steps of the
+Alberta Plan.  Module presence is not a completion claim: no step currently
+satisfies the repository's benchmark-plus-integration completion rule.  See
+``RESEARCH_STATUS.md`` for the evidence levels, held-out results, known
+failures, and remaining end-to-end gates.
 
 Examples
 --------
@@ -44,7 +37,7 @@ References
 - Streaming Deep Reinforcement Learning Finally Works (Elsayed et al., 2024)
 """
 
-__version__ = "0.26.0"
+__version__ = "0.27.0"
 
 # Baseline optimizers
 from alberta_framework.core.actor_critic import (
@@ -94,6 +87,7 @@ from alberta_framework.core.average_reward import (
     DifferentialTDLearner,
     DifferentialTDState,
     DifferentialTDUpdateResult,
+    DiscretePolicySample,
     run_average_reward_horde_actor_critic_from_arrays,
     run_average_reward_horde_from_arrays,
     run_differential_gtd_from_arrays,
@@ -116,6 +110,8 @@ from alberta_framework.core.behavior_model import (
     BehaviorModel,
     BehaviorModelArrayResult,
     BehaviorModelConfig,
+    BehaviorModelInputGradient,
+    BehaviorModelResourceBudget,
     BehaviorModelSampleResult,
     BehaviorModelState,
     BehaviorModelUpdateResult,
@@ -125,6 +121,12 @@ from alberta_framework.core.behavior_model import (
     floor_and_renormalize_probabilities,
     run_behavior_model_from_arrays,
     selected_action_probabilities,
+)
+from alberta_framework.core.canonical_upgd import (
+    CanonicalUPGD,
+    CanonicalUPGDConfig,
+    CanonicalUPGDState,
+    CanonicalUPGDUpdate,
 )
 
 # Checkpoint utilities
@@ -144,6 +146,26 @@ from alberta_framework.core.continual_backprop import (
     run_cbp_learning_loop,
 )
 from alberta_framework.core.cumulant_discovery import CumulantDiscovery
+from alberta_framework.core.delight import (
+    DelightfulPolicyGradientConfig,
+    DelightfulPolicyGradientDiagnostics,
+    DelightfulPolicyGradientResult,
+    DelightOutcomeStratification,
+    DelightStratumDiagnostics,
+    GradientCandidateSemantics,
+    GradientJoyApplicationResult,
+    GradientJoyAssessment,
+    GradientJoyConfig,
+    GradientJoyDiagnostics,
+    GradientJoyEvidence,
+    LearningValue,
+    LearningValueAvailability,
+    PolicyGradientMode,
+    apply_gradient_joy_update,
+    assess_gradient_joy,
+    discrete_delightful_policy_gradient,
+    stratify_delight_outcomes,
+)
 
 # Diagnostics
 from alberta_framework.core.diagnostics import (
@@ -201,6 +223,17 @@ from alberta_framework.core.dreaming import (
     score_dream_candidates,
     slice_imagined_transition,
 )
+from alberta_framework.core.experiential_memory import (
+    ExperientialMemory,
+    ExperientialMemoryAccounting,
+    ExperientialMemoryConfig,
+    ExperientialMemoryEntries,
+    ExperientialMemoryEntry,
+    ExperientialMemoryRetrieval,
+    ExperientialMemoryState,
+    ExperientialMemoryStepResult,
+    ExperientialMemoryWriteResult,
+)
 from alberta_framework.core.feature_discovery import (
     FixedBudgetFeatureLearner,
     run_feature_discovery_arrays,
@@ -254,6 +287,15 @@ from alberta_framework.core.interaction_features import (
     FixedBudgetInteractionLearner,
     run_interaction_feature_arrays,
 )
+from alberta_framework.core.joint_partner_world import (
+    BoundedJointOutcomeConfig,
+    BoundedJointOutcomeModel,
+    BoundedJointOutcomeState,
+    JointOutcomePrediction,
+    JointOutcomeResourceBudget,
+    JointOutcomeUpdateResult,
+    PartnerMarginalDecision,
+)
 from alberta_framework.core.latent_world_model import (
     LatentWorldModel,
     LatentWorldModelConfig,
@@ -280,6 +322,14 @@ from alberta_framework.core.learners import (
     run_mlp_learning_loop_batched,
     run_td_learning_loop,
     run_true_online_td_loop,
+)
+from alberta_framework.core.learning_signals import (
+    LearningSignalAvailability,
+    LearningSignalEstimator,
+    LearningSignalEstimatorConfig,
+    LearningSignalEstimatorState,
+    LearningSignalResourceBudget,
+    TypedLearningSignals,
 )
 
 # Multi-head learner
@@ -345,6 +395,20 @@ from alberta_framework.core.optimizers import (
     bounder_from_config,
     optimizer_from_config,
 )
+from alberta_framework.core.prototype_agent import (
+    PROTOTYPE_CHECKPOINT_SCHEMA,
+    GRUPerceptionConfig,
+    GRUPerceptionState,
+    PrototypeAgent,
+    PrototypeAgentConfig,
+    PrototypeAgentState,
+    PrototypeArrayResult,
+    PrototypeTransition,
+    PrototypeUpdateResult,
+    feature_to_subtask_specs,
+    load_prototype_checkpoint,
+    save_prototype_checkpoint,
+)
 from alberta_framework.core.resource_manager import (
     GeneratorMetaResourceManager,
     LearnedResourceManager,
@@ -379,6 +443,23 @@ from alberta_framework.core.sigreg import (
     sample_sigreg_directions,
     sigreg_diagnostics,
     sliced_sigreg_loss,
+)
+from alberta_framework.core.state_builder import (
+    STATE_BUILDER_CHECKPOINT_SCHEMA,
+    FixedTraceStateBuilder,
+    FixedTraceStateBuilderConfig,
+    IdentityStateBuilder,
+    IdentityStateBuilderConfig,
+    IdentityStateBuilderState,
+    OnlineGatedStateBuilder,
+    OnlineGatedStateBuilderConfig,
+    OnlineGatedStateBuilderState,
+    StateBuilder,
+    StateBuilderBudget,
+    StateBuilderLearningDiagnostics,
+    load_state_builder_checkpoint,
+    save_state_builder_checkpoint,
+    state_builder_from_config,
 )
 from alberta_framework.core.temporal_context import (
     TemporalContextConfig,
@@ -611,11 +692,20 @@ from alberta_framework.streams.synthetic import (
 
 # Utilities
 from alberta_framework.utils.metrics import (
+    ContinualLearningSummary,
+    StabilityGap,
     compare_learners,
+    compute_backward_transfer,
     compute_cumulative_error,
+    compute_forward_transfer,
+    compute_per_task_forgetting,
+    compute_prequential_performance,
+    compute_recovery_lengths,
     compute_running_mean,
+    compute_stability_gap,
     compute_tracking_error,
     extract_metric,
+    summarize_continual_learning,
 )
 from alberta_framework.utils.nexting import multi_channel_horizon_returns
 from alberta_framework.utils.timing import Timer, format_duration
@@ -707,6 +797,10 @@ __all__ = [
     "Optimizer",
     "optimizer_from_config",
     "bounder_from_config",
+    "CanonicalUPGD",
+    "CanonicalUPGDConfig",
+    "CanonicalUPGDState",
+    "CanonicalUPGDUpdate",
     # Optimizers - TD Learning
     "AutoTDIDBD",
     "TDIDBD",
@@ -752,6 +846,48 @@ __all__ = [
     "init_dream_rollout_state",
     "score_dream_candidates",
     "slice_imagined_transition",
+    # Bounded experiential memory
+    "ExperientialMemory",
+    "ExperientialMemoryAccounting",
+    "ExperientialMemoryConfig",
+    "ExperientialMemoryEntries",
+    "ExperientialMemoryEntry",
+    "ExperientialMemoryRetrieval",
+    "ExperientialMemoryState",
+    "ExperientialMemoryStepResult",
+    "ExperientialMemoryWriteResult",
+    # Typed learning value / gradient joy / Delightful Policy Gradient
+    "DelightOutcomeStratification",
+    "DelightStratumDiagnostics",
+    "DelightfulPolicyGradientConfig",
+    "DelightfulPolicyGradientDiagnostics",
+    "DelightfulPolicyGradientResult",
+    "GradientCandidateSemantics",
+    "GradientJoyApplicationResult",
+    "GradientJoyAssessment",
+    "GradientJoyConfig",
+    "GradientJoyDiagnostics",
+    "GradientJoyEvidence",
+    "LearningValue",
+    "LearningValueAvailability",
+    "PolicyGradientMode",
+    "apply_gradient_joy_update",
+    "assess_gradient_joy",
+    "discrete_delightful_policy_gradient",
+    "stratify_delight_outcomes",
+    # PrototypeAgent — experimental composition surface spanning Steps 1–12
+    "PROTOTYPE_CHECKPOINT_SCHEMA",
+    "GRUPerceptionConfig",
+    "GRUPerceptionState",
+    "PrototypeAgent",
+    "PrototypeAgentConfig",
+    "PrototypeAgentState",
+    "PrototypeArrayResult",
+    "PrototypeTransition",
+    "PrototypeUpdateResult",
+    "feature_to_subtask_specs",
+    "load_prototype_checkpoint",
+    "save_prototype_checkpoint",
     # Learners - Supervised Learning
     "LinearLearner",
     "run_learning_loop",
@@ -782,6 +918,13 @@ __all__ = [
     "CumulantDiscovery",
     "FixedBudgetFeatureLearner",
     "FixedBudgetInteractionLearner",
+    "BoundedJointOutcomeConfig",
+    "BoundedJointOutcomeModel",
+    "BoundedJointOutcomeState",
+    "JointOutcomePrediction",
+    "JointOutcomeResourceBudget",
+    "JointOutcomeUpdateResult",
+    "PartnerMarginalDecision",
     "GeneratorMetaResourceManager",
     "HistoryFeatureExtractor",
     "WorkingMemoryConfig",
@@ -789,6 +932,22 @@ __all__ = [
     "WorkingMemoryFeaturizer",
     "WorkingMemoryState",
     "transform_working_memory_arrays",
+    # Causal state construction
+    "STATE_BUILDER_CHECKPOINT_SCHEMA",
+    "FixedTraceStateBuilder",
+    "FixedTraceStateBuilderConfig",
+    "IdentityStateBuilder",
+    "IdentityStateBuilderConfig",
+    "IdentityStateBuilderState",
+    "OnlineGatedStateBuilder",
+    "OnlineGatedStateBuilderConfig",
+    "OnlineGatedStateBuilderState",
+    "StateBuilder",
+    "StateBuilderBudget",
+    "StateBuilderLearningDiagnostics",
+    "load_state_builder_checkpoint",
+    "save_state_builder_checkpoint",
+    "state_builder_from_config",
     "LearnedResourceManager",
     "finite_candidate_hedge_regret_bound",
     "optimal_hedge_learning_rate",
@@ -827,6 +986,13 @@ __all__ = [
     "LatentWorldModelUpdateResult",
     "run_action_conditioned_world_model_learning_loop",
     "run_latent_world_model_learning_loop",
+    # Typed predict-before-update learning signals
+    "LearningSignalAvailability",
+    "LearningSignalEstimator",
+    "LearningSignalEstimatorConfig",
+    "LearningSignalEstimatorState",
+    "LearningSignalResourceBudget",
+    "TypedLearningSignals",
     "Step1KernelConfig",
     "Step1SmokeResult",
     "Step2AssociativeConfig",
@@ -889,6 +1055,8 @@ __all__ = [
     "BehaviorModel",
     "BehaviorModelArrayResult",
     "BehaviorModelConfig",
+    "BehaviorModelInputGradient",
+    "BehaviorModelResourceBudget",
     "BehaviorModelSampleResult",
     "BehaviorModelState",
     "BehaviorModelUpdateResult",
@@ -988,6 +1156,7 @@ __all__ = [
     "DifferentialGTDLearner",
     "DifferentialGTDState",
     "DifferentialGTDUpdateResult",
+    "DiscretePolicySample",
     "DifferentialSARSAAgent",
     "DifferentialSARSAArrayResult",
     "DifferentialSARSAConfig",
@@ -1072,11 +1241,20 @@ __all__ = [
     # Stream utilities
     "make_scale_range",
     # Utilities
+    "ContinualLearningSummary",
+    "StabilityGap",
     "compare_learners",
+    "compute_backward_transfer",
     "compute_cumulative_error",
+    "compute_forward_transfer",
+    "compute_per_task_forgetting",
+    "compute_prequential_performance",
+    "compute_recovery_lengths",
     "compute_running_mean",
+    "compute_stability_gap",
     "compute_tracking_error",
     "extract_metric",
+    "summarize_continual_learning",
     "multi_channel_horizon_returns",
     # Checkpoint utilities
     "checkpoint_exists",
@@ -1144,14 +1322,10 @@ if _pipeline_available:
         "run_pipeline_smoke",
     ]
 
-# Compatibility shim for callers that imported the old nested benchmark package
-# before benchmarks were consolidated at the repository root. The benchmarks/
-# tree is not vendored into this package, so the shim is best-effort.
-import importlib as _importlib
-import sys as _sys
-
-try:
-    benchmarks = _importlib.import_module("benchmarks")
-    _sys.modules.setdefault("alberta_framework.benchmarks", benchmarks)
-except ModuleNotFoundError:
-    pass
+# The packaged benchmark integrations live at ``alberta_framework.benchmarks``
+# (forager family + official Foragax protocol bindings). A legacy shim used to
+# alias a repository-root ``benchmarks`` package to this name; once the real
+# subpackage existed, that alias could shadow it whenever an unrelated
+# top-level ``benchmarks`` directory was importable. The alias is removed
+# (CHANGELOG 0.27.0); import the real subpackage eagerly so it always wins.
+from alberta_framework import benchmarks as benchmarks

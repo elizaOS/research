@@ -21,6 +21,8 @@ from alberta_framework.streams.alberta_plan_step1 import (
     XDistShiftStream,
 )
 
+pytestmark = pytest.mark.slow
+
 # -----------------------------------------------------------------------------
 # AlbertaPlanStep1Stream
 # -----------------------------------------------------------------------------

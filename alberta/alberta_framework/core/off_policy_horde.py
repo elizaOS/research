@@ -137,18 +137,25 @@ class NonlinearSharedGTDHordeLearningResult:
 class OffPolicyHordeLearner:
     """Nonlinear off-policy Horde with per-demon importance ratios.
 
-    The update is a clipped off-policy semi-gradient TD backend:
+    The update is a clipped per-decision importance-sampled semi-gradient
+    TD(lambda) backend (Sutton & Barto 2nd ed., eq. 12.23; GQ(lambda),
+    Maei & Sutton 2010):
 
     ``delta_i = c_i + gamma_i V_i(s') - V_i(s)``
 
-    ``effective_error_i = min(rho_i, ratio_clip) * delta_i``
+    ``z_i <- gamma_i lambda_i min(rho_i, trace_ratio_clip) z_i
+    + min(rho_i, ratio_clip) grad V_i(s)``
 
-    The shared trunk receives the summed current-step cotangent
-    ``sum_i effective_error_i grad_h V_i(s)``.  Per-head traces use
-    ``gamma_i * lambda_i * min(rho_i, trace_ratio_clip)`` as the transition
-    trace coefficient.  This keeps the nonlinear shared trunk on the same
-    conservative footing as ``HordeLearner`` while making head traces and all
-    demon updates ratio-aware.
+    ``w_i <- w_i + alpha delta_i z_i``
+
+    Each decision's ratio enters the trace exactly once; with the clips
+    inactive this is the canonical ``z_t = rho_t (gamma lambda z_{t-1}
+    + grad)`` with update ``delta_t z_t``.  The trace-free shared trunk
+    receives the summed current-step cotangent
+    ``sum_i min(rho_i, ratio_clip) delta_i grad_h V_i(s)``.  This keeps the
+    nonlinear shared trunk on the same conservative footing as
+    ``HordeLearner`` while making head traces and all demon updates
+    ratio-aware.
 
     Full GTD/GQ/TDC MSPBE correction is intentionally out of scope for this
     first backend because it requires secondary weights and a different
@@ -410,7 +417,7 @@ class OffPolicyHordeLearner:
         cotangent = jnp.zeros(hidden.shape[0], dtype=jnp.float32)
         predictions_list: list[Array] = []
         td_errors_list: list[Array] = []
-        effective_errors_list: list[Array] = []
+        masked_td_errors_list: list[Array] = []
 
         for i in range(n_demons):
             pred_i = MultiHeadMLPLearner._head_forward(
@@ -426,14 +433,14 @@ class OffPolicyHordeLearner:
             td_errors_list.append(
                 jnp.where(active_mask[i], td_error_i, jnp.nan)
             )
-            effective_errors_list.append(effective_error_i)
+            masked_td_errors_list.append(masked_td_error_i)
             cotangent = cotangent + effective_error_i * jnp.squeeze(
                 state.head_params.weights[i]
             )
 
         predictions = jnp.stack(predictions_list)
         td_errors = jnp.stack(td_errors_list)
-        effective_errors = jnp.stack(effective_errors_list)
+        masked_td_errors = jnp.stack(masked_td_errors_list)
 
         trunk_weight_grads, trunk_bias_grads = trunk_vjp_fn(cotangent)
 
@@ -530,8 +537,13 @@ class OffPolicyHordeLearner:
             old_w_trace, old_b_trace = state.head_traces[i]
             old_w_opt, old_b_opt = state.head_optimizer_states[i]
 
-            w_grad = hidden.reshape(1, -1)
-            b_grad = jnp.ones(1, dtype=jnp.float32)
+            # Per-decision IS: the current ratio scales this step's gradient
+            # as it enters the trace, and the trace decay carries the
+            # (trace-clipped) ratio forward, so ``z = rho (gl z + grad)``
+            # when the two clips agree.  The update below is ``delta * z``
+            # with no additional ratio.
+            w_grad = clipped_rhos[i] * hidden.reshape(1, -1)
+            b_grad = clipped_rhos[i] * jnp.ones(1, dtype=jnp.float32)
             head_gl = discounts[i] * lamdas[i] * trace_coefficients[i]
 
             if replacing:
@@ -549,7 +561,7 @@ class OffPolicyHordeLearner:
                 new_w_trace = head_gl * old_w_trace + w_grad
                 new_b_trace = head_gl * old_b_trace + b_grad
 
-            error_i = effective_errors[i]
+            error_i = masked_td_errors[i]
             w_step, new_w_opt = head_optimizer.update_from_gradient(
                 old_w_opt,
                 new_w_trace,
@@ -815,6 +827,8 @@ class NonlinearSharedGTDHordeLearner:
         next_predictions = state.head_w @ next_hidden + state.head_b
         td_targets = cumulants + discounts * next_predictions
         td_errors = td_targets - predictions
+        active_mask = ~jnp.isnan(td_targets)
+        safe_td_errors = jnp.where(active_mask, td_errors, 0.0)
         clipped_rhos = jnp.minimum(
             jnp.maximum(jnp.asarray(rhos, dtype=jnp.float32), 0.0),
             jnp.asarray(self._ratio_clip, dtype=jnp.float32),
@@ -854,11 +868,17 @@ class NonlinearSharedGTDHordeLearner:
                 + jnp.vdot(state.secondary_head_w[i], grad_head_w)
                 + state.secondary_head_b[i] * grad_head_b
             )
-            correction_trunk_w = discounts[i] * secondary_dot * next_grad_trunk_w
-            correction_trunk_b = discounts[i] * secondary_dot * next_grad_trunk_b
-            correction_head_w = discounts[i] * secondary_dot * next_grad_head_w
-            correction_head_b = discounts[i] * secondary_dot * next_grad_head_b
-            rho_delta = clipped_rhos[i] * td_errors[i]
+            # The correction is rho-weighted like the main term (TDC with
+            # importance sampling, Sutton & Barto 2nd ed., Section 11.7;
+            # GQ(0) with e = rho grad, Maei & Sutton 2010).  Inactive demons
+            # (NaN cumulant) contribute nothing this step.
+            masked_rho = jnp.where(active_mask[i], clipped_rhos[i], 0.0)
+            rho_dot = masked_rho * discounts[i] * secondary_dot
+            correction_trunk_w = rho_dot * next_grad_trunk_w
+            correction_trunk_b = rho_dot * next_grad_trunk_b
+            correction_head_w = rho_dot * next_grad_head_w
+            correction_head_b = rho_dot * next_grad_head_b
+            rho_delta = masked_rho * safe_td_errors[i]
 
             trunk_w_step = trunk_w_step + primary_alpha * (
                 rho_delta * grad_trunk_w - correction_trunk_w
@@ -873,16 +893,17 @@ class NonlinearSharedGTDHordeLearner:
                 primary_alpha * (rho_delta * grad_head_b - correction_head_b)
             )
 
-            sec_trunk_w = state.secondary_trunk_w[i] + secondary_beta * (
+            masked_beta = jnp.where(active_mask[i], secondary_beta, 0.0)
+            sec_trunk_w = state.secondary_trunk_w[i] + masked_beta * (
                 rho_delta * grad_trunk_w - secondary_dot * grad_trunk_w
             )
-            sec_trunk_b = state.secondary_trunk_b[i] + secondary_beta * (
+            sec_trunk_b = state.secondary_trunk_b[i] + masked_beta * (
                 rho_delta * grad_trunk_b - secondary_dot * grad_trunk_b
             )
-            sec_head_w = state.secondary_head_w[i] + secondary_beta * (
+            sec_head_w = state.secondary_head_w[i] + masked_beta * (
                 rho_delta * grad_head_w - secondary_dot * grad_head_w
             )
-            sec_head_b = state.secondary_head_b[i] + secondary_beta * (
+            sec_head_b = state.secondary_head_b[i] + masked_beta * (
                 rho_delta * grad_head_b - secondary_dot * grad_head_b
             )
             new_secondary_trunk_w.append(sec_trunk_w)

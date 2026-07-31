@@ -349,6 +349,20 @@ def test_curate_resets_option_weights() -> None:
     state_after = run_step11_scan(
         agent, state, jnp.zeros(n_steps), jr.normal(jr.key(1), (n_steps, 4))
     ).state
+    # Curate at a coherent primitive boundary. If the scan ends inside the
+    # sole option, production curation correctly defers replacement.
+    state_after = state_after.replace(
+        stomp_state=state_after.stomp_state.replace(
+            executing_option=jnp.array(-1, dtype=jnp.int32),
+            base_last_action=jnp.array(0, dtype=jnp.int32),
+            last_primitive_action=jnp.array(0, dtype=jnp.int32),
+            option_cumreward=jnp.array(0.0, dtype=jnp.float32),
+            option_env_cumreward=jnp.array(0.0, dtype=jnp.float32),
+            option_baseline_mass=jnp.array(0.0, dtype=jnp.float32),
+            option_discount=jnp.array(1.0, dtype=jnp.float32),
+            option_steps=jnp.array(0, dtype=jnp.int32),
+        )
+    )
     _, curated_state = agent.curate(state_after, jr.key(0))
     # Option 0 was the only option and should be reset
     chex.assert_trees_all_close(

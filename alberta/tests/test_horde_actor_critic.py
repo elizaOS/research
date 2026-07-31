@@ -303,9 +303,8 @@ def test_bsuite_horde_ac_pairwise_feature_dim_reaches_actor() -> None:
     """Pairwise lift should initialize the core actor on the lifted feature dim."""
     dm_env = pytest.importorskip("dm_env", reason="dm_env not installed")
     pytest.importorskip("bsuite", reason="bsuite not installed")
-    from dm_env import specs
-
     from benchmarks.bsuite.agents import horde_actor_critic
+    from dm_env import specs
 
     obs_spec = specs.Array(shape=(4,), dtype=np.float32, name="obs")
     action_spec = specs.DiscreteArray(num_values=3, name="action")
@@ -327,9 +326,8 @@ def test_bsuite_qhorde_ac_pairwise_feature_dim_reaches_actor() -> None:
     """Q-Horde adapter should initialize core actor on lifted features."""
     dm_env = pytest.importorskip("dm_env", reason="dm_env not installed")
     pytest.importorskip("bsuite", reason="bsuite not installed")
-    from dm_env import specs
-
     from benchmarks.bsuite.agents import qhorde_ac
+    from dm_env import specs
 
     obs_spec = specs.Array(shape=(4,), dtype=np.float32, name="obs")
     action_spec = specs.DiscreteArray(num_values=3, name="action")
@@ -417,6 +415,28 @@ def test_qhorde_actor_critic_config_roundtrip_and_exports() -> None:
 
     assert TopLevelQHordeAC is QHordeActorCriticAgent
     assert CoreQHordeAC is QHordeActorCriticAgent
+
+
+def test_qhorde_actor_critic_requires_zero_gamma_for_action_heads() -> None:
+    critic = HordeLearner(
+        create_horde_spec(
+            [
+                GVFSpec(  # type: ignore[call-arg]
+                    name="q",
+                    demon_type=DemonType.CONTROL,
+                    gamma=0.9,
+                    lamda=0.0,
+                    cumulant_index=-1,
+                )
+            ]
+        ),
+        hidden_sizes=(),
+    )
+    with pytest.raises(ValueError, match="already-bootstrapped"):
+        QHordeActorCriticAgent(
+            QHordeActorCriticConfig(n_actions=1),
+            critic,
+        )
 
 
 def test_qhorde_actor_critic_update_is_jittable() -> None:
@@ -796,6 +816,81 @@ class TestNonlinearHordeActorCriticUpdate:
         )
         assert float(trace_norm) <= 0.0501
 
+    def test_obgd_bounds_raw_autostep_step_before_td_error_application(self) -> None:
+        """Large TD errors must enter the ObGD denominator exactly once."""
+        critic = HordeLearner(
+            create_horde_spec(
+                [GVFSpec(  # type: ignore[call-arg]
+                    name="v",
+                    demon_type=DemonType.PREDICTION,
+                    gamma=0.0,
+                    lamda=0.0,
+                    cumulant_index=0,
+                )]
+            ),
+            hidden_sizes=(),
+            step_size=0.03,
+        )
+        cfg = NonlinearHordeActorCriticConfig(
+            n_actions=2,
+            hidden_sizes=(),
+            actor_sparsity=0.0,
+        )
+        optimizer = Autostep(initial_step_size=0.5)
+        unbounded = NonlinearHordeActorCriticAgent(
+            cfg,
+            critic,
+            actor_optimizer=optimizer,
+        )
+        kappa = 0.5
+        bounded = NonlinearHordeActorCriticAgent(
+            cfg,
+            critic,
+            actor_optimizer=optimizer,
+            actor_bounder=ObGDBounding(kappa=kappa),
+        )
+        observation = jnp.array([1.0, -0.5], dtype=jnp.float32)
+        initial = unbounded.init(2, jr.key(27))
+        initial, _, _ = unbounded.start(initial, observation)
+        bounded_initial = bounded.init(2, jr.key(27))
+        bounded_initial, _, _ = bounded.start(bounded_initial, observation)
+
+        unbounded_result = unbounded.update(
+            initial,
+            jnp.asarray(10.0, dtype=jnp.float32),
+            observation,
+        )
+        bounded_result = bounded.update(
+            bounded_initial,
+            jnp.asarray(10.0, dtype=jnp.float32),
+            observation,
+        )
+        td_error = float(unbounded_result.td_error)
+        assert abs(td_error) > 1.0
+
+        full_steps = (
+            unbounded_result.state.actor_head_w - initial.actor_head_w,
+            unbounded_result.state.actor_head_b - initial.actor_head_b,
+        )
+        raw_l1 = sum(float(jnp.sum(jnp.abs(step / td_error))) for step in full_steps)
+        expected_scale = 1.0 / max(kappa * max(abs(td_error), 1.0) * raw_l1, 1.0)
+        assert float(bounded_result.bound_metric) == pytest.approx(
+            expected_scale,
+            rel=1e-5,
+        )
+        chex.assert_trees_all_close(
+            bounded_result.state.actor_head_w - bounded_initial.actor_head_w,
+            expected_scale * full_steps[0],
+            rtol=1e-5,
+            atol=1e-6,
+        )
+        chex.assert_trees_all_close(
+            bounded_result.state.actor_head_b - bounded_initial.actor_head_b,
+            expected_scale * full_steps[1],
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
     def test_trunk_weights_update(self) -> None:
         critic = HordeLearner(
             create_horde_spec(
@@ -959,6 +1054,25 @@ class TestNonlinearQHordeActorCritic:
             hidden_sizes=(16,),
         )
         with pytest.raises(ValueError, match="control demon"):
+            NonlinearQHordeActorCriticAgent(
+                NonlinearQHordeActorCriticConfig(n_actions=1),
+                critic,
+            )
+
+    def test_requires_zero_gamma_for_prebootstrapped_action_heads(self) -> None:
+        critic = HordeLearner(
+            create_horde_spec(
+                [GVFSpec(  # type: ignore[call-arg]
+                    name="q",
+                    demon_type=DemonType.CONTROL,
+                    gamma=0.9,
+                    lamda=0.0,
+                    cumulant_index=-1,
+                )]
+            ),
+            hidden_sizes=(16,),
+        )
+        with pytest.raises(ValueError, match="already-bootstrapped"):
             NonlinearQHordeActorCriticAgent(
                 NonlinearQHordeActorCriticConfig(n_actions=1),
                 critic,

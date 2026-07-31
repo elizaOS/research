@@ -283,12 +283,10 @@ def popcount_uint64(values: Any) -> UInt8Array:
     """Return population counts for each ``uint64`` value."""
     x = np.asarray(values, dtype=np.uint64)
     x = x - ((x >> np.uint64(1)) & np.uint64(0x5555555555555555))
-    x = (x & np.uint64(0x3333333333333333)) + (
-        (x >> np.uint64(2)) & np.uint64(0x3333333333333333)
-    )
+    x = (x & np.uint64(0x3333333333333333)) + ((x >> np.uint64(2)) & np.uint64(0x3333333333333333))
     x = (x + (x >> np.uint64(4))) & np.uint64(0x0F0F0F0F0F0F0F0F)
     counts = (x * np.uint64(0x0101010101010101)) >> np.uint64(56)
-    return counts.astype(np.uint8)
+    return cast(UInt8Array, counts.astype(np.uint8))
 
 
 def packed_hamming_distances(

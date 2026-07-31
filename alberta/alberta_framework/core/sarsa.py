@@ -3,12 +3,14 @@
 Wraps ``HordeLearner`` with epsilon-greedy action selection and SARSA
 target computation. Each action maps to a control demon (head) in the
 Horde. The SARSA target ``r + gamma * Q(s', a')`` is computed externally
-and passed as the cumulant to the Horde, so control demons use gamma=0
-internally (single-step prediction of the externally-computed target).
+and passed as the cumulant to the Horde; the control heads' transition
+discounts are zeroed via ``update_with_discounts`` so no internal
+bootstrap is added on top of the external target.
 
-This avoids modifying the Horde's TD target logic: the real discount
-lives in ``SARSAConfig.gamma``, while each control demon sees its
-cumulant as a supervised target.
+The control demons carry the real ``SARSAConfig.gamma`` in their spec so
+head eligibility traces decay by ``gamma * lamda`` (SARSA(lambda)); with
+``lamda=0`` this reduces to one-step SARSA. Traces are reset at episode
+boundaries.
 
 Optionally, prediction demons can coexist with control demons in the
 same Horde — they learn alongside the Q-heads without interference.
@@ -194,12 +196,21 @@ class SARSAArrayResult:
 
 def _make_control_demons(
     n_actions: int,
+    gamma: float,
     lamda: float = 0.0,
 ) -> list[GVFSpec]:
-    """Create n_actions control demons with gamma=0 (targets computed externally).
+    """Create n_actions control demons (SARSA targets computed externally).
+
+    The demon ``gamma`` carries the real discount so each head's
+    eligibility trace decays by ``gamma * lamda`` (SARSA(lambda)).
+    The TD target does not bootstrap internally: ``SARSAAgent.update``
+    zeroes the control heads' transition discounts via
+    ``update_with_discounts``, so the externally computed SARSA target
+    is the full target.
 
     Args:
         n_actions: Number of discrete actions
+        gamma: Real discount factor (drives head trace decay only)
         lamda: Trace decay for head eligibility traces
 
     Returns:
@@ -209,7 +220,7 @@ def _make_control_demons(
         GVFSpec(  # type: ignore[call-arg]
             name=f"q_{i}",
             demon_type=DemonType.CONTROL,
-            gamma=0.0,
+            gamma=gamma,
             lamda=lamda,
             cumulant_index=-1,  # external cumulant (SARSA target)
         )
@@ -223,8 +234,9 @@ class SARSAAgent:
     Wraps ``HordeLearner`` with epsilon-greedy action selection and
     SARSA target computation. Each action maps to a control demon (head)
     in the Horde. The SARSA target ``r + gamma * Q(s', a')`` is computed
-    externally and passed as the cumulant, so control demons use gamma=0
-    internally.
+    externally and passed as the cumulant; the control heads' transition
+    discounts are zeroed at update time, while their eligibility traces
+    decay by the real ``gamma * lamda`` (SARSA(lambda)).
 
     Optionally, additional prediction demons can coexist with the control
     demons — they learn alongside the Q-heads.
@@ -284,7 +296,9 @@ class SARSAAgent:
         self._lamda = lamda
 
         # Build HordeSpec: control demons first, then prediction demons
-        control_demons = _make_control_demons(sarsa_config.n_actions, lamda=lamda)
+        control_demons = _make_control_demons(
+            sarsa_config.n_actions, gamma=sarsa_config.gamma, lamda=lamda
+        )
         all_demons: list[GVFSpec] = list(control_demons)
         if prediction_demons is not None:
             all_demons.extend(prediction_demons)
@@ -333,10 +347,7 @@ class SARSAAgent:
         pred_demons = None
         if self._n_prediction_demons > 0:
             all_demons = self._horde.horde_spec.demons
-            pred_demons = [
-                d.to_config()
-                for d in all_demons[self._sarsa_config.n_actions :]
-            ]
+            pred_demons = [d.to_config() for d in all_demons[self._sarsa_config.n_actions :]]
 
         return {
             "type": "SARSAAgent",
@@ -363,13 +374,9 @@ class SARSAAgent:
         bounder_cfg = config.pop("bounder", None)
         bounder = bounder_from_config(bounder_cfg) if bounder_cfg is not None else None
         normalizer_cfg = config.pop("normalizer", None)
-        normalizer = (
-            normalizer_from_config(normalizer_cfg) if normalizer_cfg is not None else None
-        )
+        normalizer = normalizer_from_config(normalizer_cfg) if normalizer_cfg is not None else None
         head_opt_cfg = config.pop("head_optimizer", None)
-        head_optimizer = (
-            optimizer_from_config(head_opt_cfg) if head_opt_cfg is not None else None
-        )
+        head_optimizer = optimizer_from_config(head_opt_cfg) if head_opt_cfg is not None else None
         pred_demons_cfg = config.pop("prediction_demons", None)
         prediction_demons = None
         if pred_demons_cfg is not None:
@@ -444,9 +451,9 @@ class SARSAAgent:
         greedy_action = jnp.argmax(q_values + gumbel_noise).astype(jnp.int32)
 
         # Random action
-        random_action = jr.randint(
-            random_key, (), 0, self._sarsa_config.n_actions
-        ).astype(jnp.int32)
+        random_action = jr.randint(random_key, (), 0, self._sarsa_config.n_actions).astype(
+            jnp.int32
+        )
 
         # Epsilon-greedy selection
         explore = jr.uniform(explore_key) < state.epsilon
@@ -506,13 +513,34 @@ class SARSAAgent:
         if prediction_cumulants is not None:
             cumulants = cumulants.at[n_actions:].set(prediction_cumulants)
 
-        # Horde update: learns from (s_t, cumulants, s')
-        horde_result = self._horde.update(
+        # Horde update: learns from (s_t, cumulants, s'). Control heads use
+        # zero transition discounts (the SARSA target above already contains
+        # the gamma * Q(s', a') bootstrap); prediction demons keep their
+        # configured gammas. Head traces still decay by the spec's
+        # gamma * lamda, which is what makes this SARSA(lambda).
+        discounts = self._horde.horde_spec.gammas.at[:n_actions].set(0.0)
+        horde_result = self._horde.update_with_discounts(
             state.learner_state,
             state.last_observation,
             cumulants,
             observation,
+            discounts,
         )
+
+        # SARSA(lambda) trace maintenance. The inner learner decays only the
+        # active head's trace (inactive heads are frozen by NaN masking), so
+        # decay the untouched control heads here and clear all control-head
+        # traces at episode boundaries so credit never crosses a reset.
+        new_learner_state = horde_result.state
+        if self._lamda > 0.0:
+            gl = jnp.asarray(gamma * self._lamda, dtype=jnp.float32)
+            carry = 1.0 - jnp.asarray(terminated, dtype=jnp.float32)
+            head_traces = list(new_learner_state.head_traces)
+            for i in range(n_actions):
+                w_trace, b_trace = head_traces[i]
+                decay = jnp.where(state.last_action == i, 1.0, gl) * carry
+                head_traces[i] = (decay * w_trace, decay * b_trace)
+            new_learner_state = new_learner_state.replace(head_traces=tuple(head_traces))
 
         # TD error for the taken action
         q_old = q_previous[state.last_action]
@@ -526,15 +554,13 @@ class SARSAAgent:
             lambda: jnp.maximum(
                 cfg.epsilon_end,
                 cfg.epsilon_start
-                - (cfg.epsilon_start - cfg.epsilon_end)
-                * new_step_count
-                / cfg.epsilon_decay_steps,
+                - (cfg.epsilon_start - cfg.epsilon_end) * new_step_count / cfg.epsilon_decay_steps,
             ),
             lambda: state.epsilon,
         )
 
         new_state = SARSAState(  # type: ignore[call-arg]
-            learner_state=horde_result.state,
+            learner_state=new_learner_state,
             last_action=next_action,
             last_observation=observation,
             epsilon=new_epsilon,
@@ -605,9 +631,7 @@ def run_sarsa_episode(
         state = state.replace(rng_key=new_key)  # type: ignore[attr-defined]
 
         # SARSA update
-        result = agent.update(
-            state, reward_arr, next_obs, term_arr, next_action
-        )
+        result = agent.update(state, reward_arr, next_obs, term_arr, next_action)
         state = result.state
 
         rewards.append(float(reward))
@@ -685,9 +709,7 @@ def run_sarsa_continuing(
         state = state.replace(rng_key=new_key)  # type: ignore[attr-defined]
 
         # SARSA update
-        result = agent.update(
-            state, reward_arr, next_obs, term_arr, next_action
-        )
+        result = agent.update(state, reward_arr, next_obs, term_arr, next_action)
         state = result.state
 
         rewards.append(float(reward))

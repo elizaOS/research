@@ -5,12 +5,348 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added the strict, namespaced continual-IA v2 development-only contract and
+  `CONTINUAL_IA_V2_RUNBOOK.md`. It freezes treatment `recommendation_p075`,
+  exact acceptance probability 0.75, the old gates with seed start 60, and
+  seeds 60–89 under immutable source/runtime-byte-bound
+  plan/reservation/one-seed-shard/merge files. Persistent reservations are
+  published before execution, shards retain complete primitive causal traces
+  and exact replay, and merge replays once before reconstructing all paired
+  intervals, budgets, credit, identity, and gates. The self-issued schema has
+  no external pre-run chronology and can never set `internally_accepted=true`.
+  The contract is unissued: no plan, reservation, v2 seed execution, shard, or
+  artifact exists.
+- Added the active, namespaced UPGD Input-permuted MNIST v3 future-execution
+  contract and `UPGD_IPMNIST_V3_RUNBOOK.md`. It requires one immutable pre-run
+  plan, exact selected configuration/hyperparameters and closed deviations,
+  exactly 20 operator-reserved fresh seeds, data/runtime/static-import-closure/command
+  bindings, one learner/seed per shard, atomic no-overwrite publication, and
+  exact Cartesian merge with raw shard hashes and recomputed summaries. No v3
+  plan has been issued, no v3 result exists, and no fresh v3 seed has been
+  consumed. The self-issued, externally unattested schema is permanently
+  nonpromoting; all sealed completed-diagnostic records remain unchanged.
+- Added a fail-closed verifier-issued tuning-envelope boundary for a future
+  immutable Forager OCI evaluation adapter. It binds the tuning report, raw
+  evidence, source tree/archive, read-only content-addressed source mount,
+  runtime profile, and environment RNG schedule to an externally authenticated
+  authority. The host/snapshot runner cannot invoke the adapter or promote its
+  own tuning report, and candidate OCI metadata is not attestation.
+- Added a strict, permanently nonpromoting validator and reconciliation
+  receipt for the completed 10-seed UPGD Input-permuted MNIST diagnostic. The
+  original finalizer artifact remains byte-exact; the canonical reconciled
+  artifact repairs its note and portable post-hoc cache binding without
+  repairing the absent execution-time provenance or 10-vs-20-seed deviation.
+- Added immutable corrections for the four-seed Forager development records:
+  an RTU capture-digest addendum and a reconciled DQN comparison receipt using
+  the public importer. The descriptive RTU-minus-DQN mean is `+0.3309` on four
+  consumed seeds, but comparator timing, runtime, representation, resources,
+  replay, and update work are unmatched, so the receipt permanently forbids
+  inferential, causal, speed, SOTA, and Alberta Plan claims.
+- Replaced the slowly-changing-regression v1 writer and retrospectively
+  calibrated qualitative gate with a strict namespaced v2 development
+  protocol. It adds a selected ReLU/Kaiming/true-MSE ordinary-BP path,
+  distinguishes Alberta-local CBP/UPGD extensions, requires immutable
+  one-method/seed shards under a pre-run source/run/runtime-bound plan, checks
+  exact paired coverage and shared environments, and reconstructs descriptive
+  results from size/SHA-bound shards. The self-recorded envelope is not
+  external attestation, so every valid v2 artifact remains permanently
+  nonpromoting.
+
+## [0.27.0] - 2026-07-31
+
+### Added
+
+- Added an initial publication-shaped Nature-2024 slowly-changing-regression runner
+  (Dohare et al.): the `m + 1`-bit stream with `f` flipping bits every
+  `T` examples, the 100-LTU random sign-weight target network with
+  `(m + 1) * beta - S_i` thresholds, and a fully vmapped 100-run runner over
+  plain-SGD `MLPLearner`, `CBPMLPLearner`, and `UPGDLearner` with 40k-example
+  bins over 3M examples. This initial path was not protocol exact: learner
+  initialization, MSE scaling, RNG/numeric semantics, target-bias encoding,
+  comparator identity, provenance, and post-hoc thresholds differed or were
+  incomplete. No full artifact was produced; the Unreleased v2 contract
+  replaces its artifact-writing path.
+
+- Added a strict, reconstructing continual-evaluation report with
+  predict-before-update traces, evaluator-only regime metadata, a candidate
+  plus at least two exactly budget-matched baselines, continual-transfer and
+  recovery metrics, p50/p95/p99 latency, delayed/dropped observations, memory
+  and optional energy measurements, graded safety/near-miss accounting, and
+  required component/plasticity diagnostics. Reports remain explicitly
+  `not-assessed`; constructing one is not a scientific pass.
+- Added identity, fixed-trace, and online trainable gated state builders under
+  one causal fixed-budget contract, including checkpoint parity and a
+  development-only partially observable diagnostic.
+- Added a gradient-level `assess_gradient_joy` control-plane audit for the
+  literal question “does this candidate gradient/update spark joy?” It uses
+  caller-supplied objective, retention, and safety probes under a required
+  `probe_independence_attested` contract plus a trust bound, fails closed on
+  unavailable, unattested, or invalid evidence, and requires explicit
+  availability for all eight separately reported learning-value channels.
+  Raw-candidate factors produce a tentative soft-weighted update; both stages
+  must satisfy objective, retention, and safety magnitude gates. Numeric
+  controls must survive as finite normal float32 values, and cosine alignment
+  is range-clipped with an explicit float32 endpoint policy. Paper-specific
+  Delightful Policy Gradient remains a distinct actor-sample experiment.
+  Added `apply_gradient_joy_update` as the atomic parameter-application boundary:
+  it reassesses internally, requires exact parameter/update PyTree contracts,
+  re-audits the effective stored delta after dtype cast and parameter addition,
+  applies atomically, and reports the formed candidate and effective-delta
+  assessments separately from a parameter change actually being `applied`.
+  No integrated production consumer or realized-benefit result is claimed.
+- Added a predict-before-update typed learning-signal producer that keeps
+  ensemble epistemic disagreement, aleatoric uncertainty, normalized residual,
+  learning progress, and sustained change probability separate, with warm-up
+  flags, noisy-TV and change diagnostics, bounded counters, and fixed resource
+  accounting. Causal ordering is part of the caller contract.
+- Added fixed-capacity experiential memory with typed provenance/version
+  metadata, query-before-write ordering, similarity/reliability/staleness
+  retrieval, deterministic utility/recency eviction, controlled stale- and
+  wrong-version abstention checks, exact byte accounting, and checkpoint/scan
+  parity. No transfer benefit is claimed.
+- Added source-profiled canonical UPGD implementations for the paper,
+  official README, and official experiment equations, plus a numerically safe
+  extended default. Regression tests pin their documented normalization and
+  update-multiplier differences instead of silently blending variants.
+- Preserved the immutable recurring- and scale-pair evidence artifacts after
+  multiple registered implementation, artifact-builder, and CLI sources
+  evolved. The live evidence registry now reports both claims as
+  source-invalidated; consumed-seed
+  compatibility reruns cannot promote, and any renewed claim needs a new
+  path/schema plus untouched preregistered seeds. Their generation CLIs now
+  reject the reserved canonical paths even if those files are missing, reject
+  every existing destination before running, and publish new-path
+  reproductions atomically without overwriting a concurrent writer.
+- Added the historically accepted immutable
+  `alberta.scale_robust_pair_feature_evidence.v2` package comparison on 30
+  exact namespace-derived fresh seeds. The strict artifact records primitive
+  phase rows, structural retention, paired intervals, fixed resources, source
+  hashes, and scientific digest
+  `c2fee922c04a59fe26b4b8c9cfa77ddd9198cfa2bc923f54fec14b649bd3bb2c`.
+  Its scope remains narrow: visible context, an exhaustive finite pair archive,
+  one fixed learner initialization, and a primary-versus-legacy comparison
+  that changes scale normalization and ObGD while adding 464 bytes.
+- Added L0 substrates for the next integrated kernel: an uncued recurring
+  scripted-partner stream, online partner-action prediction with an input-loss
+  gradient, a bounded joint-outcome model with external partner-belief
+  marginalization, and fail-closed atomic feature-bank routing by descriptor
+  identity. These do not yet constitute learning-partner coadaptation or L3.
+- Added a bounded L0 hidden-partner kernel that composes online gated state,
+  pair-feature discovery, partner prediction, all-cell joint-world planning,
+  atomic descriptor routing, and explicit-action differential SARSA in one
+  causal update. Shape-matched ablations isolate state learning, recurrent
+  memory, feature deployment, survivor carry, active-utility retention, and
+  planning. Evicted downstream columns have no dormant identity archive, and
+  full-life discovery/control benefit remains development work.
+- Added `PrototypeTransition`, full-Prototype-state checkpoint helpers, and
+  public Prototype exports. This effective-outcome/continuation path carries
+  environment
+  continuation through real world-model, primitive/option control, the IA
+  exo-cortex, scan, and accepted dream updates, while optional per-GVF
+  continuation reaches Horde without erasing each demon's declared horizon.
+  It does not yet implement WP4's planned explicit action and separate
+  terminated/truncated fields.
+- Added an opt-in `sample_one_hot` Prototype dream-observation mode for wholly
+  one-hot control features. It projects finite model outputs to categorical
+  mass, samples on an RNG stream isolated from legacy anchor/action choices,
+  and vetoes malformed, non-finite, or zero-mass projections without changing
+  learner state. The legacy expectation-valued path and serialized config stay
+  unchanged by default. An eight-seed consumed-development RiverSwim diagnostic
+  measured `0.2475` versus `0.1930` mean lifetime reward (paired `+0.0545`,
+  6/8 seeds positive); it is explicitly nonpromoting and carries no held-out
+  efficacy claim.
+- Added **SwiftTD** (`core/swift_td.py`) — Javed, Sharifnassab & Sutton
+  (RLC 2024) step-size optimization with an overshoot bound and step-size
+  decay, float32-exact against the authors' C++ reference. Follows the
+  `TDOptimizer` interface, so it drives `TDLinearLearner` and the TD learning
+  loops.
+- Added the **stacked linear Horde** (`core/stacked_horde.py`): the GVF demon
+  axis as one batched array axis with exact TD(λ) semantics, per-decision
+  importance sampling, NaN cumulant masking, and a `nexting_spec` helper.
+  Measured on CPU: 1,024 demons × 2,000 steps in ~0.2 s steady state
+  (~0.3 s compile) versus ~140 s run + ~144 s compile for the loop-unrolled
+  multi-head path, and 65,536 demons at ~4.0e7 demon-updates/s.
+- Added the **Alberta Gauntlet and lifetime streams plus certification
+  suites** (`streams/gauntlet.py`, `tests/test_gauntlet_certification.py`,
+  `tests/test_gauntlet_discovery.py`, `tests/test_lifetime_demonstration.py`,
+  `tests/test_lifetime_longevity.py`): tracking/relevance/recovery/
+  scale-robustness scorecards (P1–P6), the exhaustive pair-discovery rung, the
+  64k-step single-life demonstration, and the reproducible 1M-step × 8-seed
+  longevity extension (zero non-finite steps over 8M updates, late-life
+  savings 10–18x with no erosion, recurrence re-entry error 0.19x first
+  exposure).
+- Added **closed-loop control gates** (`streams/closed_loop.py`,
+  `tests/test_control_learning_gates.py`): the 2-state switching MDP and
+  RiverSwim with analytic optima, plus SARSA/DifferentialSARSA reward-rise
+  gates against random baselines.
+- Added **multi-agent streams and simulations** (`streams/opponent.py`,
+  `streams/matrix_game.py`, `streams/recurring_multiagent.py`,
+  `tests/test_multiagent_sim.py`): learning-opponent and adversarial-pursuit
+  streams (endogenous non-stationarity; a frozen predictor is driven to 1771
+  MSE while continual learners hold ≤0.12), the recurring convention game
+  (instant convention recall on rule recurrence with context), and the frozen
+  two-agent world behind the promoted coadaptation claim.
+- Added **context inference** (`core/context_inference.py`,
+  `tests/test_context_inference.py`): a bounded bank of per-(state, action)
+  reward tables inferring the active hidden regime and gating control
+  features by inferred slot. Development evidence: +0.519 mean paired gap
+  over the no-context ablation on the tested hidden two-rule life.
+- Added **TD/GVF-target discovery** (`tests/test_td_target_discovery.py`):
+  pair-feature discovery against the controller's differential-SARSA target
+  `r − r̄ + Q(s', a')`; at least three of four context-binding products found
+  per seed and ~+0.16 recurrence advantage over the raw twin (development,
+  oracle-visible context).
+- Added **discovery-driven control** (`tests/test_discovery_control_life.py`):
+  features discovered online from action-conditioned reward prediction feed a
+  bias-free `DifferentialSARSAAgent` with Q-weight carry-over by feature
+  identity across bank refreshes; the discovered bank recovers 92–94% of the
+  oracle-representation advantage (development).
+- Added the **integrated single-life diagnostic**
+  (`tests/test_integrated_life.py`): one uninterrupted 48,000-step
+  closed-loop life with 120 payoff switches and a mid-life input-noise
+  stressor; the gated rung reaches ≥0.969 lifetime reward with flat
+  re-coordination and a +0.60 paired memory gap versus its ablation
+  (development; visible context, hand-built representation).
+- Added **held-out confirmation** of the wave-3 development results
+  (`tests/test_held_out_confirmation.py`): precommitted floors passed on
+  first-run, then-uninspected batches for primary-only scale discovery,
+  discovery-control, a hand-gated life, and longevity (nonpromoting
+  robustness evidence).
+- Added the **Forager benchmark family**
+  (`alberta_framework/benchmarks/`: `forager.py`, `causal_map_forager.py`,
+  `forager_matrix.py`, `forager_results.py`, `official_foragax.py`): the
+  pinned `continual-foragax==0.55.0` integration with paper presets, a causal
+  feature encoder, the `alberta_horde_ac` and `alberta_causal_map` methods,
+  official-NPZ and legacy-SQLite importers, and strict paired statistics —
+  plus the `alberta-forager-benchmark` console script, the `[forager]`
+  optional-dependency extra, and `FORAGER_BENCHMARK.md`. Preserved the
+  completed four-seed RTU-RTRL 500k development run as a byte-pinned,
+  explicitly nonpromoting receipt with recomputed summary tests.
+- Added publication-shaped development runners for slowly-changing regression
+  and UPGD Input-permuted MNIST (`upgd_ipmnist`). The UPGD lane
+  completed a 10-seed matched development diagnostic: UPGD-W/AdamW mean online
+  accuracies were `0.7791470803916454`/`0.7190002817213534`, and the paired
+  descriptive mean difference was `0.06014679867029188` (10/10 positive).
+  Preserved the original `outputs/upgd_ipmnist/results.v1.json`, whose strict
+  failure is limited to its 10-vs-20-seed note, and added the structurally valid
+  `outputs/upgd_ipmnist/results.reconciled_nonpromoting.v2.json` plus
+  current addendum `outputs/upgd_ipmnist/nonpromoting_receipt.v2.json`, which
+  preserves `nonpromoting_receipt.v1.json` byte-for-byte. They remain permanently
+  nonpromoting: 10 rather than 20 published seeds, documented
+  stream/logging/numeric deviations, no execution-time
+  source/full-closure/command/environment/data binding, and an AdamW
+  figure-read-off gap of about `+0.039`. No inferential, SOTA, or Alberta Plan
+  claim follows; a fresh source-bound full-seed run is required.
+
+### Changed
+
+- Narrowed README and PrototypeAgent claims: the repository contains
+  mechanisms across the Alberta Plan, not a completed twelve-step agent.
+- Replaced the package import docstring's all-steps-Complete table with the
+  evidence-level status and relabeled the legacy `alberta-evidence-gate` as an
+  artifact-availability check rather than scientific validation.
+- Corrected STOMP's discounted differential semi-MDP reward/baseline
+  accounting, primitive-action credit, option-model planning, OaK transition
+  ownership and active-option curation, and Prototype dream isolation.
+- Added held-out recurring-feature, world-model decision-fidelity, and
+  recurring multi-agent evaluations. Each documents its restricted claim;
+  none is an end-to-end Alberta Plan result.
+- Added a fail-closed held-out IA artifact. Its v1 run remains a valid
+  scientific rejection: causal reward uplift and augmentation controls pass,
+  but action-changing intervention prevalence is 8.73% versus the frozen 10%
+  gate. A consumed-seed replay reproduced every v1 scientific field exactly at
+  the time and remains explicitly nonpromoting; later `average_reward.py` drift
+  now makes live current-source compatibility invalid. The old threshold was
+  not retuned.
+- Restored the original narrow FTL decision-fidelity claim through a
+  fail-closed historical/current-source compatibility chain. The chain pins
+  the original bytes and scientific digest, reconstructs acceptance from
+  primitive rows, requires an exact current-source replay on consumed seeds
+  30–59, and permits drift only in the artifact-builder hash. The replay is
+  nonpromoting, and the absence of the exact historical builder source is
+  recorded as a source-recoverability limitation.
+- Reclassified the context-inference, TD-target-discovery,
+  Prototype-retention, and historical wave-3 confirmation suites as
+  development/nonpromoting evidence. Their inspected seeds, oracle or
+  hand-built context paths, frozen feature bank, unequal resource budgets,
+  and missing strict artifacts or component ablations remain explicit.
+- Added separate conventional option-return and expected-duration TD heads
+  plus a deterministic Step 5 renewal diagnostic. The diagnostic reaches L1:
+  it shows that return/duration ranks a fast option correctly where return
+  alone does not, but uses supplied options and features and is not a promoted
+  semi-Markov control result.
+- Added `alberta-evidence-status`, a machine-readable index that invokes each
+  strict promoted-artifact validator and distinguishes accepted evidence,
+  valid scientific rejections, missing runs, and invalid artifacts. The index
+  records frozen commands, protocols, configurations, seeds, thresholds,
+  artifact and source hashes, environment provenance, limitations, and
+  validation timestamps. Its explicit dirty-state policy requires registered
+  source hashes to match while recording unrelated worktree changes. Unit and
+  smoke evidence is structurally barred from scientific promotion, with
+  pytest lanes registered for unit, integration, scientific, and development
+  work. The index explicitly is not an Alberta Plan completion certificate.
+
+### Fixed
+
+All fixed failing-test-first during this campaign:
+
+- SARSA dead-λ for control heads.
+- STOMP environment-reward grounding and its idle-update leak.
+- OaK curation zeroing instead of re-initializing replaced options, and
+  step-0 eviction.
+- IA exo-cortex crediting its own actions instead of the partner's.
+- Step-7 pre-warmup RNG freeze.
+- Off-policy Horde ρ² trace composition and the GTD correction term's
+  missing ρ.
+- `reset_dormant_neurons` optimizer-pytree corruption.
+- Baseline optimizers missing from the config registry.
+- Prototype-basis recycled slots inheriting stale readouts.
+- Compositional raw-index aliasing.
+- UPGD-memory blend-logit gradient bias.
+- Mann-Whitney rank-biserial sign inversion in the statistics utilities.
+
+### Removed
+
+- Removed the legacy root-`benchmarks` import shim from
+  `alberta_framework/__init__.py`. It registered any importable top-level
+  `benchmarks` package under the `alberta_framework.benchmarks` name, which
+  could shadow the real packaged subpackage once one existed. The real
+  subpackage is now imported eagerly and always wins
+  (`tests/test_benchmarks_shim.py`).
+
+### Packaging
+
+- Version 0.27.0 across `pyproject.toml`, `alberta_framework.__version__`,
+  and `CITATION.cff` (which had been stuck at 0.17.1).
+- Registered the five evidence CLIs as console scripts:
+  `alberta-ia-evidence`, `alberta-multiagent-evidence`, `alberta-ftl-evidence`,
+  `alberta-recurring-feature-evidence`, and `alberta-scale-robust-evidence`.
+- The sdist now includes `RESEARCH_STATUS.md` and
+  `CONTINUAL_LEARNING_EVIDENCE.md`.
+- ruff and mypy now target Python 3.12, matching `requires-python`.
+- README rewritten: streams/testbeds, new mechanisms, the evidence registry,
+  and benchmark lanes; removed dead CI/PyPI badges and the dead hosted-docs
+  section; the canonical repository URL is now
+  `https://github.com/lalalune/alberta` (see `VENDORING.md` for fork status).
+- `VENDORING.md` rewritten to describe this tree as a development fork with a
+  divergence summary; `CLAUDE.md`/`AGENTS.md` contributor guides added.
+
+### Tests
+
+- 2,641 passed and 55 skipped in the last full pre-release run, up from
+  1,901 at 0.26.0; the suite now collects 3,284 tests across the `unit`,
+  `integration`, `scientific`, and `development` marker lanes.
+
 ## [0.26.0] - 2026-05-22
 
 ### Added
 
 - **GRU recursive perception for PrototypeAgent (Step 8a)** — fixed-weight echo-state
-  GRU augments raw observations with learned hidden state before passing to all
+  GRU augments raw observations with recurrent hidden state before passing to all
   downstream components (OaK, Horde, world model). Glorot-uniform weight init,
   zero hidden init, pure-functional `_gru_step`. Controlled via
   `GRUPerceptionConfig(observation_dim, hidden_dim)` in `PrototypeAgentConfig`.
@@ -87,11 +423,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **PrototypeAgent end-to-end benchmark** — 5-seed CartPole-v1 continuing
-  control benchmark proves all 12 integrated steps run correctly; both flat
-  DifferentialSARSAAgent and PrototypeAgent achieve mean reward 1.000 (5/5 seeds
-  positive) with no NaN weights (`benchmarks/prototype_end_to_end.py`,
-  results in `outputs/prototype_end_to_end/`)
+- **PrototypeAgent CartPole composition smoke** — a 5-seed continuing-control
+  run exercised the configured composition without non-finite weights. Both
+  flat DifferentialSARSAAgent and PrototypeAgent reached the reward ceiling
+  (mean 1.000), so this was a wiring/stability check, not evidence that the
+  composed mechanisms helped or that all twelve steps were integrated
+  (`benchmarks/prototype_end_to_end.py`, results in
+  `outputs/prototype_end_to_end/`)
 
 ### Added (continued)
 
@@ -153,8 +491,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `base_traces`; the underlying `MultiHeadMLPLearner` has `n_heads = n_total_actions`
   - `STOMPConfig.base_hidden_sizes: tuple[int, ...] = ()` enables nonlinear trunks;
     the empty-tuple default preserves previous linear behaviour exactly
-  - Semi-MDP differential Q target (`R_o - r̄·T_o + γ_o·max Q(s')`) computed via
-    NaN-masked `MultiHeadMLPLearner.update` — compatible with both linear and MLP paths
+  - Discounted semi-MDP differential Q target
+    (`R_o^γ - r̄·Σ_{k=0}^{T_o-1}γ^k + γ^{T_o}·max Q(s')`) computed via
+    NaN-masked `MultiHeadMLPLearner.update` — compatible with both linear and
+    MLP paths; at `γ=1` the baseline mass reduces to the raw duration `T_o`
   - OaK curation resets the curated option's head (weights, biases, traces, optimizer
     states) inside the `MultiHeadMLPState` rather than zeroing a raw weight slice
   - `STOMPAgent.base_q_values(state, obs)` and `OaKAgent.base_q_values(state, obs)`
@@ -167,7 +507,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **PrototypeAgent** — all 12 Alberta Plan steps in a single continuing agent
+- **PrototypeAgent** — experimental composition surface for mechanisms
+  associated with Steps 1–12
   - `PrototypeAgentConfig`: minimal defaults (just `n_primitive_actions` + `observation_dim`)
   - Single `.update()` integrates world model, buffer, OaK, dreaming, Horde, and IA
   - `feature_to_subtask_specs`: automatic subtask extraction from OaK Q-weight importances

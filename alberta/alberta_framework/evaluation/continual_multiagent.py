@@ -1,0 +1,858 @@
+"""Fail-closed A-B-A benchmark for the recurring two-agent stream.
+
+This benchmark is intentionally narrow.  It tests whether a tiny, fixed-memory
+online controller can learn two visibly cued coordination regimes, retain the
+first regime while learning the second, and exploit an online-learning partner.
+It does not establish general feature discovery or completion of the Alberta
+Plan.
+
+The learner receives only ordinary observations, its selected action, and the
+shared reward.  It is never passed a phase index, change flag, oracle field, or
+task-boundary callback.  Evaluation knows the A-B-A schedule, but its policy
+probes are read-only counterfactual rollouts and never replace the continuing
+life state.
+
+Three paired conditions have identical two-scalar action and controller-state
+budgets:
+
+``frozen``
+    Neither agent writes learning updates.
+``learner_only``
+    Agent 0 learns while agent 1 remains frozen.
+``joint_adaptive``
+    Both agents learn.  Comparing this with ``learner_only`` reports the
+    benefit of partner learning (coadaptation uplift).  It is not an
+    intelligence-amplification or recommendation-intervention estimate.
+
+The deliberately simple controller is an epsilon-greedy, per-agent contextual
+bandit over the two visible context channels and two actions.  Separate
+contextual values make this a retention sanity check, not a feature-finding
+solution.  All updates are predict-act-observe-update and use no replay.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from time import perf_counter, perf_counter_ns
+from typing import Literal
+
+import jax
+import jax.numpy as jnp
+import jax.random as jr
+import numpy as np
+from jax import Array
+from numpy.typing import NDArray
+
+from alberta_framework.streams.recurring_multiagent import (
+    AVOID_CONTEXT,
+    AVOID_CONTEXT_INDEX,
+    MEET_CONTEXT,
+    MEET_CONTEXT_INDEX,
+    RecurringTwoAgentState,
+    RecurringTwoAgentTransition,
+    RecurringTwoAgentWorld,
+)
+from alberta_framework.utils.metrics import (
+    ContinualLearningSummary,
+    compute_recovery_lengths,
+    summarize_continual_learning,
+)
+
+type ConditionName = Literal["frozen", "learner_only", "joint_adaptive"]
+type StepFunction = Callable[
+    [RecurringTwoAgentState, Array],
+    tuple[RecurringTwoAgentTransition, RecurringTwoAgentState],
+]
+
+PHASE_NAMES = ("A1-meet", "B-avoid", "A2-meet")
+CONDITION_MASKS: tuple[tuple[ConditionName, tuple[bool, bool]], ...] = (
+    ("frozen", (False, False)),
+    ("learner_only", (True, False)),
+    ("joint_adaptive", (True, True)),
+)
+
+
+@dataclass(frozen=True)
+class ContinualMultiAgentConfig:
+    """Scientific and resource configuration for one A-B-A life."""
+
+    phase_steps: int = 64
+    nuisance_dim: int = 4
+    learning_rate: float = 0.15
+    exploration_rate: float = 0.20
+    probe_horizon: int = 12
+    probe_tail_steps: int = 4
+    recovery_reward_threshold: float = 0.70
+    recovery_window: int = 4
+    stability_reference_reward: float = 0.75
+    bootstrap_resamples: int = 10_000
+    confidence_level: float = 0.95
+    bootstrap_seed: int = 2_026_073_000
+
+    def __post_init__(self) -> None:
+        if self.phase_steps < 2:
+            raise ValueError("phase_steps must be at least 2")
+        if self.nuisance_dim < 0:
+            raise ValueError("nuisance_dim must be non-negative")
+        if not 0.0 < self.learning_rate <= 1.0:
+            raise ValueError("learning_rate must lie in (0, 1]")
+        if not 0.0 <= self.exploration_rate <= 1.0:
+            raise ValueError("exploration_rate must lie in [0, 1]")
+        if not 1 <= self.probe_tail_steps <= self.probe_horizon:
+            raise ValueError("probe_tail_steps must lie in [1, probe_horizon]")
+        if self.probe_horizon > self.phase_steps:
+            raise ValueError("probe_horizon cannot cross a phase boundary")
+        if not 0.0 <= self.recovery_reward_threshold <= 1.0:
+            raise ValueError("recovery_reward_threshold must lie in [0, 1]")
+        if not 1 <= self.recovery_window <= self.phase_steps:
+            raise ValueError("recovery_window must lie in [1, phase_steps]")
+        if not 0.0 <= self.stability_reference_reward <= 1.0:
+            raise ValueError("stability_reference_reward must lie in [0, 1]")
+        if self.bootstrap_resamples < 1_000:
+            raise ValueError("bootstrap_resamples must be at least 1000")
+        if not 0.0 < self.confidence_level < 1.0:
+            raise ValueError("confidence_level must lie in (0, 1)")
+        if not 0 <= self.bootstrap_seed < 2**32:
+            raise ValueError("bootstrap_seed must lie in [0, 2**32)")
+
+
+@dataclass(frozen=True)
+class AcceptanceThresholds:
+    """Explicit default thresholds for the multi-seed acceptance decision."""
+
+    minimum_seed_count: int = 30
+    evidence_seed_start: int = 30
+    minimum_reward_uplift_over_frozen: float = 0.15
+    minimum_partner_uplift: float = 0.20
+    minimum_recurrent_a_probe_reward: float = 0.90
+    maximum_mean_forgetting: float = 0.05
+    maximum_interference_forgetting: float = 0.01
+    minimum_recurrence_recovery_fraction: float = 0.95
+    maximum_mean_recurrence_recovery_steps: float = 16.0
+    maximum_mean_stability_gap: float = 0.20
+    maximum_update_latency_ms: float = 5.0
+
+
+@dataclass(frozen=True)
+class ControllerBudget:
+    """Persistent dynamic state and action accounting for one condition."""
+
+    state_scalars: int
+    state_bytes: int
+    action_scalars_per_step: int
+
+
+@dataclass(frozen=True)
+class TimingMetrics:
+    """Steady-state timing after one environment compilation warm-up."""
+
+    wall_seconds: float
+    mean_step_latency_ms: float
+    mean_update_latency_ms: float
+    p95_update_latency_ms: float
+
+
+@dataclass(frozen=True)
+class BootstrapInterval:
+    """Deterministic non-parametric interval over paired seed statistics."""
+
+    estimate: float
+    lower: float
+    upper: float
+    confidence_level: float
+    resamples: int
+    sample_size: int
+    method: str = "paired-percentile-bootstrap"
+
+
+@dataclass(frozen=True)
+class ConditionResult:
+    """All evidence from one seed and one uninterrupted condition."""
+
+    seed: int
+    condition: ConditionName
+    learning_mask: tuple[bool, bool]
+    online_rewards: NDArray[np.float64]
+    phase_mean_rewards: NDArray[np.float64]
+    performance_matrix: NDArray[np.float64]
+    summary: ContinualLearningSummary
+    recovery_lengths: NDArray[np.int64]
+    recurrence_recovery_steps: int
+    interference_forgetting: float
+    controller_budget: ControllerBudget
+    timing: TimingMetrics
+
+
+@dataclass(frozen=True)
+class AggregateEvidence:
+    """Paired multi-seed evidence used by the acceptance evaluator."""
+
+    seeds: tuple[int, ...]
+    frozen_prequential_reward: float
+    learner_only_prequential_reward: float
+    joint_adaptive_prequential_reward: float
+    reward_uplift_over_frozen: float
+    reward_uplift_interval: BootstrapInterval
+    partner_uplift: float
+    partner_uplift_interval: BootstrapInterval
+    joint_adaptive_phase_rewards: NDArray[np.float64]
+    joint_adaptive_performance_matrix: NDArray[np.float64]
+    recurrent_a_probe_reward: float
+    mean_forgetting: float
+    max_forgetting: float
+    mean_interference_forgetting: float
+    recurrence_recovery_fraction: float
+    mean_recurrence_recovery_steps: float
+    mean_stability_gap: float
+    maximum_update_latency_ms: float
+    state_scalars: int
+    state_bytes: int
+    action_scalars_per_step: int
+    budgets_identical: bool
+    all_values_finite: bool
+
+
+@dataclass(frozen=True)
+class AcceptanceEvidence:
+    """One fail-closed threshold comparison and its observed value."""
+
+    name: str
+    passed: bool
+    actual: float
+    comparator: str
+    threshold: float
+    detail: str
+
+
+@dataclass(frozen=True)
+class AcceptanceResult:
+    """Acceptance never skips: every failed check carries numeric evidence."""
+
+    passed: bool
+    checks: tuple[AcceptanceEvidence, ...]
+
+    @property
+    def failures(self) -> tuple[AcceptanceEvidence, ...]:
+        """Return all failed checks without hiding later failures."""
+
+        return tuple(check for check in self.checks if not check.passed)
+
+
+@dataclass(frozen=True)
+class ContinualMultiAgentReport:
+    """Complete benchmark report across paired seeds and conditions."""
+
+    config: ContinualMultiAgentConfig
+    thresholds: AcceptanceThresholds
+    condition_results: tuple[ConditionResult, ...]
+    aggregate: AggregateEvidence
+    acceptance: AcceptanceResult
+
+
+@dataclass
+class _ControllerState:
+    """Fixed-size contextual values plus counter-based random state."""
+
+    action_values: NDArray[np.float32]
+    random_state: NDArray[np.uint64]
+
+
+def _initial_controller(seed: int) -> _ControllerState:
+    return _ControllerState(
+        action_values=np.zeros((2, 2, 2), dtype=np.float32),
+        random_state=np.asarray((seed, 0), dtype=np.uint64),
+    )
+
+
+def _controller_budget(controller: _ControllerState) -> ControllerBudget:
+    arrays = (controller.action_values, controller.random_state)
+    return ControllerBudget(
+        state_scalars=sum(int(array.size) for array in arrays),
+        state_bytes=sum(int(array.nbytes) for array in arrays),
+        action_scalars_per_step=2,
+    )
+
+
+def _visible_contexts(observation: NDArray[np.float32]) -> NDArray[np.int64]:
+    context_cues = observation[:, MEET_CONTEXT_INDEX : AVOID_CONTEXT_INDEX + 1]
+    return np.argmax(context_cues, axis=1).astype(np.int64)
+
+
+def _select_actions(
+    controller: _ControllerState,
+    observation: NDArray[np.float32],
+    exploration_rate: float,
+) -> tuple[NDArray[np.float32], NDArray[np.int64], NDArray[np.int64]]:
+    """Select two actions using only ordinary observation and stored state."""
+
+    contexts = _visible_contexts(observation)
+    seed = int(controller.random_state[0])
+    step = int(controller.random_state[1])
+    generator = np.random.default_rng(seed * 100_003 + step)
+    explore_draws = generator.random(2)
+    random_actions = generator.integers(0, 2, size=2, dtype=np.int64)
+
+    action_indices = np.empty((2,), dtype=np.int64)
+    for agent in range(2):
+        values = controller.action_values[agent, contexts[agent]]
+        tied = bool(values[0] == values[1])
+        if tied or explore_draws[agent] < exploration_rate:
+            action_indices[agent] = random_actions[agent]
+        else:
+            action_indices[agent] = int(np.argmax(values))
+    actions = (2 * action_indices - 1).astype(np.float32)
+    return actions, action_indices, contexts
+
+
+def _update_controller(
+    controller: _ControllerState,
+    action_indices: NDArray[np.int64],
+    contexts: NDArray[np.int64],
+    reward: float,
+    learning_rate: float,
+    learning_mask: tuple[bool, bool],
+) -> _ControllerState:
+    """Perform one post-reward update; frozen agents suppress candidate writes."""
+
+    values = controller.action_values.copy()
+    for agent in range(2):
+        action = int(action_indices[agent])
+        context = int(contexts[agent])
+        old_value = float(values[agent, context, action])
+        candidate = old_value + learning_rate * (reward - old_value)
+        if learning_mask[agent]:
+            values[agent, context, action] = np.float32(candidate)
+
+    random_state = controller.random_state.copy()
+    random_state[1] += np.uint64(1)
+    return _ControllerState(action_values=values, random_state=random_state)
+
+
+def _probe_state(
+    world: RecurringTwoAgentWorld,
+    *,
+    context: int,
+    phase_steps: int,
+) -> RecurringTwoAgentState:
+    initial = world.init(jr.key(2_147_483_647))
+    return RecurringTwoAgentState(  # type: ignore[call-arg]
+        key=initial.key,
+        positions=jnp.asarray((-0.5, 0.5), dtype=jnp.float32),
+        velocities=jnp.zeros((2,), dtype=jnp.float32),
+        nuisance=jnp.zeros_like(initial.nuisance),
+        step_count=jnp.asarray(context * phase_steps, dtype=jnp.int32),
+    )
+
+
+def _probe_policy(
+    world: RecurringTwoAgentWorld,
+    step_world: StepFunction,
+    controller: _ControllerState,
+    *,
+    context: int,
+    config: ContinualMultiAgentConfig,
+) -> float:
+    """Read-only deterministic rollout from a fixed evaluator-owned state."""
+
+    state = _probe_state(world, context=context, phase_steps=config.phase_steps)
+    action_preferences = (
+        controller.action_values[:, context, 1] - controller.action_values[:, context, 0]
+    )
+    actions = np.sign(action_preferences).astype(np.float32)
+    rewards = np.empty((config.probe_horizon,), dtype=np.float64)
+    for step_index in range(config.probe_horizon):
+        transition, state = step_world(state, jnp.asarray(actions))
+        rewards[step_index] = float(transition.reward[0])
+    return float(np.mean(rewards[-config.probe_tail_steps :]))
+
+
+def _run_condition(
+    world: RecurringTwoAgentWorld,
+    step_world: StepFunction,
+    *,
+    seed: int,
+    condition: ConditionName,
+    learning_mask: tuple[bool, bool],
+    config: ContinualMultiAgentConfig,
+) -> ConditionResult:
+    state = world.init(jr.key(seed))
+    observation = np.asarray(world.observe(state), dtype=np.float32)
+    controller = _initial_controller(seed)
+    total_steps = 3 * config.phase_steps
+    rewards = np.empty((total_steps,), dtype=np.float64)
+    update_latencies_ns = np.empty((total_steps,), dtype=np.float64)
+    performance_rows: list[list[float]] = []
+
+    wall_start = perf_counter()
+    for step_index in range(total_steps):
+        actions, action_indices, contexts = _select_actions(
+            controller,
+            observation,
+            config.exploration_rate,
+        )
+        transition, state = step_world(state, jnp.asarray(actions))
+        reward = float(transition.reward[0])
+        rewards[step_index] = reward
+        observation = np.asarray(transition.next_observation, dtype=np.float32)
+
+        update_start = perf_counter_ns()
+        controller = _update_controller(
+            controller,
+            action_indices,
+            contexts,
+            reward,
+            config.learning_rate,
+            learning_mask,
+        )
+        update_latencies_ns[step_index] = perf_counter_ns() - update_start
+
+        # Evaluator-only checkpoint: the continuing state and learner are not
+        # modified by either counterfactual rollout.
+        if (step_index + 1) % config.phase_steps == 0:
+            performance_rows.append(
+                [
+                    _probe_policy(
+                        world,
+                        step_world,
+                        controller,
+                        context=MEET_CONTEXT,
+                        config=config,
+                    ),
+                    _probe_policy(
+                        world,
+                        step_world,
+                        controller,
+                        context=AVOID_CONTEXT,
+                        config=config,
+                    ),
+                ]
+            )
+    wall_seconds = perf_counter() - wall_start
+
+    performance_matrix = np.asarray(performance_rows, dtype=np.float64)
+    phase_mean_rewards = np.mean(
+        rewards.reshape(3, config.phase_steps),
+        axis=1,
+    )
+    summary = summarize_continual_learning(
+        performance_matrix,
+        [0, 1],
+        rewards,
+        config.stability_reference_reward,
+    )
+    recovery_lengths = compute_recovery_lengths(
+        rewards,
+        [config.phase_steps, 2 * config.phase_steps],
+        config.recovery_reward_threshold,
+        window_size=config.recovery_window,
+    )
+    interference_forgetting = max(
+        0.0,
+        float(performance_matrix[0, MEET_CONTEXT]) - float(performance_matrix[1, MEET_CONTEXT]),
+    )
+    update_latency_ms = update_latencies_ns / 1_000_000.0
+    return ConditionResult(
+        seed=seed,
+        condition=condition,
+        learning_mask=learning_mask,
+        online_rewards=rewards,
+        phase_mean_rewards=np.asarray(phase_mean_rewards, dtype=np.float64),
+        performance_matrix=performance_matrix,
+        summary=summary,
+        recovery_lengths=recovery_lengths,
+        recurrence_recovery_steps=int(recovery_lengths[1]),
+        interference_forgetting=interference_forgetting,
+        controller_budget=_controller_budget(controller),
+        timing=TimingMetrics(
+            wall_seconds=wall_seconds,
+            mean_step_latency_ms=1_000.0 * wall_seconds / total_steps,
+            mean_update_latency_ms=float(np.mean(update_latency_ms)),
+            p95_update_latency_ms=float(np.percentile(update_latency_ms, 95)),
+        ),
+    )
+
+
+def _condition_results(
+    results: Sequence[ConditionResult],
+    condition: ConditionName,
+) -> tuple[ConditionResult, ...]:
+    selected = tuple(result for result in results if result.condition == condition)
+    if not selected:
+        raise ValueError(f"missing required condition: {condition}")
+    return selected
+
+
+def paired_bootstrap_mean_interval(
+    paired_differences: NDArray[np.float64],
+    *,
+    confidence_level: float,
+    resamples: int,
+    seed: int,
+) -> BootstrapInterval:
+    """Return a reproducible percentile interval for a paired mean.
+
+    The caller supplies one already-paired difference per seed.  Resampling
+    those differences, rather than independently resampling each condition,
+    preserves the common-random-number experimental design.
+    """
+
+    values = np.asarray(paired_differences, dtype=np.float64)
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError("paired_differences must be a non-empty vector")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("paired_differences must contain only finite values")
+    if not 0.0 < confidence_level < 1.0:
+        raise ValueError("confidence_level must lie in (0, 1)")
+    if resamples < 1:
+        raise ValueError("resamples must be positive")
+    if not 0 <= seed < 2**32:
+        raise ValueError("seed must lie in [0, 2**32)")
+
+    generator = np.random.default_rng(seed)
+    indices = generator.integers(
+        0,
+        values.size,
+        size=(resamples, values.size),
+        dtype=np.int64,
+    )
+    bootstrap_means = np.mean(values[indices], axis=1)
+    tail_probability = (1.0 - confidence_level) / 2.0
+    lower, upper = np.quantile(
+        bootstrap_means,
+        (tail_probability, 1.0 - tail_probability),
+    )
+    return BootstrapInterval(
+        estimate=float(np.mean(values)),
+        lower=float(lower),
+        upper=float(upper),
+        confidence_level=confidence_level,
+        resamples=resamples,
+        sample_size=int(values.size),
+    )
+
+
+def aggregate_evidence(
+    results: Sequence[ConditionResult],
+    *,
+    confidence_level: float = 0.95,
+    bootstrap_resamples: int = 10_000,
+    bootstrap_seed: int = 2_026_073_000,
+) -> AggregateEvidence:
+    """Aggregate paired condition results without discarding failed seeds."""
+
+    if not results:
+        raise ValueError("results must be non-empty")
+    frozen = _condition_results(results, "frozen")
+    learner_only = _condition_results(results, "learner_only")
+    joint_adaptive = _condition_results(results, "joint_adaptive")
+    seed_sets = tuple(
+        tuple(result.seed for result in group) for group in (frozen, learner_only, joint_adaptive)
+    )
+    if seed_sets[0] != seed_sets[1] or seed_sets[0] != seed_sets[2]:
+        raise ValueError("conditions must contain identical seeds in identical order")
+    if len(set(seed_sets[0])) != len(seed_sets[0]):
+        raise ValueError("paired condition seeds must be unique")
+
+    frozen_rewards = np.asarray(
+        [result.summary.prequential_performance for result in frozen],
+        dtype=np.float64,
+    )
+    learner_only_rewards = np.asarray(
+        [result.summary.prequential_performance for result in learner_only],
+        dtype=np.float64,
+    )
+    adaptive_rewards = np.asarray(
+        [result.summary.prequential_performance for result in joint_adaptive],
+        dtype=np.float64,
+    )
+    reward_uplift_differences = adaptive_rewards - frozen_rewards
+    partner_uplift_differences = adaptive_rewards - learner_only_rewards
+    reward_uplift_interval = paired_bootstrap_mean_interval(
+        reward_uplift_differences,
+        confidence_level=confidence_level,
+        resamples=bootstrap_resamples,
+        seed=bootstrap_seed,
+    )
+    partner_uplift_interval = paired_bootstrap_mean_interval(
+        partner_uplift_differences,
+        confidence_level=confidence_level,
+        resamples=bootstrap_resamples,
+        seed=(bootstrap_seed + 1) % 2**32,
+    )
+    adaptive_phase_rewards = np.mean(
+        np.stack([result.phase_mean_rewards for result in joint_adaptive]),
+        axis=0,
+    )
+    adaptive_performance_matrix = np.mean(
+        np.stack([result.performance_matrix for result in joint_adaptive]),
+        axis=0,
+    )
+    recurrence_steps = np.asarray(
+        [result.recurrence_recovery_steps for result in joint_adaptive],
+        dtype=np.int64,
+    )
+    recovered = recurrence_steps >= 0
+    mean_recovery = (
+        float(np.mean(recurrence_steps[recovered])) if np.any(recovered) else float("inf")
+    )
+    budgets = tuple(result.controller_budget for result in results)
+    first_budget = budgets[0]
+    budgets_identical = all(budget == first_budget for budget in budgets[1:])
+
+    numeric_arrays = (
+        [result.online_rewards for result in results]
+        + [result.phase_mean_rewards for result in results]
+        + [result.performance_matrix for result in results]
+    )
+    timings = np.asarray(
+        [
+            (
+                result.timing.wall_seconds,
+                result.timing.mean_step_latency_ms,
+                result.timing.mean_update_latency_ms,
+                result.timing.p95_update_latency_ms,
+            )
+            for result in results
+        ],
+        dtype=np.float64,
+    )
+    all_values_finite = all(np.all(np.isfinite(array)) for array in numeric_arrays) and bool(
+        np.all(np.isfinite(timings))
+    )
+
+    return AggregateEvidence(
+        seeds=seed_sets[0],
+        frozen_prequential_reward=float(np.mean(frozen_rewards)),
+        learner_only_prequential_reward=float(np.mean(learner_only_rewards)),
+        joint_adaptive_prequential_reward=float(np.mean(adaptive_rewards)),
+        reward_uplift_over_frozen=reward_uplift_interval.estimate,
+        reward_uplift_interval=reward_uplift_interval,
+        partner_uplift=partner_uplift_interval.estimate,
+        partner_uplift_interval=partner_uplift_interval,
+        joint_adaptive_phase_rewards=np.asarray(adaptive_phase_rewards, dtype=np.float64),
+        joint_adaptive_performance_matrix=np.asarray(
+            adaptive_performance_matrix,
+            dtype=np.float64,
+        ),
+        recurrent_a_probe_reward=float(adaptive_performance_matrix[-1, MEET_CONTEXT]),
+        mean_forgetting=float(
+            np.mean([result.summary.mean_forgetting for result in joint_adaptive])
+        ),
+        max_forgetting=float(np.max([result.summary.max_forgetting for result in joint_adaptive])),
+        mean_interference_forgetting=float(
+            np.mean([result.interference_forgetting for result in joint_adaptive])
+        ),
+        recurrence_recovery_fraction=float(np.mean(recovered)),
+        mean_recurrence_recovery_steps=mean_recovery,
+        mean_stability_gap=float(
+            np.mean([result.summary.stability_gap_mean for result in joint_adaptive])
+        ),
+        maximum_update_latency_ms=float(
+            np.max([result.timing.p95_update_latency_ms for result in results])
+        ),
+        state_scalars=first_budget.state_scalars,
+        state_bytes=first_budget.state_bytes,
+        action_scalars_per_step=first_budget.action_scalars_per_step,
+        budgets_identical=budgets_identical,
+        all_values_finite=all_values_finite,
+    )
+
+
+def _minimum_check(
+    name: str,
+    actual: float,
+    threshold: float,
+    detail: str,
+) -> AcceptanceEvidence:
+    passed = bool(np.isfinite(actual) and actual >= threshold)
+    return AcceptanceEvidence(
+        name=name,
+        passed=passed,
+        actual=actual,
+        comparator=">=",
+        threshold=threshold,
+        detail=detail,
+    )
+
+
+def _maximum_check(
+    name: str,
+    actual: float,
+    threshold: float,
+    detail: str,
+) -> AcceptanceEvidence:
+    passed = bool(np.isfinite(actual) and actual <= threshold)
+    return AcceptanceEvidence(
+        name=name,
+        passed=passed,
+        actual=actual,
+        comparator="<=",
+        threshold=threshold,
+        detail=detail,
+    )
+
+
+def evaluate_acceptance(
+    aggregate: AggregateEvidence,
+    thresholds: AcceptanceThresholds | None = None,
+) -> AcceptanceResult:
+    """Evaluate every threshold and return evidence for every failure.
+
+    Missing/non-finite evidence fails the relevant comparison.  There is no
+    skipped or "not evaluated" acceptance state.
+    """
+
+    limits = AcceptanceThresholds() if thresholds is None else thresholds
+    expected_evidence_seeds = tuple(
+        range(
+            limits.evidence_seed_start,
+            limits.evidence_seed_start + limits.minimum_seed_count,
+        )
+    )
+    checks = (
+        _minimum_check(
+            "seed_count",
+            float(len(aggregate.seeds)),
+            float(limits.minimum_seed_count),
+            "Promoted evidence requires the pre-registered number of unique paired seeds.",
+        ),
+        _minimum_check(
+            "evidence_seed_schedule",
+            float(aggregate.seeds == expected_evidence_seeds),
+            1.0,
+            "Promoted evidence must use the frozen held-out consecutive seed schedule.",
+        ),
+        _minimum_check(
+            "all_values_finite",
+            float(aggregate.all_values_finite),
+            1.0,
+            "Every reward, probe, and timing value must be finite.",
+        ),
+        _minimum_check(
+            "budgets_identical",
+            float(aggregate.budgets_identical),
+            1.0,
+            "All conditions must use identical persistent state and actions.",
+        ),
+        _minimum_check(
+            "reward_uplift_over_frozen",
+            aggregate.reward_uplift_interval.lower,
+            limits.minimum_reward_uplift_over_frozen,
+            "Lower confidence bound for paired joint-adaptive minus frozen reward.",
+        ),
+        _minimum_check(
+            "partner_uplift",
+            aggregate.partner_uplift_interval.lower,
+            limits.minimum_partner_uplift,
+            "Lower confidence bound for paired joint-adaptive minus learner-only "
+            "reward (coadaptation, not an IA intervention).",
+        ),
+        _minimum_check(
+            "recurrent_a_probe_reward",
+            aggregate.recurrent_a_probe_reward,
+            limits.minimum_recurrent_a_probe_reward,
+            "Read-only A probe after the full A-B-A life.",
+        ),
+        _maximum_check(
+            "mean_forgetting",
+            aggregate.mean_forgetting,
+            limits.maximum_mean_forgetting,
+            "Peak-to-final degradation across both probe tasks.",
+        ),
+        _maximum_check(
+            "interference_forgetting",
+            aggregate.mean_interference_forgetting,
+            limits.maximum_interference_forgetting,
+            "A-probe degradation from immediately after A1 to after B.",
+        ),
+        _minimum_check(
+            "recurrence_recovery_fraction",
+            aggregate.recurrence_recovery_fraction,
+            limits.minimum_recurrence_recovery_fraction,
+            "Fraction of seeds recovering during recurrent A.",
+        ),
+        _maximum_check(
+            "mean_recurrence_recovery_steps",
+            aggregate.mean_recurrence_recovery_steps,
+            limits.maximum_mean_recurrence_recovery_steps,
+            "Mean steps to a sustained reward threshold among seeds that "
+            "recovered after A recurred; recovery fraction is gated separately.",
+        ),
+        _maximum_check(
+            "mean_stability_gap",
+            aggregate.mean_stability_gap,
+            limits.maximum_mean_stability_gap,
+            "Online reward deficit below the configured reference.",
+        ),
+        _maximum_check(
+            "update_latency_ms",
+            aggregate.maximum_update_latency_ms,
+            limits.maximum_update_latency_ms,
+            "Worst per-run p95 controller-update latency.",
+        ),
+    )
+    return AcceptanceResult(
+        passed=all(check.passed for check in checks),
+        checks=checks,
+    )
+
+
+def run_continual_multiagent_benchmark(
+    *,
+    seeds: Sequence[int] = tuple(range(30, 60)),
+    config: ContinualMultiAgentConfig | None = None,
+    thresholds: AcceptanceThresholds | None = None,
+) -> ContinualMultiAgentReport:
+    """Run paired seeded conditions and return a fail-closed report."""
+
+    benchmark_config = ContinualMultiAgentConfig() if config is None else config
+    acceptance_thresholds = AcceptanceThresholds() if thresholds is None else thresholds
+    seed_tuple = tuple(int(seed) for seed in seeds)
+    if not seed_tuple:
+        raise ValueError("seeds must be non-empty")
+    if len(set(seed_tuple)) != len(seed_tuple):
+        raise ValueError("seeds must be unique")
+    if any(seed < 0 or seed >= 2**31 for seed in seed_tuple):
+        raise ValueError("seeds must lie in [0, 2**31)")
+
+    # Immediate dynamics make the causal effect of each bounded action visible
+    # while preserving an uninterrupted physical state across phase switches.
+    world = RecurringTwoAgentWorld(
+        context_length=benchmark_config.phase_steps,
+        nuisance_dim=benchmark_config.nuisance_dim,
+        damping=0.0,
+        acceleration=0.25,
+        max_speed=0.25,
+    )
+    step_world: StepFunction = jax.jit(world.step)
+    warm_state = world.init(jr.key(seed_tuple[0]))
+    warm_transition, _ = step_world(warm_state, jnp.zeros((2,), dtype=jnp.float32))
+    warm_transition.reward.block_until_ready()
+
+    results = tuple(
+        _run_condition(
+            world,
+            step_world,
+            seed=seed,
+            condition=condition,
+            learning_mask=mask,
+            config=benchmark_config,
+        )
+        for seed in seed_tuple
+        for condition, mask in CONDITION_MASKS
+    )
+    aggregate = aggregate_evidence(
+        results,
+        confidence_level=benchmark_config.confidence_level,
+        bootstrap_resamples=benchmark_config.bootstrap_resamples,
+        bootstrap_seed=benchmark_config.bootstrap_seed,
+    )
+    acceptance = evaluate_acceptance(aggregate, acceptance_thresholds)
+    return ContinualMultiAgentReport(
+        config=benchmark_config,
+        thresholds=acceptance_thresholds,
+        condition_results=results,
+        aggregate=aggregate,
+        acceptance=acceptance,
+    )

@@ -22,20 +22,38 @@ from alberta_framework.utils.export import (
     save_experiment_report,
 )
 from alberta_framework.utils.metrics import (
+    ContinualLearningSummary,
+    StabilityGap,
     compare_learners,
+    compute_backward_transfer,
     compute_cumulative_error,
+    compute_forward_transfer,
+    compute_per_task_forgetting,
+    compute_prequential_performance,
+    compute_recovery_lengths,
     compute_running_mean,
+    compute_stability_gap,
     compute_tracking_error,
     extract_metric,
+    summarize_continual_learning,
 )
 
 __all__ = [
     # Metrics
+    "ContinualLearningSummary",
+    "StabilityGap",
     "compare_learners",
+    "compute_backward_transfer",
     "compute_cumulative_error",
+    "compute_forward_transfer",
+    "compute_per_task_forgetting",
+    "compute_prequential_performance",
+    "compute_recovery_lengths",
     "compute_running_mean",
+    "compute_stability_gap",
     "compute_tracking_error",
     "extract_metric",
+    "summarize_continual_learning",
     # Experiments
     "AggregatedResults",
     "ExperimentConfig",

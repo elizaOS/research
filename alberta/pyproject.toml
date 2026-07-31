@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "alberta-framework"
-version = "0.26.0"
-description = "Implementation of the Alberta Plan for AI Research - continual learning with meta-learned step-sizes"
+version = "0.27.0"
+description = "JAX research framework for investigating continual learning and the Alberta Plan"
 readme = "README.md"
 license = "Apache-2.0"
 # Vendored into elizaOS at packages/research/alberta (see VENDORING.md). Relaxed from
@@ -61,6 +61,10 @@ docs = [
 gymnasium = [
     "gymnasium>=0.29.0",
 ]
+forager = [
+    "continual-foragax==0.55.0",
+    "gymnax==0.0.9",
+]
 bsuite = [
     "dm-env>=1.6",
     "optax>=0.1.7",
@@ -72,15 +76,24 @@ gpu = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/j-klawson/alberta-framework"
-Repository = "https://github.com/j-klawson/alberta-framework"
-Documentation = "https://j-klawson.github.io/alberta-framework"
-Issues = "https://github.com/j-klawson/alberta-framework/issues"
+Homepage = "https://github.com/lalalune/alberta"
+Repository = "https://github.com/lalalune/alberta"
+Issues = "https://github.com/lalalune/alberta/issues"
 
 [project.scripts]
 alberta-step1-smoke = "alberta_framework.cli:step1_smoke_main"
 alberta-step2-smoke = "alberta_framework.cli:step2_smoke_main"
 alberta-evidence-gate = "alberta_framework.cli:evidence_gate_main"
+alberta-evidence-status = "alberta_framework.evaluation.evidence_manifest_cli:main"
+alberta-forager-benchmark = "alberta_framework.forager_cli:main"
+alberta-historical-forager = "alberta_framework.forager_cli:historical_main"
+alberta-foragax-oci = "alberta_framework.benchmarks.official_foragax_oci:main"
+alberta-foragax-open-screen = "alberta_framework.benchmarks.foragax_open_screen:main"
+alberta-ia-evidence = "alberta_framework.evaluation.continual_ia_cli:main"
+alberta-multiagent-evidence = "alberta_framework.evaluation.continual_multiagent_cli:main"
+alberta-ftl-evidence = "alberta_framework.evaluation.ftl_decision_cli:main"
+alberta-recurring-feature-evidence = "alberta_framework.evaluation.recurring_feature_cli:main"
+alberta-scale-robust-evidence = "alberta_framework.evaluation.scale_robust_feature_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["alberta_framework"]
@@ -91,6 +104,10 @@ include = [
     "/CITATION.cff",
     "/LICENSE",
     "/README.md",
+    "/FORAGER_BENCHMARK.md",
+    "/HISTORICAL_FORAGER_RECONSTRUCTED.md",
+    "/RESEARCH_STATUS.md",
+    "/CONTINUAL_LEARNING_EVIDENCE.md",
     "/pyproject.toml",
     "/alberta_framework",
 ]
@@ -113,7 +130,7 @@ exclude = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py313"
+target-version = "py312"
 extend-exclude = [
     ".claude",
     "benchmarks",
@@ -141,7 +158,7 @@ select = ["E", "F", "I", "N", "W", "UP"]
 ignore = ["F722"]
 
 [tool.mypy]
-python_version = "3.13"
+python_version = "3.12"
 warn_return_any = true
 warn_unused_ignores = true
 strict = true
@@ -149,6 +166,10 @@ files = ["alberta_framework"]
 
 [[tool.mypy.overrides]]
 module = "gymnasium.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "foragax.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
@@ -328,3 +349,10 @@ disable_error_code = ["call-arg", "no-any-return"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v"
+markers = [
+    "unit: fast isolated behavior or contract tests; never scientific evidence",
+    "integration: tests spanning components, persistence, or process/CLI boundaries",
+    "scientific: frozen promoted-evidence protocols; may be expensive and require preregistered seeds",
+    "development: calibration or exploratory protocols that must never promote scientific claims",
+    "slow: wall-clock heavy modules (>~30s serial); excluded from the fast per-PR CI lane",
+]

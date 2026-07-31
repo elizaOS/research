@@ -77,6 +77,15 @@ class Step9DreamingConfig:
             gives a linear model.
         model_step_size: Step-size for the world model learner.
         model_sparsity: Sparse-init fraction for the world model.
+        model_include_action_interactions: Append observation-by-action
+            interaction features to the world-model input. With
+            ``model_hidden_sizes=()`` the base model is linear in
+            ``concat(obs, one_hot(action))`` — *additive* in state and action —
+            so it cannot represent any reward with state-action interaction
+            structure (its per-state action gap is one global offset shared by
+            every state). Enable this for tasks whose reward depends jointly
+            on state and action (e.g. the XOR payoffs of
+            ``SwitchingTwoStateMDP``).
         model_use_layer_norm: Enable layer normalisation in the world model.
         model_gamma: Maximum discount (clips the predicted discount head).
         dreaming_warmup_steps: Real transitions required before any dream can
@@ -90,6 +99,24 @@ class Step9DreamingConfig:
         planning_budget: Number of dream steps per real transition.
         buffer_capacity: Number of recent real observations to retain for
             anchor sampling.
+        dreams_update_average_reward: Whether imagined (dream) updates may
+            move the differential-SARSA average-reward estimate rbar.
+            **Default False — a behavior change (2026-07) from the original
+            Step 9, where dream TD errors always updated rbar.** Dyna
+            doctrine: planning backups improve *value* estimates, while the
+            reward-rate estimate is a property of actual behavior in the real
+            environment — imagined experience should not move it. Coupling
+            dreams to rbar distorts the rate estimate in whichever direction
+            the model's reward bias points; the measured effect depends on
+            the bootstrap regime. Under undiscounted updates (discount 1.0)
+            corrupt imagined rewards inflate rbar, which makes real TD errors
+            more negative, speeds unlearning, and *masks* the damage corrupt
+            dreams do to the Q-function. Under discounted updates (e.g. the
+            0.99 used by :func:`step9_update`) the coupling measured strictly
+            worse on both sides of a payoff-flip stress: gated mean regret
+            113.5-115.6 vs ~97 protected, permissive 239.3-251.5 vs ~131
+            (see tests/test_planning_benefit.py). Set True to restore the
+            legacy coupled behavior.
     """
 
     control: Step6DifferentialSARSAConfig = field(
@@ -100,6 +127,7 @@ class Step9DreamingConfig:
     model_hidden_sizes: tuple[int, ...] = (64,)
     model_step_size: float = 0.03
     model_sparsity: float = 0.9
+    model_include_action_interactions: bool = False
     model_use_layer_norm: bool = True
     model_gamma: float = 0.99
     dreaming_warmup_steps: int = 100
@@ -112,6 +140,7 @@ class Step9DreamingConfig:
     dream_surprise_weight: float = 1.0
     dream_utility_weight: float = 1.0
     buffer_capacity: int = 64
+    dreams_update_average_reward: bool = False
 
     def __post_init__(self) -> None:
         """Validate hyperparameters."""
@@ -165,6 +194,7 @@ class Step9DreamingConfig:
             use_layer_norm=self.model_use_layer_norm,
             gamma=self.model_gamma,
             error_decay=self.model_error_decay,
+            include_action_interactions=self.model_include_action_interactions,
         )
 
 
@@ -286,15 +316,21 @@ def step9_update(
     ``model_state.model_error_ema <= dreaming_max_model_error`` AND the
     predicted transition is numerically finite.
     """
+    real_discount = jnp.asarray(config.model_gamma, dtype=jnp.float32)
     real_model_result = model.update(
         state.world_model_state,
         state.control_state.last_observation,
         state.control_state.last_action,
         reward,
-        jnp.asarray(config.model_gamma, dtype=jnp.float32),
+        real_discount,
         next_observation,
     )
-    real_control_result = agent.update(state.control_state, reward, next_observation)
+    real_control_result = agent.update(
+        state.control_state,
+        reward,
+        next_observation,
+        discount=real_discount,
+    )
     control_after_real = real_control_result.state
     model_state = cast(ActionConditionedWorldModelState, real_model_result.state)
     behavior_model = BehaviorModel(
@@ -417,13 +453,22 @@ def step9_update(
                 temp_state,
                 prediction.reward,
                 prediction.next_observation,
+                discount=prediction.discount,
             )
+            dream_state = dream_result.state
+            if not config.dreams_update_average_reward:
+                # Planning backups improve value estimates only: restore the
+                # pre-dream reward-rate estimate so imagined rewards can never
+                # move rbar (see Step9DreamingConfig docstring).
+                dream_state = dream_state.replace(
+                    average_reward=rollout_ctrl.average_reward
+                )
             next_behavior = behavior_model.sample_action(
                 rollout_behavior,
                 prediction.next_observation,
             )
             return (
-                dream_result.state,
+                dream_state,
                 next_behavior.state,
                 prediction.next_observation,
                 next_behavior.action,

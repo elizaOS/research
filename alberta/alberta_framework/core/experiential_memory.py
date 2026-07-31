@@ -1,0 +1,854 @@
+# mypy: disable-error-code="call-arg,name-defined"
+"""Bounded, fail-closed experiential memory for continuing agents.
+
+The memory stores fixed-width episodic exemplars and retrieves from the state
+that existed before the current exemplar is written.  Retrieval keeps reward,
+safety, uncertainty, reliability, and eviction utility as separate signals;
+in particular, reward is never folded into either reliability or utility.
+
+All persistent state is held in fixed-shape JAX arrays.  The implementation is
+therefore compatible with ``jax.jit`` and ``jax.lax.scan`` and exposes exact
+array-byte and entry-count accounting.
+"""
+
+from __future__ import annotations
+
+import functools
+import math
+from dataclasses import asdict, dataclass
+from typing import Any, cast
+
+import chex
+import jax
+import jax.numpy as jnp
+from jax import Array
+from jaxtyping import Bool, Float, Int
+
+_INT32_MAX = 2_147_483_647
+_UINT32_MAX = 4_294_967_295
+
+
+@dataclass(frozen=True)
+class ExperientialMemoryConfig:
+    """Static allocation and retrieval policy for experiential memory.
+
+    Args:
+        capacity: Maximum number of persistent exemplars.
+        observation_dim: Width of the stored grounded observation.
+        key_dim: Width of the retrieval key.
+        action_dim: Width of the stored action.
+        outcome_dim: Width of the stored outcome vector.
+        top_k: Maximum neighbors considered by one query.
+        min_neighbors: Minimum eligible neighbors required to retrieve.
+        distance_scale: Positive scale for the RBF key similarity.
+        min_similarity: Minimum RBF similarity for an eligible neighbor.
+        min_effective_reliability: Minimum reliability after staleness decay.
+        max_uncertainty: Maximum query and exemplar uncertainty.
+        max_safety_cost: Maximum exemplar safety cost.
+        max_age: Maximum chronological exemplar age.
+        staleness_scale: Exponential reliability-decay timescale.
+        utility_decay: Per-step decay for explicit eviction utility.
+        eviction_utility_weight: Utility contribution to retention priority.
+        eviction_recency_weight: Recency contribution to retention priority.
+        recency_scale: Scale of the reciprocal recency score.
+    """
+
+    capacity: int
+    observation_dim: int
+    key_dim: int
+    action_dim: int
+    outcome_dim: int
+    top_k: int = 4
+    min_neighbors: int = 1
+    distance_scale: float = 1.0
+    min_similarity: float = 0.5
+    min_effective_reliability: float = 0.1
+    max_uncertainty: float = 1.0
+    max_safety_cost: float = 1.0
+    max_age: int = 10_000
+    staleness_scale: float = 1_000.0
+    utility_decay: float = 0.999
+    eviction_utility_weight: float = 1.0
+    eviction_recency_weight: float = 1.0
+    recency_scale: float = 100.0
+
+    def to_config(self) -> dict[str, object]:
+        """Return a JSON-serializable configuration."""
+        payload = asdict(self)
+        payload["type"] = "ExperientialMemoryConfig"
+        return payload
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> ExperientialMemoryConfig:
+        """Reconstruct and validate a configuration dictionary."""
+        payload = dict(config)
+        type_name = payload.pop("type", None)
+        if type_name not in {None, "ExperientialMemoryConfig"}:
+            raise ValueError(f"unexpected config type: {type_name!r}")
+        result = cls(**payload)
+        _validate_config(result)
+        return result
+
+
+@chex.dataclass(frozen=True)
+class ExperientialMemoryEntry:
+    """One typed experiential exemplar presented for bounded storage."""
+
+    observation: Float[Array, " observation_dim"]
+    key: Float[Array, " key_dim"]
+    action: Float[Array, " action_dim"]
+    outcome: Float[Array, " outcome_dim"]
+    reward: Float[Array, ""]
+    uncertainty: Float[Array, ""]
+    safety_cost: Float[Array, ""]
+    reliability: Float[Array, ""]
+    utility: Float[Array, ""]
+    representation_version: Int[Array, ""]
+    valid: Bool[Array, ""]
+    age: Int[Array, ""]
+    provenance_id: Int[Array, ""]
+    source_id: Int[Array, ""]
+
+
+@chex.dataclass(frozen=True)
+class ExperientialMemoryEntries:
+    """Fixed-capacity structure-of-arrays for persistent exemplars."""
+
+    observations: Float[Array, "capacity observation_dim"]
+    keys: Float[Array, "capacity key_dim"]
+    actions: Float[Array, "capacity action_dim"]
+    outcomes: Float[Array, "capacity outcome_dim"]
+    rewards: Float[Array, " capacity"]
+    uncertainties: Float[Array, " capacity"]
+    safety_costs: Float[Array, " capacity"]
+    reliabilities: Float[Array, " capacity"]
+    utilities: Float[Array, " capacity"]
+    representation_versions: Int[Array, " capacity"]
+    valid: Bool[Array, " capacity"]
+    ages: Int[Array, " capacity"]
+    recency_ages: Int[Array, " capacity"]
+    provenance_ids: Int[Array, " capacity"]
+    source_ids: Int[Array, " capacity"]
+    retrieval_counts: Int[Array, " capacity"]
+
+
+@chex.dataclass(frozen=True)
+class ExperientialMemoryState:
+    """Complete fixed-shape persistent memory state."""
+
+    entries: ExperientialMemoryEntries
+    active_count: Int[Array, ""]
+    step_count: Int[Array, ""]
+    query_count: Int[Array, ""]
+    accepted_query_count: Int[Array, ""]
+    write_count: Int[Array, ""]
+    rejected_write_count: Int[Array, ""]
+    eviction_count: Int[Array, ""]
+    persistent_bytes: Array
+
+
+@chex.dataclass(frozen=True)
+class ExperientialMemoryRetrieval:
+    """A gated retrieval and its auditable neighbor diagnostics.
+
+    Retrieved payloads are all-zero when ``accepted`` is false.  Neighbor
+    diagnostics remain available so an evaluator can localize an abstention.
+    """
+
+    accepted: Bool[Array, ""]
+    observation: Float[Array, " observation_dim"]
+    action: Float[Array, " action_dim"]
+    outcome: Float[Array, " outcome_dim"]
+    reward: Float[Array, ""]
+    uncertainty: Float[Array, ""]
+    safety_cost: Float[Array, ""]
+    effective_reliability: Float[Array, ""]
+    neighbor_indices: Int[Array, " top_k"]
+    neighbor_mask: Bool[Array, " top_k"]
+    neighbor_weights: Float[Array, " top_k"]
+    neighbor_similarities: Float[Array, " top_k"]
+    neighbor_reliabilities: Float[Array, " top_k"]
+    neighbor_ages: Int[Array, " top_k"]
+    neighbor_provenance_ids: Int[Array, " top_k"]
+    query_valid: Bool[Array, ""]
+    version_compatible: Bool[Array, ""]
+    freshness_ok: Bool[Array, ""]
+    uncertainty_ok: Bool[Array, ""]
+    safety_ok: Bool[Array, ""]
+    has_neighbors: Bool[Array, ""]
+
+
+@chex.dataclass(frozen=True)
+class ExperientialMemoryWriteResult:
+    """State and accounting returned by one bounded write."""
+
+    state: ExperientialMemoryState
+    wrote: Bool[Array, ""]
+    slot: Int[Array, ""]
+    evicted: Bool[Array, ""]
+    evicted_provenance_id: Int[Array, ""]
+
+
+@chex.dataclass(frozen=True)
+class ExperientialMemoryStepResult:
+    """One causal query-before-write operation."""
+
+    state: ExperientialMemoryState
+    retrieval: ExperientialMemoryRetrieval
+    wrote: Bool[Array, ""]
+    slot: Int[Array, ""]
+    evicted: Bool[Array, ""]
+    evicted_provenance_id: Int[Array, ""]
+
+
+@chex.dataclass(frozen=True)
+class ExperientialMemoryAccounting:
+    """Exact persistent allocation and lifetime operation counts."""
+
+    active_entries: Int[Array, ""]
+    capacity_entries: Int[Array, ""]
+    slot_bytes: Array
+    persistent_bytes: Array
+    queries: Int[Array, ""]
+    accepted_queries: Int[Array, ""]
+    writes: Int[Array, ""]
+    rejected_writes: Int[Array, ""]
+    evictions: Int[Array, ""]
+
+
+def _validate_finite(name: str, value: float) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a real number")
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+
+
+def _validate_config(config: ExperientialMemoryConfig) -> None:
+    for name in (
+        "capacity",
+        "observation_dim",
+        "key_dim",
+        "action_dim",
+        "outcome_dim",
+        "top_k",
+        "min_neighbors",
+    ):
+        value = getattr(config, name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be an integer")
+        if value < 1:
+            raise ValueError(f"{name} must be positive")
+    if config.top_k > config.capacity:
+        raise ValueError("top_k must be <= capacity")
+    if config.min_neighbors > config.top_k:
+        raise ValueError("min_neighbors must be <= top_k")
+    if isinstance(config.max_age, bool) or not isinstance(config.max_age, int):
+        raise ValueError("max_age must be an integer")
+    if config.max_age < 0:
+        raise ValueError("max_age must be non-negative")
+
+    for name in (
+        "distance_scale",
+        "min_similarity",
+        "min_effective_reliability",
+        "max_uncertainty",
+        "max_safety_cost",
+        "staleness_scale",
+        "utility_decay",
+        "eviction_utility_weight",
+        "eviction_recency_weight",
+        "recency_scale",
+    ):
+        _validate_finite(name, cast(float, getattr(config, name)))
+
+    if config.distance_scale <= 0.0:
+        raise ValueError("distance_scale must be positive")
+    if not 0.0 <= config.min_similarity <= 1.0:
+        raise ValueError("min_similarity must be in [0, 1]")
+    if not 0.0 < config.min_effective_reliability <= 1.0:
+        raise ValueError("min_effective_reliability must be in (0, 1]")
+    if config.max_uncertainty < 0.0:
+        raise ValueError("max_uncertainty must be non-negative")
+    if config.max_safety_cost < 0.0:
+        raise ValueError("max_safety_cost must be non-negative")
+    if config.staleness_scale <= 0.0:
+        raise ValueError("staleness_scale must be positive")
+    if not 0.0 <= config.utility_decay <= 1.0:
+        raise ValueError("utility_decay must be in [0, 1]")
+    if config.eviction_utility_weight < 0.0:
+        raise ValueError("eviction_utility_weight must be non-negative")
+    if config.eviction_recency_weight < 0.0:
+        raise ValueError("eviction_recency_weight must be non-negative")
+    if config.eviction_utility_weight + config.eviction_recency_weight <= 0.0:
+        raise ValueError("at least one eviction retention weight must be positive")
+    if config.recency_scale <= 0.0:
+        raise ValueError("recency_scale must be positive")
+
+
+def _saturating_increment(value: Array) -> Array:
+    maximum_minus_one = jnp.asarray(_INT32_MAX - 1, dtype=jnp.int32)
+    return jnp.minimum(value, maximum_minus_one) + jnp.asarray(1, dtype=jnp.int32)
+
+
+def _tree_nbytes(tree: Any) -> int:
+    return sum(int(leaf.size) * int(leaf.dtype.itemsize) for leaf in jax.tree.leaves(tree))
+
+
+def _configured_nbytes(config: ExperientialMemoryConfig) -> tuple[int, int]:
+    vector_values = config.observation_dim + config.key_dim + config.action_dim + config.outcome_dim
+    # Five float scalars, six int32 scalars, and one bool per slot.
+    slot_bytes = 4 * (vector_values + 5 + 6) + 1
+    # Seven int32 counters and the uint32 byte-count scalar live beside slots.
+    persistent_bytes = config.capacity * slot_bytes + 8 * 4
+    return persistent_bytes, slot_bytes
+
+
+class ExperientialMemory:
+    """Fixed-capacity episodic memory with conservative retrieval.
+
+    ``query`` is read-only.  ``step`` first performs that query against the
+    previous state, records any accepted access, advances ages once, and only
+    then writes the supplied exemplar.  This ordering prevents target leakage
+    from a current transition into its own prediction.
+    """
+
+    def __init__(self, config: ExperientialMemoryConfig):
+        _validate_config(config)
+        self._config = config
+        persistent_bytes, slot_bytes = _configured_nbytes(config)
+        if persistent_bytes > _UINT32_MAX:
+            raise ValueError("persistent memory allocation exceeds uint32 byte accounting")
+        self._persistent_bytes = persistent_bytes
+        self._slot_bytes = slot_bytes
+
+    @property
+    def config(self) -> ExperientialMemoryConfig:
+        """Memory configuration."""
+        return self._config
+
+    @property
+    def persistent_bytes(self) -> int:
+        """Exact bytes occupied by all persistent JAX array leaves."""
+        return self._persistent_bytes
+
+    @property
+    def slot_bytes(self) -> int:
+        """Exact bytes occupied by one fixed-capacity entry slot."""
+        return self._slot_bytes
+
+    def to_config(self) -> dict[str, object]:
+        """Serialize the memory construction configuration."""
+        return {
+            "type": "ExperientialMemory",
+            "config": self._config.to_config(),
+        }
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> ExperientialMemory:
+        """Reconstruct a memory from :meth:`to_config` output."""
+        if config.get("type") not in {None, "ExperientialMemory"}:
+            raise ValueError(f"unexpected memory type: {config.get('type')!r}")
+        inner = cast(dict[str, Any], config["config"])
+        return cls(ExperientialMemoryConfig.from_config(inner))
+
+    def _make_initial_state(self, persistent_bytes: int) -> ExperientialMemoryState:
+        cfg = self._config
+        zeros = functools.partial(jnp.zeros, dtype=jnp.float32)
+        entries = ExperientialMemoryEntries(
+            observations=zeros((cfg.capacity, cfg.observation_dim)),
+            keys=zeros((cfg.capacity, cfg.key_dim)),
+            actions=zeros((cfg.capacity, cfg.action_dim)),
+            outcomes=zeros((cfg.capacity, cfg.outcome_dim)),
+            rewards=zeros((cfg.capacity,)),
+            uncertainties=zeros((cfg.capacity,)),
+            safety_costs=zeros((cfg.capacity,)),
+            reliabilities=zeros((cfg.capacity,)),
+            utilities=zeros((cfg.capacity,)),
+            representation_versions=jnp.full((cfg.capacity,), -1, dtype=jnp.int32),
+            valid=jnp.zeros((cfg.capacity,), dtype=jnp.bool_),
+            ages=jnp.zeros((cfg.capacity,), dtype=jnp.int32),
+            recency_ages=jnp.zeros((cfg.capacity,), dtype=jnp.int32),
+            provenance_ids=jnp.full((cfg.capacity,), -1, dtype=jnp.int32),
+            source_ids=jnp.full((cfg.capacity,), -1, dtype=jnp.int32),
+            retrieval_counts=jnp.zeros((cfg.capacity,), dtype=jnp.int32),
+        )
+        zero = jnp.asarray(0, dtype=jnp.int32)
+        return ExperientialMemoryState(
+            entries=entries,
+            active_count=zero,
+            step_count=zero,
+            query_count=zero,
+            accepted_query_count=zero,
+            write_count=zero,
+            rejected_write_count=zero,
+            eviction_count=zero,
+            persistent_bytes=jnp.asarray(persistent_bytes, dtype=jnp.uint32),
+        )
+
+    def init(self) -> ExperientialMemoryState:
+        """Return an empty, fixed-shape memory state."""
+        state = self._make_initial_state(persistent_bytes=self._persistent_bytes)
+        if _tree_nbytes(state) != self._persistent_bytes:
+            raise RuntimeError("persistent byte accounting disagrees with allocated state")
+        return state
+
+    def _canonical_entry(self, entry: ExperientialMemoryEntry) -> ExperientialMemoryEntry:
+        cfg = self._config
+        return ExperientialMemoryEntry(
+            observation=jnp.asarray(entry.observation, dtype=jnp.float32).reshape(
+                (cfg.observation_dim,)
+            ),
+            key=jnp.asarray(entry.key, dtype=jnp.float32).reshape((cfg.key_dim,)),
+            action=jnp.asarray(entry.action, dtype=jnp.float32).reshape((cfg.action_dim,)),
+            outcome=jnp.asarray(entry.outcome, dtype=jnp.float32).reshape((cfg.outcome_dim,)),
+            reward=jnp.asarray(entry.reward, dtype=jnp.float32).reshape(()),
+            uncertainty=jnp.asarray(entry.uncertainty, dtype=jnp.float32).reshape(()),
+            safety_cost=jnp.asarray(entry.safety_cost, dtype=jnp.float32).reshape(()),
+            reliability=jnp.asarray(entry.reliability, dtype=jnp.float32).reshape(()),
+            utility=jnp.asarray(entry.utility, dtype=jnp.float32).reshape(()),
+            representation_version=jnp.asarray(
+                entry.representation_version, dtype=jnp.int32
+            ).reshape(()),
+            valid=jnp.asarray(entry.valid, dtype=jnp.bool_).reshape(()),
+            age=jnp.asarray(entry.age, dtype=jnp.int32).reshape(()),
+            provenance_id=jnp.asarray(entry.provenance_id, dtype=jnp.int32).reshape(()),
+            source_id=jnp.asarray(entry.source_id, dtype=jnp.int32).reshape(()),
+        )
+
+    @staticmethod
+    def _entry_is_valid(entry: ExperientialMemoryEntry) -> Array:
+        finite_payload = (
+            jnp.all(jnp.isfinite(entry.observation))
+            & jnp.all(jnp.isfinite(entry.key))
+            & jnp.all(jnp.isfinite(entry.action))
+            & jnp.all(jnp.isfinite(entry.outcome))
+            & jnp.isfinite(entry.reward)
+            & jnp.isfinite(entry.uncertainty)
+            & jnp.isfinite(entry.safety_cost)
+            & jnp.isfinite(entry.reliability)
+            & jnp.isfinite(entry.utility)
+        )
+        valid_metadata = (
+            (entry.uncertainty >= 0.0)
+            & (entry.safety_cost >= 0.0)
+            & (entry.reliability >= 0.0)
+            & (entry.reliability <= 1.0)
+            & (entry.utility >= 0.0)
+            & (entry.representation_version >= 0)
+            & (entry.age >= 0)
+            & (entry.provenance_id >= 0)
+            & (entry.source_id >= 0)
+        )
+        return entry.valid & finite_payload & valid_metadata
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def query(
+        self,
+        state: ExperientialMemoryState,
+        key: Float[Array, " key_dim"],
+        representation_version: Int[Array, ""],
+        query_uncertainty: Float[Array, ""],
+    ) -> ExperientialMemoryRetrieval:
+        """Retrieve an eligible weighted neighborhood without mutating state."""
+        cfg = self._config
+        entries = state.entries
+        query_key = jnp.asarray(key, dtype=jnp.float32).reshape((cfg.key_dim,))
+        query_version = jnp.asarray(representation_version, dtype=jnp.int32).reshape(())
+        query_uncertainty_value = jnp.asarray(query_uncertainty, dtype=jnp.float32).reshape(())
+
+        query_valid = (
+            jnp.all(jnp.isfinite(query_key))
+            & jnp.isfinite(query_uncertainty_value)
+            & (query_uncertainty_value >= 0.0)
+            & (query_version >= 0)
+        )
+
+        finite_rows = (
+            jnp.all(jnp.isfinite(entries.observations), axis=1)
+            & jnp.all(jnp.isfinite(entries.keys), axis=1)
+            & jnp.all(jnp.isfinite(entries.actions), axis=1)
+            & jnp.all(jnp.isfinite(entries.outcomes), axis=1)
+            & jnp.isfinite(entries.rewards)
+            & jnp.isfinite(entries.uncertainties)
+            & jnp.isfinite(entries.safety_costs)
+            & jnp.isfinite(entries.reliabilities)
+            & jnp.isfinite(entries.utilities)
+        )
+        sane_rows = (
+            entries.valid
+            & finite_rows
+            & (entries.uncertainties >= 0.0)
+            & (entries.safety_costs >= 0.0)
+            & (entries.reliabilities >= 0.0)
+            & (entries.reliabilities <= 1.0)
+            & (entries.utilities >= 0.0)
+            & (entries.representation_versions >= 0)
+            & (entries.ages >= 0)
+            & (entries.recency_ages >= 0)
+            & (entries.provenance_ids >= 0)
+            & (entries.source_ids >= 0)
+            & (entries.retrieval_counts >= 0)
+        )
+        same_version = sane_rows & (entries.representation_versions == query_version)
+        fresh = same_version & (entries.ages <= cfg.max_age)
+        uncertainty_eligible = fresh & (entries.uncertainties <= cfg.max_uncertainty)
+        safety_eligible = fresh & (entries.safety_costs <= cfg.max_safety_cost)
+
+        safe_query_key = jnp.where(jnp.isfinite(query_key), query_key, 0.0)
+        safe_keys = jnp.where(finite_rows[:, None], entries.keys, 0.0)
+        squared_distance = jnp.mean(
+            (safe_keys - safe_query_key[None, :]) ** 2,
+            axis=1,
+        )
+        similarities = jnp.exp(
+            -squared_distance / jnp.asarray(cfg.distance_scale, dtype=jnp.float32)
+        )
+        staleness = jnp.exp(
+            -entries.ages.astype(jnp.float32) / jnp.asarray(cfg.staleness_scale, dtype=jnp.float32)
+        )
+        effective_reliabilities = entries.reliabilities * staleness
+        eligible = (
+            uncertainty_eligible
+            & safety_eligible
+            & (similarities >= cfg.min_similarity)
+            & (effective_reliabilities >= cfg.min_effective_reliability)
+        )
+        scores = jnp.where(eligible, similarities * effective_reliabilities, -jnp.inf)
+        top_scores, indices = jax.lax.top_k(scores, cfg.top_k)
+        neighbor_mask = jnp.isfinite(top_scores) & (top_scores > 0.0)
+        positive_scores = jnp.where(neighbor_mask, top_scores, 0.0)
+        score_sum = jnp.sum(positive_scores)
+        neighbor_weights = positive_scores / jnp.maximum(score_sum, 1.0e-12)
+
+        neighbor_similarities = similarities[indices]
+        neighbor_reliabilities = effective_reliabilities[indices]
+        neighbor_ages = entries.ages[indices]
+        neighbor_provenance_ids = entries.provenance_ids[indices]
+
+        weighted_observation = jnp.sum(
+            neighbor_weights[:, None] * entries.observations[indices], axis=0
+        )
+        weighted_action = jnp.sum(neighbor_weights[:, None] * entries.actions[indices], axis=0)
+        weighted_outcome = jnp.sum(neighbor_weights[:, None] * entries.outcomes[indices], axis=0)
+        weighted_reward = jnp.sum(neighbor_weights * entries.rewards[indices])
+        weighted_uncertainty = jnp.sum(neighbor_weights * entries.uncertainties[indices])
+        weighted_safety_cost = jnp.sum(neighbor_weights * entries.safety_costs[indices])
+        weighted_reliability = jnp.sum(neighbor_weights * effective_reliabilities[indices])
+
+        has_neighbors = jnp.sum(neighbor_mask.astype(jnp.int32)) >= cfg.min_neighbors
+        version_compatible = jnp.any(same_version)
+        freshness_ok = jnp.any(fresh)
+        uncertainty_ok = (query_uncertainty_value <= cfg.max_uncertainty) & jnp.any(
+            uncertainty_eligible
+        )
+        safety_ok = jnp.any(safety_eligible)
+        aggregate_ok = (
+            (weighted_uncertainty <= cfg.max_uncertainty)
+            & (weighted_safety_cost <= cfg.max_safety_cost)
+            & jnp.isfinite(weighted_reliability)
+        )
+        accepted = (
+            query_valid
+            & version_compatible
+            & freshness_ok
+            & uncertainty_ok
+            & safety_ok
+            & has_neighbors
+            & aggregate_ok
+        )
+
+        def gated(value: Array) -> Array:
+            return jnp.where(accepted, value, jnp.zeros_like(value))
+
+        return ExperientialMemoryRetrieval(
+            accepted=accepted,
+            observation=gated(weighted_observation),
+            action=gated(weighted_action),
+            outcome=gated(weighted_outcome),
+            reward=gated(weighted_reward),
+            uncertainty=gated(weighted_uncertainty),
+            safety_cost=gated(weighted_safety_cost),
+            effective_reliability=gated(weighted_reliability),
+            neighbor_indices=indices.astype(jnp.int32),
+            neighbor_mask=neighbor_mask,
+            neighbor_weights=neighbor_weights,
+            neighbor_similarities=neighbor_similarities,
+            neighbor_reliabilities=neighbor_reliabilities,
+            neighbor_ages=neighbor_ages,
+            neighbor_provenance_ids=neighbor_provenance_ids,
+            query_valid=query_valid,
+            version_compatible=version_compatible,
+            freshness_ok=freshness_ok,
+            uncertainty_ok=uncertainty_ok,
+            safety_ok=safety_ok,
+            has_neighbors=has_neighbors,
+        )
+
+    def _advance(self, state: ExperientialMemoryState) -> ExperientialMemoryState:
+        entries = state.entries
+        valid = entries.valid
+        ages = jnp.where(valid, _saturating_increment(entries.ages), entries.ages)
+        recency_ages = jnp.where(
+            valid,
+            _saturating_increment(entries.recency_ages),
+            entries.recency_ages,
+        )
+        utilities = jnp.where(
+            valid,
+            entries.utilities * jnp.asarray(self._config.utility_decay, dtype=jnp.float32),
+            entries.utilities,
+        )
+        return ExperientialMemoryState(
+            entries=ExperientialMemoryEntries(
+                observations=entries.observations,
+                keys=entries.keys,
+                actions=entries.actions,
+                outcomes=entries.outcomes,
+                rewards=entries.rewards,
+                uncertainties=entries.uncertainties,
+                safety_costs=entries.safety_costs,
+                reliabilities=entries.reliabilities,
+                utilities=utilities,
+                representation_versions=entries.representation_versions,
+                valid=entries.valid,
+                ages=ages,
+                recency_ages=recency_ages,
+                provenance_ids=entries.provenance_ids,
+                source_ids=entries.source_ids,
+                retrieval_counts=entries.retrieval_counts,
+            ),
+            active_count=state.active_count,
+            step_count=_saturating_increment(state.step_count),
+            query_count=state.query_count,
+            accepted_query_count=state.accepted_query_count,
+            write_count=state.write_count,
+            rejected_write_count=state.rejected_write_count,
+            eviction_count=state.eviction_count,
+            persistent_bytes=state.persistent_bytes,
+        )
+
+    @staticmethod
+    def _record_query(
+        state: ExperientialMemoryState,
+        retrieval: ExperientialMemoryRetrieval,
+    ) -> ExperientialMemoryState:
+        entries = state.entries
+        access_increments = (
+            jnp.zeros_like(entries.retrieval_counts)
+            .at[retrieval.neighbor_indices]
+            .add(retrieval.neighbor_mask.astype(jnp.int32))
+        )
+        access_mask = access_increments > 0
+        accepted_access = retrieval.accepted & access_mask
+        retrieval_counts = jnp.where(
+            accepted_access,
+            _saturating_increment(entries.retrieval_counts),
+            entries.retrieval_counts,
+        )
+        recency_ages = jnp.where(accepted_access, 0, entries.recency_ages)
+        return ExperientialMemoryState(
+            entries=ExperientialMemoryEntries(
+                observations=entries.observations,
+                keys=entries.keys,
+                actions=entries.actions,
+                outcomes=entries.outcomes,
+                rewards=entries.rewards,
+                uncertainties=entries.uncertainties,
+                safety_costs=entries.safety_costs,
+                reliabilities=entries.reliabilities,
+                utilities=entries.utilities,
+                representation_versions=entries.representation_versions,
+                valid=entries.valid,
+                ages=entries.ages,
+                recency_ages=recency_ages,
+                provenance_ids=entries.provenance_ids,
+                source_ids=entries.source_ids,
+                retrieval_counts=retrieval_counts,
+            ),
+            active_count=state.active_count,
+            step_count=state.step_count,
+            query_count=_saturating_increment(state.query_count),
+            accepted_query_count=jnp.where(
+                retrieval.accepted,
+                _saturating_increment(state.accepted_query_count),
+                state.accepted_query_count,
+            ),
+            write_count=state.write_count,
+            rejected_write_count=state.rejected_write_count,
+            eviction_count=state.eviction_count,
+            persistent_bytes=state.persistent_bytes,
+        )
+
+    def _write_advanced(
+        self,
+        state: ExperientialMemoryState,
+        raw_entry: ExperientialMemoryEntry,
+    ) -> ExperientialMemoryWriteResult:
+        entry = self._canonical_entry(raw_entry)
+        can_write = self._entry_is_valid(entry)
+        cfg = self._config
+
+        def do_write(
+            current: ExperientialMemoryState,
+        ) -> tuple[ExperientialMemoryState, Array, Array, Array]:
+            current_entries = current.entries
+            has_empty = jnp.any(~current_entries.valid)
+            empty_slot = jnp.argmax((~current_entries.valid).astype(jnp.int32))
+            recency_score = 1.0 / (
+                1.0
+                + current_entries.recency_ages.astype(jnp.float32)
+                / jnp.asarray(cfg.recency_scale, dtype=jnp.float32)
+            )
+            retention_score = (
+                jnp.asarray(cfg.eviction_utility_weight, dtype=jnp.float32)
+                * current_entries.utilities
+                + jnp.asarray(cfg.eviction_recency_weight, dtype=jnp.float32) * recency_score
+            )
+            retention_score = jnp.where(current_entries.valid, retention_score, jnp.inf)
+            eviction_slot = jnp.argmin(retention_score)
+            slot = jnp.where(has_empty, empty_slot, eviction_slot).astype(jnp.int32)
+            evicted = ~has_empty
+            evicted_provenance_id = jnp.where(
+                evicted, current_entries.provenance_ids[slot], -1
+            ).astype(jnp.int32)
+
+            next_entries = ExperientialMemoryEntries(
+                observations=current_entries.observations.at[slot].set(entry.observation),
+                keys=current_entries.keys.at[slot].set(entry.key),
+                actions=current_entries.actions.at[slot].set(entry.action),
+                outcomes=current_entries.outcomes.at[slot].set(entry.outcome),
+                rewards=current_entries.rewards.at[slot].set(entry.reward),
+                uncertainties=current_entries.uncertainties.at[slot].set(entry.uncertainty),
+                safety_costs=current_entries.safety_costs.at[slot].set(entry.safety_cost),
+                reliabilities=current_entries.reliabilities.at[slot].set(entry.reliability),
+                utilities=current_entries.utilities.at[slot].set(entry.utility),
+                representation_versions=current_entries.representation_versions.at[slot].set(
+                    entry.representation_version
+                ),
+                valid=current_entries.valid.at[slot].set(True),
+                ages=current_entries.ages.at[slot].set(entry.age),
+                recency_ages=current_entries.recency_ages.at[slot].set(entry.age),
+                provenance_ids=current_entries.provenance_ids.at[slot].set(entry.provenance_id),
+                source_ids=current_entries.source_ids.at[slot].set(entry.source_id),
+                retrieval_counts=current_entries.retrieval_counts.at[slot].set(0),
+            )
+            next_state = ExperientialMemoryState(
+                entries=next_entries,
+                active_count=jnp.where(
+                    has_empty,
+                    _saturating_increment(current.active_count),
+                    current.active_count,
+                ),
+                step_count=current.step_count,
+                query_count=current.query_count,
+                accepted_query_count=current.accepted_query_count,
+                write_count=_saturating_increment(current.write_count),
+                rejected_write_count=current.rejected_write_count,
+                eviction_count=jnp.where(
+                    evicted,
+                    _saturating_increment(current.eviction_count),
+                    current.eviction_count,
+                ),
+                persistent_bytes=current.persistent_bytes,
+            )
+            return next_state, slot, evicted, evicted_provenance_id
+
+        def reject_write(
+            current: ExperientialMemoryState,
+        ) -> tuple[ExperientialMemoryState, Array, Array, Array]:
+            rejected = ExperientialMemoryState(
+                entries=current.entries,
+                active_count=current.active_count,
+                step_count=current.step_count,
+                query_count=current.query_count,
+                accepted_query_count=current.accepted_query_count,
+                write_count=current.write_count,
+                rejected_write_count=_saturating_increment(current.rejected_write_count),
+                eviction_count=current.eviction_count,
+                persistent_bytes=current.persistent_bytes,
+            )
+            return (
+                rejected,
+                jnp.asarray(-1, dtype=jnp.int32),
+                jnp.asarray(False),
+                jnp.asarray(-1, dtype=jnp.int32),
+            )
+
+        next_state, slot, evicted, evicted_provenance_id = jax.lax.cond(
+            can_write, do_write, reject_write, state
+        )
+        return ExperientialMemoryWriteResult(
+            state=next_state,
+            wrote=can_write,
+            slot=slot,
+            evicted=evicted,
+            evicted_provenance_id=evicted_provenance_id,
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def write(
+        self,
+        state: ExperientialMemoryState,
+        entry: ExperientialMemoryEntry,
+    ) -> ExperientialMemoryWriteResult:
+        """Advance time once and attempt one bounded exemplar write."""
+        return self._write_advanced(self._advance(state), entry)
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def step(
+        self,
+        state: ExperientialMemoryState,
+        query_key: Float[Array, " key_dim"],
+        representation_version: Int[Array, ""],
+        query_uncertainty: Float[Array, ""],
+        entry: ExperientialMemoryEntry,
+    ) -> ExperientialMemoryStepResult:
+        """Query the pre-write state, then age/access/write exactly once."""
+        retrieval = self.query(
+            state,
+            query_key,
+            representation_version,
+            query_uncertainty,
+        )
+        advanced = self._advance(state)
+        accessed = self._record_query(advanced, retrieval)
+        write_result = self._write_advanced(accessed, entry)
+        return ExperientialMemoryStepResult(
+            state=write_result.state,
+            retrieval=retrieval,
+            wrote=write_result.wrote,
+            slot=write_result.slot,
+            evicted=write_result.evicted,
+            evicted_provenance_id=write_result.evicted_provenance_id,
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def accounting(
+        self,
+        state: ExperientialMemoryState,
+    ) -> ExperientialMemoryAccounting:
+        """Return exact capacity, byte, and lifetime-operation accounting."""
+        return ExperientialMemoryAccounting(
+            active_entries=state.active_count,
+            capacity_entries=jnp.asarray(self._config.capacity, dtype=jnp.int32),
+            slot_bytes=jnp.asarray(self._slot_bytes, dtype=jnp.uint32),
+            persistent_bytes=state.persistent_bytes,
+            queries=state.query_count,
+            accepted_queries=state.accepted_query_count,
+            writes=state.write_count,
+            rejected_writes=state.rejected_write_count,
+            evictions=state.eviction_count,
+        )
+
+
+__all__ = [
+    "ExperientialMemory",
+    "ExperientialMemoryAccounting",
+    "ExperientialMemoryConfig",
+    "ExperientialMemoryEntries",
+    "ExperientialMemoryEntry",
+    "ExperientialMemoryRetrieval",
+    "ExperientialMemoryState",
+    "ExperientialMemoryStepResult",
+    "ExperientialMemoryWriteResult",
+]

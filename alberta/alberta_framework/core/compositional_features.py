@@ -2214,9 +2214,12 @@ class CompositionalFeatureLearner:
         possible, a fresh random composition that respects the depth budget
         and the topological invariant.
         """
-        del observation  # not used by the simple raw-input refresh path
         n_features = self._n_features
-        feature_dim = self._raw_input_dim_from_state(parent_a, ops)
+        # The raw-input dim is static under JIT: it is the observation length.
+        # Using it (rather than ``n_features``) keeps OP_RAW fallback indices
+        # inside the raw-input range so they never alias a wrong raw feature.
+        feature_dim = observation.shape[0]
+        del observation  # only the static shape is needed by the refresh path
 
         # Descendant cascade: scan through slots and propagate the mask.
         def cascade_step(
@@ -2347,20 +2350,6 @@ class CompositionalFeatureLearner:
             )
         )
         return ops_f, pa_f, pb_f, theta_f, depth_f, utils_f, ages_f, ow_f
-
-    def _raw_input_dim_from_state(self, parent_a: Array, ops: Array) -> int:
-        """Recover the raw input dim from state shapes.
-
-        We assume the first ``feature_dim`` slots are ``OP_RAW`` with
-        ``parent_a == slot_index``; we recover that dim from the leading
-        run of OP_RAW slots at init.  This is purely a Python-side helper
-        used for refill fallbacks; it returns a Python int derived from
-        ``self._n_features`` (since at runtime we can't introspect the
-        active raw-input dim under JIT).  We use ``self._n_features`` as a
-        safe upper bound.
-        """
-        del parent_a, ops
-        return self._n_features
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def update(

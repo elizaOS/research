@@ -189,11 +189,22 @@ def test_init_step10_state_shapes() -> None:
     chex.assert_shape(state.base_learner_state.head_params.weights[0], (1, 4))
     chex.assert_shape(state.option_policies.q_weights, (1, 2, 4))
     chex.assert_shape(state.option_models.next_state_weights, (1, 4, 4))
+    chex.assert_shape(state.option_models.baseline_mass_ema, (1,))
+    chex.assert_shape(state.option_baseline_mass, ())
 
 
-def test_init_step10_state_executing_option_is_minus_one() -> None:
-    _, state = _setup()
-    assert int(state.executing_option) == -1
+def test_init_step10_state_records_first_selected_action() -> None:
+    agent, state = _setup()
+    executing_option = int(state.executing_option)
+    assert -1 <= executing_option < agent.config.n_options
+    assert 0 <= int(state.last_primitive_action) < agent.config.n_primitive_actions
+    if executing_option >= 0:
+        assert int(state.base_last_action) == (
+            agent.config.n_primitive_actions + executing_option
+        )
+        chex.assert_trees_all_close(state.option_start_obs, state.base_last_obs)
+    else:
+        assert int(state.base_last_action) < agent.config.n_primitive_actions
 
 
 def test_init_step10_state_step_count_zero() -> None:

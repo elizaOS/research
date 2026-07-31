@@ -3,12 +3,14 @@
 import time
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import pytest
 
 from alberta_framework import (
     IDBD,
+    LMS,
     AGCBounding,
     Autostep,
     BatchedMLPResult,
@@ -1178,3 +1180,100 @@ class TestNeuronUtility:
         restored = MLPLearner.from_config(cfg)
         assert restored._track_neuron_utility is True
         assert restored._neuron_utility_decay == pytest.approx(0.95)
+
+
+class TestResetDormantOptimizerState:
+    """Collapse-reset-recover: dormant reset must reinitialise optimizer slices.
+
+    ``reset_dormant_neurons`` must splice ``init_for_shape`` values into the
+    optimizer state for reset neurons (not zeros: IDBD stores *log* step-sizes
+    where zero means exp(0)=1.0, and Autostep step-sizes adapt multiplicatively
+    so zero sticks at zero) and must leave shared scalar leaves (e.g.
+    ``meta_step_size``) scalar.
+    """
+
+    N_HIDDEN = 8
+    FEATURE_DIM = 4
+    N_RESET = 3
+
+    @pytest.mark.parametrize(
+        "make_optimizer",
+        [
+            lambda: LMS(step_size=0.05),
+            lambda: IDBD(initial_step_size=0.05, meta_step_size=0.01),
+            lambda: Autostep(initial_step_size=0.05, meta_step_size=0.01),
+        ],
+        ids=["lms", "idbd", "autostep"],
+    )
+    def test_collapse_reset_recover(self, make_optimizer):
+        optimizer = make_optimizer()
+        learner = MLPLearner(
+            hidden_sizes=(self.N_HIDDEN,),
+            optimizer=optimizer,
+            sparsity=0.0,
+            track_neuron_utility=True,
+            neuron_utility_decay=0.9,
+        )
+        state = learner.init(feature_dim=self.FEATURE_DIM, key=jr.key(0))
+
+        # Learnable linear target so error can recover after the reset.
+        w_true = jnp.array([0.5, -0.3, 0.8, 0.1], dtype=jnp.float32)
+        obs_seq = jr.normal(jr.key(1), (1000, self.FEATURE_DIM), dtype=jnp.float32)
+
+        for t in range(200):
+            obs = obs_seq[t % obs_seq.shape[0]]
+            state = learner.update(state, obs, jnp.dot(w_true, obs)[None]).state
+
+        # Force exactly the first N_RESET neurons dormant.
+        assert state.neuron_utility is not None
+        forced = jnp.where(
+            jnp.arange(self.N_HIDDEN) < self.N_RESET, 0.0, 1.0
+        ).astype(jnp.float32)
+        state = state.replace(neuron_utility=(forced,))
+        reset_state = learner.reset_dormant_neurons(state, jr.key(2), threshold=0.5)
+
+        mask = jnp.arange(self.N_HIDDEN) < self.N_RESET
+        fresh_states = (
+            optimizer.init_for_shape((self.N_HIDDEN, self.FEATURE_DIM)),
+            optimizer.init_for_shape((self.N_HIDDEN,)),
+        )
+        for j, fresh in enumerate(fresh_states):
+            old_leaves = jax.tree_util.tree_leaves(state.optimizer_states[j])
+            new_leaves = jax.tree_util.tree_leaves(reset_state.optimizer_states[j])
+            fresh_leaves = jax.tree_util.tree_leaves(fresh)
+            for old, new, ref in zip(old_leaves, new_leaves, fresh_leaves):
+                # Leaf shapes must be preserved: scalar leaves stay scalar.
+                assert new.shape == old.shape
+                if new.ndim == 0:
+                    # Shared scalars (e.g. meta_step_size) must be untouched.
+                    assert jnp.allclose(new, old)
+                else:
+                    sel = mask[:, None] if new.ndim == 2 else mask
+                    # Reset slices equal fresh init_for_shape values.
+                    assert jnp.allclose(
+                        jnp.where(sel, new, 0.0), jnp.where(sel, ref, 0.0)
+                    )
+                    # Non-reset slices are untouched.
+                    assert jnp.allclose(
+                        jnp.where(sel, 0.0, new), jnp.where(sel, 0.0, old)
+                    )
+
+        # Recovery: 1000 further updates must stay finite and reduce error.
+        state = reset_state
+        sq_errors = []
+        for t in range(1000):
+            obs = obs_seq[t]
+            result = learner.update(state, obs, jnp.dot(w_true, obs)[None])
+            state = result.state
+            sq_errors.append(float(jnp.squeeze(result.error)) ** 2)
+
+        for leaf in jax.tree_util.tree_leaves(state):
+            assert bool(jnp.all(jnp.isfinite(leaf)))
+        for j in range(len(state.optimizer_states)):
+            old_leaves = jax.tree_util.tree_leaves(reset_state.optimizer_states[j])
+            new_leaves = jax.tree_util.tree_leaves(state.optimizer_states[j])
+            for old, new in zip(old_leaves, new_leaves):
+                assert new.shape == old.shape
+        mse_first = sum(sq_errors[:100]) / 100.0
+        mse_last = sum(sq_errors[-100:]) / 100.0
+        assert mse_last < mse_first

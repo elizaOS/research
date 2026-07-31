@@ -211,6 +211,11 @@ class QHordeActorCriticAgent:
         for idx, demon in enumerate(critic.horde_spec.demons[: config.n_actions]):
             if demon.demon_type is not DemonType.CONTROL:
                 raise ValueError(f"critic head {idx} must be a control demon")
+            if demon.gamma != 0.0:
+                raise ValueError(
+                    f"critic action head {idx} must use gamma=0 because the "
+                    "adapter supplies an already-bootstrapped SARSA target"
+                )
         self._config = config
         self._critic = critic
         self._actor_bounder = actor_bounder
@@ -383,16 +388,17 @@ class QHordeActorCriticAgent:
             else actor_td_error
         )
         actor_steps: tuple[Array, ...] = (
-            cfg.actor_step_size * actor_scale * actor_trace_weights,
-            cfg.actor_step_size * actor_scale * actor_trace_bias,
+            cfg.actor_step_size * actor_trace_weights,
+            cfg.actor_step_size * actor_trace_bias,
         )
         bound_metric = jnp.array(1.0, dtype=jnp.float32)
         if self._actor_bounder is not None:
             actor_steps, bound_metric = self._actor_bounder.bound(
                 actor_steps,
-                actor_td_error,
+                actor_scale,
                 (state.actor_weights, state.actor_bias),
             )
+        actor_steps = tuple(actor_scale * step for step in actor_steps)
         carry_traces = effective_gamma != 0.0
         updated = state.replace(  # type: ignore[attr-defined]
             actor_weights=state.actor_weights + actor_steps[0],
@@ -671,8 +677,8 @@ class HordeActorCriticAgent:
         actor_trace_weights = actor_decay * state.actor_trace_weights + actor_grad_weights
         actor_trace_bias = actor_decay * state.actor_trace_bias + actor_grad_bias
         actor_steps: tuple[Array, ...] = (
-            cfg.actor_step_size * actor_td_error * actor_trace_weights,
-            cfg.actor_step_size * actor_td_error * actor_trace_bias,
+            cfg.actor_step_size * actor_trace_weights,
+            cfg.actor_step_size * actor_trace_bias,
         )
         bound_metric = jnp.array(1.0, dtype=jnp.float32)
         if self._actor_bounder is not None:
@@ -681,6 +687,7 @@ class HordeActorCriticAgent:
                 actor_td_error,
                 (state.actor_weights, state.actor_bias),
             )
+        actor_steps = tuple(actor_td_error * step for step in actor_steps)
         carry_traces = value_discount != 0.0
 
         updated = state.replace(  # type: ignore[attr-defined]
@@ -1364,8 +1371,8 @@ class NonlinearHordeActorCriticAgent:
                 error=actor_td_error,
             )
             new_trunk_opt_states.extend([new_opt_w, new_opt_b])
-            trunk_w_steps.append(actor_td_error * raw_w)
-            trunk_b_steps.append(actor_td_error * raw_b)
+            trunk_w_steps.append(raw_w)
+            trunk_b_steps.append(raw_b)
 
         raw_head_w, new_head_opt_w = self._actor_optimizer.update_from_gradient(
             state.actor_head_opt_w, new_head_trace_w, error=actor_td_error
@@ -1373,8 +1380,8 @@ class NonlinearHordeActorCriticAgent:
         raw_head_b, new_head_opt_b = self._actor_optimizer.update_from_gradient(
             state.actor_head_opt_b, new_head_trace_b, error=actor_td_error
         )
-        head_w_step = actor_td_error * raw_head_w
-        head_b_step = actor_td_error * raw_head_b
+        head_w_step = raw_head_w
+        head_b_step = raw_head_b
 
         bound_metric = jnp.array(1.0, dtype=jnp.float32)
         if self._actor_bounder is not None:
@@ -1399,6 +1406,10 @@ class NonlinearHordeActorCriticAgent:
             trunk_b_steps = list(bounded_steps[n_hidden : 2 * n_hidden])
             head_w_step = bounded_steps[2 * n_hidden]
             head_b_step = bounded_steps[2 * n_hidden + 1]
+        trunk_w_steps = [actor_td_error * step for step in trunk_w_steps]
+        trunk_b_steps = [actor_td_error * step for step in trunk_b_steps]
+        head_w_step = actor_td_error * head_w_step
+        head_b_step = actor_td_error * head_b_step
 
         new_trunk_weights = tuple(
             w + step for w, step in zip(state.actor_trunk.weights, trunk_w_steps)
@@ -1604,6 +1615,11 @@ class NonlinearQHordeActorCriticAgent:
         for idx, demon in enumerate(critic.horde_spec.demons[: config.n_actions]):
             if demon.demon_type is not DemonType.CONTROL:
                 raise ValueError(f"critic head {idx} must be a control demon")
+            if demon.gamma != 0.0:
+                raise ValueError(
+                    f"critic action head {idx} must use gamma=0 because the "
+                    "adapter supplies an already-bootstrapped SARSA target"
+                )
         self._config = config
         self._critic = critic
         self._actor_optimizer = (
@@ -1882,8 +1898,8 @@ class NonlinearQHordeActorCriticAgent:
                 error=actor_signal,
             )
             new_trunk_opt_states.extend([new_opt_w, new_opt_b])
-            trunk_w_steps.append(actor_signal * raw_w)
-            trunk_b_steps.append(actor_signal * raw_b)
+            trunk_w_steps.append(raw_w)
+            trunk_b_steps.append(raw_b)
 
         raw_head_w, new_head_opt_w = self._actor_optimizer.update_from_gradient(
             state.actor_head_opt_w, new_head_trace_w, error=actor_signal
@@ -1891,14 +1907,14 @@ class NonlinearQHordeActorCriticAgent:
         raw_head_b, new_head_opt_b = self._actor_optimizer.update_from_gradient(
             state.actor_head_opt_b, new_head_trace_b, error=actor_signal
         )
-        head_w_step = actor_signal * raw_head_w
-        head_b_step = actor_signal * raw_head_b
+        head_w_step = raw_head_w
+        head_b_step = raw_head_b
 
         bound_metric = jnp.array(1.0, dtype=jnp.float32)
         if self._actor_bounder is not None:
             bounded_steps, bound_metric = self._actor_bounder.bound(
                 (*trunk_w_steps, *trunk_b_steps, head_w_step, head_b_step),
-                actor_td_error,
+                actor_signal,
                 (
                     *state.actor_trunk.weights,
                     *state.actor_trunk.biases,
@@ -1910,6 +1926,10 @@ class NonlinearQHordeActorCriticAgent:
             trunk_b_steps = list(bounded_steps[n_hidden : 2 * n_hidden])
             head_w_step = bounded_steps[2 * n_hidden]
             head_b_step = bounded_steps[2 * n_hidden + 1]
+        trunk_w_steps = [actor_signal * step for step in trunk_w_steps]
+        trunk_b_steps = [actor_signal * step for step in trunk_b_steps]
+        head_w_step = actor_signal * head_w_step
+        head_b_step = actor_signal * head_b_step
 
         carry_traces = effective_gamma != 0.0
         updated = state.replace(  # type: ignore[attr-defined]

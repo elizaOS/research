@@ -81,11 +81,16 @@ class OaKConfig:
             eligible for replacement.  Set to 0 to disable automatic
             threshold gating (replace the worst option unconditionally when
             :meth:`curate` is called).
+        min_steps_before_curation: Minimum number of primitive steps
+            (``step_count``) before :meth:`curate` may evict an option.
+            Guards against evicting on untrained utility EMAs.  0 (default)
+            disables the guard, preserving unconditional curation.
     """
 
     stomp: STOMPConfig = dataclasses.field(default_factory=_default_stomp_config)
     utility_ema_decay: float = 0.99
     curation_threshold: float = 0.0
+    min_steps_before_curation: int = 0
 
     def __post_init__(self) -> None:
         if not self.stomp.subtask_specs:
@@ -94,6 +99,8 @@ class OaKConfig:
             raise ValueError("utility_ema_decay must be in [0, 1]")
         if self.curation_threshold < 0.0:
             raise ValueError("curation_threshold must be non-negative")
+        if self.min_steps_before_curation < 0:
+            raise ValueError("min_steps_before_curation must be non-negative")
 
     @property
     def n_options(self) -> int:
@@ -114,6 +121,7 @@ class OaKConfig:
             "stomp": self.stomp.to_config(),
             "utility_ema_decay": self.utility_ema_decay,
             "curation_threshold": self.curation_threshold,
+            "min_steps_before_curation": self.min_steps_before_curation,
         }
 
     @classmethod
@@ -166,6 +174,8 @@ class OaKUpdateResult:
     option_terminated: Array
     pseudo_reward: Float[Array, ""]
     utility_ema: Float[Array, " n_options"]
+    planning_backups: Int[Array, ""]
+    planning_td_error: Float[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -180,6 +190,8 @@ class OaKArrayResult:
     option_terminations: Array
     pseudo_rewards: Float[Array, " num_steps"]
     utility_emas: Float[Array, "num_steps n_options"]
+    planning_backups: Int[Array, " num_steps"]
+    planning_td_errors: Float[Array, " num_steps"]
 
 
 # ---------------------------------------------------------------------------
@@ -439,13 +451,32 @@ class OaKAgent:
     def start(self, state: OaKState, initial_observation: Array) -> OaKState:
         """Prime the agent with an initial observation."""
         new_stomp = self._stomp.start(state.stomp_state, initial_observation)
-        return cast(OaKState, state.replace(stomp_state=new_stomp))
+        started_option = new_stomp.executing_option
+        started_mask = (
+            jnp.arange(self._config.n_options, dtype=jnp.int32)
+            == jnp.maximum(started_option, jnp.array(0, dtype=jnp.int32))
+        )
+        new_execution_counts = state.execution_counts + jnp.where(
+            started_mask & (started_option >= 0),
+            jnp.ones(self._config.n_options, dtype=jnp.int32),
+            jnp.zeros(self._config.n_options, dtype=jnp.int32),
+        )
+        return cast(
+            OaKState,
+            state.replace(
+                stomp_state=new_stomp,
+                execution_counts=new_execution_counts,
+            ),
+        )
 
     def update(
         self,
         state: OaKState,
         env_reward: Array,
         next_observation: Array,
+        discount: Array | None = None,
+        *,
+        enable_option_planning: bool = True,
     ) -> OaKUpdateResult:
         """Process one real-time primitive STOMP + utility-tracking step.
 
@@ -456,6 +487,8 @@ class OaKAgent:
             state: Current OaK state.
             env_reward: Scalar environment reward.
             next_observation: Next observation from the environment.
+            discount: Effective continuation multiplier. ``None`` preserves
+                STOMP's historical primitive/``option_gamma`` behavior.
 
         Returns:
             :class:`OaKUpdateResult` with new state and per-step diagnostics.
@@ -464,34 +497,57 @@ class OaKAgent:
         n_opt = cfg.n_options
 
         stomp_result: STOMPUpdateResult = self._stomp.update(
-            state.stomp_state, env_reward, next_observation
+            state.stomp_state,
+            env_reward,
+            next_observation,
+            discount,
+            enable_planning=enable_option_planning,
         )
 
-        executing = stomp_result.state.executing_option
-        option_idx = jnp.maximum(executing, jnp.array(0, dtype=jnp.int32))
-        option_mask = jnp.arange(n_opt, dtype=jnp.int32) == option_idx
-        is_exec = executing >= jnp.array(0, dtype=jnp.int32)
+        # The pseudo-reward in ``stomp_result`` belongs to the transition just
+        # completed, so credit it to the option that owned that transition
+        # before STOMP selected the next action. This is especially important
+        # on termination: the post-transition state may be primitive or may
+        # already be executing a different (or restarted) option.
+        prior_option = state.stomp_state.executing_option
+        prior_option_idx = jnp.maximum(
+            prior_option, jnp.array(0, dtype=jnp.int32)
+        )
+        prior_option_mask = (
+            jnp.arange(n_opt, dtype=jnp.int32) == prior_option_idx
+        )
+        was_executing = prior_option >= jnp.array(0, dtype=jnp.int32)
 
-        # Utility EMA: update when the option is executing
+        # Utility EMA: update the option that generated this transition.
         decay = jnp.asarray(cfg.utility_ema_decay, dtype=jnp.float32)
         new_utility_ema = jnp.where(
-            option_mask & is_exec,
+            prior_option_mask & was_executing,
             decay * state.utility_ema + (1.0 - decay) * stomp_result.pseudo_reward,
             state.utility_ema,
         )
 
-        # Execution count: increment on option start
-        was_idle = state.stomp_state.executing_option < jnp.array(0, dtype=jnp.int32)
-        just_started = was_idle & is_exec
+        # Execution count belongs to the option selected *after* the
+        # transition. A termination followed by the same option is a genuine
+        # restart and therefore counts as a new execution.
+        post_option = stomp_result.state.executing_option
+        post_option_idx = jnp.maximum(
+            post_option, jnp.array(0, dtype=jnp.int32)
+        )
+        post_option_mask = jnp.arange(n_opt, dtype=jnp.int32) == post_option_idx
+        is_executing_after = post_option >= jnp.array(0, dtype=jnp.int32)
+        just_started = is_executing_after & (
+            (~was_executing) | stomp_result.option_terminated
+        )
         new_exec_counts = state.execution_counts + jnp.where(
-            option_mask & just_started,
+            post_option_mask & just_started,
             jnp.ones(n_opt, dtype=jnp.int32),
             jnp.zeros(n_opt, dtype=jnp.int32),
         )
 
-        # Cumulative pseudo-reward: accumulate while executing
+        # Cumulative pseudo-reward follows the same transition ownership as
+        # utility, including the terminating pseudo-reward.
         new_cum_pseudo = state.cumulative_pseudo_rewards + jnp.where(
-            option_mask & is_exec,
+            prior_option_mask & was_executing,
             jnp.full(n_opt, stomp_result.pseudo_reward, dtype=jnp.float32),
             jnp.zeros(n_opt, dtype=jnp.float32),
         )
@@ -513,6 +569,8 @@ class OaKAgent:
             option_terminated=stomp_result.option_terminated,
             pseudo_reward=stomp_result.pseudo_reward,
             utility_ema=new_utility_ema,
+            planning_backups=stomp_result.planning_backups,
+            planning_td_error=stomp_result.planning_td_error,
         )
 
     def scan(
@@ -520,15 +578,21 @@ class OaKAgent:
         state: OaKState,
         env_rewards: Array,
         next_observations: Array,
+        discounts: Array | None = None,
     ) -> OaKArrayResult:
-        """Run OaK over pre-collected continuing transition arrays via scan."""
+        """Run OaK over transition arrays, optionally with explicit discounts."""
 
         def step_fn(
             carry: OaKState,
-            inputs: tuple[Array, Array],
+            inputs: tuple[Array, Array, Array],
         ) -> tuple[OaKState, tuple[Array, ...]]:
-            reward, next_obs = inputs
-            result = self.update(carry, reward, next_obs)
+            reward, next_obs, transition_discount = inputs
+            result = self.update(
+                carry,
+                reward,
+                next_obs,
+                transition_discount if discounts is not None else None,
+            )
             return result.state, (
                 result.td_error,
                 result.average_reward,
@@ -537,7 +601,14 @@ class OaKAgent:
                 result.option_terminated,
                 result.pseudo_reward,
                 result.utility_ema,
+                result.planning_backups,
+                result.planning_td_error,
             )
+
+        if discounts is None:
+            scan_discounts = jnp.ones_like(env_rewards, dtype=jnp.float32)
+        else:
+            scan_discounts = jnp.asarray(discounts, dtype=jnp.float32)
 
         final_state, (
             td_errors,
@@ -547,7 +618,13 @@ class OaKAgent:
             option_terminations,
             pseudo_rewards,
             utility_emas,
-        ) = jax.lax.scan(step_fn, state, (env_rewards, next_observations))
+            planning_backups,
+            planning_td_errors,
+        ) = jax.lax.scan(
+            step_fn,
+            state,
+            (env_rewards, next_observations, scan_discounts),
+        )
 
         return OaKArrayResult(
             state=final_state,
@@ -558,6 +635,8 @@ class OaKAgent:
             option_terminations=option_terminations,
             pseudo_rewards=pseudo_rewards,
             utility_emas=utility_emas,
+            planning_backups=planning_backups,
+            planning_td_errors=planning_td_errors,
         )
 
     def curate(
@@ -575,6 +654,12 @@ class OaKAgent:
         Curation is a **Python-level operation** — it runs outside
         ``jax.lax.scan`` / JIT and materialises JAX array values.
 
+        When ``config.min_steps_before_curation > 0`` and fewer primitive
+        steps have elapsed, no eviction occurs and ``(self, state)`` is
+        returned unchanged. Curation is also deferred when the lowest-utility
+        option is currently executing, so a subtask specification is never
+        changed in the middle of its trajectory.
+
         Args:
             state: Current OaK state.
             key: JAX PRNG key for selecting the replacement feature index.
@@ -589,12 +674,23 @@ class OaKAgent:
         cfg = self._config
         utility = state.utility_ema
 
+        # Minimum-uptime guard: never evict before utilities have had time
+        # to be learned (untrained EMAs would make the choice arbitrary)
+        if int(state.step_count) < cfg.min_steps_before_curation:
+            return self, state
+
         # Find option with lowest utility
         worst_idx = int(jnp.argmin(utility))
         worst_utility = float(utility[worst_idx])
 
         # Skip if utility is above threshold and threshold > 0
         if cfg.curation_threshold > 0.0 and worst_utility >= cfg.curation_threshold:
+            return self, state
+
+        # Replacing an active option would reinterpret its already-dispatched
+        # action and accumulated trajectory under a different SubtaskSpec.
+        # Defer this curation attempt until the option has terminated.
+        if int(state.stomp_state.executing_option) == worst_idx:
             return self, state
 
         # Pick replacement feature index
@@ -630,10 +726,15 @@ class OaKAgent:
         new_op_traces = state.stomp_state.option_policies.traces.at[idx].set(
             jnp.zeros_like(state.stomp_state.option_policies.traces[idx])
         )
+        new_op_average_rewards = (
+            state.stomp_state.option_policies.average_rewards.at[idx].set(0.0)
+        )
         new_option_policies = cast(
             IntraOptionPoliciesState,
             state.stomp_state.option_policies.replace(
-                q_weights=new_op_weights, traces=new_op_traces
+                q_weights=new_op_weights,
+                traces=new_op_traces,
+                average_rewards=new_op_average_rewards,
             ),
         )
 
@@ -644,6 +745,11 @@ class OaKAgent:
             OptionModelsState,
             state.stomp_state.option_models.replace(
                 cumreward_ema=state.stomp_state.option_models.cumreward_ema.at[idx].set(0.0),
+                env_return_ema=state.stomp_state.option_models.env_return_ema.at[idx].set(0.0),
+                duration_ema=state.stomp_state.option_models.duration_ema.at[idx].set(0.0),
+                baseline_mass_ema=state.stomp_state.option_models.baseline_mass_ema.at[
+                    idx
+                ].set(0.0),
                 discount_ema=state.stomp_state.option_models.discount_ema.at[idx].set(1.0),
                 next_state_weights=new_ns_weights,
                 n_completions=state.stomp_state.option_models.n_completions.at[idx].set(0),
@@ -664,8 +770,13 @@ class OaKAgent:
             (jnp.zeros_like(tw), jnp.zeros_like(tb)) if i == base_action_idx else (tw, tb)
             for i, (tw, tb) in enumerate(ls.head_traces)
         )
+        # Optimizer state must be reset to a *fresh init*, not zeros: LMS
+        # stores the step-size itself and IDBD stores log step-sizes
+        # (exp(0) = 1.0), so zeroed state would freeze or corrupt learning.
+        key, init_key = jr.split(key)
+        fresh_ls = self._stomp.base_learner.init(cfg.observation_dim, init_key)
         new_head_opt_states = tuple(
-            jax.tree_util.tree_map(jnp.zeros_like, opt) if i == base_action_idx else opt
+            fresh_ls.head_optimizer_states[i] if i == base_action_idx else opt
             for i, opt in enumerate(ls.head_optimizer_states)
         )
         new_base_learner_state = ls.replace(

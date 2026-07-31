@@ -1,3 +1,4 @@
+# mypy: disable-error-code="call-arg,name-defined"
 """Online behavior/action prediction for discrete-action agents.
 
 The behavior model is a temporally uniform supervised learner for
@@ -10,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 from typing import Any
 
 import chex
@@ -18,6 +20,14 @@ import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
 from jaxtyping import Float, Int
+
+_INT32_MAX = 2**31 - 1
+
+
+def _saturating_int32_increment(value: Array) -> Array:
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    counter = jnp.asarray(value, dtype=jnp.int32)
+    return jnp.minimum(jnp.maximum(counter, 0), maximum - 1) + 1
 
 
 def floor_and_renormalize_probabilities(
@@ -42,9 +52,7 @@ def floor_and_renormalize_probabilities(
     )
     normalized = clipped / normalizer
     floor_mass = jnp.asarray(min_probability * n_actions, dtype=jnp.float32)
-    return jnp.asarray(min_probability, dtype=jnp.float32) + (
-        1.0 - floor_mass
-    ) * normalized
+    return jnp.asarray(min_probability, dtype=jnp.float32) + (1.0 - floor_mass) * normalized
 
 
 def selected_action_probabilities(
@@ -132,9 +140,7 @@ def epsilon_greedy_probabilities(
     n_actions = q.shape[-1]
     eps = jnp.asarray(epsilon, dtype=jnp.float32)
     max_q = jnp.max(q, axis=-1, keepdims=True)
-    greedy_mask = jnp.isclose(q, max_q, atol=tie_tolerance, rtol=0.0).astype(
-        jnp.float32
-    )
+    greedy_mask = jnp.isclose(q, max_q, atol=tie_tolerance, rtol=0.0).astype(jnp.float32)
     n_greedy = jnp.sum(greedy_mask, axis=-1, keepdims=True)
     explore = eps / n_actions
     exploit = (1.0 - eps) * greedy_mask / jnp.maximum(n_greedy, 1.0)
@@ -168,22 +174,28 @@ class BehaviorModelConfig:
 
     def __post_init__(self) -> None:
         """Validate scalar hyperparameters."""
-        if self.n_actions <= 0:
+        if (
+            isinstance(self.n_actions, bool)
+            or not isinstance(self.n_actions, int)
+            or self.n_actions <= 0
+        ):
             raise ValueError("n_actions must be positive")
-        if self.step_size < 0.0:
-            raise ValueError("step_size must be non-negative")
-        if self.temperature <= 0.0:
-            raise ValueError("temperature must be positive")
-        if self.l2_penalty < 0.0:
-            raise ValueError("l2_penalty must be non-negative")
-        if self.max_gradient_norm is not None and self.max_gradient_norm <= 0.0:
+        if not math.isfinite(self.step_size) or self.step_size < 0.0:
+            raise ValueError("step_size must be finite and non-negative")
+        if not math.isfinite(self.temperature) or self.temperature <= 0.0:
+            raise ValueError("temperature must be finite and positive")
+        if not math.isfinite(self.l2_penalty) or self.l2_penalty < 0.0:
+            raise ValueError("l2_penalty must be finite and non-negative")
+        if self.max_gradient_norm is not None and (
+            not math.isfinite(self.max_gradient_norm) or self.max_gradient_norm <= 0.0
+        ):
             raise ValueError("max_gradient_norm must be positive when provided")
-        if self.min_probability <= 0.0:
-            raise ValueError("min_probability must be positive")
-        if self.ratio_clip <= 0.0:
-            raise ValueError("ratio_clip must be positive")
-        if not 0.0 <= self.diagnostic_decay < 1.0:
-            raise ValueError("diagnostic_decay must be in [0, 1)")
+        if not math.isfinite(self.min_probability) or not 0.0 < self.min_probability < 1.0:
+            raise ValueError("min_probability must be finite and lie in (0, 1)")
+        if not math.isfinite(self.ratio_clip) or self.ratio_clip <= 0.0:
+            raise ValueError("ratio_clip must be finite and positive")
+        if not math.isfinite(self.diagnostic_decay) or not 0.0 <= self.diagnostic_decay < 1.0:
+            raise ValueError("diagnostic_decay must be finite and lie in [0, 1)")
 
     def to_config(self) -> dict[str, Any]:
         """Serialize configuration to a JSON-compatible dictionary."""
@@ -206,6 +218,48 @@ class BehaviorModelState:
     nll_ema: Float[Array, ""]
     accuracy_ema: Float[Array, ""]
     confidence_ema: Float[Array, ""]
+
+
+@dataclasses.dataclass(frozen=True)
+class BehaviorModelResourceBudget:
+    """Exact persistent-state accounting for a configured feature width.
+
+    The byte count covers the arrays in :class:`BehaviorModelState` when
+    initialized with JAX's default two-word typed PRNG key. It excludes Python
+    objects, compiled executables, and transient update buffers. The model has
+    no replay storage.
+    """
+
+    feature_dim: int
+    n_actions: int
+    trainable_float32_scalars: int
+    diagnostic_float32_scalars: int
+    administrative_int32_scalars: int
+    rng_uint32_scalars: int
+    state_nbytes: int
+    learned_float32_scalars_touched_per_update: int
+    replay_capacity: int
+
+    def to_dict(self) -> dict[str, int]:
+        """Return a JSON-compatible resource record."""
+        return dataclasses.asdict(self)
+
+
+@chex.dataclass(frozen=True)
+class BehaviorModelInputGradient:
+    """Pre-update cross-entropy gradient with respect to input features.
+
+    This result is read-only: computing it does not advance diagnostics, RNG,
+    or parameters. ``gradient`` is the derivative of the unfloored softmax
+    cross entropy. Probability flooring remains confined to reporting and
+    importance-ratio safety.
+    """
+
+    logits: Float[Array, " n_actions"]
+    probabilities: Float[Array, " n_actions"]
+    loss: Float[Array, ""]
+    gradient: Float[Array, " feature_dim"]
+    gradient_norm: Float[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -283,7 +337,9 @@ class BehaviorModel:
 
     def init(self, feature_dim: int, key: Array) -> BehaviorModelState:
         """Initialize parameters and diagnostics."""
-        return BehaviorModelState(  # type: ignore[call-arg]
+        if isinstance(feature_dim, bool) or not isinstance(feature_dim, int) or feature_dim <= 0:
+            raise ValueError("feature_dim must be a positive integer")
+        return BehaviorModelState(
             weights=jnp.zeros(
                 (self._config.n_actions, feature_dim),
                 dtype=jnp.float32,
@@ -294,6 +350,32 @@ class BehaviorModel:
             nll_ema=jnp.array(0.0, dtype=jnp.float32),
             accuracy_ema=jnp.array(0.0, dtype=jnp.float32),
             confidence_ema=jnp.array(0.0, dtype=jnp.float32),
+        )
+
+    def resource_budget(self, feature_dim: int) -> BehaviorModelResourceBudget:
+        """Return exact fixed-state accounting for ``feature_dim``.
+
+        The implementation initializes ``weights`` and ``bias`` as trainable
+        float32 arrays, keeps three float32 diagnostics and one int32 counter,
+        and stores a default JAX typed key backed by two uint32 words.
+        """
+        if isinstance(feature_dim, bool) or not isinstance(feature_dim, int) or feature_dim <= 0:
+            raise ValueError("feature_dim must be a positive integer")
+        trainable = self._config.n_actions * feature_dim + self._config.n_actions
+        diagnostics = 3
+        administrative = 1
+        rng_words = 2
+        state_nbytes = 4 * (trainable + diagnostics + administrative + rng_words)
+        return BehaviorModelResourceBudget(
+            feature_dim=feature_dim,
+            n_actions=self._config.n_actions,
+            trainable_float32_scalars=trainable,
+            diagnostic_float32_scalars=diagnostics,
+            administrative_int32_scalars=administrative,
+            rng_uint32_scalars=rng_words,
+            state_nbytes=state_nbytes,
+            learned_float32_scalars_touched_per_update=trainable + diagnostics,
+            replay_capacity=0,
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -342,6 +424,39 @@ class BehaviorModel:
         return jnp.log(self.action_probability(state, observation, action))
 
     @functools.partial(jax.jit, static_argnums=(0,))
+    def input_loss_gradient(
+        self,
+        state: BehaviorModelState,
+        observation: Array,
+        action: Array,
+    ) -> BehaviorModelInputGradient:
+        """Differentiate the pre-update prediction loss through its features.
+
+        This is the supported causal bridge from partner prediction into a
+        trainable state builder. Callers must invoke it before
+        :meth:`update`, and before advancing a recurrent state builder to the
+        next observation, so the gradient refers to the representation that
+        produced the scored prediction.
+        """
+        cfg = self._config
+        obs = jnp.asarray(observation, dtype=jnp.float32)
+        action_id = jnp.asarray(action, dtype=jnp.int32)
+        logits = state.weights @ obs + state.bias
+        scaled_logits = logits / cfg.temperature
+        probabilities = jax.nn.softmax(scaled_logits)
+        one_hot = jax.nn.one_hot(action_id, cfg.n_actions, dtype=jnp.float32)
+        loss = -jnp.sum(one_hot * jax.nn.log_softmax(scaled_logits))
+        logit_gradient = (probabilities - one_hot) / cfg.temperature
+        gradient = state.weights.T @ logit_gradient
+        return BehaviorModelInputGradient(
+            logits=logits,
+            probabilities=probabilities,
+            loss=loss,
+            gradient=gradient,
+            gradient_norm=jnp.linalg.norm(gradient),
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
     def update(
         self,
         state: BehaviorModelState,
@@ -365,8 +480,7 @@ class BehaviorModel:
 
         if cfg.max_gradient_norm is not None:
             grad_norm = jnp.sqrt(
-                jnp.sum(weight_gradient * weight_gradient)
-                + jnp.sum(bias_gradient * bias_gradient)
+                jnp.sum(weight_gradient * weight_gradient) + jnp.sum(bias_gradient * bias_gradient)
             )
             grad_scale = jnp.minimum(
                 1.0,
@@ -383,9 +497,7 @@ class BehaviorModel:
         )
         log_likelihood = jnp.log(action_prob)
         loss = -log_likelihood
-        entropy = -jnp.sum(
-            probabilities * jnp.log(jnp.maximum(probabilities, cfg.min_probability))
-        )
+        entropy = -jnp.sum(probabilities * jnp.log(jnp.maximum(probabilities, cfg.min_probability)))
         confidence = jnp.max(probabilities)
         predicted_action = jnp.argmax(probabilities).astype(jnp.int32)
         correct = (predicted_action == action_id).astype(jnp.float32)
@@ -411,12 +523,12 @@ class BehaviorModel:
         new_state = state.replace(  # type: ignore[attr-defined]
             weights=state.weights + cfg.step_size * weight_gradient,
             bias=state.bias + cfg.step_size * bias_gradient,
-            step_count=state.step_count + 1,
+            step_count=_saturating_int32_increment(state.step_count),
             nll_ema=nll_ema,
             accuracy_ema=accuracy_ema,
             confidence_ema=confidence_ema,
         )
-        return BehaviorModelUpdateResult(  # type: ignore[call-arg]
+        return BehaviorModelUpdateResult(
             state=new_state,
             logits=logits,
             probabilities=probabilities,
@@ -450,7 +562,7 @@ class BehaviorModel:
             action,
             min_probability=self._config.min_probability,
         )
-        return BehaviorModelSampleResult(  # type: ignore[call-arg]
+        return BehaviorModelSampleResult(
             state=state.replace(rng_key=key),  # type: ignore[attr-defined]
             action=action,
             probabilities=probabilities,
@@ -502,16 +614,19 @@ def run_behavior_model_from_arrays(
             result.correct,
         )
 
-    final_state, (
-        probabilities,
-        action_probabilities,
-        log_likelihoods,
-        losses,
-        entropies,
-        confidences,
-        correct,
+    (
+        final_state,
+        (
+            probabilities,
+            action_probabilities,
+            log_likelihoods,
+            losses,
+            entropies,
+            confidences,
+            correct,
+        ),
     ) = jax.lax.scan(_scan_fn, state, (observations, actions))
-    return BehaviorModelArrayResult(  # type: ignore[call-arg]
+    return BehaviorModelArrayResult(
         state=final_state,
         probabilities=probabilities,
         action_probabilities=action_probabilities,
@@ -527,6 +642,8 @@ __all__ = [
     "BehaviorModel",
     "BehaviorModelArrayResult",
     "BehaviorModelConfig",
+    "BehaviorModelInputGradient",
+    "BehaviorModelResourceBudget",
     "BehaviorModelSampleResult",
     "BehaviorModelState",
     "BehaviorModelUpdateResult",
