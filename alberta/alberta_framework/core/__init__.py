@@ -366,6 +366,15 @@ from alberta_framework.core.recurrent_trace_actor_critic import (
     RecurrentTraceActorCriticState,
     RecurrentTraceActorCriticUpdateResult,
 )
+from alberta_framework.core.representation_gradient_mixer import (
+    REPRESENTATION_GRADIENT_MIXER_CONFIG_SCHEMA,
+    GradientMixMode,
+    GradientNormalization,
+    RepresentationGradientMixDiagnostics,
+    RepresentationGradientMixerConfig,
+    RepresentationGradientMixResult,
+    mix_representation_gradients,
+)
 from alberta_framework.core.resource_manager import (
     finite_candidate_hedge_regret_bound,
     optimal_hedge_learning_rate,
@@ -709,6 +718,14 @@ __all__ = [
     "ReplayActionEncoding",
     "load_model_replay_rehearsal_checkpoint",
     "save_model_replay_rehearsal_checkpoint",
+    # Explicit two-source representation-gradient composition
+    "REPRESENTATION_GRADIENT_MIXER_CONFIG_SCHEMA",
+    "GradientMixMode",
+    "GradientNormalization",
+    "RepresentationGradientMixDiagnostics",
+    "RepresentationGradientMixerConfig",
+    "RepresentationGradientMixResult",
+    "mix_representation_gradients",
     # Dreaming / self-simulation
     "ActionConditionedDreamWorld",
     "BehaviorModelDreamPolicy",

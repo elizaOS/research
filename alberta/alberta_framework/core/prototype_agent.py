@@ -78,7 +78,18 @@ from alberta_framework.core.model_replay_rehearsal import (
     RealModelReplayEvent,
 )
 from alberta_framework.core.oak import OaKAgent, OaKConfig, OaKState
-from alberta_framework.core.options import STOMPConfig, SubtaskSpec
+from alberta_framework.core.options import (
+    STOMPConfig,
+    SubtaskSpec,
+    check_option_terminated,
+    compute_pseudo_reward,
+)
+from alberta_framework.core.representation_gradient_mixer import (
+    RepresentationGradientMixDiagnostics,
+    RepresentationGradientMixResult,
+    RepresentationGradientMixerConfig,
+    mix_representation_gradients,
+)
 from alberta_framework.core.state_builder import (
     IdentityStateBuilderConfig,
     OnlineGatedStateBuilderConfig,
@@ -376,6 +387,13 @@ class PrototypeAgentConfig:
             The proposal is formed from the source state that emitted the
             modeled representation and committed into the already-advanced
             destination state, preserving its recurrent history.
+        representation_gradient_mixer: Optional successor path that explicitly
+            mixes the current transition's causal control TD-loss gradient with
+            the real grounded world-model gradient. Its presence enables online
+            builder learning without changing the legacy flag. ``behavior_only``
+            and ``discard`` can be used without an ensemble; modes with an active
+            grounded-world contribution require an ensemble or model-rehearsal
+            lane. Replay gradients are never eligible inputs.
         gradient_joy: Optional literal ``sparks_joy`` audit for each proposed
             builder update. Missing or incomplete probe evidence vetoes only
             the representation update; control and model learning continue.
@@ -399,6 +417,7 @@ class PrototypeAgentConfig:
     gru_perception: GRUPerceptionConfig | None = None
     state_builder: StateBuilderConfig | None = None
     learn_state_builder_from_world_model: bool = False
+    representation_gradient_mixer: RepresentationGradientMixerConfig | None = None
     gradient_joy: GradientJoyConfig | None = None
     auto_curate_every: int = 0
 
@@ -421,6 +440,15 @@ class PrototypeAgentConfig:
             raise ValueError("auto_curate_every must be non-negative")
         if not isinstance(self.learn_state_builder_from_world_model, bool):
             raise ValueError("learn_state_builder_from_world_model must be boolean")
+        mixer = self.representation_gradient_mixer
+        if mixer is not None and not isinstance(
+            mixer,
+            RepresentationGradientMixerConfig,
+        ):
+            raise ValueError(
+                "representation_gradient_mixer must be a "
+                "RepresentationGradientMixerConfig"
+            )
         configured_model_lanes = sum(
             model is not None
             for model in (
@@ -528,24 +556,51 @@ class PrototypeAgentConfig:
                     "dream_next_observation_mode='sample_one_hot' requires "
                     "the raw legacy path or an identity state_builder"
                 )
-        if self.learn_state_builder_from_world_model:
+        if self.learn_state_builder_from_world_model and mixer is None:
+            if self.world_model_ensemble is None and self.model_replay_rehearsal is None:
+                raise ValueError(
+                    "learn_state_builder_from_world_model requires "
+                    "world_model_ensemble or model_replay_rehearsal"
+                )
+        state_builder_learning_enabled = (
+            self.learn_state_builder_from_world_model or mixer is not None
+        )
+        if state_builder_learning_enabled:
+            if not isinstance(self.state_builder, OnlineGatedStateBuilderConfig):
+                raise ValueError(
+                    "online representation learning requires an "
+                    "OnlineGatedStateBuilderConfig"
+                )
+        if mixer is not None:
+            if mixer.representation_dim != self.oak.observation_dim:
+                raise ValueError(
+                    "representation_gradient_mixer.representation_dim must match "
+                    f"oak.observation_dim ({self.oak.observation_dim}), got "
+                    f"{mixer.representation_dim}"
+                )
+            grounded_world_active = (
+                mixer.mode in {"full", "world_only"}
+                and mixer.grounded_world_weight > 0.0
+            )
+            if grounded_world_active and (
+                self.world_model_ensemble is None
+                and self.model_replay_rehearsal is None
+            ):
+                raise ValueError(
+                    "an active grounded-world mixer source requires "
+                    "world_model_ensemble or model_replay_rehearsal"
+                )
+        if self.gradient_joy is not None:
+            if not state_builder_learning_enabled:
+                raise ValueError(
+                    "gradient_joy requires online representation learning"
+                )
             if (
                 self.world_model_ensemble is None
                 and self.model_replay_rehearsal is None
             ):
                 raise ValueError(
-                    "learn_state_builder_from_world_model requires "
-                    "world_model_ensemble or model_replay_rehearsal"
-                )
-            if not isinstance(self.state_builder, OnlineGatedStateBuilderConfig):
-                raise ValueError(
-                    "learn_state_builder_from_world_model requires an "
-                    "OnlineGatedStateBuilderConfig"
-                )
-        if self.gradient_joy is not None:
-            if not self.learn_state_builder_from_world_model:
-                raise ValueError(
-                    "gradient_joy requires learn_state_builder_from_world_model"
+                    "gradient_joy requires causal ensemble learning signals"
                 )
             if self.gradient_joy.candidate_semantics != "update":
                 raise ValueError(
@@ -593,6 +648,10 @@ class PrototypeAgentConfig:
             payload["state_builder"] = self.state_builder.to_config()
         if self.learn_state_builder_from_world_model:
             payload["learn_state_builder_from_world_model"] = True
+        if self.representation_gradient_mixer is not None:
+            payload["representation_gradient_mixer"] = (
+                self.representation_gradient_mixer.to_config()
+            )
         if self.gradient_joy is not None:
             payload["gradient_joy"] = self.gradient_joy.to_config()
         return payload
@@ -653,6 +712,16 @@ class PrototypeAgentConfig:
             raise ValueError(
                 "learn_state_builder_from_world_model must be boolean"
             )
+        mixer_raw = data.pop("representation_gradient_mixer", None)
+        if mixer_raw is not None and not isinstance(mixer_raw, dict):
+            raise ValueError(
+                "representation_gradient_mixer must be a configuration object"
+            )
+        representation_gradient_mixer = (
+            RepresentationGradientMixerConfig.from_config(mixer_raw)
+            if mixer_raw is not None
+            else None
+        )
         gradient_joy_raw = data.pop("gradient_joy", None)
         if gradient_joy_raw is not None and not isinstance(gradient_joy_raw, dict):
             raise ValueError("gradient_joy must be a configuration object")
@@ -697,6 +766,7 @@ class PrototypeAgentConfig:
             learn_state_builder_from_world_model=(
                 learn_state_builder_from_world_model
             ),
+            representation_gradient_mixer=representation_gradient_mixer,
             gradient_joy=gradient_joy,
             auto_curate_every=auto_curate_every,
         )

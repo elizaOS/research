@@ -8,10 +8,12 @@ matched campaign is launched.  It is deliberately outside the frozen
 candidate source tree: the candidate tree and configuration bytes are checked
 against the pinned qualification, then executed in an isolated child process.
 
-Only action-stream digests, first pairwise action-divergence indices, and
-bounded per-channel respawn-estimator aggregates cross the child boundary.
-Rewards are consumed one scalar at a time by the frozen policy and are never
-returned, retained as a host array, scored, or written.
+Only action-tree digests, canonical first-divergence proofs, at most two action
+scalars per divergent pair, and bounded respawn-estimator aggregates cross the
+child boundary.  The action scalars are in the public four-action domain and
+are necessary to verify the indexed Merkle leaves.  Rewards are consumed one
+scalar at a time by the frozen policy and are never returned, retained as a
+host array, scored, or written.
 
 This is permanently open-development and nonpromoting.  A run with no
 pairwise action divergence writes a rejection receipt and exits nonzero.
@@ -642,7 +644,11 @@ def _extract_pinned_source_archive(
     try:
         with tarfile.open(fileobj=io.BytesIO(archive_raw), mode="r:") as archive:
             for member in archive:
-                name = member.name[:-1] if member.isdir() and member.name.endswith("/") else member.name
+                name = (
+                    member.name[:-1]
+                    if member.isdir() and member.name.endswith("/")
+                    else member.name
+                )
                 relative = PurePosixPath(name)
                 if (
                     not name
@@ -2016,7 +2022,10 @@ def _validate_child_payload(payload: Mapping[str, Any]) -> bool:
                 "estimated_delay",
             }:
                 raise CausalGridDivergenceProbeError("channel diagnostic fields drifted")
-            if channel["channel_index"] != channel_index:
+            if (
+                type(channel["channel_index"]) is not int
+                or channel["channel_index"] != channel_index
+            ):
                 raise CausalGridDivergenceProbeError("channel diagnostic order drifted")
             _require_int(
                 channel["exact_count_final"],

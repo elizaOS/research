@@ -196,9 +196,7 @@ class _CreationInputs:
 
 def _require_sha256(value: Any, label: str) -> str:
     if type(value) is not str or _SHA256_RE.fullmatch(value) is None:
-        raise ForagerMatchedFinalAnalysisError(
-            f"{label} must be a lowercase SHA-256"
-        )
+        raise ForagerMatchedFinalAnalysisError(f"{label} must be a lowercase SHA-256")
     return value
 
 
@@ -310,9 +308,7 @@ def _analysis_runtime_source_identity() -> dict[str, Any]:
         },
         "statistics_contract_schema": statistics.CONTRACT_SCHEMA,
         "statistics_result_schema": statistics.RESULT_SCHEMA,
-        "primary_implementation_sha256": (
-            statistics.PRIMARY_BOOTSTRAP_IMPLEMENTATION_SHA256
-        ),
+        "primary_implementation_sha256": (statistics.PRIMARY_BOOTSTRAP_IMPLEMENTATION_SHA256),
         "secondary_implementation_sha256": (
             statistics.SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SHA256
         ),
@@ -356,17 +352,13 @@ def _directory_inventory(
             try:
                 metadata = entry.stat(follow_symlinks=False)
             except OSError as exc:
-                raise ForagerMatchedFinalAnalysisError(
-                    f"cannot inspect {label} entry"
-                ) from exc
+                raise ForagerMatchedFinalAnalysisError(f"cannot inspect {label} entry") from exc
             if entry.name in expected_directories:
                 safe = stat.S_ISDIR(metadata.st_mode)
             else:
                 safe = stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1
             if not safe:
-                raise ForagerMatchedFinalAnalysisError(
-                    f"{label} contains an unsafe entry"
-                )
+                raise ForagerMatchedFinalAnalysisError(f"{label} contains an unsafe entry")
             inventory[entry.name] = seal._stat_identity(metadata)
     if set(inventory) != expected:
         raise ForagerMatchedFinalAnalysisError(
@@ -412,8 +404,7 @@ def _parse_bindings(
     if set(value) != expected_keys:
         raise ForagerMatchedFinalAnalysisError("bindings cache shape drifted")
     if (
-        value["schema_version"]
-        != evidence.AUTHENTICATED_EVIDENCE_BINDINGS_SCHEMA_VERSION
+        value["schema_version"] != evidence.AUTHENTICATED_EVIDENCE_BINDINGS_SCHEMA_VERSION
         or value["stage"] != expected_stage
     ):
         raise ForagerMatchedFinalAnalysisError("bindings cache schema/stage drifted")
@@ -522,9 +513,7 @@ def _load_seal_snapshot(
             )
             != initial
         ):
-            raise ForagerMatchedFinalAnalysisError(
-                "seal input changed during snapshot"
-            )
+            raise ForagerMatchedFinalAnalysisError("seal input changed during snapshot")
         seal._assert_open_directory_path(opened, "final-analysis seal input")
         return content, artifacts
     finally:
@@ -581,8 +570,7 @@ def _validate_exact_completed_panel(
         or completed.active_seeds != completed.protocol.evaluation_seeds
         or len(completed.active_seeds) != _EXPECTED_SEEDS
         or len(completed.seed_artifacts) != _EXPECTED_CANDIDATES
-        or sum(len(records) for records in completed.seed_artifacts.values())
-        != _EXPECTED_CELLS
+        or sum(len(records) for records in completed.seed_artifacts.values()) != _EXPECTED_CELLS
         or completed.verification_request.stage != "sealed_evaluation"
         or completed.completion_summary.get("promotion_authorized") is not False
         or completed.completion_summary.get("performance_claim") is not False
@@ -609,30 +597,19 @@ def _assert_snapshot_matches_completed(
             universe.matched_current_candidate_universe_descriptor()
         ),
         "execution-plan.json": completed.plan.canonical_bytes,
-        "source-manifest.json": executor.canonical_json_bytes(
-            completed.plan.source_manifest
-        ),
-        "executor-manifest.json": executor.canonical_json_bytes(
-            completed.plan.executor_manifest
-        ),
+        "source-manifest.json": executor.canonical_json_bytes(completed.plan.source_manifest),
+        "executor-manifest.json": executor.canonical_json_bytes(completed.plan.executor_manifest),
         "execution-schedule.json": executor.canonical_json_bytes(completed.schedule),
-        "live-runtime.json": executor.canonical_json_bytes(
-            completed.live_runtime.unsigned_dict
-        ),
-        "execution-receipt-index.json": (
-            completed.execution_receipt_index.canonical_bytes
-        ),
+        "live-runtime.json": executor.canonical_json_bytes(completed.live_runtime.unsigned_dict),
+        "execution-receipt-index.json": (completed.execution_receipt_index.canonical_bytes),
         "score-evidence.json": completed.score_evidence.canonical_bytes,
         "verification-request.json": completed.verification_request.canonical_bytes,
         "completion-summary.json": _canonical(completed.completion_summary),
     }
-    drifted = [
-        name for name, expected in exact.items() if evaluation_artifacts[name] != expected
-    ]
+    drifted = [name for name, expected in exact.items() if evaluation_artifacts[name] != expected]
     if drifted:
         raise ForagerMatchedFinalAnalysisError(
-            "evaluation snapshot differs from replayed completion: "
-            + ", ".join(drifted)
+            "evaluation snapshot differs from replayed completion: " + ", ".join(drifted)
         )
     for name, digest in completed.final_file_sha256.items():
         if hashlib.sha256(evaluation_artifacts[name]).hexdigest() != digest:
@@ -650,8 +627,7 @@ def _load_creation_inputs(
     runner: executor.ProcessRunner | None,
 ) -> _CreationInputs:
     if not all(
-        isinstance(path, Path)
-        for path in (qualification_root, seal_root, evaluation_campaign_root)
+        isinstance(path, Path) for path in (qualification_root, seal_root, evaluation_campaign_root)
     ):
         raise TypeError("qualification, seal, and evaluation roots must be Paths")
     seal_content, seal_artifacts = _load_seal_snapshot(seal_root)
@@ -719,14 +695,10 @@ def _assert_same_creation_inputs(
         or current.completed.protocol != expected.completed.protocol
         or current.completed.candidate_ids != expected.completed.candidate_ids
         or current.completed.active_seeds != expected.completed.active_seeds
-        or current.completed.final_file_sha256
-        != expected.completed.final_file_sha256
-        or current.completed.verification_request
-        != expected.completed.verification_request
+        or current.completed.final_file_sha256 != expected.completed.final_file_sha256
+        or current.completed.verification_request != expected.completed.verification_request
     ):
-        raise ForagerMatchedFinalAnalysisError(
-            f"final-analysis inputs changed {label}"
-        )
+        raise ForagerMatchedFinalAnalysisError(f"final-analysis inputs changed {label}")
 
 
 def _validate_evaluation_receipt_index(
@@ -744,16 +716,12 @@ def _validate_evaluation_receipt_index(
     unsigned = dict(payload)
     unsigned.pop("payload_sha256", None)
     if campaign._canonical_sha256(unsigned) != declared:
-        raise ForagerMatchedFinalAnalysisError(
-            "evaluation receipt-index self-hash differs"
-        )
+        raise ForagerMatchedFinalAnalysisError("evaluation receipt-index self-hash differs")
     candidate_order = tuple(item.candidate_id for item in scores.candidate_scores)
     required = {
         "schema_version": executor.MATCHED_EXECUTION_RECEIPT_INDEX_SCHEMA_VERSION,
         "classification": "content_complete_execution_receipt_preimages",
-        "authentication_state": (
-            "content_only_unendorsed_external_verifier_required"
-        ),
+        "authentication_state": ("content_only_unendorsed_external_verifier_required"),
         "promotion_authorized": False,
         "external_verification_required": True,
         "stage": "sealed_evaluation",
@@ -774,9 +742,7 @@ def _validate_evaluation_receipt_index(
     drifted = [name for name, expected in required.items() if payload.get(name) != expected]
     raw_receipts = payload.get("execution_receipts")
     if drifted or type(raw_receipts) is not list or len(raw_receipts) != len(candidate_order):
-        raise ForagerMatchedFinalAnalysisError(
-            "evaluation receipt-index header closure drifted"
-        )
+        raise ForagerMatchedFinalAnalysisError("evaluation receipt-index header closure drifted")
     for index, (raw_item, score) in enumerate(
         zip(raw_receipts, scores.candidate_scores, strict=True)
     ):
@@ -864,11 +830,9 @@ def _validate_qualification_manifest(
     authority = payload.get("authority")
     reward_boundary = payload.get("reward_blind_boundary")
     if (
-        payload.get("schema_version")
-        != qualification.MATCHED_CURRENT_QUALIFICATION_SCHEMA_VERSION
+        payload.get("schema_version") != qualification.MATCHED_CURRENT_QUALIFICATION_SCHEMA_VERSION
         or payload.get("classification") != "content_only_unendorsed_nonpromoting"
-        or payload.get("status")
-        != "structurally_qualified_external_trust_resolution_required"
+        or payload.get("status") != "structurally_qualified_external_trust_resolution_required"
         or payload.get("promotion_authorized") is not False
         or payload.get("performance_claim") is not False
         or payload.get("external_verification_required") is not True
@@ -891,10 +855,8 @@ def _validate_qualification_manifest(
             "reward_arrays_read": 0,
             "result_archives_opened": 0,
         }
-        or payload.get("candidate_order")
-        != list(open_protocol.MATCHED_CURRENT_CANDIDATE_IDS)
-        or payload.get("open_protocol_sha256")
-        != seal_content.open_protocol.protocol_sha256
+        or payload.get("candidate_order") != list(open_protocol.MATCHED_CURRENT_CANDIDATE_IDS)
+        or payload.get("open_protocol_sha256") != seal_content.open_protocol.protocol_sha256
     ):
         raise ForagerMatchedFinalAnalysisError(
             "evaluation qualification authority/reward closure drifted"
@@ -940,9 +902,7 @@ def _validate_executor_qualification_artifacts(
     cpu = payload.get("cpu_qualification")
     rng = payload.get("rng_parity_qualification")
     if type(cpu) is not dict or type(rng) is not dict:
-        raise ForagerMatchedFinalAnalysisError(
-            f"{label} qualification records must be objects"
-        )
+        raise ForagerMatchedFinalAnalysisError(f"{label} qualification records must be objects")
     cpu_value = cast(dict[str, Any], cpu)
     rng_value = cast(dict[str, Any], rng)
     _require_exact_keys(
@@ -1007,42 +967,30 @@ def _validate_executor_qualification_artifacts(
         "trust_profiles_at_seal": 0,
     }
     if (
-        payload["schema_version"]
-        != "alberta.forager_matched_qualification_artifacts.v1"
-        or payload["classification"]
-        != "content_identity_only_external_verification_required"
+        payload["schema_version"] != "alberta.forager_matched_qualification_artifacts.v1"
+        or payload["classification"] != "content_identity_only_external_verification_required"
         or cpu_value["authority_boundary"] != expected_authority
-        or receipt_value["path"]
-        != "official_cpu_qualification_5eca_2000001_v1/receipt.v1.json"
-        or receipt_value["file_sha256"]
-        != executor.CPU_QUALIFICATION_RECEIPT_FILE_SHA256
+        or receipt_value["path"] != "official_cpu_qualification_5eca_2000001_v1/receipt.v1.json"
+        or receipt_value["file_sha256"] != executor.CPU_QUALIFICATION_RECEIPT_FILE_SHA256
         or qualification_value["path"]
         != "official_cpu_qualification_5eca_2000001_v1/qualification.json"
-        or qualification_value["file_sha256"]
-        != executor.CPU_QUALIFICATION_FILE_SHA256
-        or qualification_value["qualification_sha256"]
-        != executor.QUALIFIED_EXECUTOR_RECEIPT_SHA256
+        or qualification_value["file_sha256"] != executor.CPU_QUALIFICATION_FILE_SHA256
+        or qualification_value["qualification_sha256"] != executor.QUALIFIED_EXECUTOR_RECEIPT_SHA256
         or environment_value["path"]
         != "official_cpu_qualification_5eca_2000001_v1/environment-profile.json"
-        or environment_value["file_sha256"]
-        != executor.CPU_ENVIRONMENT_PROFILE_FILE_SHA256
+        or environment_value["file_sha256"] != executor.CPU_ENVIRONMENT_PROFILE_FILE_SHA256
         or environment_value["canonical_payload_sha256"]
         != executor.QUALIFIED_RUNTIME_PROFILE_SHA256
-        or rng_plan_value["path"]
-        != "rng_parity_live_qualification_v1_execution/plan.json"
+        or rng_plan_value["path"] != "rng_parity_live_qualification_v1_execution/plan.json"
         or rng_plan_value["file_sha256"] != executor.RNG_PARITY_PLAN_FILE_SHA256
-        or rng_receipt_value["path"]
-        != "rng_parity_live_qualification_v1_execution/receipt.json"
-        or rng_receipt_value["file_sha256"]
-        != executor.RNG_PARITY_RECEIPT_FILE_SHA256
-        or rng_value["status"]
-        != "content_complete_external_executor_receipt_unverified"
+        or rng_receipt_value["path"] != "rng_parity_live_qualification_v1_execution/receipt.json"
+        or rng_receipt_value["file_sha256"] != executor.RNG_PARITY_RECEIPT_FILE_SHA256
+        or rng_value["status"] != "content_complete_external_executor_receipt_unverified"
         or rng_value["external_executor_receipt_requires_trust_resolver"] is not True
         or rng_value["promotion_authorized"] is not False
         or rng_value["environment_rng_schedule_sha256"]
         != executor.MATCHED_ENVIRONMENT_RNG_SCHEDULE_SHA256
-        or rng_value["rng_parity_contract_sha256"]
-        != executor.RNG_PARITY_CONTRACT_SHA256
+        or rng_value["rng_parity_contract_sha256"] != executor.RNG_PARITY_CONTRACT_SHA256
     ):
         raise ForagerMatchedFinalAnalysisError(
             f"{label} authority and qualification closure drifted"
@@ -1084,9 +1032,7 @@ def _validate_plan_and_manifests(
     )
     raw_candidates = source_manifest.get("candidates")
     if type(raw_candidates) is not list or len(raw_candidates) != len(candidate_order):
-        raise ForagerMatchedFinalAnalysisError(
-            "evaluation source manifest candidate block drifted"
-        )
+        raise ForagerMatchedFinalAnalysisError("evaluation source manifest candidate block drifted")
     source_keys = {
         "candidate_id",
         "capability_descriptor_sha256",
@@ -1119,10 +1065,8 @@ def _validate_plan_and_manifests(
         if (
             candidate["candidate_id"] != candidate_id
             or candidate["source"] != frozen_candidate.source.to_dict()
-            or candidate["configuration"]
-            != frozen_candidate.configuration.to_dict()
-            or candidate["entrypoint_family"]
-            != frozen_candidate.entrypoint_family
+            or candidate["configuration"] != frozen_candidate.configuration.to_dict()
+            or candidate["entrypoint_family"] != frozen_candidate.entrypoint_family
             or candidate["capability_descriptor_sha256"]
             != protocol.candidate_capability_descriptor_sha256(frozen_candidate)
             or candidate["capability_qualification_receipt_sha256"]
@@ -1175,47 +1119,36 @@ def _validate_plan_and_manifests(
         label="evaluation executor qualification artifacts",
     )
     if (
-        source_manifest.get("schema_version")
-        != executor.MATCHED_SOURCE_MANIFEST_SCHEMA_VERSION
+        source_manifest.get("schema_version") != executor.MATCHED_SOURCE_MANIFEST_SCHEMA_VERSION
         or source_manifest.get("stage") != "sealed_evaluation"
-        or source_manifest.get("protocol_sha256")
-        != sealed_protocol.protocol_sha256
+        or source_manifest.get("protocol_sha256") != sealed_protocol.protocol_sha256
         or executor_manifest.get("schema_version")
         != executor.MATCHED_EXECUTOR_MANIFEST_SCHEMA_VERSION
         or executor_manifest.get("authentication_state")
         != "unendorsed_external_trust_resolution_required"
-        or executor_manifest.get("protocol_sha256")
-        != sealed_protocol.protocol_sha256
+        or executor_manifest.get("protocol_sha256") != sealed_protocol.protocol_sha256
         or executor_manifest.get("runtime") != sealed_protocol.runtime.to_dict()
-        or executor_manifest.get("sandbox")
-        != sealed_protocol.runtime.sandbox.to_dict()
+        or executor_manifest.get("sandbox") != sealed_protocol.runtime.sandbox.to_dict()
         or qualified_lock
         != {
             "image_sha256": executor.QUALIFIED_IMAGE_SHA256,
             "runtime_profile_sha256": executor.QUALIFIED_RUNTIME_PROFILE_SHA256,
-            "executor_qualification_receipt_sha256": (
-                executor.QUALIFIED_EXECUTOR_RECEIPT_SHA256
-            ),
-            "environment_rng_schedule_sha256": (
-                executor.MATCHED_ENVIRONMENT_RNG_SCHEDULE_SHA256
-            ),
+            "executor_qualification_receipt_sha256": (executor.QUALIFIED_EXECUTOR_RECEIPT_SHA256),
+            "environment_rng_schedule_sha256": (executor.MATCHED_ENVIRONMENT_RNG_SCHEDULE_SHA256),
             "rng_parity_contract_sha256": executor.RNG_PARITY_CONTRACT_SHA256,
             "metric_semantics_sha256": executor.MATCHED_METRIC_SEMANTICS_SHA256,
         }
-        or helper_value["path"]
-        != "alberta_framework/benchmarks/_forager_matched_container.py"
+        or helper_value["path"] != "alberta_framework/benchmarks/_forager_matched_container.py"
         or helper_value["contract"] != executor.CONTAINER_CONTRACT
         or _SHA256_RE.fullmatch(str(helper_value["sha256"])) is None
         or type(helper_value["size_bytes"]) is not int
         or helper_value["size_bytes"] <= 0
-        or scorer_value["path"]
-        != "alberta_framework/benchmarks/_foragax_open_screen_scorer_v3.py"
+        or scorer_value["path"] != "alberta_framework/benchmarks/_foragax_open_screen_scorer_v3.py"
         or type(scorer_value["size_bytes"]) is not int
         or scorer_value["size_bytes"] <= 0
         or scorer_value["execution_boundary"]
         != "qualified_oci_only_host_must_not_load_reward_arrays"
-        or scorer_value["sha256"]
-        != sealed_protocol.analysis_plan.metric_implementation_sha256
+        or scorer_value["sha256"] != sealed_protocol.analysis_plan.metric_implementation_sha256
         or resource_limits
         != {
             "cpu_quota": executor._CONTAINER_CPU_QUOTA,
@@ -1258,9 +1191,7 @@ def _validate_plan_and_manifests(
             or type(template["argv"]) is not list
             or not all(type(item) is str for item in template["argv"])
         ):
-            raise ForagerMatchedFinalAnalysisError(
-                "evaluation candidate command template drifted"
-            )
+            raise ForagerMatchedFinalAnalysisError("evaluation candidate command template drifted")
 
 
 def _expected_campaign_manifest(
@@ -1277,9 +1208,7 @@ def _expected_campaign_manifest(
     selected = candidate_order[:4]
     fixed = candidate_order[4:]
     return {
-        "schema_version": (
-            sealed_campaign.MATCHED_SEALED_EVALUATION_CAMPAIGN_SCHEMA_VERSION
-        ),
+        "schema_version": (sealed_campaign.MATCHED_SEALED_EVALUATION_CAMPAIGN_SCHEMA_VERSION),
         "classification": "content_only_unendorsed_nonpromoting",
         "status": "prepared_sealed_evaluation_fresh_authentication_required",
         "stage": "sealed_evaluation",
@@ -1303,9 +1232,7 @@ def _expected_campaign_manifest(
         ),
         "sealed_transition_sha256": seal_content.sealed_transition_sha256,
         "protocol_sha256": sealed_protocol.protocol_sha256,
-        "candidate_universe_sha256": (
-            sealed_protocol.selection_plan.candidate_universe_sha256
-        ),
+        "candidate_universe_sha256": (sealed_protocol.selection_plan.candidate_universe_sha256),
         "execution_plan_sha256": plan_sha256,
         "source_manifest_sha256": scores.source_evidence_sha256,
         "executor_manifest_sha256": scores.executor_evidence_sha256,
@@ -1322,12 +1249,8 @@ def _expected_campaign_manifest(
             "max_attempts_per_cell": campaign._MAX_ATTEMPTS_PER_CELL,
             "max_failure_records_per_attempt": campaign._MAX_FAILURE_RECORDS_PER_ATTEMPT,
             "max_raw_archive_bytes": campaign._MAX_RAW_BYTES,
-            "max_retained_raw_bytes_per_cell": (
-                campaign._MAX_RETAINED_RAW_BYTES_PER_CELL
-            ),
-            "max_retained_raw_bytes_per_campaign": (
-                campaign._MAX_RETAINED_RAW_BYTES_PER_CAMPAIGN
-            ),
+            "max_retained_raw_bytes_per_cell": (campaign._MAX_RETAINED_RAW_BYTES_PER_CELL),
+            "max_retained_raw_bytes_per_campaign": (campaign._MAX_RETAINED_RAW_BYTES_PER_CAMPAIGN),
         },
         "completion_boundary": (
             "evaluation_score_evidence_and_unresolved_verification_request_only"
@@ -1369,9 +1292,8 @@ def _validate_evaluation_snapshot(
         sealed_protocol,
         transition,
     )
-    if (
-        transition_payload != expected_transition
-        or transition_payload != seal._plain(seal_content.sealed_transition)
+    if transition_payload != expected_transition or transition_payload != seal._plain(
+        seal_content.sealed_transition
     ):
         raise ForagerMatchedFinalAnalysisError(
             "evaluation sealed transition differs from typed replay"
@@ -1380,16 +1302,15 @@ def _validate_evaluation_snapshot(
         artifacts["seal-manifest.json"],
         "evaluation seal manifest",
     ) != seal._plain(seal_content.manifest):
-        raise ForagerMatchedFinalAnalysisError(
-            "evaluation seal manifest differs from seal closure"
+        raise ForagerMatchedFinalAnalysisError("evaluation seal manifest differs from seal closure")
+    if (
+        seal._decode_canonical(
+            artifacts["candidate-universe.json"],
+            "evaluation candidate universe",
         )
-    if seal._decode_canonical(
-        artifacts["candidate-universe.json"],
-        "evaluation candidate universe",
-    ) != universe.matched_current_candidate_universe_descriptor():
-        raise ForagerMatchedFinalAnalysisError(
-            "evaluation candidate universe snapshot drifted"
-        )
+        != universe.matched_current_candidate_universe_descriptor()
+    ):
+        raise ForagerMatchedFinalAnalysisError("evaluation candidate universe snapshot drifted")
     qualification_manifest = seal._decode_canonical(
         artifacts["qualification-manifest.json"],
         "evaluation qualification manifest",
@@ -1411,12 +1332,8 @@ def _validate_evaluation_snapshot(
         artifacts["executor-manifest.json"],
         "evaluation executor manifest",
     )
-    scores = evidence.parse_matched_score_evidence(
-        artifacts["score-evidence.json"]
-    )
-    request = executor.parse_verification_request(
-        artifacts["verification-request.json"]
-    )
+    scores = evidence.parse_matched_score_evidence(artifacts["score-evidence.json"])
+    request = executor.parse_verification_request(artifacts["verification-request.json"])
     _assert_request_bindings(request, evaluation_bindings)
     candidate_order = tuple(item.candidate_id for item in scores.candidate_scores)
     _validate_plan_and_manifests(
@@ -1429,28 +1346,23 @@ def _validate_evaluation_snapshot(
     if (
         qualification_manifest.get("frozen_executor_qualification_artifacts")
         != executor_manifest.get("qualification_artifacts")
-        or
-        plan.get("schema_version") != executor.MATCHED_EXECUTION_PLAN_SCHEMA_VERSION
+        or plan.get("schema_version") != executor.MATCHED_EXECUTION_PLAN_SCHEMA_VERSION
         or plan.get("classification") != "matched_current_execution_candidate"
         or plan.get("stage") != "sealed_evaluation"
         or plan.get("promotion_authorized") is not False
         or plan.get("external_verification_required") is not True
         or plan.get("protocol_sha256") != sealed_protocol.protocol_sha256
         or plan.get("horizon") != sealed_protocol.horizon
-        or tuple(cast(list[Any], plan.get("active_seeds")))
-        != sealed_protocol.active_seeds
+        or tuple(cast(list[Any], plan.get("active_seeds"))) != sealed_protocol.active_seeds
         or tuple(cast(list[Any], plan.get("candidate_order"))) != candidate_order
         or plan.get("source_manifest") != source_manifest
         or plan.get("executor_manifest") != executor_manifest
         or plan.get("source_manifest_sha256") != scores.source_evidence_sha256
         or plan.get("executor_manifest_sha256") != scores.executor_evidence_sha256
         or campaign._canonical_sha256(source_manifest) != scores.source_evidence_sha256
-        or campaign._canonical_sha256(executor_manifest)
-        != scores.executor_evidence_sha256
+        or campaign._canonical_sha256(executor_manifest) != scores.executor_evidence_sha256
     ):
-        raise ForagerMatchedFinalAnalysisError(
-            "evaluation execution-plan closure drifted"
-        )
+        raise ForagerMatchedFinalAnalysisError("evaluation execution-plan closure drifted")
     live_runtime = seal._decode_canonical(
         artifacts["live-runtime.json"],
         "evaluation live runtime",
@@ -1479,21 +1391,14 @@ def _validate_evaluation_snapshot(
         )
     labels = cast(dict[str, Any], image_config).get("Labels")
     if (
-        live_runtime.get("schema_version")
-        != executor.MATCHED_LIVE_RUNTIME_SCHEMA_VERSION
-        or live_runtime.get("executor_manifest_sha256")
-        != scores.executor_evidence_sha256
-        or image_value.get("Id")
-        != f"sha256:{sealed_protocol.runtime.image_sha256}"
+        live_runtime.get("schema_version") != executor.MATCHED_LIVE_RUNTIME_SCHEMA_VERSION
+        or live_runtime.get("executor_manifest_sha256") != scores.executor_evidence_sha256
+        or image_value.get("Id") != f"sha256:{sealed_protocol.runtime.image_sha256}"
         or type(labels) is not dict
-        or cast(dict[str, Any], labels).get(
-            "io.elizaos.alberta.foragax.launcher-contract"
-        )
+        or cast(dict[str, Any], labels).get("io.elizaos.alberta.foragax.launcher-contract")
         != "oci-read-only-stdout-tar-v4"
     ):
-        raise ForagerMatchedFinalAnalysisError(
-            "evaluation live-runtime closure drifted"
-        )
+        raise ForagerMatchedFinalAnalysisError("evaluation live-runtime closure drifted")
     live_runtime_sha256 = campaign._canonical_sha256(live_runtime)
     receipt_index = seal._decode_canonical(
         artifacts["execution-receipt-index.json"],
@@ -1531,8 +1436,7 @@ def _validate_evaluation_snapshot(
         or len(expected_selected) != 4
         or len(expected_fixed) != 2
         or set(expected_selected) & set(expected_fixed)
-        or expected_fixed
-        != sealed_protocol.evaluation_panel.fixed_descriptive_candidate_ids
+        or expected_fixed != sealed_protocol.evaluation_panel.fixed_descriptive_candidate_ids
     ):
         raise ForagerMatchedFinalAnalysisError(
             "evaluation selected/fixed six-candidate partition drifted"
@@ -1542,9 +1446,7 @@ def _validate_evaluation_snapshot(
         "evaluation completion summary",
     )
     expected_completion = {
-        "schema_version": (
-            sealed_campaign.MATCHED_SEALED_EVALUATION_COMPLETION_SCHEMA_VERSION
-        ),
+        "schema_version": (sealed_campaign.MATCHED_SEALED_EVALUATION_COMPLETION_SCHEMA_VERSION),
         "classification": "content_only_unendorsed_nonpromoting",
         "status": "complete_content_only_external_verification_unresolved",
         "stage": "sealed_evaluation",
@@ -1565,9 +1467,7 @@ def _validate_evaluation_snapshot(
         "execution_receipt_index_payload_sha256": receipt_payload_sha256,
         "score_evidence_sha256": scores.payload_sha256,
         "verification_subject_sha256": request.verification_subject_sha256,
-        "evaluation_verification_authentication_state": (
-            "unresolved_external_verifier_required"
-        ),
+        "evaluation_verification_authentication_state": ("unresolved_external_verifier_required"),
         "selection_inherited_from_seal": True,
         "sealed_protocol_inherited_from_seal": True,
         "evaluation_artifacts_created": True,
@@ -1649,13 +1549,9 @@ def _build_contract_and_result(
         raise ForagerMatchedFinalAnalysisError(
             "statistics contract differs from the sealed evaluation transition"
         )
-    fixed_ids = (
-        seal_content.sealed_protocol.evaluation_panel.fixed_descriptive_candidate_ids
-    )
+    fixed_ids = seal_content.sealed_protocol.evaluation_panel.fixed_descriptive_candidate_ids
     method_ids = tuple(method.method_id for method in contract.methods)
-    diagnostic_ids = tuple(
-        item.candidate_id for item in contract.fixed_descriptive_diagnostics
-    )
+    diagnostic_ids = tuple(item.candidate_id for item in contract.fixed_descriptive_diagnostics)
     compared_ids = {
         endpoint
         for comparison in (
@@ -1681,8 +1577,7 @@ def _build_contract_and_result(
     result_payload = result.to_payload()
     if (
         result_payload.get("no_promotion_authority") is not True
-        or result_payload.get("evidence_digests_require_external_validation")
-        is not True
+        or result_payload.get("evidence_digests_require_external_validation") is not True
     ):
         raise ForagerMatchedFinalAnalysisError(
             "statistics result lost its no-promotion authority boundary"
@@ -1696,10 +1591,7 @@ def _artifact_digest_map(
     analysis_artifacts: Mapping[str, bytes],
 ) -> dict[str, str]:
     values = {
-        **{
-            f"seal/{name}": hashlib.sha256(raw).hexdigest()
-            for name, raw in seal_artifacts.items()
-        },
+        **{f"seal/{name}": hashlib.sha256(raw).hexdigest() for name, raw in seal_artifacts.items()},
         **{
             f"evaluation/{name}": hashlib.sha256(raw).hexdigest()
             for name, raw in evaluation_artifacts.items()
@@ -1715,9 +1607,7 @@ def _artifact_digest_map(
         *(f"analysis/{name}" for name in _ANALYSIS_ARTIFACTS),
     }
     if set(values) != expected:
-        raise ForagerMatchedFinalAnalysisError(
-            "final-analysis artifact digest inventory drifted"
-        )
+        raise ForagerMatchedFinalAnalysisError("final-analysis artifact digest inventory drifted")
     return values
 
 
@@ -1735,12 +1625,8 @@ def _build_manifest(
     result: statistics.MatchedComparisonResult,
     artifact_sha256: Mapping[str, str],
 ) -> dict[str, Any]:
-    fixed_ids = tuple(
-        item.candidate_id for item in contract.fixed_descriptive_diagnostics
-    )
-    candidate_order = tuple(
-        item.candidate_id for item in evaluation_scores.candidate_scores
-    )
+    fixed_ids = tuple(item.candidate_id for item in contract.fixed_descriptive_diagnostics)
+    candidate_order = tuple(item.candidate_id for item in evaluation_scores.candidate_scores)
     selected_ids = tuple(method.method_id for method in contract.methods)
     if (
         len(candidate_order) != _EXPECTED_CANDIDATES
@@ -1766,9 +1652,7 @@ def _build_manifest(
     numpy_runtime = cast(dict[str, Any], runtime["numpy"])
     body: dict[str, Any] = {
         "schema_version": MATCHED_FINAL_ANALYSIS_MANIFEST_SCHEMA_VERSION,
-        "classification": (
-            "freshly_authenticated_inputs_at_creation_cache_only_nonpromoting"
-        ),
+        "classification": ("freshly_authenticated_inputs_at_creation_cache_only_nonpromoting"),
         "status": "complete_selected_six_panel_analysis",
         "stage": "sealed_evaluation_analysis",
         "authority_boundary": {
@@ -1783,12 +1667,8 @@ def _build_manifest(
             "selection_winner_candidate_ids": list(selected_ids),
             "fixed_descriptive_candidate_ids": list(fixed_ids),
             "primary_gate_pass_never_authorizes_promotion": True,
-            "secondary_sign_flip_interpretation": (
-                "nonconfirmatory_sensitivity_only"
-            ),
-            "secondary_sign_exchangeability_assumption": (
-                "unstated_in_frozen_protocol"
-            ),
+            "secondary_sign_flip_interpretation": ("nonconfirmatory_sensitivity_only"),
+            "secondary_sign_exchangeability_assumption": ("unstated_in_frozen_protocol"),
             "secondary_inferential_claim_authorized": False,
             "secondary_reject_flags_are_claim_gates": False,
             "sota_claim_authorized": False,
@@ -1813,18 +1693,12 @@ def _build_manifest(
         "artifact_sha256": dict(artifact_sha256),
         "analysis_execution": {
             "runtime_source_payload_sha256": runtime_source["payload_sha256"],
-            "finalizer_source_sha256": cast(dict[str, Any], sources["finalizer"])[
-                "sha256"
-            ],
-            "statistics_source_sha256": cast(
-                dict[str, Any], sources["statistics"]
-            )["sha256"],
+            "finalizer_source_sha256": cast(dict[str, Any], sources["finalizer"])["sha256"],
+            "statistics_source_sha256": cast(dict[str, Any], sources["statistics"])["sha256"],
             "python_implementation": python_runtime["implementation"],
             "python_version": python_runtime["version"],
             "numpy_version": numpy_runtime["version"],
-            "source_hashes_and_runtime_identity_are_integrity_metadata_not_authentication": (
-                True
-            ),
+            "source_hashes_and_runtime_identity_are_integrity_metadata_not_authentication": (True),
         },
         "seal": {
             "seal_manifest_payload_sha256": _require_sha256(
@@ -1832,19 +1706,13 @@ def _build_manifest(
                 "seal manifest payload",
             ),
             "open_protocol_sha256": seal_content.open_protocol.protocol_sha256,
-            "open_score_evidence_sha256": (
-                seal_content.open_score_evidence.payload_sha256
-            ),
+            "open_score_evidence_sha256": (seal_content.open_score_evidence.payload_sha256),
             "open_verification_subject_sha256": (
                 seal_content.open_verification_request.verification_subject_sha256
             ),
-            "open_verification_receipt_sha256": (
-                open_bindings.verification_receipt_sha256
-            ),
+            "open_verification_receipt_sha256": (open_bindings.verification_receipt_sha256),
             "open_bindings_cache_sha256": open_bindings.bindings_sha256,
-            "selection_result_sha256": (
-                seal_content.selection_result.selection_result_sha256
-            ),
+            "selection_result_sha256": (seal_content.selection_result.selection_result_sha256),
             "selection_report_sha256": _require_sha256(
                 seal_content.selection_report.get("payload_sha256"),
                 "selection report payload",
@@ -1855,19 +1723,13 @@ def _build_manifest(
         "evaluation": {
             "protocol_sha256": evaluation_scores.protocol_sha256,
             "score_evidence_sha256": evaluation_scores.payload_sha256,
-            "verification_subject_sha256": (
-                evaluation_request.verification_subject_sha256
-            ),
-            "verification_receipt_sha256": (
-                evaluation_bindings.verification_receipt_sha256
-            ),
+            "verification_subject_sha256": (evaluation_request.verification_subject_sha256),
+            "verification_receipt_sha256": (evaluation_bindings.verification_receipt_sha256),
             "bindings_cache_sha256": evaluation_bindings.bindings_sha256,
             "execution_receipt_index_payload_sha256": (
                 evaluation_completion["execution_receipt_index_payload_sha256"]
             ),
-            "execution_plan_sha256": evaluation_completion[
-                "execution_plan_sha256"
-            ],
+            "execution_plan_sha256": evaluation_completion["execution_plan_sha256"],
             "execution_schedule_sha256": evaluation_schedule["schedule_sha256"],
             "candidate_order": list(candidate_order),
             "active_seeds": list(evaluation_scores.active_seeds),
@@ -1878,15 +1740,9 @@ def _build_manifest(
             "contract_payload_sha256": contract.payload_sha256,
             "result_schema": statistics.RESULT_SCHEMA,
             "result_payload_sha256": result.payload_sha256,
-            "primary_implementation_sha256": (
-                contract.primary_analysis_implementation_sha256
-            ),
-            "secondary_implementation_sha256": (
-                contract.secondary_analysis_implementation_sha256
-            ),
-            "primary_hypothesis_id": (
-                contract.primary_comparison.hypothesis_id
-            ),
+            "primary_implementation_sha256": (contract.primary_analysis_implementation_sha256),
+            "secondary_implementation_sha256": (contract.secondary_analysis_implementation_sha256),
+            "primary_hypothesis_id": (contract.primary_comparison.hypothesis_id),
             "primary_superiority_passed": result.primary.superiority_passed,
             "secondary_sensitivity_records": secondary_sensitivity_records,
             "paired_analysis_candidate_ids": list(selected_ids),
@@ -2082,9 +1938,7 @@ def _load_from_open_root(
             )
             != root_inventory
         ):
-            raise ForagerMatchedFinalAnalysisError(
-                "final-analysis bundle changed during replay"
-            )
+            raise ForagerMatchedFinalAnalysisError("final-analysis bundle changed during replay")
         for directory, label in (
             (seal_directory, "final-analysis seal subtree"),
             (evaluation_directory, "final-analysis evaluation subtree"),
@@ -2136,9 +1990,7 @@ def _prospective_output(
     if not output_root.name or output_root.name in {".", ".."}:
         raise ForagerMatchedFinalAnalysisError("final-analysis output name is unsafe")
     if output_root.exists() or output_root.is_symlink():
-        raise ForagerMatchedFinalAnalysisError(
-            "final-analysis output root already exists"
-        )
+        raise ForagerMatchedFinalAnalysisError("final-analysis output root already exists")
     try:
         prospective = output_root.resolve(strict=False)
         protected = (
@@ -2151,9 +2003,7 @@ def _prospective_output(
             "final-analysis output or input path cannot be resolved"
         ) from exc
     if any(campaign._paths_overlap(prospective, path) for path in protected):
-        raise ForagerMatchedFinalAnalysisError(
-            "final-analysis output overlaps an input root"
-        )
+        raise ForagerMatchedFinalAnalysisError("final-analysis output overlaps an input root")
     return prospective
 
 
@@ -2174,25 +2024,18 @@ def _sync_files(
             expected = initial[name]
             before = os.fstat(descriptor)
             if seal._stat_identity(before) != expected:
-                raise ForagerMatchedFinalAnalysisError(
-                    f"{label} entry changed before fsync"
-                )
+                raise ForagerMatchedFinalAnalysisError(f"{label} entry changed before fsync")
             os.fsync(descriptor)
             current = os.stat(name, dir_fd=opened.descriptor, follow_symlinks=False)
             if (
                 seal._stat_identity(os.fstat(descriptor)) != expected
                 or seal._stat_identity(current) != expected
             ):
-                raise ForagerMatchedFinalAnalysisError(
-                    f"{label} entry changed during fsync"
-                )
+                raise ForagerMatchedFinalAnalysisError(f"{label} entry changed during fsync")
         finally:
             os.close(descriptor)
     os.fsync(opened.descriptor)
-    if (
-        _directory_inventory(opened, expected_files=names, label=label)
-        != initial
-    ):
+    if _directory_inventory(opened, expected_files=names, label=label) != initial:
         raise ForagerMatchedFinalAnalysisError(f"{label} changed during fsync")
     seal._assert_open_directory_path(opened, label)
 
@@ -2220,11 +2063,7 @@ def _sync_staged_tree(staging: seal._OpenDirectory) -> None:
         label="staged final-analysis root",
     )
     for name in _pair_names(_ROOT_FILES):
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(name, flags, dir_fd=staging.descriptor)
         try:
             os.fsync(descriptor)
@@ -2244,9 +2083,7 @@ def _sync_staged_tree(staging: seal._OpenDirectory) -> None:
         )
         != root_inventory
     ):
-        raise ForagerMatchedFinalAnalysisError(
-            "staged final-analysis root changed during fsync"
-        )
+        raise ForagerMatchedFinalAnalysisError("staged final-analysis root changed during fsync")
     seal._assert_open_directory_path(staging, "staged final-analysis root")
 
 
@@ -2327,14 +2164,10 @@ def _publish_bundle(
         verified = _load_from_open_root(staging)
         statistics_manifest = cast(Mapping[str, Any], manifest["statistics"])
         if (
-            verified.contract.payload_sha256
-            != statistics_manifest["contract_payload_sha256"]
-            or verified.result.payload_sha256
-            != statistics_manifest["result_payload_sha256"]
+            verified.contract.payload_sha256 != statistics_manifest["contract_payload_sha256"]
+            or verified.result.payload_sha256 != statistics_manifest["result_payload_sha256"]
         ):
-            raise ForagerMatchedFinalAnalysisError(
-                "staged final-analysis typed replay drifted"
-            )
+            raise ForagerMatchedFinalAnalysisError("staged final-analysis typed replay drifted")
         _sync_staged_tree(staging)
         seal._publish_verified_no_replace(
             parent,
@@ -2403,9 +2236,7 @@ def _resolve_evaluation(
     _validate_request_pin(
         request,
         expected_trust_anchor_identity=expected_trust_anchor_identity,
-        expected_verification_subject_sha256=(
-            expected_verification_subject_sha256
-        ),
+        expected_verification_subject_sha256=(expected_verification_subject_sha256),
         label="evaluation",
     )
     try:
@@ -2455,17 +2286,13 @@ def create_forager_matched_final_analysis_bundle(
     _validate_request_pin(
         open_request,
         expected_trust_anchor_identity=expected_open_trust_anchor_identity,
-        expected_verification_subject_sha256=(
-            expected_open_verification_subject_sha256
-        ),
+        expected_verification_subject_sha256=(expected_open_verification_subject_sha256),
         label="open",
     )
     _validate_request_pin(
         evaluation_request,
         expected_trust_anchor_identity=expected_evaluation_trust_anchor_identity,
-        expected_verification_subject_sha256=(
-            expected_evaluation_verification_subject_sha256
-        ),
+        expected_verification_subject_sha256=(expected_evaluation_verification_subject_sha256),
         label="evaluation",
     )
     expected_manifest = _require_sha256(
@@ -2473,9 +2300,7 @@ def create_forager_matched_final_analysis_bundle(
         "expected seal manifest payload",
     )
     if inputs.seal_content.manifest.get("payload_sha256") != expected_manifest:
-        raise ForagerMatchedFinalAnalysisError(
-            "seal manifest differs from caller-pinned payload"
-        )
+        raise ForagerMatchedFinalAnalysisError("seal manifest differs from caller-pinned payload")
     prospective = _prospective_output(
         inputs,
         qualification_root,
@@ -2489,14 +2314,10 @@ def create_forager_matched_final_analysis_bundle(
             resolver=open_resolver,
             expected_trust_anchor_identity=expected_open_trust_anchor_identity,
             expected_seal_manifest_sha256=expected_manifest,
-            expected_verification_subject_sha256=(
-                expected_open_verification_subject_sha256
-            ),
+            expected_verification_subject_sha256=(expected_open_verification_subject_sha256),
         )
     except (OSError, ValueError) as exc:
-        raise ForagerMatchedFinalAnalysisError(
-            f"open trust resolution failed: {exc}"
-        ) from exc
+        raise ForagerMatchedFinalAnalysisError(f"open trust resolution failed: {exc}") from exc
     replay_live = inputs.completed.live_runtime
     replayed_after_open = _load_creation_inputs(
         qualification_root,
@@ -2517,9 +2338,7 @@ def create_forager_matched_final_analysis_bundle(
         evaluation_request,
         evaluation_resolver,
         expected_trust_anchor_identity=expected_evaluation_trust_anchor_identity,
-        expected_verification_subject_sha256=(
-            expected_evaluation_verification_subject_sha256
-        ),
+        expected_verification_subject_sha256=(expected_evaluation_verification_subject_sha256),
     )
     replay_live = inputs.completed.live_runtime
     replayed_after_evaluation = _load_creation_inputs(
@@ -2566,9 +2385,7 @@ def create_forager_matched_final_analysis_bundle(
         "evaluation-authenticated-bindings-cache.json": executor.canonical_json_bytes(
             evaluation_bindings.to_dict()
         ),
-        "statistics-contract.json": _canonical(
-            cast(Mapping[str, Any], contract.to_payload())
-        ),
+        "statistics-contract.json": _canonical(cast(Mapping[str, Any], contract.to_payload())),
         "statistics-result.json": result.canonical_json(),
     }
     artifact_sha256 = _artifact_digest_map(
@@ -2624,18 +2441,12 @@ def publish_authenticated_final_analysis(
         open_resolver=open_resolver,
         evaluation_resolver=evaluation_resolver,
         expected_open_trust_anchor_identity=expected_open_trust_anchor_identity,
-        expected_open_verification_subject_sha256=(
-            expected_open_verification_subject_sha256
-        ),
-        expected_evaluation_trust_anchor_identity=(
-            expected_evaluation_trust_anchor_identity
-        ),
+        expected_open_verification_subject_sha256=(expected_open_verification_subject_sha256),
+        expected_evaluation_trust_anchor_identity=(expected_evaluation_trust_anchor_identity),
         expected_evaluation_verification_subject_sha256=(
             expected_evaluation_verification_subject_sha256
         ),
-        expected_seal_manifest_payload_sha256=(
-            expected_seal_manifest_payload_sha256
-        ),
+        expected_seal_manifest_payload_sha256=(expected_seal_manifest_payload_sha256),
         runtime=runtime,
         runner=runner,
     )
@@ -2682,23 +2493,17 @@ def authenticate_final_analysis_content(
         "expected seal manifest payload",
     )
     if content.seal_content.manifest.get("payload_sha256") != seal_manifest_pin:
-        raise ForagerMatchedFinalAnalysisError(
-            "seal manifest differs from caller-pinned payload"
-        )
+        raise ForagerMatchedFinalAnalysisError("seal manifest differs from caller-pinned payload")
     _validate_request_pin(
         content.seal_content.open_verification_request,
         expected_trust_anchor_identity=expected_open_trust_anchor_identity,
-        expected_verification_subject_sha256=(
-            expected_open_verification_subject_sha256
-        ),
+        expected_verification_subject_sha256=(expected_open_verification_subject_sha256),
         label="open",
     )
     _validate_request_pin(
         content.evaluation_verification_request,
         expected_trust_anchor_identity=expected_evaluation_trust_anchor_identity,
-        expected_verification_subject_sha256=(
-            expected_evaluation_verification_subject_sha256
-        ),
+        expected_verification_subject_sha256=(expected_evaluation_verification_subject_sha256),
         label="evaluation",
     )
     try:
@@ -2707,21 +2512,15 @@ def authenticate_final_analysis_content(
             resolver=open_resolver,
             expected_trust_anchor_identity=expected_open_trust_anchor_identity,
             expected_seal_manifest_sha256=seal_manifest_pin,
-            expected_verification_subject_sha256=(
-                expected_open_verification_subject_sha256
-            ),
+            expected_verification_subject_sha256=(expected_open_verification_subject_sha256),
         )
     except (OSError, ValueError) as exc:
-        raise ForagerMatchedFinalAnalysisError(
-            f"open trust resolution failed: {exc}"
-        ) from exc
+        raise ForagerMatchedFinalAnalysisError(f"open trust resolution failed: {exc}") from exc
     evaluation_bindings = _resolve_evaluation(
         content.evaluation_verification_request,
         evaluation_resolver,
         expected_trust_anchor_identity=expected_evaluation_trust_anchor_identity,
-        expected_verification_subject_sha256=(
-            expected_evaluation_verification_subject_sha256
-        ),
+        expected_verification_subject_sha256=(expected_evaluation_verification_subject_sha256),
     )
     if (
         open_bindings != content.open_bindings_cache
@@ -2746,6 +2545,7 @@ __all__ = [
     "ForagerMatchedFinalAnalysisError",
     "FreshFinalAnalysisBindings",
     "MATCHED_FINAL_ANALYSIS_MANIFEST_SCHEMA_VERSION",
+    "MATCHED_FINAL_ANALYSIS_RUNTIME_SOURCE_SCHEMA_VERSION",
     "PublishedFinalAnalysisUncertainError",
     "authenticate_final_analysis_content",
     "create_forager_matched_final_analysis_bundle",

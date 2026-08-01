@@ -115,3 +115,7 @@ Terminated
 FAILED upgd_w_fade_head seed 2 (exit 143) — see outputs/ipmnist_screening/logs/upgd_w_fade_head_seed2.log
 === endgame2 start 2026-08-01T15:19:28-07:00
 2026-08-01T15:19:28-07:00 shards=26 (waiting for 60 before jobs3)
+2026-08-01T15:23:17-07:00 shards=26 (waiting for 60 before jobs3)
+2026-08-01T15:24:28-07:00 shards=26 (waiting for 60 before jobs3)
+2026-08-01T15:28:17-07:00 shards=26 (waiting for 60 before jobs3)
+2026-08-01T15:29:28-07:00 shards=26 (waiting for 60 before jobs3)

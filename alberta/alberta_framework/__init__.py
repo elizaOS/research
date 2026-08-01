@@ -466,6 +466,15 @@ from alberta_framework.core.prototype_agent import (
     load_prototype_checkpoint,
     save_prototype_checkpoint,
 )
+from alberta_framework.core.representation_gradient_mixer import (
+    REPRESENTATION_GRADIENT_MIXER_CONFIG_SCHEMA,
+    GradientMixMode,
+    GradientNormalization,
+    RepresentationGradientMixDiagnostics,
+    RepresentationGradientMixerConfig,
+    RepresentationGradientMixResult,
+    mix_representation_gradients,
+)
 from alberta_framework.core.resource_manager import (
     GeneratorMetaResourceManager,
     LearnedResourceManager,
@@ -1017,6 +1026,14 @@ __all__ = [
     "ReplayActionEncoding",
     "load_model_replay_rehearsal_checkpoint",
     "save_model_replay_rehearsal_checkpoint",
+    # Explicit two-source representation-gradient composition
+    "REPRESENTATION_GRADIENT_MIXER_CONFIG_SCHEMA",
+    "GradientMixMode",
+    "GradientNormalization",
+    "RepresentationGradientMixDiagnostics",
+    "RepresentationGradientMixerConfig",
+    "RepresentationGradientMixResult",
+    "mix_representation_gradients",
     # PrototypeAgent — experimental composition surface spanning Steps 1–12
     "PROTOTYPE_CHECKPOINT_SCHEMA",
     "GRUPerceptionConfig",

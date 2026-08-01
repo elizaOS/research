@@ -56,7 +56,12 @@ WORLD_MODEL_CALIBRATION_CHECKPOINT_SCHEMA = (
 DEVELOPMENT_STATUS = "development-only-not-assessed"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_PATHS = (
+    Path("alberta_framework/core/initializers.py"),
     Path("alberta_framework/core/learning_signals.py"),
+    Path("alberta_framework/core/multi_head_learner.py"),
+    Path("alberta_framework/core/normalizers.py"),
+    Path("alberta_framework/core/optimizers.py"),
+    Path("alberta_framework/core/types.py"),
     Path("alberta_framework/core/world_model.py"),
     Path("alberta_framework/core/world_model_ensemble.py"),
     Path("alberta_framework/evaluation/world_model_calibration.py"),
@@ -369,6 +374,22 @@ class WorldModelOpenLoopProbe:
             bool,
         ):
             raise ValueError("rollout availability flags must be boolean")
+        if not isinstance(self.target_next_observations, tuple) or not isinstance(
+            self.target_rewards,
+            tuple,
+        ) or not isinstance(self.target_continuations, tuple):
+            raise ValueError("rollout target sequences must be tuples")
+        for index, target in enumerate(self.target_next_observations):
+            if len(_finite_tuple(f"target_next_observations[{index}]", target)) != len(
+                observation
+            ):
+                raise ValueError("rollout target observation dimension mismatch")
+        for index, reward in enumerate(self.target_rewards):
+            _finite_real(f"target_rewards[{index}]", reward)
+        for index, continuation in enumerate(self.target_continuations):
+            value = _finite_real(f"target_continuations[{index}]", continuation)
+            if value < 0.0 or value > 1.0:
+                raise ValueError("rollout continuation targets must be in [0, 1]")
         if self.grounded_targets_available and self.exact_reconstruction_available:
             horizon = len(self.actions)
             if (
@@ -377,17 +398,6 @@ class WorldModelOpenLoopProbe:
                 or len(self.target_continuations) != horizon
             ):
                 raise ValueError("grounded exact rollout targets must match the action horizon")
-            for index, target in enumerate(self.target_next_observations):
-                if len(_finite_tuple(f"target_next_observations[{index}]", target)) != len(
-                    observation
-                ):
-                    raise ValueError("rollout target observation dimension mismatch")
-            for index, reward in enumerate(self.target_rewards):
-                _finite_real(f"target_rewards[{index}]", reward)
-            for index, continuation in enumerate(self.target_continuations):
-                value = _finite_real(f"target_continuations[{index}]", continuation)
-                if value < 0.0 or value > 1.0:
-                    raise ValueError("rollout continuation targets must be in [0, 1]")
 
     def to_config(self) -> dict[str, object]:
         return {
@@ -557,7 +567,7 @@ def _state_tree_payload(state: FrozenState) -> dict[str, object]:
     leaves, structure = jax.tree.flatten(state)
     payload: list[dict[str, object]] = []
     for index, leaf in enumerate(leaves):
-        array = np.asarray(jax.device_get(_materialize_key(leaf)))
+        array = np.asarray(jax.device_get(jnp.asarray(_materialize_key(leaf))))
         contiguous = np.ascontiguousarray(array)
         payload.append(
             {
@@ -574,7 +584,7 @@ def _state_tree_payload(state: FrozenState) -> dict[str, object]:
 
 def _logical_tree_size(state: FrozenState) -> tuple[int, int]:
     arrays = [
-        np.asarray(jax.device_get(_materialize_key(leaf)))
+        np.asarray(jax.device_get(jnp.asarray(_materialize_key(leaf))))
         for leaf in jax.tree.leaves(state)
     ]
     return (
@@ -1221,6 +1231,8 @@ def _case_primitives(
             abs_tol=1e-6,
         ):
             raise ValueError("mean continuation prediction does not reconstruct from members")
+        if not np.allclose(np.mean(member_raw, axis=0), raw_mean, rtol=0.0, atol=1e-6):
+            raise ValueError("mean raw prediction does not reconstruct from members")
         decoded = np.concatenate(
             (member_next, member_rewards[:, None], member_continuations[:, None]),
             axis=1,
@@ -1273,7 +1285,17 @@ def _case_primitives(
             abs_tol=1e-10,
         ):
             raise ValueError("decoded mean disagreement does not reconstruct")
-        _number(epistemic.get("ensemble_raw_disagreement"), "raw disagreement")
+        raw_disagreement = _number(
+            epistemic.get("ensemble_raw_disagreement"),
+            "raw disagreement",
+        )
+        if member_raw is None or not math.isclose(
+            raw_disagreement,
+            float(np.mean(np.var(member_raw, axis=0))),
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise ValueError("raw ensemble disagreement does not reconstruct from members")
     elif any(epistemic.get(name) is not None for name in expected_epistemic - {"available"}):
         raise ValueError("unavailable epistemic fields must be null")
 
@@ -1849,6 +1871,7 @@ def _validate_probe_trace_binding(
     raw_trace: Mapping[str, object],
     probes: WorldModelCalibrationProbeSet,
     config: WorldModelCalibrationConfig,
+    model: FrozenModel,
     *,
     observation_dim: int,
     n_actions: int,
@@ -1874,6 +1897,17 @@ def _validate_probe_trace_binding(
             or targets.get("continuation") != probe.continuation_target
         ):
             raise ValueError(f"raw case {index} decoded targets do not match probe")
+        target_model = model.member_model if isinstance(model, WorldModelEnsemble) else model
+        expected_raw_target = _python_vector(
+            target_model.targets(
+                jnp.asarray(probe.observation, dtype=jnp.float32),
+                jnp.asarray(probe.reward_target, dtype=jnp.float32),
+                jnp.asarray(probe.continuation_target, dtype=jnp.float32),
+                jnp.asarray(probe.next_observation_target, dtype=jnp.float32),
+            )
+        )
+        if targets.get("raw") != expected_raw_target:
+            raise ValueError(f"raw case {index} normalized targets do not reconstruct")
         expected_state_region = int(
             np.digitize(
                 np.asarray(
@@ -2001,7 +2035,12 @@ def validate_world_model_calibration_report(
         if not isinstance(model_config, Mapping):
             errors.append("snapshot model_config must be an object")
         else:
-            if snapshot.get("model_config_sha256") != _canonical_sha256(model_config):
+            try:
+                model_config_digest = _canonical_sha256(model_config)
+            except (TypeError, ValueError) as error:
+                errors.append(f"snapshot model_config is not canonical JSON: {error}")
+                model_config_digest = None
+            if snapshot.get("model_config_sha256") != model_config_digest:
                 errors.append("snapshot model config digest does not match")
             try:
                 report_model = _model_from_snapshot_config(
@@ -2039,6 +2078,7 @@ def validate_world_model_calibration_report(
         and config is not None
         and observation_dim is not None
         and n_actions is not None
+        and report_model is not None
         and reconstructed_probes is not None
     ):
         try:
@@ -2047,6 +2087,7 @@ def validate_world_model_calibration_report(
                 raw_value,
                 reconstructed_probes,
                 config,
+                report_model,
                 observation_dim=observation_dim,
                 n_actions=n_actions,
             )
@@ -2095,17 +2136,21 @@ def validate_world_model_calibration_report(
     if not isinstance(hashes_value, Mapping) or set(hashes_value) != expected_hash_fields:
         errors.append("report hash fields do not match v1")
     else:
-        expected_hashes = {
-            "config_sha256": _canonical_sha256(config_value),
-            "source_manifest_sha256": _canonical_sha256(source_value),
-            "snapshot_sha256": _canonical_sha256(snapshot_value),
-            "probe_set_sha256": _canonical_sha256(probe_value),
-            "raw_trace_sha256": _canonical_sha256(raw_value),
-            "summary_sha256": _canonical_sha256(summary_value),
-            "resource_accounting_sha256": _canonical_sha256(resources_value),
-        }
-        if dict(hashes_value) != expected_hashes:
-            errors.append("one or more canonical component hashes do not match")
+        try:
+            expected_hashes = {
+                "config_sha256": _canonical_sha256(config_value),
+                "source_manifest_sha256": _canonical_sha256(source_value),
+                "snapshot_sha256": _canonical_sha256(snapshot_value),
+                "probe_set_sha256": _canonical_sha256(probe_value),
+                "raw_trace_sha256": _canonical_sha256(raw_value),
+                "summary_sha256": _canonical_sha256(summary_value),
+                "resource_accounting_sha256": _canonical_sha256(resources_value),
+            }
+        except (TypeError, ValueError) as error:
+            errors.append(f"report components are not canonical JSON: {error}")
+        else:
+            if dict(hashes_value) != expected_hashes:
+                errors.append("one or more canonical component hashes do not match")
 
     optional_values = (model, state, probes)
     if any(value is not None for value in optional_values) and not all(
@@ -2113,6 +2158,7 @@ def validate_world_model_calibration_report(
     ):
         errors.append("model, state, and probes must be supplied together for replay validation")
     elif model is not None and state is not None and probes is not None and config is not None:
+        state_hash_before = frozen_world_model_state_sha256(state)
         try:
             live_snapshot = _snapshot_descriptor(model, state)
             live_raw, live_one_step_calls, live_rollout_calls = _evaluate_raw_trace(
@@ -2124,6 +2170,8 @@ def validate_world_model_calibration_report(
         except (TypeError, ValueError) as error:
             errors.append(f"snapshot replay validation failed: {error}")
         else:
+            if frozen_world_model_state_sha256(state) != state_hash_before:
+                errors.append("snapshot replay validation mutated the supplied state")
             if live_snapshot != snapshot_value:
                 errors.append("supplied snapshot does not match report snapshot hash/resources")
             if probes.to_config() != probe_value:

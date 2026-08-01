@@ -19,10 +19,16 @@ Traceback (most recent call last):
                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   File "/home/shaw/milady/research/alberta/alberta_framework/benchmarks/slowly_changing_regression_v2.py", line 1937, in _read_validated_plan
     _require_current_plan_bindings(plan, "run-plan validation after final reread")
-  File "/home/shaw/milady/research/alberta/alberta_framework/benchmarks/slowly_changing_regression_v2.py", line 1914, in _require_current_plan_bindings
+  File "/home/shaw/milady/research/alberta/alberta_framework/benchmarks/slowly_changing_regression_v2.py", line 1915, in _require_current_plan_bindings
+    _json_exact_equal(plan["source_manifest"], _build_source_manifest()),
+                                               ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/shaw/milady/research/alberta/alberta_framework/benchmarks/slowly_changing_regression_v2.py", line 1017, in _build_source_manifest
+    snapshot = _source_closure_snapshot()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/shaw/milady/research/alberta/alberta_framework/benchmarks/slowly_changing_regression_v2.py", line 1005, in _source_closure_snapshot
     _require(
   File "/home/shaw/milady/research/alberta/alberta_framework/benchmarks/slowly_changing_regression_v2.py", line 254, in _require
     _fail(message)
   File "/home/shaw/milady/research/alberta/alberta_framework/benchmarks/slowly_changing_regression_v2.py", line 249, in _fail
     raise SCRV2ValidationError(message)
-alberta_framework.benchmarks.slowly_changing_regression_v2.SCRV2ValidationError: current source bytes differ from the pre-run plan during run-plan validation after final reread
+alberta_framework.benchmarks.slowly_changing_regression_v2.SCRV2ValidationError: source file changed while its manifest was being built: alberta_framework/core/integrated_hidden_partner.py

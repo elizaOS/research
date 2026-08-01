@@ -299,7 +299,7 @@ def test_config_round_trip_and_exact_default_composition() -> None:
     assert agent.router.config.total_feature_dim == DEPLOYED_FEATURE_DIM == 24
 
     payload = config.to_config()
-    assert payload["schema_version"] == "alberta.integrated-hidden-partner.l0.v14"
+    assert payload["schema_version"] == "alberta.integrated-hidden-partner.l0.v15"
     assert payload["schema_version"] == INTEGRATED_HIDDEN_PARTNER_SCHEMA_VERSION
     assert payload["development_level"] == "L0"
     assert payload["accepted_scientific_evidence"] is False
@@ -308,14 +308,14 @@ def test_config_round_trip_and_exact_default_composition() -> None:
     ]
     extra = copy.deepcopy(payload)
     extra["promoted_evidence"] = True
-    with pytest.raises(ValueError, match="v14 schema"):
+    with pytest.raises(ValueError, match="v15 schema"):
         IntegratedHiddenPartnerConfig.from_config(extra)
     invalid_claim = copy.deepcopy(payload)
     invalid_claim["accepted_scientific_evidence"] = True
     with pytest.raises(ValueError, match="not accepted"):
         IntegratedHiddenPartnerConfig.from_config(invalid_claim)
     old_schema = copy.deepcopy(payload)
-    old_schema["schema_version"] = "alberta.integrated-hidden-partner.l0.v13"
+    old_schema["schema_version"] = "alberta.integrated-hidden-partner.l0.v14"
     with pytest.raises(ValueError, match="unsupported"):
         IntegratedHiddenPartnerConfig.from_config(old_schema)
 
@@ -2008,7 +2008,7 @@ def test_custom_initial_bank_starts_router_and_interaction_in_exact_order() -> N
 
     custom_budget = custom_agent.resource_budget(custom.state)
     legacy_budget = legacy_agent.resource_budget(legacy.state)
-    assert custom_budget.total_state_nbytes == legacy_budget.total_state_nbytes == 6748
+    assert custom_budget.total_state_nbytes == legacy_budget.total_state_nbytes == 6757
     assert jax.tree_util.tree_structure(custom.state) == jax.tree_util.tree_structure(legacy.state)
     chex.assert_trees_all_equal(
         custom.diagnostics.selection.rng_key_before,
@@ -3419,8 +3419,8 @@ def test_default_grounded_lane_is_absent_and_preserves_legacy_state_bytes() -> N
     assert budget.grounded_world_update_counter_nbytes == 0
     assert budget.grounded_world_joint_cells_per_decision == 0
     assert budget.planner_cell_evaluations_per_decision == 4
-    assert budget.decision_cache_nbytes == 294
-    assert budget.total_state_nbytes == _tree_array_nbytes(start.state) == 6748
+    assert budget.decision_cache_nbytes == 303
+    assert budget.total_state_nbytes == _tree_array_nbytes(start.state) == 6757
 
 
 def test_grounded_nested_configs_roundtrip_and_reject_incomplete_or_wrong_shapes() -> None:
@@ -3839,8 +3839,8 @@ def test_enabled_gradient_modes_have_exact_resource_and_shape_parity_under_jit()
         assert budget.grounded_world_update_counter_nbytes == 4
         assert budget.grounded_world_joint_cells_per_decision == 4
         assert budget.planner_cell_evaluations_per_decision == 8
-        assert budget.decision_cache_nbytes == 492
-        assert budget.total_state_nbytes == 10_950
+        assert budget.decision_cache_nbytes == 501
+        assert budget.total_state_nbytes == 10_959
         assert budget.total_state_nbytes == _tree_array_nbytes(start.state)
         assert bool(result.diagnostics.all_finite)
         totals.append(budget.total_state_nbytes)

@@ -275,6 +275,33 @@ def test_source_identity_rejects_byte_drift(tmp_path: Path) -> None:
         )
 
 
+def test_pinned_source_archive_reconstructs_exact_private_inventory(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "private-source"
+
+    probe._extract_pinned_source_archive(
+        probe.DEFAULT_QUALIFICATION_ROOT,
+        destination,
+    )
+
+    expected = probe._load_source_inventory_records(
+        probe.DEFAULT_QUALIFICATION_ROOT / "sources" / "alberta" / "inventory.json"
+    )
+    assert probe._source_inventory_records(destination) == list(expected)
+    assert destination != (
+        probe.DEFAULT_QUALIFICATION_ROOT / "sources" / "alberta" / "source"
+    )
+    with pytest.raises(
+        probe.CausalGridDivergenceProbeError,
+        match="unexpectedly exists",
+    ):
+        probe._extract_pinned_source_archive(
+            probe.DEFAULT_QUALIFICATION_ROOT,
+            destination,
+        )
+
+
 def test_qualification_mount_mirror_is_minimal_exact_and_world_readable(
     tmp_path: Path,
 ) -> None:
@@ -486,6 +513,27 @@ def test_divergence_payload_has_one_based_witnesses_and_passes() -> None:
     }
     assert receipt["promotion_authorized"] is False
     assert receipt["protocol_relationship"]["retroactive_evidence_gate"] is False
+    disclosed_actions = [
+        action
+        for pair in receipt["pairwise_action_divergence"]
+        if pair["first_divergence_merkle_proof"] is not None
+        for action in (
+            pair["first_divergence_merkle_proof"]["left_action"],
+            pair["first_divergence_merkle_proof"]["right_action"],
+        )
+    ]
+    assert len(disclosed_actions) == 2 * receipt["divergence_summary"][
+        "divergent_pair_count"
+    ]
+    assert all(action in {0, 1, 2, 3} for action in disclosed_actions)
+    assert receipt["action_boundary"] == {
+        "action_arrays_emitted": False,
+        "action_arrays_persisted": False,
+        "commitment": probe.ACTION_MERKLE_ENCODING,
+        "first_divergence_proof": "canonical_paired_merkle_descent_v1",
+        "maximum_disclosed_action_scalars": len(disclosed_actions),
+        "scalar_domain": [0, 1, 2, 3],
+    }
     protected = {"actions", "observations", "states", "rewards", "regrets", "returns", "scores"}
     assert not (_all_mapping_keys(receipt) & protected)
 
@@ -559,6 +607,13 @@ def test_child_schema_rejects_channel_shape_and_impossible_delay_aggregates() ->
     )
     with pytest.raises(probe.CausalGridDivergenceProbeError, match="inconsistent"):
         probe._validate_child_payload(impossible)
+
+    boolean_index = _child_payload()
+    boolean_index["candidates"][0]["per_channel_diagnostics"][0][
+        "channel_index"
+    ] = False
+    with pytest.raises(probe.CausalGridDivergenceProbeError, match="order drifted"):
+        probe._validate_child_payload(boolean_index)
 
 
 def test_child_schema_rejects_protected_or_unknown_array_fields() -> None:
@@ -730,30 +785,28 @@ def test_probe_source_mutation_across_oci_execution_is_rejected(
     runtime.write_bytes(b"fake docker executable")
     runtime.chmod(0o755)
     probe_mount = _private_probe_mount(tmp_path)
-    source_reads = iter((b"before", b"after"))
 
-    monkeypatch.setattr(
-        probe,
-        "_read_probe_source",
-        lambda **_kwargs: next(source_reads),
-    )
-    monkeypatch.setattr(
-        probe,
-        "_run_bounded_command",
-        lambda command, **_kwargs: subprocess.CompletedProcess(
+    def mutate_private_probe(command: tuple[str, ...], **_kwargs: Any) -> Any:
+        original_size = probe_mount.stat().st_size
+        probe_mount.chmod(0o600)
+        probe_mount.write_bytes(b"x" * original_size)
+        return subprocess.CompletedProcess(
             command,
             0,
             probe._canonical_json_bytes(_child_payload()),
             b"",
-        ),
-    )
+        )
+
+    monkeypatch.setattr(probe, "_run_bounded_command", mutate_private_probe)
 
     with pytest.raises(probe.CausalGridDivergenceProbeError, match="bytes changed"):
         probe._run_child_with_qualification_mount(
             qualification_root,
             probe_mount,
             oci_runtime=runtime,
-            expected_probe_source_sha256=hashlib.sha256(b"before").hexdigest(),
+            expected_probe_source_sha256=hashlib.sha256(
+                Path(probe.__file__).read_bytes()
+            ).hexdigest(),
         )
 
 
@@ -770,6 +823,7 @@ def test_oci_interrupts_always_attempt_named_container_cleanup(
     qualification_root.mkdir()
     runtime.write_bytes(b"fake docker executable")
     runtime.chmod(0o755)
+    probe_mount = _private_probe_mount(tmp_path)
     cleanup_names: list[str] = []
 
     def interrupt(*_args: Any, **_kwargs: Any) -> Any:
@@ -789,8 +843,8 @@ def test_oci_interrupts_always_attempt_named_container_cleanup(
 
     with pytest.raises(type(fault)):
         probe._run_child_with_qualification_mount(
-            source_root,
             qualification_root,
+            probe_mount,
             oci_runtime=runtime,
             expected_probe_source_sha256=hashlib.sha256(
                 Path(probe.__file__).read_bytes()
@@ -1100,4 +1154,42 @@ def test_merkle_proof_rejects_noncanonical_path_equal_actions_and_hidden_earlier
             divergence_index=divergence_index,
             left_root_sha256=roots["left_root_sha256"],
             right_root_sha256=probe._action_merkle_root_sha256(earlier_tree),
+        )
+
+
+def test_merkle_proof_rejects_boolean_integer_aliases() -> None:
+    left_actions = bytes(probe.FIXED_STEPS)
+    right_values = bytearray(left_actions)
+    right_values[0] = 1
+    right_actions = bytes(right_values)
+    left_tree = probe._build_action_merkle_tree(left_actions)
+    right_tree = probe._build_action_merkle_tree(right_actions)
+    proof = probe._first_divergence_merkle_proof(
+        left_tree,
+        right_tree,
+        divergence_index=0,
+        left_action=0,
+        right_action=1,
+    )
+    roots = {
+        "left_root_sha256": probe._action_merkle_root_sha256(left_tree),
+        "right_root_sha256": probe._action_merkle_root_sha256(right_tree),
+    }
+
+    boolean_index = copy.deepcopy(proof)
+    boolean_index["divergence_index"] = False
+    with pytest.raises(probe.CausalGridDivergenceProbeError, match="identity drifted"):
+        probe._validate_first_divergence_merkle_proof(
+            boolean_index,
+            divergence_index=0,
+            **roots,
+        )
+
+    boolean_level = copy.deepcopy(proof)
+    boolean_level["levels"][-1]["level"] = True
+    with pytest.raises(probe.CausalGridDivergenceProbeError, match="noncanonical"):
+        probe._validate_first_divergence_merkle_proof(
+            boolean_level,
+            divergence_index=0,
+            **roots,
         )

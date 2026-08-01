@@ -140,12 +140,8 @@ def _plan(
                     ].runtime_binding.capability_qualification_receipt_sha256
                 ),
                 "source": frozen.candidate_index[candidate_id].source.to_dict(),
-                "configuration": (
-                    frozen.candidate_index[candidate_id].configuration.to_dict()
-                ),
-                "entrypoint_family": (
-                    frozen.candidate_index[candidate_id].entrypoint_family
-                ),
+                "configuration": (frozen.candidate_index[candidate_id].configuration.to_dict()),
+                "entrypoint_family": (frozen.candidate_index[candidate_id].entrypoint_family),
             }
             for candidate_id in candidate_ids
         ],
@@ -172,9 +168,7 @@ def _plan(
             "source_manifest": source_manifest,
             "source_manifest_sha256": campaign._canonical_sha256(source_manifest),
             "executor_manifest": executor_manifest,
-            "executor_manifest_sha256": campaign._canonical_sha256(
-                executor_manifest
-            ),
+            "executor_manifest_sha256": campaign._canonical_sha256(executor_manifest),
             "candidate_command_templates": [
                 {
                     "candidate_id": candidate_id,
@@ -190,9 +184,7 @@ def _plan(
         source_manifest=MappingProxyType(source_manifest),
         executor_manifest=MappingProxyType(executor_manifest),
         payload=payload,
-        candidate_index=MappingProxyType(
-            {item.candidate.candidate_id: item for item in prepared}
-        ),
+        candidate_index=MappingProxyType({item.candidate.candidate_id: item for item in prepared}),
         cpu_qualification_root=base.cpu_qualification_root,
         rng_parity_qualification_root=base.rng_parity_qualification_root,
     )
@@ -231,13 +223,10 @@ def _panel(
                     raw_archive_size=len(raw),
                     live_runtime=live,
                     scorer_record={
-                        "fov_last_10pct_ema_auc": float(candidate_index + 1)
-                        + seed_index / 100.0,
+                        "fov_last_10pct_ema_auc": float(candidate_index + 1) + seed_index / 100.0,
                         "npz_sha256": _sha(f"npz:{label}:{candidate_id}:{seed}"),
                         "npz_size_bytes": 4096 + seed_index,
-                        "reward_trace_sha256": _sha(
-                            f"trace:{label}:{candidate_id}:{seed}"
-                        ),
+                        "reward_trace_sha256": _sha(f"trace:{label}:{candidate_id}:{seed}"),
                         "reward_dtype": "<f4",
                         "reward_shape": [frozen.horizon],
                     },
@@ -348,8 +337,7 @@ def _fixture(
         verification_request=open_request,
         completion_summary=open_summary,
         final_file_sha256={
-            name: hashlib.sha256(raw).hexdigest()
-            for name, raw in open_final_raw.items()
+            name: hashlib.sha256(raw).hexdigest() for name, raw in open_final_raw.items()
         },
     )
     monkeypatch.setattr(
@@ -364,9 +352,7 @@ def _fixture(
         seal_root,
         resolver=lambda _request: open_bindings,
         expected_trust_anchor_identity=open_bindings.trust_anchor_identity,
-        expected_verification_subject_sha256=(
-            open_bindings.verification_subject_sha256
-        ),
+        expected_verification_subject_sha256=(open_bindings.verification_subject_sha256),
     )
 
     transition = protocol.validate_sealed_protocol_transition(
@@ -547,9 +533,7 @@ def _creation_kwargs(value: _Fixture) -> dict[str, Any]:
             Any,
             lambda _request: value.evaluation_bindings,
         ),
-        "expected_open_trust_anchor_identity": (
-            value.open_bindings.trust_anchor_identity
-        ),
+        "expected_open_trust_anchor_identity": (value.open_bindings.trust_anchor_identity),
         "expected_open_verification_subject_sha256": (
             value.open_bindings.verification_subject_sha256
         ),
@@ -559,9 +543,7 @@ def _creation_kwargs(value: _Fixture) -> dict[str, Any]:
         "expected_evaluation_verification_subject_sha256": (
             value.evaluation_bindings.verification_subject_sha256
         ),
-        "expected_seal_manifest_payload_sha256": seal_content.manifest[
-            "payload_sha256"
-        ],
+        "expected_seal_manifest_payload_sha256": seal_content.manifest["payload_sha256"],
     }
 
 
@@ -645,12 +627,14 @@ def test_publish_orders_authentication_before_analysis_and_replays_offline(
         for candidate in content.evaluation_score_evidence.candidate_scores
     )
     expected_descriptive = ("exact_ppo", "search_oracle")
-    assert tuple(
-        item.candidate_id for item in content.contract.fixed_descriptive_diagnostics
-    ) == expected_descriptive
-    assert tuple(
-        item.candidate_id for item in content.result.fixed_descriptive_exclusions
-    ) == expected_descriptive
+    assert (
+        tuple(item.candidate_id for item in content.contract.fixed_descriptive_diagnostics)
+        == expected_descriptive
+    )
+    assert (
+        tuple(item.candidate_id for item in content.result.fixed_descriptive_exclusions)
+        == expected_descriptive
+    )
     inferential = {method.method_id for method in content.contract.methods}
     assert inferential.isdisjoint(expected_descriptive)
 
@@ -676,17 +660,12 @@ def test_publish_orders_authentication_before_analysis_and_replays_offline(
     assert claim["scope"] == "selected_six_panel_only"
     assert claim["promotion_authorized"] is False
     assert claim["sota_claim_authorized"] is False
-    assert claim["secondary_sign_flip_interpretation"] == (
-        "nonconfirmatory_sensitivity_only"
-    )
-    assert claim["secondary_sign_exchangeability_assumption"] == (
-        "unstated_in_frozen_protocol"
-    )
+    assert claim["secondary_sign_flip_interpretation"] == ("nonconfirmatory_sensitivity_only")
+    assert claim["secondary_sign_exchangeability_assumption"] == ("unstated_in_frozen_protocol")
     assert claim["secondary_inferential_claim_authorized"] is False
     assert claim["secondary_reject_flags_are_claim_gates"] is False
     assert tuple(claim["selected_six_candidate_ids"]) == tuple(
-        candidate.candidate_id
-        for candidate in content.evaluation_score_evidence.candidate_scores
+        candidate.candidate_id for candidate in content.evaluation_score_evidence.candidate_scores
     )
     assert len(claim["selection_winner_candidate_ids"]) == 4
     assert tuple(claim["fixed_descriptive_candidate_ids"]) == expected_descriptive
@@ -847,9 +826,7 @@ def test_content_loading_is_resolver_free_and_fresh_auth_checks_both_caches(
         **_creation_kwargs(fixture),
         "open_resolver": open_resolver,
         "evaluation_resolver": evaluation_resolver,
-        "expected_analysis_manifest_payload_sha256": content.manifest[
-            "payload_sha256"
-        ],
+        "expected_analysis_manifest_payload_sha256": content.manifest["payload_sha256"],
     }
     authenticated = final_analysis.authenticate_final_analysis_content(
         content,
@@ -1121,9 +1098,7 @@ def test_publication_parent_aba_is_rejected_without_touching_replacement(
             **_creation_kwargs(fixture),
         )
     assert not output.exists()
-    assert (parent_path / "replacement-owner").read_text(encoding="utf-8") == (
-        "must-survive"
-    )
+    assert (parent_path / "replacement-owner").read_text(encoding="utf-8") == ("must-survive")
     assert not tuple(moved_parent.glob(".seal-partial-*"))
 
 
@@ -1282,9 +1257,7 @@ def test_partial_child_open_failure_closes_every_prior_descriptor(
         nonlocal calls
         calls += 1
         if calls == failure_ordinal:
-            raise final_analysis.ForagerMatchedFinalAnalysisError(
-                "injected child open failure"
-            )
+            raise final_analysis.ForagerMatchedFinalAnalysisError("injected child open failure")
         opened = real_open_child(parent, name, label)
         opened_descriptors.append(opened.descriptor)
         return opened
@@ -1344,9 +1317,12 @@ def test_analysis_runtime_source_artifact_binds_executing_code_and_runtime(
     assert python["version"] == list(sys.version_info[:3])
     assert python["cache_tag"] == sys.implementation.cache_tag
     assert numpy["version"] == np.__version__
-    assert cast(Mapping[str, Any], content.manifest["analysis_execution"])[
-        "runtime_source_payload_sha256"
-    ] == artifact["payload_sha256"]
+    assert (
+        cast(Mapping[str, Any], content.manifest["analysis_execution"])[
+            "runtime_source_payload_sha256"
+        ]
+        == artifact["payload_sha256"]
+    )
 
     baseline = final_analysis._analysis_source_records()
 
@@ -1432,9 +1408,7 @@ def test_nested_authority_threat_and_reward_tampering_fails_semantic_replay(
         ),
         (
             "completion-summary.json",
-            lambda payload: payload.__setitem__(
-                "cached_bindings_accepted_as_authority", True
-            ),
+            lambda payload: payload.__setitem__("cached_bindings_accepted_as_authority", True),
         ),
     )
     for name, mutate in mutations:
@@ -1492,3 +1466,23 @@ def test_plan_source_executor_live_and_receipt_shapes_are_exact(
                 seal_content,
                 fixture.evaluation_bindings,
             )
+
+    changed = dict(artifacts)
+    executor_payload = cast(
+        dict[str, Any],
+        json.loads(changed["executor-manifest.json"]),
+    )
+    qualification_artifacts = cast(dict[str, Any], executor_payload["qualification_artifacts"])
+    cpu_qualification = cast(dict[str, Any], qualification_artifacts["cpu_qualification"])
+    authority = cast(dict[str, Any], cpu_qualification["authority_boundary"])
+    authority["performance_claim"] = True
+    changed["executor-manifest.json"] = seal.canonical_json_bytes(executor_payload)
+    with pytest.raises(
+        final_analysis.ForagerMatchedFinalAnalysisError,
+        match="authority and qualification closure drifted",
+    ):
+        final_analysis._validate_evaluation_snapshot(
+            changed,
+            seal_content,
+            fixture.evaluation_bindings,
+        )

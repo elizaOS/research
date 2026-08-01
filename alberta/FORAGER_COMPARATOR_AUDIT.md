@@ -6,10 +6,11 @@
 
 ## Technical summary
 
-The official upstream repository contains only one learning configuration for the exact
-stationary task `ForagaxTwoBiomeLarge-v1` with aperture 9: DQN. It also contains Random,
-Search-Nearest, and Search-Oracle baselines for that environment. Frozen v1 registers the
-upstream DQN and Search-Oracle, but not Random or Search-Nearest.
+The official upstream repository contains one production learning configuration for the
+exact stationary task `ForagaxTwoBiomeLarge-v1` with aperture 9, plus one development DQN
+sweep configuration. It also contains Random, Search-Nearest, and Search-Oracle baselines
+for that environment. Frozen v1 registers the production DQN and Search-Oracle, but not
+Random or Search-Nearest.
 
 The registered LayerNorm DQN, CReLU DQN, ReDo, DRQN, PPO, and RTU-PPO arms broaden the
 method panel through explicit task adaptations. **None of those arms is an exact upstream
@@ -25,7 +26,7 @@ is interpreted.
 
 The audit was read-only. It did not execute benchmarks or inspect reward arrays.
 
-| Item | Immutable identity |
+| Item | Audit-time record or immutable identity |
 |---|---|
 | Official repository | `https://github.com/steventango/continual-foragax-agents.git` |
 | Audited branch | `main`, verified against the remote on 2026-07-31 |
@@ -36,6 +37,9 @@ The audit was read-only. It did not execute benchmarks or inspect reward arrays.
 | Frozen candidate universe | SHA-256 `2c3b214cf29e013e3f8d88b2558bd94f75e92330bf0ddcc6afd7514279a1ee77` |
 | Frozen open protocol | SHA-256 `b17da8af19cac570c426c74ff6bbc0e4ee0a4b95a4486c3ad5da19ceb3f8176e` |
 | Primary paper | [Forager paper, arXiv:2605.01131v1](https://arxiv.org/html/2605.01131v1) |
+
+The branch name, verification date, and temporary checkout are audit-time context. The
+commit, Git tree, version, and frozen descriptor hashes are the immutable identities.
 
 The exact frozen task is:
 
@@ -100,9 +104,10 @@ candidate-wise bootstrap interval, not by the candidate's tuning mean, then adva
 Alberta candidate and three external candidates. The held-out stage evaluates only those
 four selected candidates plus two fixed descriptive references on 30 new seeds.
 
-Consequently, held-out v1 can compare the preregistered tuning-selected candidates within
-that six-arm evaluation panel. It cannot identify a held-out best candidate among all 21
-inferential arms, and it cannot support the candidate-universe descriptor's broader
+Consequently, held-out v1 executes three named Alberta-vs-external contrasts among four
+tuning-selected inferential arms; the two fixed references are descriptive only. It
+supports neither a winner among the six executed arms nor a held-out best among all 21
+inferential candidates, and it cannot support the candidate-universe descriptor's broader
 “best among the frozen registered matched candidate panel” wording. That wording is an
 immutable-v1 claim-scope defect, not permission to reinterpret or edit the frozen protocol.
 Any result must remain conditional on the declared selection rule and must not be called a
@@ -120,14 +125,21 @@ The secondary p-values, adjusted p-values, and reject flags may therefore be rep
 frozen descriptive sensitivity calculations, but they must not be treated as valid
 confirmatory mean-superiority tests. A future protocol must preregister a justified
 sampling model and compatible test, or use a calibrated bounded-mean procedure, before
-secondary gates carry inferential weight. This limitation does not alter the separately
-specified primary held-out contrast.
+secondary gates carry inferential weight. Holm adjusts valid p-values; it cannot repair
+p-values that lack sign-exchangeability.
 
-### Frozen v1 tuning is not the paper's FOV tuning protocol
+This defect is separate from the frozen primary calculation, but the ordinary paired
+percentile bootstrap is not assumption-free either. The protocol states no seed-
+superpopulation, sampling model, or bootstrap regularity conditions. Its nominal 95%
+lower endpoint is therefore a frozen resampling summary, not an established population-
+level confidence bound.
 
-The paper-oriented FOV protocol uses five disjoint 10,000-step tuning seeds. Frozen v1
-instead gives every inferential candidate ten 499,712-step tuning seeds. This is a much
-larger local matched-selection protocol, not a replay of the paper's tuning procedure.
+### Frozen v1 tuning replays neither reconstructed nor current FOV tuning
+
+Alberta's reconstructed historical NumPy FOV preset declares five 10,000-step tuning
+runs; its provenance is explicitly not an upstream attestation. The pinned current
+Foragax E138 sweep declares five 50,000-step runs. Frozen v1 instead gives every
+inferential candidate ten 499,712-step tuning seeds, so it replays neither protocol.
 The horizon arithmetic is internally consistent (`244 × 2,048 = 3,904 × 128 =
 499,712`); the difference is a reproduction-scope limit, not an execution defect.
 
@@ -192,7 +204,7 @@ nonlearning reference rather than a learning-comparator candidate.
 
 These are protocol-bound counts, not general properties of the methods.
 
-| Candidate | Protocol parameter count | Optimizer updates | Replay capacity | Recurrent state elements |
+| Candidate | Protocol parameter count | Optimizer updates | Replay capacity | Protocol `recurrent_state_elements` |
 |---|---:|---:|---:|---:|
 | causal-map q grid (9 arms) | 0 | 0 | 0 | 1,847 |
 | `alberta_horde_default` | 41,285 | 499,712 | 0 | 0 |
@@ -208,18 +220,23 @@ These are protocol-bound counts, not general properties of the methods.
 | `isolated_ppo` | 305,381 | 31,232 | 0 | 0 |
 | `isolated_rtu` | 452,069 | 15,616 | 0 | 288,768 |
 
-The table now includes all 14 Alberta inferential arms. Its parameter column follows the
-frozen protocol ledger; in particular, the recurrent64 Horde also has a 61,248-element
-fixed substrate supplement outside its 49,477 trainable parameters. The causal-map arms
-have no trainable parameters but carry a 1,847-element learned finite state.
+The table now includes all 14 Alberta inferential arms, but its columns are not a complete
+or cross-method memory/compute census. Parameter counts exclude optimizer state and target
+snapshots. PPO's replay value of zero excludes 2,048/128-step rollout storage, and causal
+optimizer updates of zero exclude 499,712 non-gradient state updates. Recurrent64 Horde
+also has a 61,248-element fixed substrate outside its 49,477 trainable parameters. The
+causal-map arms have no trainable parameters but carry a 1,847-element learned finite state.
+Local RTU's value 32 counts actor/critic carry only; it excludes 576 RTRL sensitivities,
+576 Taylor sensitivities, 4,685 eligibility-tree elements, normalization/history, and RNG.
 
-The Alberta Horde and local RTU bundles consume engineered visible-image channel means,
-the previous action and reward, and three reward traces with decays 0.9, 0.99, and 0.999.
-The causal-map bundle uses public 15×15 toroidal geometry, the four-action convention, and
-the public move/reward-before-respawn transition order as structural prior knowledge. It
-does not consume evaluator state, global position, the hidden object grid, biome labels,
-or evaluator `info`, but its inductive bias is still materially different from a generic
-pixel learner.
+Alberta Horde and local RTU receive the full flattened image plus engineered channel means,
+the previous action/reward, and three reward traces with decays 0.9, 0.99, and 0.999.
+Registered DQN/DRQN receive the image plus previous action/reward through `NNAgent`
+defaults; PPO/RTU-PPO likewise receive image plus previous action/reward. The unmatched
+additions are chiefly Alberta's means/traces and the causal planner's structural priors.
+That planner uses public 15×15 toroidal geometry, the four-action convention, and the
+public move/reward-before-respawn transition order. It does not consume evaluator state,
+global position, the hidden object grid, biome labels, or evaluator `info`.
 
 Consequently, any eventual matched-panel result is conditional on the frozen method and
 resource bundle. It does not isolate architecture, memory, replay, or compute as a causal
@@ -282,16 +299,19 @@ This addendum distinguishes the exact stationary task from related Forager tasks
 read-only literature and official-source audit; it does not add a candidate to frozen v1,
 change a result, or establish a general Forager leaderboard.
 
-### No published exact-task learning SOTA was found in the audited sources
+### No published exact-task learning SOTA was found in the bounded audited corpus
 
-No published or official learning result found in the audited source is directly comparable
-to the frozen task: `ForagaxTwoBiomeLarge-v1`, color observation, aperture 9, and a
+The bounded corpus comprised the pinned official repository, the primary Forager paper,
+its cited experiment/configuration families, and the 2026 streaming RTU-RTRL paper below;
+it was not a systematic review of every publication venue. No result found there is
+directly comparable to `ForagaxTwoBiomeLarge-v1`, color observation, aperture 9, and a
 499,712-step horizon. The [Forager paper](https://arxiv.org/html/2605.01131v1) reports a
-field-of-view experiment with DQN and 30 independent trials, but it does not publish an
-exhaustive learning-method ranking for this exact stationary configuration. Accordingly,
-neither v1 nor a future run may call a learning arm “Forager SOTA.” Frozen v1 can report
-only held-out contrasts among its preregistered tuning-selected candidates, conditional on
-the configured policies, resources, task, horizon, seeds, and metric.
+field-of-view experiment with DQN and 30 independent trials, but not an exhaustive
+learning-method ranking for this exact stationary configuration. Accordingly, v1 cannot
+call a learning arm “Forager SOTA.” Any future SOTA claim requires a fresh, documented
+exact-task literature search. Frozen v1 can report only its three named held-out
+calculations, conditional on the configured policies, resources, task, horizon, seeds,
+and metric.
 
 The sole upstream production learning configuration at this exact environment and aperture
 is [E138 FOV9 DQN](https://github.com/steventango/continual-foragax-agents/blob/9710f60fa30da5badc451ad7ce3ff296d5070830/experiments/E138-two-biome-large/foragax/ForagaxTwoBiomeLarge-v1/9/DQN.json).

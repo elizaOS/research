@@ -4,16 +4,19 @@ Date: 2026-07-31
 
 ## Decision
 
-**GO for the frozen v1 Alberta panel.** The audit found no correctness, task-access,
-RNG-coupling, archive, scoring, or hidden-resource blocker in the 14 Alberta candidates.
-This is a narrow implementation-integrity conclusion, not evidence that any candidate
-will perform well and not an Alberta Plan completion claim. It does not supersede the
-selection-scope and statistical limitations recorded in `FORAGER_COMPARATOR_AUDIT.md`.
+**Internal Alberta implementation review: GO. Campaign authority: NOT CLEARED.** The
+audit found no correctness, task-access, RNG-coupling, archive, or scoring blocker in the
+14 Alberta candidates under the frozen four-field resource ledger. It did not close total
+persistent memory or compute. The bound campaign remains content-only, unendorsed, and
+nonpromoting; external trust resolution and executor-receipt verification remain required.
+This is not performance evidence or an Alberta Plan completion claim. It does not
+supersede the scope and statistical limitations in `FORAGER_COMPARATOR_AUDIT.md`.
 
-Before spending the full campaign budget, run the new public-seed q-grid diagnostic.
-That diagnostic is engineering-only and permanently nonpromoting. A valid rejection may
-motivate abandoning v1, but it cannot retroactively amend the frozen v1 protocol or turn
-seed 0 into an evidence gate.
+Before spending the full campaign budget, run the new public-seed q-grid diagnostic in
+addition to resolving the campaign's independent authority blockers. The diagnostic is
+engineering-only and permanently nonpromoting. A valid rejection may motivate abandoning
+v1, but it cannot retroactively amend the frozen protocol or turn seed 0 into an evidence
+gate.
 
 ## Scope and boundaries
 
@@ -75,14 +78,15 @@ allowed transform, and round-trips through its frozen parser.
 
 | Severity | Finding | Disposition |
 |---|---|---|
-| Blocker | None found | Frozen v1 may remain frozen. |
+| Authority blocker | Campaign execution/promotion authority is not cleared. | External trust resolution and executor-receipt verification remain required; the q probe cannot supply them. |
 | Medium verification gap | No real-task aggregate previously demonstrated behavioral divergence among the q=.50/.75/.90 arms. | Addressed by a new nonpromoting, seed-0, fixed-10k diagnostic; it has not been run. |
 | Low | The matched worker accepts the uint32 seed domain, while the Horde/RTU runner validator caps seeds at signed int32. | Inactive for the frozen campaign seeds, which are far below the signed-int32 limit. |
 | Low transparency | Recurrent Horde has a substantial fixed GRU substrate not represented in the four primary resource fields. | Explicitly disclosed by the qualification supplement; budgets are intentionally unmatched, so this is not a hidden budget violation. |
+| Resource-accounting limitation | Local RTU's declared `recurrent_state_elements=32` counts actor/critic carry only. | It excludes RTRL and Taylor sensitivities, AC(lambda) eligibility trees, normalization/history, and RNG state; total persistent memory and compute remain unmatched. |
 | Low performance risk | Horde's nonlinear critic path uses the documented gradient-only Autostep approximation rather than exact scalar-error Table-1 semantics. | May affect performance; no contract or execution-integrity violation. |
 | Low/no-op surface | `include_hint` is ineffective for array FOV observations; recurrent scale/bias fields are inactive when hidden size is zero; `freeze_after_steps=None` and causal `visit_penalty=0` are value-level no-ops. | Shared or explicit inactive settings, not accidental duplicate candidates. |
 
-## q-grid result
+## q-grid source analysis and planned diagnostic
 
 The q parameter is mathematically live. In
 `causal_map_forager._estimated_respawn_delay` (frozen source line 872),
@@ -100,10 +104,11 @@ The relevant path is:
 - `causal_map_step` (line 1858) performs one online update per transition.
 
 The diagnostic harness `forager_causal_grid_divergence_probe.py` fixes seed 0, epsilon
-0.05, q values 0.50/0.75/0.90, and exactly 10,000 transitions, with immutable action
-prefix checkpoints at 2k intervals. All lanes receive identical reset and per-transition
-environment keys. It hashes the action executed before `env.step`, records one-based
-first-divergence commitment witnesses, and never emits a reward array. Exit meanings are:
+0.05, q values 0.50/0.75/0.90, and exactly 10,000 transitions. All lanes receive identical
+reset and per-transition environment keys. It commits the action executed before
+`env.step` in fixed domain-separated SHA-256 Merkle trees. A canonical paired descent
+proves the first divergent index against both candidate roots; it persists at most two
+bounded action scalars per divergent pair and never emits a reward array. Exit meanings are:
 
 - `0`: at least one pair diverged;
 - `1`: structurally valid no-divergence rejection;
@@ -111,15 +116,15 @@ first-divergence commitment witnesses, and never emits a reward array. Exit mean
 - `3`: the final path was published but durability or replay verification is uncertain.
 
 The harness uses the qualified digest-pinned OCI image, bounded streaming stdout/stderr,
-named-container cleanup on timeout and all exceptional exits, pre/during/post probe-source
-identity checks, dirfd-anchored Linux `renameat2(RENAME_NOREPLACE)` publication, held-inode
-destination checks, and a strict two-file receipt loader. Linux `renameat2` is required;
-absence fails closed. Filesystem protection assumes cooperative writers after the verified
-publication boundary—an owner capable of replacing paths can still mutate local state.
+named-container cleanup on timeout and all exceptional exits, private exact harness bytes,
+dirfd-anchored Linux `renameat2(RENAME_NOREPLACE)` publication, held-inode destination
+checks, and a strict two-file receipt loader. Linux `renameat2` is required; absence fails
+closed. Noncooperative same-uid writers remain outside the local filesystem threat model.
 Because the frozen qualification root is mode 0700 while the OCI process runs as uid 65532,
 the parent copies only the 13 exact hash-bound inputs into a temporary mode-0444/0755 mirror,
-mounts that mirror read-only, and removes it when the child returns. The child revalidates
-every copied binding; the parent revalidates the private frozen root after execution.
+mounts that mirror read-only, and removes it when the child returns. The live source tree is
+not mounted: the child reconstructs the pinned source archive in private tmpfs and verifies
+all 205 files before import. The parent revalidates the private frozen root after execution.
 
 ## State, RNG, update, and resource audit
 
@@ -131,15 +136,20 @@ every copied binding; the parent revalidates the private frozen root after execu
   online update per transition and have no replay buffer.
 - RTU's exact/Taylor update selection, ObGD signal use, finite guards, and RTRL state flow
   are internally coherent.
+- Local RTU's protocol field `recurrent_state_elements=32` is carry-only. In addition to
+  that carry, its persistent state includes 576 RTRL sensitivity elements, 576 Taylor
+  sensitivity elements, 4,685 AC(lambda) eligibility elements, normalization/history,
+  and RNG state. Those categories are not closed by the frozen four-field ledger.
 - `alberta_horde_recurrent64` has 49,477 trainable parameters, 64 recurrent carry
   elements, and 61,248 fixed-substrate floats: 48,768 input-kernel, 12,288 recurrent-kernel,
   and 192 bias values. The qualification supplement records
   `fixed_substrate_parameter_count=61248`; it is not silently omitted.
 - Candidate selection intentionally chooses one Alberta winner from 14 arms on 10 fresh
   tuning seeds, then evaluates it on a distinct 30-seed panel. Exact ties use candidate ID.
-  The unequal Alberta/external panel breadth is explicit. Held-out comparisons concern
-  only the configured candidates selected by the frozen lower-endpoint rule; they cannot
-  identify the best held-out member of the full registered panel or equalize search effort.
+  The unequal Alberta/external panel breadth is explicit. Held-out v1 specifies three
+  Alberta-vs-external contrasts among four selected inferential arms; the two fixed arms
+  are descriptive only. It defines no winner among the six executed arms and cannot
+  identify the best held-out member of the full registered panel.
 
 ## Worker, archive, and scorer closure
 
@@ -181,7 +191,7 @@ receipt/sidecar replay.
 .venv/bin/python -m pytest tests/test_forager_causal_grid_divergence_probe.py -q -o addopts=""
 ```
 
-Final focused result: `27 passed`; ruff, strict mypy, and targeted compilation passed.
+Final focused result: `39 passed`; ruff, strict mypy, and targeted compilation passed.
 
 A read-only `.venv/bin/alberta-evidence-status` check exited `2` in the pre-existing dirty
 worktree, consistent with registered-source drift already present there. It was not
