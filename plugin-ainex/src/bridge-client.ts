@@ -21,6 +21,8 @@ import type {
 
 export interface AinexBridgeClientOptions {
   url: string;
+  /** Optional bearer secret sent only in the websocket upgrade header. */
+  authToken?: string;
   /** Auto-reconnect with exponential backoff on close. Default: true. */
   autoReconnect?: boolean;
   /** Initial reconnect delay (ms). Default 250. Doubles on every retry up to `maxReconnectDelayMs`. */
@@ -51,6 +53,62 @@ function _nextRequestId(): string {
   return `ainex-${Date.now().toString(36)}-${_idCounter.toString(36)}`;
 }
 
+function _isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (normalized === "localhost" || normalized === "::1") return true;
+  const octets = normalized.split(".");
+  return (
+    octets.length === 4 &&
+    octets.every((octet) => /^\d{1,3}$/.test(octet)) &&
+    Number(octets[0]) === 127 &&
+    octets.every((octet) => Number(octet) <= 255)
+  );
+}
+
+export function redactedBridgeUrl(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    if (!["ws:", "wss:"].includes(parsed.protocol) || parsed.hostname === "") {
+      return "<invalid bridge endpoint>";
+    }
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return "<invalid bridge endpoint>";
+  }
+}
+
+function _validateBridgeUrl(rawUrl: string, authenticated: boolean): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error("bridge URL must be a valid ws:// or wss:// URL");
+  }
+  if (!["ws:", "wss:"].includes(parsed.protocol)) {
+    throw new Error("bridge URL must use ws:// or wss://");
+  }
+  if (parsed.username !== "" || parsed.password !== "") {
+    throw new Error("bridge credentials must not be placed in URL userinfo");
+  }
+  if (authenticated && (parsed.search !== "" || parsed.hash !== "")) {
+    throw new Error(
+      "authenticated bridge URLs must not contain a query or fragment",
+    );
+  }
+  if (authenticated && parsed.pathname !== "/") {
+    throw new Error("authenticated bridge URLs must use the root path");
+  }
+  if (
+    authenticated &&
+    parsed.protocol !== "wss:" &&
+    !_isLoopbackHostname(parsed.hostname)
+  ) {
+    throw new Error(
+      "authenticated bridge URLs must use wss:// or a loopback ws:// endpoint",
+    );
+  }
+}
+
 export class AinexBridgeClient {
   readonly url: string;
   readonly autoReconnect: boolean;
@@ -65,9 +123,20 @@ export class AinexBridgeClient {
   private pending = new Map<string, PendingSend>();
   private eventHandlers = new Map<string, Set<BridgeEventHandler>>();
   private connectPromise: Promise<void> | null = null;
+  private readonly authToken: string | null;
 
   constructor(options: AinexBridgeClientOptions) {
+    if (
+      options.authToken !== undefined &&
+      !/^[\x21-\x7e]{32,4096}$/.test(options.authToken)
+    ) {
+      throw new Error(
+        "bridge auth token must contain 32..4096 visible ASCII characters",
+      );
+    }
+    _validateBridgeUrl(options.url, options.authToken !== undefined);
     this.url = options.url;
+    this.authToken = options.authToken ?? null;
     this.autoReconnect = options.autoReconnect ?? true;
     this.reconnectDelayMs = options.reconnectDelayMs ?? 250;
     this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? 5000;
@@ -87,7 +156,11 @@ export class AinexBridgeClient {
 
     this.closing = false;
     this.connectPromise = new Promise<void>((resolve, reject) => {
-      const ws = new WebSocket(this.url);
+      const ws = this.authToken
+        ? new WebSocket(this.url, {
+            headers: { Authorization: `Bearer ${this.authToken}` },
+          })
+        : new WebSocket(this.url);
       this.ws = ws;
 
       ws.once("open", () => {
@@ -134,7 +207,9 @@ export class AinexBridgeClient {
     options: SendOptions = {},
   ): Promise<ResponseEnvelope> {
     if (!this.connected || !this.ws) {
-      throw new Error(`bridge not connected (url=${this.url})`);
+      throw new Error(
+        `bridge not connected (url=${redactedBridgeUrl(this.url)})`,
+      );
     }
     const ws = this.ws;
     const request_id = _nextRequestId();

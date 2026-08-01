@@ -82,7 +82,7 @@ class TestJointMapping:
 
     def test_joint_table_matches_constants(self):
         """bridge/isaaclab/joint_map.py should list same arm joints."""
-        from bridge.isaaclab.joint_map import ARM_JOINT_NAMES as BRIDGE_ARM
+        from eliza_robot.bridge.isaaclab.joint_map import ARM_JOINT_NAMES as BRIDGE_ARM
         assert set(BRIDGE_ARM) == set(consts.ARM_JOINT_NAMES)
 
     def test_all_joints_have_range(self):
@@ -231,20 +231,20 @@ class TestBridgeServoPath:
     """Verify the bridge servo.set conversion path."""
 
     def test_radians_to_pulse_center(self):
-        from bridge.isaaclab.joint_map import radians_to_pulse
+        from eliza_robot.bridge.isaaclab.joint_map import radians_to_pulse
         assert radians_to_pulse(0.0, 14) == 500
 
     def test_radians_to_pulse_limits(self):
-        from bridge.isaaclab.joint_map import radians_to_pulse
+        from eliza_robot.bridge.isaaclab.joint_map import radians_to_pulse
         assert radians_to_pulse(2.09, 14) == 1000
         assert radians_to_pulse(-2.09, 14) == 0
 
     def test_pulse_to_radians_center(self):
-        from bridge.isaaclab.joint_map import pulse_to_radians
+        from eliza_robot.bridge.isaaclab.joint_map import pulse_to_radians
         assert abs(pulse_to_radians(500, 14)) < 0.01
 
     def test_roundtrip_conversion(self):
-        from bridge.isaaclab.joint_map import radians_to_pulse, pulse_to_radians
+        from eliza_robot.bridge.isaaclab.joint_map import pulse_to_radians, radians_to_pulse
         for rad in [-1.5, -0.5, 0.0, 0.5, 1.5]:
             pulse = radians_to_pulse(rad, 14)
             recovered = pulse_to_radians(pulse, 14)
@@ -252,13 +252,13 @@ class TestBridgeServoPath:
 
     def test_arm_joint_servo_ids(self):
         """All arm joints should have valid servo IDs."""
-        from bridge.isaaclab.joint_map import joint_name_to_servo_id
+        from eliza_robot.bridge.isaaclab.joint_map import joint_name_to_servo_id
         for name in consts.ARM_JOINT_NAMES:
             sid = joint_name_to_servo_id(name)
             assert 13 <= sid <= 22, f"{name}: servo ID {sid} out of arm range [13,22]"
 
     def test_servo_id_roundtrip(self):
-        from bridge.isaaclab.joint_map import (
+        from eliza_robot.bridge.isaaclab.joint_map import (
             joint_name_to_servo_id,
             servo_id_to_joint_name,
         )
@@ -272,7 +272,7 @@ class TestActionLibrary:
     """Verify the ACTION_LIBRARY arm movements."""
 
     def test_wave_uses_left_arm(self):
-        from bridge.isaaclab.actions import ACTION_LIBRARY
+        from eliza_robot.bridge.isaaclab.actions import ACTION_LIBRARY
         wave = ACTION_LIBRARY["wave"]
         # First keyframe should set l_sho_pitch
         kf0 = wave.keyframes[0]
@@ -280,7 +280,7 @@ class TestActionLibrary:
         assert kf0.positions["l_sho_pitch"] < -1.0, "Wave should raise left arm"
 
     def test_wave_has_elbow_oscillation(self):
-        from bridge.isaaclab.actions import ACTION_LIBRARY
+        from eliza_robot.bridge.isaaclab.actions import ACTION_LIBRARY
         wave = ACTION_LIBRARY["wave"]
         elbow_values = [kf.positions.get("l_el_yaw", 0.0) for kf in wave.keyframes]
         # Should have both positive and negative elbow yaw
@@ -288,8 +288,8 @@ class TestActionLibrary:
         assert any(v < -0.5 for v in elbow_values), "Wave should have negative elbow yaw"
 
     def test_all_actions_have_valid_joints(self):
-        from bridge.isaaclab.actions import ACTION_LIBRARY
-        from bridge.isaaclab.joint_map import JOINT_BY_NAME
+        from eliza_robot.bridge.isaaclab.actions import ACTION_LIBRARY
+        from eliza_robot.bridge.isaaclab.joint_map import JOINT_BY_NAME
         for action_name, seq in ACTION_LIBRARY.items():
             for i, kf in enumerate(seq.keyframes):
                 for joint_name in kf.positions:
@@ -298,8 +298,8 @@ class TestActionLibrary:
                     )
 
     def test_all_actions_within_limits(self):
-        from bridge.isaaclab.actions import ACTION_LIBRARY
-        from bridge.isaaclab.joint_map import JOINT_BY_NAME
+        from eliza_robot.bridge.isaaclab.actions import ACTION_LIBRARY
+        from eliza_robot.bridge.isaaclab.joint_map import JOINT_BY_NAME
         for action_name, seq in ACTION_LIBRARY.items():
             for i, kf in enumerate(seq.keyframes):
                 for joint_name, val in kf.positions.items():
@@ -310,8 +310,8 @@ class TestActionLibrary:
                     )
 
     def test_stand_returns_to_default(self):
-        from bridge.isaaclab.actions import ACTION_LIBRARY
-        from bridge.isaaclab.ainex_cfg import STAND_JOINT_POSITIONS
+        from eliza_robot.bridge.isaaclab.actions import ACTION_LIBRARY
+        from eliza_robot.bridge.isaaclab.ainex_cfg import STAND_JOINT_POSITIONS
         stand = ACTION_LIBRARY["stand"]
         # Stand should have exactly the STAND_JOINT_POSITIONS
         kf = stand.keyframes[0]
@@ -327,8 +327,8 @@ class TestArmBodyPositions:
 
     def test_arms_forward_gripper_in_front(self):
         """With arms forward, gripper bodies should be in front of torso."""
-        from eliza_robot.sim.mujoco.arm_test import apply_pose, get_body_positions
         from eliza_robot.sim.mujoco.arm_poses import ARM_POSES
+        from eliza_robot.sim.mujoco.arm_test import apply_pose, get_body_positions
 
         model, data = _load_and_stand()
         apply_pose(model, data, ARM_POSES["arms_forward"].joints, settle_steps=500)

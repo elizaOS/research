@@ -3,12 +3,14 @@
     "real": {
       "description": "Real AiNex robot via ROS1",
       "backend": "ros_real",
-      "host": "0.0.0.0",
+      "host": "127.0.0.1",
       "rosbridge_port": 9090,
       "envelope_port": 9100,
       "publish_hz": 15.0,
       "max_commands_per_sec": 30,
       "deadman_timeout_sec": 1.0,
+      "auth_token": "",
+      "physical_resource_id": "",
       "requires_ros": true,
       "camera_url": "http://{robot_ip}:8080/stream?topic=/camera/image_raw&type=mjpeg&quality=70"
     },
@@ -89,12 +91,14 @@
     "asimov-real": {
       "description": "ASIMOV-1 hardware via Menlo LiveKit/protobuf API",
       "backend": "asimov_remote",
-      "host": "0.0.0.0",
+      "host": "127.0.0.1",
       "rosbridge_port": 9094,
       "envelope_port": 9104,
       "publish_hz": 50.0,
       "max_commands_per_sec": 50,
       "deadman_timeout_sec": 1.0,
+      "auth_token": "",
+      "physical_resource_id": "",
       "requires_ros": false,
       "camera_url": "",
       "profile_id": "asimov-1",
@@ -109,6 +113,8 @@
     "AINEX_PUBLISH_HZ": "publish_hz",
     "AINEX_MAX_CMD_SEC": "max_commands_per_sec",
     "AINEX_DEADMAN_SEC": "deadman_timeout_sec",
-    "AINEX_CAMERA_URL": "camera_url"
+    "AINEX_CAMERA_URL": "camera_url",
+    "ELIZA_ROBOT_BRIDGE_AUTH_TOKEN": "auth_token",
+    "ELIZA_ROBOT_PHYSICAL_RESOURCE_ID": "physical_resource_id"
   }
 }

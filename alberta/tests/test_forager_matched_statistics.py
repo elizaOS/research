@@ -11,15 +11,18 @@ from fractions import Fraction
 import numpy as np
 import pytest
 
+from alberta_framework.benchmarks import forager_matched_statistics as statistics_module
 from alberta_framework.benchmarks.forager_matched_statistics import (
+    PRIMARY_BOOTSTRAP_IMPLEMENTATION_SHA256,
+    SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SHA256,
     BootstrapSpec,
     ComparisonSpec,
+    DescriptiveDiagnosticScores,
     EvidenceBinding,
     LearningMethodScores,
     MatchedComparisonContract,
     MatchedStatisticsError,
     PermutationSpec,
-    PrivilegedDiagnosticScores,
     analyze_matched_scores,
     canonical_payload_sha256,
     holm_adjust,
@@ -27,6 +30,8 @@ from alberta_framework.benchmarks.forager_matched_statistics import (
     paired_differences,
     paired_percentile_bootstrap_lower_bound,
     paired_sign_flip_test,
+    primary_bootstrap_implementation_descriptor,
+    secondary_sign_flip_holm_implementation_descriptor,
     validate_result_payload,
 )
 
@@ -41,7 +46,14 @@ EVIDENCE = EvidenceBinding(
     runtime_profile_sha256="4" * 64,
     source_evidence_sha256="5" * 64,
     executor_evidence_sha256="6" * 64,
-    sealed_protocol_sha256="7" * 64,
+    score_evidence_sha256="7" * 64,
+    execution_closure_sha256="8" * 64,
+    authenticated_bindings_sha256="9" * 64,
+    external_verification_subject_sha256="e" * 64,
+    external_verification_receipt_sha256="a" * 64,
+    sealed_protocol_sha256="b" * 64,
+    selection_result_sha256="c" * 64,
+    selection_report_sha256="d" * 64,
 )
 BOOTSTRAP = BootstrapSpec(resamples=257, seed=7_001, confidence=0.95)
 PERMUTATION = PermutationSpec(
@@ -73,7 +85,7 @@ def _contract(
     alberta_scores: tuple[float, ...] = (2.0, 3.0, 4.0, 5.0),
     primary_scores: tuple[float, ...] = (1.0, 2.0, 3.0, 4.0),
     secondary: tuple[LearningMethodScores, ...] = (),
-    diagnostics: tuple[PrivilegedDiagnosticScores, ...] = (),
+    diagnostics: tuple[DescriptiveDiagnosticScores, ...] = (),
     margin: float = 0.0,
 ) -> MatchedComparisonContract:
     alberta = _method("alberta_candidate_v1", alberta_scores)
@@ -93,10 +105,12 @@ def _contract(
             )
             for method in secondary
         ),
-        privileged_diagnostics=diagnostics,
+        fixed_descriptive_diagnostics=diagnostics,
         bootstrap=BOOTSTRAP,
         permutation=PERMUTATION,
         primary_margin=margin,
+        primary_analysis_implementation_sha256=(PRIMARY_BOOTSTRAP_IMPLEMENTATION_SHA256),
+        secondary_analysis_implementation_sha256=(SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SHA256),
     )
 
 
@@ -118,6 +132,55 @@ def test_bootstrap_uses_paired_pcg64_and_one_sided_lower_quantile() -> None:
     assert result.alpha == pytest.approx(0.05)
     assert result.estimate == pytest.approx(3.25)
     assert result == paired_percentile_bootstrap_lower_bound(differences, BOOTSTRAP)
+
+
+def test_analysis_implementation_descriptors_are_hash_bound_and_semantically_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = primary_bootstrap_implementation_descriptor()
+    secondary = secondary_sign_flip_holm_implementation_descriptor()
+
+    assert canonical_payload_sha256(primary) == PRIMARY_BOOTSTRAP_IMPLEMENTATION_SHA256
+    assert canonical_payload_sha256(secondary) == SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SHA256
+    assert primary["paired_difference_arithmetic"] == ("binary64_subtraction_then_finite_check")
+    assert primary["downstream_arithmetic"] == ("exact_dyadic_fraction_then_binary64")
+    assert secondary["paired_difference_arithmetic"] == ("binary64_subtraction_then_finite_check")
+    multiplicity = secondary["multiplicity"]
+    assert isinstance(multiplicity, dict)
+    assert multiplicity["alpha_conversion"] == "Fraction.from_float(binary64_alpha)"
+
+    contract = _contract()
+    implementations = contract.to_payload()["analysis_implementations"]
+    assert isinstance(implementations, dict)
+    assert implementations["primary"] == {
+        "descriptor": primary,
+        "implementation_sha256": PRIMARY_BOOTSTRAP_IMPLEMENTATION_SHA256,
+    }
+    assert implementations["secondary"] == {
+        "descriptor": secondary,
+        "implementation_sha256": SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SHA256,
+    }
+    with pytest.raises(MatchedStatisticsError, match="unknown primary"):
+        replace(contract, primary_analysis_implementation_sha256="0" * 64)
+    with pytest.raises(MatchedStatisticsError, match="unknown secondary"):
+        replace(contract, secondary_analysis_implementation_sha256="0" * 64)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            statistics_module,
+            "_BOOTSTRAP_CHUNK_ELEMENTS",
+            statistics_module._BOOTSTRAP_CHUNK_ELEMENTS + 1,
+        )
+        with pytest.raises(MatchedStatisticsError, match="primary.*descriptor drifted"):
+            contract.to_payload()
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            statistics_module,
+            "_SIGN_FLIP_CHUNK_ELEMENTS",
+            statistics_module._SIGN_FLIP_CHUNK_ELEMENTS + 1,
+        )
+        with pytest.raises(MatchedStatisticsError, match="secondary.*descriptor drifted"):
+            contract.to_payload()
 
 
 def test_bootstrap_mean_is_exact_for_finite_float_cancellation() -> None:
@@ -143,9 +206,7 @@ def test_bootstrap_mean_is_exact_for_finite_float_cancellation() -> None:
     ]
 
     assert result.estimate == float(Fraction(1, 3))
-    assert result.lower_bound == float(
-        np.quantile(oracle_distribution, 0.05, method="linear")
-    )
+    assert result.lower_bound == float(np.quantile(oracle_distribution, 0.05, method="linear"))
 
 
 def test_primary_gate_is_strict_and_margin_is_nonnegative() -> None:
@@ -175,10 +236,14 @@ def test_exact_seed_order_is_required_for_every_learning_method() -> None:
             methods=(alberta, primary, reordered),
             primary_comparison=ComparisonSpec("primary_h", "alberta", "primary"),
             secondary_comparisons=(ComparisonSpec("secondary_h", "reordered", "primary"),),
-            privileged_diagnostics=(),
+            fixed_descriptive_diagnostics=(),
             bootstrap=BOOTSTRAP,
             permutation=PERMUTATION,
             primary_margin=0.0,
+            primary_analysis_implementation_sha256=(PRIMARY_BOOTSTRAP_IMPLEMENTATION_SHA256),
+            secondary_analysis_implementation_sha256=(
+                SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SHA256
+            ),
         )
 
 
@@ -192,7 +257,13 @@ def test_exact_seed_order_is_required_for_every_learning_method() -> None:
         replace(EVIDENCE, runtime_profile_sha256="d" * 64),
         replace(EVIDENCE, source_evidence_sha256="e" * 64),
         replace(EVIDENCE, executor_evidence_sha256="f" * 64),
-        replace(EVIDENCE, sealed_protocol_sha256="a" * 64),
+        replace(EVIDENCE, score_evidence_sha256="e" * 64),
+        replace(EVIDENCE, execution_closure_sha256="f" * 64),
+        replace(EVIDENCE, authenticated_bindings_sha256="e" * 64),
+        replace(EVIDENCE, external_verification_receipt_sha256="f" * 64),
+        replace(EVIDENCE, sealed_protocol_sha256="e" * 64),
+        replace(EVIDENCE, selection_result_sha256="f" * 64),
+        replace(EVIDENCE, selection_report_sha256="e" * 64),
     ],
 )
 def test_each_evidence_binding_mismatch_fails_closed(
@@ -210,10 +281,14 @@ def test_each_evidence_binding_mismatch_fails_closed(
             ),
             primary_comparison=ComparisonSpec("primary_h", "alberta", "primary"),
             secondary_comparisons=(),
-            privileged_diagnostics=(),
+            fixed_descriptive_diagnostics=(),
             bootstrap=BOOTSTRAP,
             permutation=PERMUTATION,
             primary_margin=0.0,
+            primary_analysis_implementation_sha256=(PRIMARY_BOOTSTRAP_IMPLEMENTATION_SHA256),
+            secondary_analysis_implementation_sha256=(
+                SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SHA256
+            ),
         )
 
 
@@ -223,6 +298,13 @@ def test_evidence_binding_uses_digests_not_caller_trust_booleans() -> None:
     assert "executor_trusted" not in payload
     assert payload["source_evidence_sha256"] == "5" * 64
     assert payload["executor_evidence_sha256"] == "6" * 64
+    assert payload["score_evidence_sha256"] == "7" * 64
+    assert payload["execution_closure_sha256"] == "8" * 64
+    assert payload["authenticated_bindings_sha256"] == "9" * 64
+    assert payload["external_verification_receipt_sha256"] == "a" * 64
+    assert payload["sealed_protocol_sha256"] == "b" * 64
+    assert payload["selection_result_sha256"] == "c" * 64
+    assert payload["selection_report_sha256"] == "d" * 64
 
     with pytest.raises(MatchedStatisticsError, match="source_evidence_sha256"):
         replace(EVIDENCE, source_evidence_sha256="trusted")
@@ -240,10 +322,14 @@ def test_primary_comparison_and_preregistered_methods_are_required() -> None:
             methods=methods,
             primary_comparison=comparison,
             secondary_comparisons=(),
-            privileged_diagnostics=(),
+            fixed_descriptive_diagnostics=(),
             bootstrap=BOOTSTRAP,
             permutation=PERMUTATION,
             primary_margin=0.0,
+            primary_analysis_implementation_sha256=(PRIMARY_BOOTSTRAP_IMPLEMENTATION_SHA256),
+            secondary_analysis_implementation_sha256=(
+                SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SHA256
+            ),
         )
 
     with pytest.raises(MatchedStatisticsError, match="must not be empty"):
@@ -264,29 +350,85 @@ def test_comparison_ids_and_unordered_pairs_are_unique() -> None:
             methods=methods,
             primary_comparison=ComparisonSpec("a_vs_b", "a", "b"),
             secondary_comparisons=(ComparisonSpec("b_vs_a", "b", "a"),),
-            privileged_diagnostics=(),
+            fixed_descriptive_diagnostics=(),
             bootstrap=BOOTSTRAP,
             permutation=PERMUTATION,
             primary_margin=0.0,
+            primary_analysis_implementation_sha256=(PRIMARY_BOOTSTRAP_IMPLEMENTATION_SHA256),
+            secondary_analysis_implementation_sha256=(
+                SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SHA256
+            ),
         )
 
 
-def test_privileged_diagnostics_are_explicitly_excluded_from_superiority() -> None:
-    high = PrivilegedDiagnosticScores(
-        diagnostic_id="oracle_ceiling",
-        seeds=(999,),
-        scores=(1e300,),
+def test_fixed_descriptive_candidates_retain_order_and_truthful_exclusion_reasons() -> None:
+    shared_rng = DescriptiveDiagnosticScores(
+        candidate_id="exact_ppo",
+        seeds=SEEDS,
+        scores=(1e300,) * len(SEEDS),
+        exclusion_reasons=("shared_agent_environment_rng",),
     )
-    low = replace(high, scores=(-1e300,))
-    high_result = analyze_matched_scores(_contract(diagnostics=(high,)))
-    low_result = analyze_matched_scores(_contract(diagnostics=(low,)))
+    privileged = DescriptiveDiagnosticScores(
+        candidate_id="search_oracle",
+        seeds=SEEDS,
+        scores=(-1e300,) * len(SEEDS),
+        exclusion_reasons=("privileged_observation_access",),
+    )
+    changed = replace(shared_rng, scores=(-1e300,) * len(SEEDS))
+    high_result = analyze_matched_scores(_contract(diagnostics=(shared_rng, privileged)))
+    low_result = analyze_matched_scores(_contract(diagnostics=(changed, privileged)))
 
     assert high_result.primary == low_result.primary
     assert high_result.secondary == low_result.secondary == ()
     assert high_result.payload_sha256 != low_result.payload_sha256
-    assert high_result.diagnostic_exclusions[0].exclusion_reason == (
-        "privileged_diagnostic_not_eligible_for_superiority"
+    assert tuple(item.candidate_id for item in high_result.fixed_descriptive_exclusions) == (
+        "exact_ppo",
+        "search_oracle",
     )
+    assert high_result.fixed_descriptive_exclusions[0].exclusion_reasons == (
+        "shared_agent_environment_rng",
+    )
+    assert high_result.fixed_descriptive_exclusions[1].exclusion_reasons == (
+        "privileged_observation_access",
+    )
+    assert "PrivilegedDiagnosticScores" not in statistics_module.__all__
+    assert "PrivilegedDiagnosticExclusion" not in statistics_module.__all__
+    assert not hasattr(statistics_module, "PrivilegedDiagnosticScores")
+    assert not hasattr(statistics_module, "PrivilegedDiagnosticExclusion")
+
+    forged = replace(
+        high_result.fixed_descriptive_exclusions[0],
+        exclusion_reasons=("privileged_observation_access",),
+    )
+    with pytest.raises(MatchedStatisticsError, match="reasons do not match"):
+        replace(
+            high_result,
+            fixed_descriptive_exclusions=(
+                forged,
+                *high_result.fixed_descriptive_exclusions[1:],
+            ),
+        )
+
+
+def test_fixed_descriptive_inputs_require_common_seeds_and_nonempty_unique_reasons() -> None:
+    diagnostic = DescriptiveDiagnosticScores(
+        candidate_id="exact_ppo",
+        seeds=SEEDS,
+        scores=(1.0,) * len(SEEDS),
+        exclusion_reasons=("shared_agent_environment_rng",),
+    )
+    with pytest.raises(MatchedStatisticsError, match="exact common seed ordering"):
+        _contract(diagnostics=(replace(diagnostic, seeds=(1, 2, 3, 4)),))
+    with pytest.raises(MatchedStatisticsError, match="must not be empty"):
+        replace(diagnostic, exclusion_reasons=())
+    with pytest.raises(MatchedStatisticsError, match="unique reasons"):
+        replace(
+            diagnostic,
+            exclusion_reasons=(
+                "shared_agent_environment_rng",
+                "shared_agent_environment_rng",
+            ),
+        )
 
 
 def test_exact_sign_flip_enumerates_all_assignments_and_includes_ties() -> None:
@@ -368,11 +510,7 @@ def test_monte_carlo_masks_match_independent_pcg64_exact_arithmetic_oracle() -> 
     oracle_extreme = 0
     for mask in masks:
         subset_sum = sum(
-            (
-                value
-                for value, is_negative in zip(exact_values, mask, strict=True)
-                if is_negative
-            ),
+            (value for value, is_negative in zip(exact_values, mask, strict=True) if is_negative),
             start=Fraction(0, 1),
         )
         oracle_extreme += int(subset_sum <= 0)
@@ -430,17 +568,17 @@ def test_secondary_comparison_uses_its_explicit_intervention_and_comparator() ->
         methods=methods,
         primary_comparison=ComparisonSpec("reference_vs_external", "reference", "external"),
         secondary_comparisons=(ComparisonSpec("rtu_vs_external", "rtu", "external"),),
-        privileged_diagnostics=(),
+        fixed_descriptive_diagnostics=(),
         bootstrap=BOOTSTRAP,
         permutation=PERMUTATION,
         primary_margin=0.0,
+        primary_analysis_implementation_sha256=(PRIMARY_BOOTSTRAP_IMPLEMENTATION_SHA256),
+        secondary_analysis_implementation_sha256=(SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SHA256),
     )
 
     result = analyze_matched_scores(contract)
 
-    assert result.secondary[0].comparison == ComparisonSpec(
-        "rtu_vs_external", "rtu", "external"
-    )
+    assert result.secondary[0].comparison == ComparisonSpec("rtu_vs_external", "rtu", "external")
     assert result.secondary[0].sign_flip.observed_mean == 2.0
     assert result.secondary[0].holm.hypothesis_id == "rtu_vs_external"
 
@@ -467,7 +605,7 @@ def test_difference_properties_hold_for_synthetic_finite_inputs() -> None:
     ],
 )
 def test_nonfinite_or_non_builtin_float_scores_fail_closed(
-    invalid_scores: tuple[object, ...]
+    invalid_scores: tuple[object, ...],
 ) -> None:
     with pytest.raises(MatchedStatisticsError):
         LearningMethodScores(
@@ -533,6 +671,8 @@ def test_result_is_canonical_hash_bound_and_contains_no_host_metadata() -> None:
     assert claimed == hashlib.sha256(independently_encoded).hexdigest()
     assert claimed == result.payload_sha256
     assert load_canonical_result(raw, result.contract) == result
+    assert payload["schema"] == "alberta.forager_matched_statistics.result.v3"
+    assert payload["contract"]["schema"] == ("alberta.forager_matched_statistics.contract.v3")
     text = raw.decode("utf-8").lower()
     assert "/home/" not in text
     assert "timestamp" not in text
@@ -627,14 +767,14 @@ def test_result_replay_distinguishes_signed_zero_in_canonical_floats() -> None:
             _method("alberta_zero", (-0.0,), seeds=seeds),
             _method("baseline_zero", (0.0,), seeds=seeds),
         ),
-        primary_comparison=ComparisonSpec(
-            "zero_comparison", "alberta_zero", "baseline_zero"
-        ),
+        primary_comparison=ComparisonSpec("zero_comparison", "alberta_zero", "baseline_zero"),
         secondary_comparisons=(),
-        privileged_diagnostics=(),
+        fixed_descriptive_diagnostics=(),
         bootstrap=BOOTSTRAP,
         permutation=PERMUTATION,
         primary_margin=-0.0,
+        primary_analysis_implementation_sha256=(PRIMARY_BOOTSTRAP_IMPLEMENTATION_SHA256),
+        secondary_analysis_implementation_sha256=(SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SHA256),
     )
     result = analyze_matched_scores(contract)
     positive_contract = replace(
@@ -673,10 +813,49 @@ def test_loader_rejects_noncanonical_duplicate_and_nonfinite_json() -> None:
         load_canonical_result(b'{"value":NaN}', contract)
 
 
+def test_loader_bounds_raw_bytes_nodes_and_nesting_depth() -> None:
+    contract = _contract()
+    oversized = b" " * (statistics_module._MAX_CANONICAL_RESULT_BYTES + 1)
+    with pytest.raises(MatchedStatisticsError, match="maximum byte length"):
+        load_canonical_result(oversized, contract)
+
+    too_many_nodes = (
+        b'{"items":['
+        + b",".join(b"0" for _ in range(statistics_module._MAX_CANONICAL_RESULT_NODES))
+        + b"]}"
+    )
+    with pytest.raises(MatchedStatisticsError, match="too many nodes"):
+        load_canonical_result(too_many_nodes, contract)
+
+    nesting = statistics_module._MAX_CANONICAL_RESULT_DEPTH
+    too_deep = b'{"item":' + b"[" * nesting + b"0" + b"]" * nesting + b"}"
+    with pytest.raises(MatchedStatisticsError, match="nesting depth"):
+        load_canonical_result(too_deep, contract)
+
+
+@pytest.mark.parametrize(
+    "decoder_error",
+    [RecursionError("synthetic"), ValueError("synthetic"), OverflowError("synthetic")],
+)
+def test_loader_normalizes_decoder_exceptions(
+    monkeypatch: pytest.MonkeyPatch, decoder_error: Exception
+) -> None:
+    def fail_decode(*_args: object, **_kwargs: object) -> object:
+        raise decoder_error
+
+    monkeypatch.setattr(
+        "alberta_framework.benchmarks.forager_matched_statistics.json.loads",
+        fail_decode,
+    )
+    with pytest.raises(MatchedStatisticsError, match="not valid JSON"):
+        load_canonical_result(b"{}", _contract())
+
+
 def test_any_input_change_changes_contract_and_result_hashes() -> None:
     original = _contract()
     changed = _contract(alberta_scores=(2.0, 3.0, 4.0, 5.000000000000001))
     assert original.payload_sha256 != changed.payload_sha256
-    assert analyze_matched_scores(original).payload_sha256 != analyze_matched_scores(
-        changed
-    ).payload_sha256
+    assert (
+        analyze_matched_scores(original).payload_sha256
+        != analyze_matched_scores(changed).payload_sha256
+    )

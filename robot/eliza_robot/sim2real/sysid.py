@@ -28,9 +28,9 @@ import numpy as np
 from eliza_robot.bridge.backends.base import BridgeBackend
 from eliza_robot.bridge.backends.mujoco_backend import MuJocoBackend
 from eliza_robot.bridge.backends.noise_injector import NoiseInjectorBackend, NoiseProfile
+from eliza_robot.bridge.physical_execution import require_exact_command_ack
 from eliza_robot.bridge.protocol import CommandEnvelope, utc_now_iso
 from eliza_robot.sim.mujoco.demo_env import DemoEnv
-
 
 SAFE_PROBE_JOINTS = (
     # Joints that are safe to drive away from home pose on a standing
@@ -70,10 +70,15 @@ class SysIdResult:
 
 async def _send(backend: BridgeBackend, cmd: str, payload: dict) -> None:
     rid = f"sysid-{cmd}-{time.time_ns()}"
-    await backend.handle_command(CommandEnvelope(
-        request_id=rid, timestamp=utc_now_iso(),
-        command=cmd, payload=payload,
-    ))
+    response = await backend.handle_command(
+        CommandEnvelope(
+            request_id=rid,
+            timestamp=utc_now_iso(),
+            command=cmd,
+            payload=payload,
+        )
+    )
+    require_exact_command_ack(response, command=cmd)
 
 
 async def _probe_joint(
@@ -92,7 +97,8 @@ async def _probe_joint(
     samples: list[tuple[float, float]] = []
     has_read = callable(getattr(backend, "read_joint_positions", None))
     from eliza_robot.bridge.isaaclab.joint_map import (
-        joint_name_to_servo_id, radians_to_pulse,
+        joint_name_to_servo_id,
+        radians_to_pulse,
     )
     for delta in delta_angles:
         q = home_rad + delta

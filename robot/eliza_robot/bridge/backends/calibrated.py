@@ -126,15 +126,23 @@ class CalibratedBackend(BridgeBackend):
     @classmethod
     def from_file(
         cls, inner: BridgeBackend, path: str | Path
-    ) -> "CalibratedBackend":
+    ) -> CalibratedBackend:
         return cls(inner, load_calibration_file(path))
 
     @property
     def backend_name(self) -> str:
         return f"calibrated:{self._inner.backend_name}"
 
+    def physical_motion_resources(self) -> tuple[str, ...]:
+        return self._inner.physical_motion_resources()
+
     def capabilities(self) -> JsonDict:
         caps = dict(self._inner.capabilities())
+        # Calibration changes the effective target after an outer supervisor
+        # has validated it. Until this wrapper performs its own profile-bound
+        # revalidation, it must not inherit the inner safety attestation.
+        caps.pop("motion_safety", None)
+        caps["motion_safety_invalidated"] = "post_guard_calibration_transform"
         caps["calibration_applied"] = True
         caps["calibrated_joints"] = sorted(self._cal.keys())
         return caps

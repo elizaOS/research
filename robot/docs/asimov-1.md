@@ -226,15 +226,10 @@ python3 packages/research/robot/scripts/validate_asimov1_real_command_probe.py \
   --timeout 15
 ```
 
-STAND and zero-velocity are opt-in:
-
-```bash
-ASIMOV_LIVEKIT_URL=wss://... ASIMOV_LIVEKIT_TOKEN=... \
-python3 packages/research/robot/scripts/validate_asimov1_real_command_probe.py \
-  --timeout 15 \
-  --allow-stand \
-  --allow-zero-velocity
-```
+STAND and zero-velocity are not available through this raw transport probe.
+Those legacy flags now fail before connecting because motion must pass through
+the authenticated unified bridge and `MotionSafetySupervisor`. DAMP remains
+available as an explicit stop operation.
 
 For production evidence on a hardware host, collect preflight, telemetry, and
 the staged command probe into one JSON report:
@@ -248,9 +243,9 @@ python3 packages/research/robot/scripts/collect_asimov1_real_hardware_evidence.p
 ```
 
 By default this evidence runner stops after a failed strict preflight and, if
-preflight passes, sends only the DAMP command after telemetry is healthy. Add
-`--allow-stand --allow-zero-velocity` only when the robot is physically ready
-for those command stages.
+preflight passes, sends only the DAMP command after telemetry is healthy. Do
+not add `--allow-stand` or `--allow-zero-velocity`; those direct-motion stages
+are quarantined. The resulting report covers telemetry and DAMP only.
 
 Validate a captured report before treating it as real-hardware evidence:
 
@@ -286,10 +281,9 @@ python3 packages/research/robot/scripts/validate_asimov1_real_agent_readiness.py
   --require-hardware
 ```
 
-The guarded real-agent runner prints a no-motion launch plan unless
-`--allow-motion` is supplied. Use it only after production checkpoint
-validation, including `inference_check.json`, and hardware evidence validation
-pass:
+The real-agent runner prints a no-motion launch plan. Its legacy
+`--allow-motion` path is quarantined and fails before connecting because it does
+not yet act as an authenticated unified-bridge client:
 
 ```bash
 ASIMOV_LIVEKIT_URL=wss://... ASIMOV_LIVEKIT_TOKEN=... \
@@ -302,8 +296,9 @@ python3 packages/research/robot/scripts/run_asimov1_real_agent.py \
   --out /tmp/asimov-real-agent-run.json
 ```
 
-To actually connect and command hardware, add `--allow-motion`; without that
-flag the script does not connect to LiveKit or publish commands.
+Do not add `--allow-motion`. Physical agent execution remains unavailable until
+the runner uses the authenticated unified endpoint; without that flag the
+script does not connect to LiveKit or publish commands.
 
 Validate and archive the runner report before using it as real-agent evidence:
 

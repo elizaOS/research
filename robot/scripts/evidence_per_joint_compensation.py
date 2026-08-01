@@ -18,6 +18,8 @@ The honest story:
 Tested joints (the trustworthy subset from the full sys-ID):
     head_pan, head_tilt, r_gripper, l_gripper,
     r_hip_roll, r_knee, l_hip_yaw, l_hip_roll, l_ank_roll
+Physical execution is quarantined until this program is an authenticated
+unified-bridge client; it currently fails before contacting hardware.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ from eliza_robot.bridge.backends.calibrated import (
     load_calibration_file,
 )
 from eliza_robot.bridge.backends.mujoco_backend import MuJocoBackend
+from eliza_robot.bridge.physical_execution import reject_unsupervised_physical_motion
 from eliza_robot.bridge.protocol import CommandEnvelope, utc_now_iso
 from eliza_robot.sim.mujoco.demo_env import DemoEnv
 
@@ -69,7 +72,8 @@ async def _measure_one_joint(
     for angle in test_angles_rad:
         # Real receives the raw command.
         from eliza_robot.bridge.isaaclab.joint_map import (
-            joint_name_to_servo_id, radians_to_pulse,
+            joint_name_to_servo_id,
+            radians_to_pulse,
         )
         try:
             sid = joint_name_to_servo_id(joint)
@@ -151,6 +155,7 @@ def _summarize(joint_result: dict) -> dict:
 
 
 async def main_async(args) -> int:
+    reject_unsupervised_physical_motion("scripts/evidence_per_joint_compensation.py")
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 

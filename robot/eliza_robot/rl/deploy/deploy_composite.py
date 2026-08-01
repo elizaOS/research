@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import math
 import signal
@@ -22,7 +23,12 @@ from eliza_robot.bridge.isaaclab.joint_map import (
     radians_to_pulse,
 )
 from eliza_robot.rl import checkpoint_path
-from eliza_robot.rl.skills.brax_walk_skill import DEFAULT_WALK_CHECKPOINT_NAME, BraxWalkSkill
+from eliza_robot.rl.deploy.preflight_check import (
+    bridge_connect_options,
+    policy_tick_joint_payload,
+    redacted_bridge_url,
+)
+from eliza_robot.rl.skills.brax_walk_skill import DEFAULT_WALK_CHECKPOINT_NAME
 from eliza_robot.rl.skills.composite_skill import (
     DEFAULT_WAVE_CHECKPOINT_NAME,
     NUM_TOTAL_JOINTS,
@@ -36,8 +42,7 @@ from eliza_robot.rl.skills.rl_wave_skill import (
     WAVE_FREQUENCY,
     WAVE_SHOULDER_PITCH,
 )
-from eliza_robot.sim.mujoco.ainex_constants import ALL_JOINT_NAMES, LEG_JOINT_NAMES
-
+from eliza_robot.sim.mujoco.ainex_constants import ALL_JOINT_NAMES
 
 # Safety limits
 MAX_JOINT_DELTA = 0.1
@@ -168,9 +173,19 @@ class DeployComposite:
         self,
         bridge_url: str,
         auto_recover: bool = False,
+        *,
+        physical: bool = True,
     ) -> None:
+        if auto_recover:
+            raise RuntimeError(
+                "automatic fall recovery is unavailable without a separate "
+                "physical recovery supervisor"
+            )
+
         import websockets
 
+        connect_options = bridge_connect_options(bridge_url, physical=physical)
+        safe_endpoint = redacted_bridge_url(bridge_url)
         max_retries = 3
         retry_delay = 2.0
         attempt = 0
@@ -185,8 +200,8 @@ class DeployComposite:
                     )
                     await asyncio.sleep(retry_delay)
 
-                print(f"Connecting to bridge at {bridge_url}...")
-                ws = await websockets.connect(bridge_url)
+                print(f"Connecting to bridge at {safe_endpoint}...")
+                ws = await websockets.connect(bridge_url, **connect_options)
                 print("Connected to bridge.")
 
                 bridge_hz = min(self.hz, 30.0)
@@ -218,33 +233,26 @@ class DeployComposite:
                     print("\nInterrupted by user.")
                 finally:
                     print("Stopping policy mode...")
-                    try:
-                        await self._send_standing_pose(ws)
-                        await asyncio.sleep(0.5)
-                        await self._send_command(ws, "policy.stop", {})
-                        await self._recv_response(ws)
-                    except Exception:  # noqa: BLE001 — best-effort shutdown
-                        pass
-                    print("Policy stopped.")
+                    await self._stop_policy(ws, physical=physical)
 
                     if self._fell:
-                        await self._attempt_fall_recovery(ws, auto_recover)
+                        print(
+                            "Fall recovery disabled: a separate supervised recovery "
+                            "workflow is required."
+                        )
 
-                    try:
+                    with contextlib.suppress(Exception):
                         await ws.close()
-                    except Exception:  # noqa: BLE001 — best-effort close
-                        pass
 
                 return
 
             except (ConnectionError, OSError) as exc:
                 attempt += 1
-                print(f"WARNING: Connection error: {exc}")
+                detail = type(exc).__name__ if physical else str(exc)
+                print(f"WARNING: Connection error: {detail}")
                 if ws:
-                    try:
+                    with contextlib.suppress(Exception):
                         await ws.close()
-                    except Exception:  # noqa: BLE001 — best-effort close
-                        pass
                     ws = None
                 if attempt > max_retries:
                     print("EMERGENCY STOP: All reconnection attempts failed!")
@@ -255,12 +263,11 @@ class DeployComposite:
                 exc_name = type(exc).__name__
                 if "ConnectionClosed" in exc_name or "ConnectionError" in exc_name:
                     attempt += 1
-                    print(f"WARNING: WebSocket closed: {exc}")
+                    detail = exc_name if physical else str(exc)
+                    print(f"WARNING: WebSocket closed: {detail}")
                     if ws:
-                        try:
+                        with contextlib.suppress(Exception):
                             await ws.close()
-                        except Exception:  # noqa: BLE001
-                            pass
                         ws = None
                     if attempt > max_retries:
                         print("EMERGENCY STOP: All reconnection attempts failed!")
@@ -302,18 +309,22 @@ class DeployComposite:
                 print(f"WARNING: No telemetry for {heartbeat_timeout}s — connection lost!")
                 raise ConnectionError("Telemetry heartbeat timeout")
 
-            servo_cmds = self.policy_step(elapsed, ramp)
+            self.policy_step(elapsed, ramp)
 
             if not self.dry_run:
-                action_payload = {
-                    "joint_positions": {
+                action_payload = policy_tick_joint_payload(
+                    {
                         ALL_JOINT_NAMES[i]: float(self._last_targets[i])
                         for i in range(NUM_TOTAL_JOINTS)
                     },
-                    "duration": int(self.dt * 1000),
-                }
+                    duration_sec=self.dt,
+                )
                 await self._send_command(ws, "policy.tick", action_payload)
-                await self._recv_response(ws)
+                response = await self._recv_response(ws)
+                if response.get("ok") is not True:
+                    raise RuntimeError(
+                        f"policy.tick rejected: {response.get('message', 'unknown error')}"
+                    )
                 await self._process_events(ws)
 
             if t0 - last_status_time >= 2.0:
@@ -325,24 +336,23 @@ class DeployComposite:
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
 
-    async def _send_standing_pose(self, ws) -> None:
-        default = (
-            self.skill.default_pose
-            if hasattr(self.skill, "default_pose")
-            else None
-        )
-        action_payload = {
-            "joint_positions": {
-                name: float(default[i]) if default is not None else 0.0
-                for i, name in enumerate(ALL_JOINT_NAMES)
-            },
-            "duration": 500,
-        }
-        await self._send_command(ws, "policy.tick", action_payload)
+    async def _stop_policy(self, ws, *, physical: bool) -> bool:
+        """Request the bridge safety fence without issuing another motion command."""
         try:
-            await self._recv_response(ws)
-        except Exception:  # noqa: BLE001 — best-effort
-            pass
+            await self._send_command(ws, "policy.stop", {})
+            response = await self._recv_response(ws)
+        except Exception as exc:  # noqa: BLE001 — preserve the triggering failure
+            detail = type(exc).__name__ if physical else str(exc)
+            print(f"WARNING: policy.stop could not be confirmed: {detail}")
+            return False
+
+        rendered = json.dumps(response, sort_keys=True, separators=(",", ":"))
+        if response.get("ok") is True:
+            print(f"policy.stop acknowledged: {rendered}")
+            return True
+
+        print(f"WARNING: policy.stop was not acknowledged: {rendered}")
+        return False
 
     async def _send_command(self, ws, command: str, payload: dict) -> None:
         msg = {
@@ -368,7 +378,7 @@ class DeployComposite:
                 if "data" in data:
                     self._update_telemetry(data["data"])
                 return data
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 break
         return {"ok": False, "message": "timeout"}
 
@@ -379,7 +389,7 @@ class DeployComposite:
                 data = json.loads(raw)
                 if data.get("event") == "telemetry.basic":
                     self._update_telemetry(data.get("data", {}))
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return
         except Exception as exc:  # noqa: BLE001
             print(f"  WARNING: event processing error: {exc}")
@@ -405,109 +415,6 @@ class DeployComposite:
 
     def check_battery(self) -> bool:
         return hasattr(self, "_battery_mv") and 0 < self._battery_mv < BATTERY_LOW_MV
-
-    async def _attempt_fall_recovery(
-        self,
-        ws,
-        auto_recover: bool = False,
-    ) -> None:
-        getup_checkpoint = checkpoint_path("mujoco_getup/final_params")
-
-        print("\n--- Fall Recovery ---")
-
-        if getup_checkpoint.exists():
-            print(f"Getup checkpoint found at {getup_checkpoint}")
-            try:
-                getup_skill = BraxWalkSkill(
-                    checkpoint_path=str(getup_checkpoint),
-                    profile_id=self.profile_id,
-                )
-                getup_skill.set_command(vx=0.0, vy=0.0, vyaw=0.0)
-
-                print("Running getup policy for up to 5 seconds...")
-                await self._send_command(ws, "policy.start", {
-                    "task": "getup_recovery",
-                    "hz": min(self.hz, 30.0),
-                })
-                try:
-                    resp = await self._recv_response(ws)
-                    if not resp.get("ok"):
-                        print(
-                            f"  WARNING: Could not start getup policy: "
-                            f"{resp.get('message')}"
-                        )
-                        raise RuntimeError("getup policy start failed")
-                except RuntimeError:
-                    print("  Falling back to init_pose recovery")
-                    await self._fallback_init_pose(ws)
-                    return
-
-                getup_start = time.monotonic()
-                getup_duration = 5.0
-                while time.monotonic() - getup_start < getup_duration:
-                    elapsed = time.monotonic() - getup_start
-
-                    await self._process_events(ws)
-
-                    joint_feedback = self._joint_feedback
-                    targets, _ = getup_skill.get_action_from_telemetry(
-                        imu_roll=self._imu_roll,
-                        imu_pitch=self._imu_pitch,
-                        joint_positions=joint_feedback,
-                    )
-
-                    action_payload = {
-                        "joint_positions": {
-                            LEG_JOINT_NAMES[i]: float(targets[i])
-                            for i in range(len(LEG_JOINT_NAMES))
-                        },
-                        "duration": int(self.dt * 1000),
-                    }
-                    await self._send_command(ws, "policy.tick", action_payload)
-                    await self._recv_response(ws)
-
-                    if abs(self._imu_pitch) < 0.2 and abs(self._imu_roll) < 0.2:
-                        print(
-                            f"  Robot appears upright at t={elapsed:.1f}s "
-                            f"(pitch={self._imu_pitch:.3f}, roll={self._imu_roll:.3f})"
-                        )
-                        break
-
-                    await asyncio.sleep(self.dt)
-
-                await self._send_command(ws, "policy.stop", {})
-                try:
-                    await self._recv_response(ws)
-                except Exception:  # noqa: BLE001
-                    pass
-
-                print("  Getup policy complete.")
-
-            except ImportError:
-                print("  WARNING: BraxWalkSkill not available for getup")
-                await self._fallback_init_pose(ws)
-            except Exception as exc:  # noqa: BLE001
-                print(f"  WARNING: Getup policy failed: {exc}")
-                await self._fallback_init_pose(ws)
-        else:
-            print("No getup checkpoint found, using init_pose fallback")
-            await self._fallback_init_pose(ws)
-
-        print("  Waiting 2 seconds for stabilization...")
-        await asyncio.sleep(2.0)
-
-        if auto_recover:
-            print("  Auto-recover enabled -- would resume task here")
-        else:
-            print("  Recovery complete. Manual restart required.")
-
-    async def _fallback_init_pose(self, ws) -> None:
-        print("  Sending walking/init_pose for basic recovery...")
-        try:
-            await self._send_command(ws, "walking.init_pose", {})
-            await self._recv_response(ws)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  WARNING: init_pose command failed: {exc}")
 
     def _print_status(self, elapsed: float, ramp: float) -> None:
         dry = " [DRY]" if self.dry_run else ""
@@ -581,11 +488,16 @@ def main() -> None:
     parser.add_argument("--max-delta", type=float, default=MAX_JOINT_DELTA)
     parser.add_argument(
         "--auto-recover", action="store_true",
-        help="Automatically attempt to resume after fall recovery",
+        help="Unavailable until a separate physical recovery supervisor is implemented",
     )
     parser.add_argument(
         "--profile", default="hiwonder-ainex",
         help="Robot profile id",
+    )
+    parser.add_argument(
+        "--simulation",
+        action="store_true",
+        help="Connect to a nonphysical bridge without sending the hardware bearer token",
     )
 
     args = parser.parse_args()
@@ -625,14 +537,20 @@ def main() -> None:
         print(f"  Walking:    {walking_ckpt or '(default checkpoint dir)'}")
         print(f"  Upper body: {args.upper_checkpoint or '(default checkpoint dir)'}")
         print(f"  Task:       {args.task}")
-        print(f"  Bridge:     {args.bridge}")
+        print(f"  Bridge:     {redacted_bridge_url(args.bridge)}")
         print(f"  Frequency:  {args.hz} Hz")
         print(f"  Duration:   {args.duration}s")
         print(f"  Profile:    {args.profile}")
         print(f"  Command:    vx={args.vx} vy={args.vy} vyaw={args.vyaw}")
         print(f"{'='*60}")
         print()
-        asyncio.run(deployer.run_with_bridge(args.bridge, auto_recover=args.auto_recover))
+        asyncio.run(
+            deployer.run_with_bridge(
+                args.bridge,
+                auto_recover=args.auto_recover,
+                physical=not args.simulation,
+            )
+        )
 
 
 if __name__ == "__main__":

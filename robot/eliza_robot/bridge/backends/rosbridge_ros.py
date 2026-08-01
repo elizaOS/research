@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from eliza_robot.bridge.async_compat import run_in_thread
 from eliza_robot.bridge.backends.rosbridge_base import RosbridgeBackend
@@ -26,15 +27,15 @@ class Ros1RosbridgeBackend(RosbridgeBackend):
         self._cache = _RosTopicCache()
         self._ready = False
 
-        self._walk_param_pub: object | None = None
-        self._action_pub: object | None = None
-        self._head_pan_pub: object | None = None
-        self._head_tilt_pub: object | None = None
-        self._servo_set_position_pub: object | None = None
-        self._servo_set_state_pub: object | None = None
-        self._walking_command_srv: object | None = None
-        self._bus_servo_get_position_srv: object | None = None
-        self._bus_servo_get_state_srv: object | None = None
+        self._walk_param_pub: Any = None
+        self._action_pub: Any = None
+        self._head_pan_pub: Any = None
+        self._head_tilt_pub: Any = None
+        self._servo_set_position_pub: Any = None
+        self._servo_set_state_pub: Any = None
+        self._walking_command_srv: Any = None
+        self._bus_servo_get_position_srv: Any = None
+        self._bus_servo_get_state_srv: Any = None
 
     @property
     def backend_name(self) -> str:
@@ -59,13 +60,22 @@ class Ros1RosbridgeBackend(RosbridgeBackend):
         self._connect_blocking()
 
     def _connect_blocking(self) -> None:
-        import rospy
-        from ainex_interfaces.msg import AppWalkingParam, HeadState
-        from ainex_interfaces.srv import SetWalkingCommand
-        from ros_robot_controller.msg import SetBusServoState, SetBusServosPosition
-        from ros_robot_controller.srv import GetBusServoState, GetBusServosPosition
-        from sensor_msgs.msg import Imu
-        from std_msgs.msg import Bool, String, UInt16
+        import rospy  # type: ignore[import-not-found]
+        from ainex_interfaces.msg import (  # type: ignore[import-not-found]
+            AppWalkingParam,
+            HeadState,
+        )
+        from ainex_interfaces.srv import SetWalkingCommand  # type: ignore[import-not-found]
+        from ros_robot_controller.msg import (  # type: ignore[import-not-found]
+            SetBusServosPosition,
+            SetBusServoState,
+        )
+        from ros_robot_controller.srv import (  # type: ignore[import-not-found]
+            GetBusServosPosition,
+            GetBusServoState,
+        )
+        from sensor_msgs.msg import Imu  # type: ignore[import-not-found]
+        from std_msgs.msg import Bool, String, UInt16  # type: ignore[import-not-found]
 
         if not rospy.core.is_initialized():
             rospy.init_node(f"ainex_rosbridge_{self.backend_name}", anonymous=True)
@@ -133,14 +143,17 @@ class Ros1RosbridgeBackend(RosbridgeBackend):
         _ = await run_in_thread(self._publish_blocking, topic, message)
 
     def _publish_blocking(self, topic: str, message: JsonDict) -> None:
-        from ainex_interfaces.msg import AppWalkingParam, HeadState
-        from ros_robot_controller.msg import (
+        from ainex_interfaces.msg import (  # type: ignore[import-not-found]
+            AppWalkingParam,
+            HeadState,
+        )
+        from ros_robot_controller.msg import (  # type: ignore[import-not-found]
             BusServoPosition,
             BusServoState,
-            SetBusServoState,
             SetBusServosPosition,
+            SetBusServoState,
         )
-        from std_msgs.msg import String
+        from std_msgs.msg import String  # type: ignore[import-not-found]
 
         if topic == "/app/set_walking_param":
             msg = AppWalkingParam()
@@ -270,7 +283,12 @@ class Ros1RosbridgeBackend(RosbridgeBackend):
             if self._walking_command_srv is None:
                 raise RuntimeError("walking command service not ready")
             result = self._walking_command_srv(action)
-            return {"result": bool(getattr(result, "result", False))}
+            result_value = getattr(result, "result", None)
+            if result_value is not True and result_value is not False:
+                raise RuntimeError(
+                    "walking command service acknowledgement must be an exact boolean"
+                )
+            return {"result": result_value}
 
         if service == "/ros_robot_controller/bus_servo/get_position":
             ids_value = args.get("id")
@@ -298,7 +316,7 @@ class Ros1RosbridgeBackend(RosbridgeBackend):
             if self._bus_servo_get_state_srv is None:
                 raise RuntimeError("bus_servo get_state service not ready")
 
-            from ros_robot_controller.msg import GetBusServoCmd
+            from ros_robot_controller.msg import GetBusServoCmd  # type: ignore[import-not-found]
 
             cmd_msgs: list[GetBusServoCmd] = []
             for item in cmd_value:

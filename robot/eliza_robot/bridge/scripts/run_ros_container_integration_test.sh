@@ -32,16 +32,16 @@ docker run --rm --network host \
     ROSCORE_PID=$!
     sleep 2
 
-    python3 -m bridge.tools.ros_runtime_harness >/tmp/bridge-harness.log 2>&1 &
+    python3 -m eliza_robot.bridge.tools.ros_runtime_harness >/tmp/bridge-harness.log 2>&1 &
     HARNESS_PID=$!
     sleep 2
 
-    python3 -m bridge.rosbridge_server --backend ros_real --host 127.0.0.1 --port 19095 --publish-hz 20.0 >/tmp/bridge-server.log 2>&1 &
+    python3 -m eliza_robot.bridge.rosbridge_server --backend ros_sim --host 127.0.0.1 --port 19095 --publish-hz 20.0 >/tmp/bridge-server.log 2>&1 &
     SERVER_PID=$!
     sleep 2
 
     set +e
-    python3 -m bridge.tools.rosbridge_smoke --uri ws://127.0.0.1:19095
+    python3 -m eliza_robot.bridge.tools.rosbridge_smoke --uri ws://127.0.0.1:19095
     TEST_EXIT=$?
     set -e
 

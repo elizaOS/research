@@ -7,7 +7,7 @@ import os
 import unittest
 from unittest import mock
 
-from eliza_robot.bridge.server import _coerce_runtime_config
+from eliza_robot.bridge.server import RuntimeConfig, _coerce_runtime_config
 
 
 def _args(**overrides: object) -> argparse.Namespace:
@@ -64,6 +64,35 @@ class ServerConfigTests(unittest.TestCase):
 
         self.assertEqual(config.asimov_livekit_url, "wss://cli.example.invalid")
         self.assertEqual(config.asimov_livekit_token, "cli-token")
+
+    def test_physical_bridge_credentials_are_read_from_environment(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ELIZA_ROBOT_BRIDGE_AUTH_TOKEN": "a" * 32,
+                "ELIZA_ROBOT_PHYSICAL_RESOURCE_ID": "lab-ainex-01",
+            },
+            clear=True,
+        ):
+            config = _coerce_runtime_config(_args(), {})
+
+        self.assertEqual(config.auth_token, "a" * 32)
+        self.assertEqual(config.physical_resource_id, "lab-ainex-01")
+        self.assertNotIn(config.auth_token, repr(config))
+
+    def test_nonempty_physical_resource_id_must_be_canonical_raw_text(self) -> None:
+        for invalid in (" ", " leading", "trailing ", "line\nbreak", "x" * 129):
+            with (
+                self.subTest(invalid=invalid),
+                self.assertRaisesRegex(ValueError, "physical_resource_id"),
+            ):
+                RuntimeConfig(
+                    queue_size=8,
+                    max_commands_per_sec=30,
+                    deadman_timeout_sec=1.0,
+                    trace_log_path="",
+                    physical_resource_id=invalid,
+                )
 
 
 if __name__ == "__main__":

@@ -25,24 +25,34 @@ passes exact replay supports descriptive reporting only: no inferential, causal,
 speed, SOTA, protocol-exactness, or Alberta Plan claim.
 
 All plan, reservation, shard, and artifact wall-clock fields are self-reported
-diagnostics. Future timestamps are rejected, but this check is not an external
-chronology attestation and cannot prove that a plan preceded execution. The
-closed execution envelope says this directly; it must not be described as a
-held-out or independently preregistered protocol.
+diagnostics. A timestamp may be at most five seconds ahead of the validating
+clock to tolerate clock skew; anything further in the future is rejected. This
+check is not an external chronology attestation and cannot prove that a plan
+preceded execution. The closed execution envelope says this directly; it must
+not be described as a held-out or independently preregistered protocol.
 
 The source manifest binds the static transitive closure of local Python imports
 from both benchmark entry modules, plus `pyproject.toml` and `uv.lock`. Runtime
 identity binds the resolved Python executable bytes and aggregate regular-file
-content hashes for the installed Chex, JAX, jaxlib, NumPy, and jaxtyping
-distributions, as well as versions, JAX configuration, device identities, and
-selected execution-environment fields. Runtime discovery errors fail closed.
-These records are still self-recorded rather than image-attested. Plan, shard,
-and merge records bind an internally derived prescribed command identity; that
-identity is not evidence that a process actually observed the command. Raw
-process arguments are retained only as explicitly self-reported provenance,
-and direct API calls are labeled separately. Static import analysis cannot
-attest dynamically constructed imports, which is another reason this lane
-remains nonpromoting.
+content hashes for the explicit distribution set observed during a clean import
+of the benchmark in the pinned environment, plus its installed required-
+dependency metadata closure: absl-py, aiofiles, Chex, cloudpickle, etils,
+humanize, JAX, jaxlib, jaxtyping, ml-dtypes, msgpack, NumPy, opt-einsum,
+orbax-checkpoint, prometheus-client, protobuf, psutil, Pygments, PyYAML, SciPy,
+simplejson, tensorstore, toolz, typing-extensions, uvloop, and wadler-lindig. It
+also binds versions, JAX configuration, device identities, and selected
+execution-environment fields. Runtime discovery errors or a missing set member
+fail closed. This explicit set is not represented as a proof of every dependency
+that an alternate execution path might load. It does not content-hash system
+shared libraries loaded by Python or extension modules, device drivers or
+firmware, or dynamically loaded code outside distribution file manifests; those
+limits are machine-readable in every runtime manifest. These records are still
+self-recorded rather than image-attested. Plan, shard, and merge records bind an
+internally derived prescribed command identity; that identity is not evidence
+that a process actually observed the command. Raw process arguments are retained
+only as explicitly self-reported provenance, and direct API calls are labeled
+separately. Static import analysis cannot attest dynamically constructed local
+imports, which is another reason this lane remains nonpromoting.
 
 ## Declared deviations
 
@@ -82,10 +92,13 @@ runtime, exact methods, and exact seed IDs. Existing paths are never
 overwritten. Plans, reservations, shards, and artifacts are durably published
 as mode `0444`, single-link files. Publication holds the temporary-file
 descriptor through the final hard-link operation, verifies inode, size, mode,
-link count, requested ancestor identity, and exact readback bytes, and removes
-a partially linked target on failure. Readers reject symlinks, hard links,
-writable files, locator replacement, and ancestor replacement. Newly created
-ancestor directory entries are fsynced before publication continues.
+link count, requested ancestor identity, and exact readback bytes, then repeats
+target-identity and ancestor checks after readback. Failure cleanup removes a
+locator only while it still identifies the descriptor-held inode. An unknown
+concurrent substitution is never intentionally unlinked; it is left in place
+and the operation fails closed. Readers reject symlinks, hard links, writable
+files, locator replacement, and ancestor replacement. Newly created ancestor
+directory entries are fsynced before publication continues.
 
 ```bash
 .venv/bin/python -m pytest tests/test_slowly_changing_regression.py tests/test_slowly_changing_regression_v2.py -q -o addopts=""
@@ -107,13 +120,24 @@ output is derived from the plan and is unique to its method/seed identity:
 Repeat those method commands for each planned seed ID. A shard refuses to run
 if current source or runtime bytes differ from the plan, if its method/seed is
 not planned, or if its destination already exists. Immediately before numerical
-execution it durably writes `<shard>.reservation`. That immutable marker says
-the development seed/method execution was started and is irrevocably consumed;
-it remains after success or failure, so a crash cannot silently reuse the same
-planned identity. An occupied reservation blocks execution before the learner
-runs. A custom `--output` remains supported. Merge can discover any `*.json`
-filename under `--shards-dir` (reservation files do not end in `.json`), or an
-operator can pass every custom path explicitly with repeated `--shard` options.
+execution it durably writes the one canonical reservation at
+`reservations/<plan-sha256>/<method-id>/seed-<10-digit-id>.reservation`, relative
+to the plan directory. Its locator depends on the exact plan bytes, method, and
+seed, never on the shard output path. That immutable marker says the development
+seed/method execution was started and is irrevocably consumed; it remains after
+success or failure, so a crash or a different custom `--output` cannot silently
+reuse the same planned identity. An occupied reservation blocks execution before
+the learner runs. Every successful shard binds the exact reservation by canonical
+absolute locator, byte size, and SHA-256. Shard validation, merge, and artifact
+validation require and reread that marker. A custom `--output` remains supported.
+The reservation namespace is local to the plan directory: copying the same plan
+bytes into another directory creates a distinct self-issued namespace and can
+therefore permit another execution. It is not a machine-global or externally
+attested once-only registry, and no result from this lane may be described as
+independently preregistered on the strength of the reservation.
+Merge can discover any `*.json` filename under `--shards-dir` (reservation files
+do not end in `.json`), or an operator can pass every custom path explicitly with
+repeated `--shard` options.
 
 Only after all 300 shards exist, merge them. Merge first performs an exact
 deterministic replay of every shard and does not publish if any recorded float
@@ -139,12 +163,15 @@ cannot be promoted or reported as a validated result.
 The merge requires the exact method × seed Cartesian product, reads each shard
 strictly, checks shared environment identity across methods for every seed,
 binds each shard's path/size/SHA-256 and prescribed command identity, exactly
-replays every shard, and reconstructs all descriptive results. Before
-publication it exactly rereads the external plan and every shard after the long
-replay. The artifact embeds the plan and also binds the immutable external plan
-by canonical absolute locator, size, and SHA-256. Ordinary artifact validation
-does a final exact reread of the artifact, that external plan, and every shard
-after its own long replay; replacement at any point fails closed.
+replays every shard, requires each shard's exact bound reservation, and
+reconstructs all descriptive results. Before publication it exactly rereads the
+external plan, every shard, and every reservation after the long replay, then
+checks current source and runtime immediately before publication. The artifact
+embeds the plan and also binds the immutable external plan by canonical absolute
+locator, size, and SHA-256. Ordinary artifact validation does a final exact
+reread of the artifact, that external plan, every shard, and every reservation
+after its own long replay, then checks current source and runtime immediately
+before returning valid. Replacement detected by those reads fails closed.
 Duplicate keys, non-finite JSON values, missing/duplicate seeds, unknown fields,
 unsafe paths, source drift, runtime drift, or result tampering fail closed.
 

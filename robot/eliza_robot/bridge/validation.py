@@ -3,31 +3,60 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable, Mapping
 
 from eliza_robot.asimov_1.constants import ASIMOV1_FIRMWARE_JOINT_ORDER, ASIMOV1_VELOCITY_LIMITS
 from eliza_robot.bridge.protocol import CommandEnvelope
 
 
-def _require_number(payload: dict[str, object], key: str) -> float:
+def _require_number(payload: Mapping[str, object], key: str) -> float:
     value = payload.get(key)
-    if not isinstance(value, int | float):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         raise ValueError(f"payload.{key} must be a number")
-    value = float(value)
+    try:
+        value = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"payload.{key} must be finite") from exc
     if not math.isfinite(value):
         raise ValueError(f"payload.{key} must be finite")
     return value
 
 
-def _require_string(payload: dict[str, object], key: str) -> str:
+def _require_integer(payload: Mapping[str, object], key: str) -> int:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"payload.{key} must be an integer")
+    return value
+
+
+def _require_string(payload: Mapping[str, object], key: str) -> str:
     value = payload.get(key)
     if not isinstance(value, str) or value == "":
         raise ValueError(f"payload.{key} must be a non-empty string")
     return value
 
 
-def _validate_asimov_positions(payload: dict[str, object]) -> None:
+def _finite_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _validate_asimov_positions(payload: Mapping[str, object]) -> None:
+    if "positions" in payload and "joint_positions" in payload:
+        raise ValueError(
+            "ASIMOV trajectory must use exactly one target format: "
+            "positions or joint_positions"
+        )
     positions = payload.get("positions", payload.get("joint_positions"))
+    values: Iterable[object]
     if isinstance(positions, dict):
+        if not positions:
+            raise ValueError("ASIMOV trajectory joint_positions must not be empty")
         unknown = set(positions) - set(ASIMOV1_FIRMWARE_JOINT_ORDER)
         if unknown:
             raise ValueError(f"unknown ASIMOV joints: {sorted(unknown)!r}")
@@ -39,11 +68,11 @@ def _validate_asimov_positions(payload: dict[str, object]) -> None:
     else:
         raise ValueError("ASIMOV trajectory requires positions or joint_positions")
     for value in values:
-        if not isinstance(value, int | float) or not math.isfinite(float(value)):
+        if _finite_number(value) is None:
             raise ValueError("ASIMOV trajectory positions must be finite numbers")
 
 
-def _validate_asimov_gains(payload: dict[str, object]) -> None:
+def _validate_asimov_gains(payload: Mapping[str, object]) -> None:
     for key, lo, hi in (("kp", 0.0, 500.0), ("kd", 0.0, 5.0)):
         value = payload.get(key)
         if value is None:
@@ -51,11 +80,12 @@ def _validate_asimov_gains(payload: dict[str, object]) -> None:
         if not isinstance(value, list) or len(value) != len(ASIMOV1_FIRMWARE_JOINT_ORDER):
             raise ValueError(f"payload.{key} must be a {len(ASIMOV1_FIRMWARE_JOINT_ORDER)}-element list")
         for item in value:
-            if not isinstance(item, int | float) or not math.isfinite(float(item)) or not lo <= float(item) <= hi:
+            number = _finite_number(item)
+            if number is None or not lo <= number <= hi:
                 raise ValueError(f"payload.{key} values must be finite and in range {lo}..{hi}")
 
 
-def _validate_asimov_velocity(payload: dict[str, object]) -> None:
+def _validate_asimov_velocity(payload: Mapping[str, object]) -> None:
     keys = {
         "vx_mps": ("vx_mps", "x"),
         "vy_mps": ("vy_mps", "y"),
@@ -77,8 +107,8 @@ def validate_command_payload(command: CommandEnvelope) -> None:
         if "speed" not in payload and "height" not in payload:
             _validate_asimov_velocity(payload)
             return
-        speed = _require_number(payload, "speed")
-        if int(speed) not in {1, 2, 3, 4}:
+        speed = _require_integer(payload, "speed")
+        if speed not in {1, 2, 3, 4}:
             raise ValueError("payload.speed must be one of 1,2,3,4")
         height = _require_number(payload, "height")
         if height < 0.015 or height > 0.06:
@@ -123,12 +153,19 @@ def validate_command_payload(command: CommandEnvelope) -> None:
         duration = _require_number(payload, "duration")
         if duration <= 0.0 or duration > 5.0:
             raise ValueError("payload.duration out of range (0..5]")
+        if "joint_positions" in payload and "positions" in payload:
+            raise ValueError(
+                "payload must use exactly one servo target format: "
+                "joint_positions or positions"
+            )
         if "joint_positions" in payload:
             joint_positions = payload["joint_positions"]
             if not isinstance(joint_positions, dict):
                 raise ValueError("payload.joint_positions must be an object")
+            if not joint_positions:
+                raise ValueError("payload.joint_positions must not be empty")
             for value in joint_positions.values():
-                if not isinstance(value, int | float) or not math.isfinite(float(value)):
+                if _finite_number(value) is None:
                     raise ValueError("payload.joint_positions values must be finite numbers")
             return
         positions_value = payload.get("positions")
@@ -140,15 +177,15 @@ def validate_command_payload(command: CommandEnvelope) -> None:
             if not isinstance(item, dict):
                 raise ValueError(f"payload.positions[{i}] must be an object")
             item_id = item.get("id")
-            if not isinstance(item_id, int | float):
-                raise ValueError(f"payload.positions[{i}].id must be a number")
-            sid = int(item_id)
+            if isinstance(item_id, bool) or not isinstance(item_id, int):
+                raise ValueError(f"payload.positions[{i}].id must be an integer")
+            sid = item_id
             if sid < 1 or sid > 24:
                 raise ValueError(f"payload.positions[{i}].id out of range 1..24")
             item_pos = item.get("position")
-            if not isinstance(item_pos, int | float):
-                raise ValueError(f"payload.positions[{i}].position must be a number")
-            if int(item_pos) < 0 or int(item_pos) > 1000:
+            if isinstance(item_pos, bool) or not isinstance(item_pos, int):
+                raise ValueError(f"payload.positions[{i}].position must be an integer")
+            if item_pos < 0 or item_pos > 1000:
                 raise ValueError(f"payload.positions[{i}].position out of range 0..1000")
         return
 
@@ -179,13 +216,14 @@ def validate_command_payload(command: CommandEnvelope) -> None:
             if hz < 1.0 or hz > 30.0:
                 raise ValueError("payload.hz out of range 1..30")
         if "max_steps" in payload:
-            max_steps = _require_number(payload, "max_steps")
+            max_steps = _require_integer(payload, "max_steps")
             if max_steps < 1 or max_steps > 100000:
                 raise ValueError("payload.max_steps out of range 1..100000")
         return
 
     if command.command == "policy.stop":
-        # Optional: reason string
+        if "reason" in payload:
+            _require_string(payload, "reason")
         return
 
     if command.command == "policy.tick":

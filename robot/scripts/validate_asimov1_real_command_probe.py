@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Staged ASIMOV-1 hardware command probe.
 
-Default behavior is telemetry-first and DAMP-only. STAND and zero-velocity are
-available only behind explicit flags because they may move real hardware.
+Default behavior is telemetry-first and DAMP-only. The legacy STAND and
+zero-velocity flags are quarantined because they bypass the unified safety
+supervisor; selecting either fails before connecting to hardware.
 """
 
 from __future__ import annotations
@@ -20,9 +21,16 @@ if str(ROOT) not in sys.path:
 
 from eliza_robot.asimov_1.livekit_transport import LiveKitAsimovTransport  # noqa: E402
 from eliza_robot.asimov_1.real_command_probe import probe_real_command_sequence  # noqa: E402
+from eliza_robot.bridge.physical_execution import (  # noqa: E402
+    reject_unsupervised_physical_motion,
+)
 
 
 async def _run(args: argparse.Namespace) -> dict:
+    if args.allow_stand or args.allow_zero_velocity:
+        reject_unsupervised_physical_motion(
+            "scripts/validate_asimov1_real_command_probe.py motion flags"
+        )
     transport = LiveKitAsimovTransport(url=args.url, token=args.token)
     return await probe_real_command_sequence(
         transport,

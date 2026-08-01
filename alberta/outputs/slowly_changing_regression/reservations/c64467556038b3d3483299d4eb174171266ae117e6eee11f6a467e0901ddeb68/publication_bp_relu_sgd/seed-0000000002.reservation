@@ -1,0 +1,46 @@
+{
+  "benchmark": "slowly_changing_regression",
+  "evidence_role": "development_publication_shaped_extension",
+  "external_chronology_attestation_present": false,
+  "method_id": "publication_bp_relu_sgd",
+  "plan_binding": {
+    "byte_size": 42511,
+    "sha256": "c64467556038b3d3483299d4eb174171266ae117e6eee11f6a467e0901ddeb68"
+  },
+  "plan_locator": "/home/shaw/milady/research/alberta/outputs/slowly_changing_regression/plan.v2.json",
+  "prescribed_command": {
+    "canonical_semantic_argv": [
+      "run-shard",
+      "--plan-sha256",
+      "c64467556038b3d3483299d4eb174171266ae117e6eee11f6a467e0901ddeb68",
+      "--method",
+      "publication_bp_relu_sgd",
+      "--seed-id",
+      "2",
+      "--output",
+      "/home/shaw/milady/research/alberta/outputs/slowly_changing_regression/shards/publication_bp_relu_sgd_seed2.json"
+    ],
+    "canonical_semantic_argv_sha256": "30e7429972ccfbb642a5b84d110b8679fa447146cd04376e6dc27be257c3e0f9",
+    "invocation_origin": "cli",
+    "schema": "alberta.slowly_changing_regression.command_provenance.v1",
+    "self_reported_process_argv": [
+      "run-shard",
+      "--plan",
+      "outputs/slowly_changing_regression/plan.v2.json",
+      "--method",
+      "publication_bp_relu_sgd",
+      "--seed-id",
+      "2",
+      "--output",
+      "outputs/slowly_changing_regression/shards/publication_bp_relu_sgd_seed2.json"
+    ],
+    "self_reported_process_argv_sha256": "98c7425e7204355a72c015ad8a0cc04c1c98b9dee3785ec778255af8684b2fcb"
+  },
+  "reserved_unix": 1785561803,
+  "schema": "alberta.slowly_changing_regression.shard_reservation.v2",
+  "scientific_promotion_allowed": false,
+  "seed_id": 2,
+  "state": "execution_started_development_seed_irrevocably_consumed",
+  "target_locator": "/home/shaw/milady/research/alberta/outputs/slowly_changing_regression/shards/publication_bp_relu_sgd_seed2.json",
+  "timestamp_semantics": "self_reported_diagnostic_only_not_external_chronology"
+}

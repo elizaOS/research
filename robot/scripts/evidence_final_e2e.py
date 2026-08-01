@@ -48,6 +48,7 @@ from eliza_robot.bridge.backends.ainex_remote import AinexRemoteBackend
 from eliza_robot.bridge.backends.dual_target import DualTargetBackend
 from eliza_robot.bridge.backends.mujoco_backend import MuJocoBackend
 from eliza_robot.bridge.backends.state_mirror import StateMirrorBackend
+from eliza_robot.bridge.physical_execution import reject_unsupervised_physical_motion
 from eliza_robot.bridge.protocol import CommandEnvelope, utc_now_iso
 from eliza_robot.rl.text_conditioned.inference_loop import (
     InferenceLoopConfig,
@@ -171,6 +172,8 @@ def _label_strip(
 
 
 async def _run(args) -> int:
+    if not args.sim_only:
+        reject_unsupervised_physical_motion("scripts/evidence_final_e2e.py --use-real")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     manifest = _validate_checkpoint_profile(Path(args.checkpoint))
@@ -382,7 +385,7 @@ def main() -> int:
         "--use-real",
         dest="sim_only",
         action="store_false",
-        help="actually drive the physical AiNex (opt-in)",
+        help="quarantined legacy direct-hardware mode; fails before connecting",
     )
     parser.add_argument(
         "--out", type=Path,

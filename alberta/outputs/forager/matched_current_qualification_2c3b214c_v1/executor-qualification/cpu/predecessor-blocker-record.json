@@ -1,0 +1,327 @@
+{
+  "descriptors": {
+    "endorsement_sha256": "2620a972dc5a253deaf06cfe9b9a103fd4367d24432817772284dd73eb6843bf",
+    "endorsements": 0,
+    "trust_profiles": 0,
+    "trust_sha256": "e00f5a79a2b29a8e912b8e603048b02ee5206826dcd40eedff8e0c3ec6e3a9b0"
+  },
+  "effective_seed": 2000001,
+  "endorsement_granted": false,
+  "gpu_used": false,
+  "immutable_path_derivation": {
+    "config_scan": {
+      "experiment_configs_scanned": 7168,
+      "explicit_name_result": [],
+      "path_name_result": [],
+      "root_save_path": "results/{name}/{agent}"
+    },
+    "pyexputils_experiment_description_sha256": "2f15573e3a272e3222d18d630a1ab3d392f5b9d7e4976fe46449374cb8589c5f",
+    "root_config": {
+      "save_path": "results/{name}/{agent}"
+    },
+    "root_config_sha256": "8a1002b99ded1cc5c17b9210f356bafe3967658ac4730dd5e44c438476fc7a02",
+    "upstream_rules": [
+      "config.json save_path is selected by ExperimentDescription._getSaveKey at lines 52-60",
+      "ExperimentDescription.interpolateSavePath applies that template at lines 210-226",
+      "ExperimentDescription.buildSaveContext joins it below the CLI base at lines 245-247",
+      "src/continuing_main.py writes data/<index>.npz and sibling results.db below that context at lines 869-884"
+    ]
+  },
+  "immutable_runtime": {
+    "image_id": "sha256:5ecaabefce6439a8731c19e7a55fedb666788242baf035e6ffca86eb31299768",
+    "launcher_contract": "oci-read-only-stdout-tar-v4",
+      "launcher_sha256": "86c890318735c5691e5b7c37d0761e5db83f41d683fc32b92eea71e50a962416",
+    "source_archive_sha256": "1f6976de38f34a697c947891de26ad3373b294195fe82094e9d1d5b8ddfd43b6"
+  },
+  "max_steps": 1,
+  "observed_run": {
+    "archive_sha256": "7731e4a3a233fe7022bcf59c596c91af133292570681fccfce805a4086b53642",
+    "host_stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "inspection": {
+      "archive_sha256": "7731e4a3a233fe7022bcf59c596c91af133292570681fccfce805a4086b53642",
+      "db_path": "official-results/results/E138-two-biome-large/foragax/ForagaxTwoBiomeLarge-v1/9/DQN/results.db",
+      "members": [
+        {
+          "gid": 0,
+          "mode": 384,
+          "mtime": 0,
+          "path": "official-results/results/E138-two-biome-large/foragax/ForagaxTwoBiomeLarge-v1/9/DQN/data/2000001.npz",
+          "sha256": "f40bcb45df3560ee9da86852d681e1e03aa60d5832354537f7337a6063a982ef",
+          "size": 2740,
+          "uid": 0
+        },
+        {
+          "gid": 0,
+          "mode": 384,
+          "mtime": 0,
+          "path": "official-results/results/E138-two-biome-large/foragax/ForagaxTwoBiomeLarge-v1/9/DQN/results.db",
+          "sha256": "9fd069adaf7da87e1706d2f6addd2b2798a10c7ab2d036041f3079686c5455ee",
+          "size": 8192,
+          "uid": 0
+        },
+        {
+          "gid": 0,
+          "mode": 384,
+          "mtime": 0,
+          "path": "stdout.log",
+          "sha256": "34faeb8cd8b9913d3fc29974cfbbb5a1ff14dd5613a2b3174c3de0455ee3a46e",
+          "size": 5386,
+          "uid": 0
+        },
+        {
+          "gid": 0,
+          "mode": 384,
+          "mtime": 0,
+          "path": "stderr.log",
+          "sha256": "a8a7a02430e489a007c9edff29ffe4a5cb4df055ba1205cac51f0fccf78036ea",
+          "size": 645,
+          "uid": 0
+        }
+      ],
+      "npz_arrays": {
+        "abs_td_error": {
+          "dtype": "<f2",
+          "finite": true,
+          "shape": [
+            1
+          ],
+          "value_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+        },
+        "biome_id": {
+          "dtype": "<i4",
+          "finite": true,
+          "shape": [
+            1
+          ],
+          "value_sha256": "ad95131bc0b799c0b1af477fb14fcf26a6a9f76079e48bf090acb7e8367bfd0e"
+        },
+        "biome_rank": {
+          "dtype": "<i4",
+          "finite": true,
+          "shape": [
+            1
+          ],
+          "value_sha256": "9d9f290527a6be626a8f5985b26e19b237b44872b03631811df4416fc1713178"
+        },
+        "biome_regret": {
+          "dtype": "<f2",
+          "finite": true,
+          "shape": [
+            1
+          ],
+          "value_sha256": "01b384d934bbe630be3fb69e53acdff1ba346b281eef79439dff7233f9ebf83e"
+        },
+        "churn_norm": {
+          "dtype": "<f2",
+          "finite": false,
+          "shape": [
+            1
+          ],
+          "value_sha256": "0d1abbe3b9da7a48d463edb0a844f3a102dcf7fdea35f9c771d885027b31b322"
+        },
+        "hint": {
+          "dtype": "<i4",
+          "finite": true,
+          "shape": [
+            1
+          ],
+          "value_sha256": "ad95131bc0b799c0b1af477fb14fcf26a6a9f76079e48bf090acb7e8367bfd0e"
+        },
+        "loss": {
+          "dtype": "<f2",
+          "finite": true,
+          "shape": [
+            1
+          ],
+          "value_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+        },
+        "ntk_cond": {
+          "dtype": "<f4",
+          "finite": false,
+          "shape": [
+            1
+          ],
+          "value_sha256": "ef1eaf26cea96eb18f8fa3137abdf23f52852a855c22ae6f169d21a379dcd739"
+        },
+        "ntk_rank": {
+          "dtype": "<f2",
+          "finite": false,
+          "shape": [
+            1
+          ],
+          "value_sha256": "0d1abbe3b9da7a48d463edb0a844f3a102dcf7fdea35f9c771d885027b31b322"
+        },
+        "object_collected_id": {
+          "dtype": "<i4",
+          "finite": true,
+          "shape": [
+            1
+          ],
+          "value_sha256": "ad95131bc0b799c0b1af477fb14fcf26a6a9f76079e48bf090acb7e8367bfd0e"
+        },
+        "pos": {
+          "dtype": "<i4",
+          "finite": true,
+          "shape": [
+            1,
+            2
+          ],
+          "value_sha256": "4e927a47370e1afe53bf8243b7d7fa2d24e1a84dad5b4712b64ef9ba05ab0c9f"
+        },
+        "rewards": {
+          "dtype": "<f2",
+          "finite": true,
+          "shape": [
+            1
+          ],
+          "value_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+        },
+        "squared_td_error": {
+          "dtype": "<f2",
+          "finite": true,
+          "shape": [
+            1
+          ],
+          "value_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+        },
+        "weight_change": {
+          "dtype": "<f2",
+          "finite": true,
+          "shape": [
+            1
+          ],
+          "value_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+        }
+      },
+      "npz_path": "official-results/results/E138-two-biome-large/foragax/ForagaxTwoBiomeLarge-v1/9/DQN/data/2000001.npz",
+      "npz_zip_members": [
+        "abs_td_error.npy",
+        "biome_id.npy",
+        "biome_rank.npy",
+        "biome_regret.npy",
+        "churn_norm.npy",
+        "hint.npy",
+        "loss.npy",
+        "ntk_cond.npy",
+        "ntk_rank.npy",
+        "object_collected_id.npy",
+        "pos.npy",
+        "rewards.npy",
+        "squared_td_error.npy",
+        "weight_change.npy"
+      ],
+      "sqlite_columns": [
+        "batch",
+        "buffer_min_size",
+        "buffer_size",
+        "environment.aperture_size",
+        "environment.env_id",
+        "epsilon_linear_decay",
+        "experiment.ntk_freq",
+        "experiment.seed_offset",
+        "experiment.x_ref_steps",
+        "final_epsilon",
+        "gamma",
+        "initial_epsilon",
+        "optimizer.alpha",
+        "optimizer.beta1",
+        "optimizer.beta2",
+        "optimizer.eps",
+        "optimizer.name",
+        "representation.hidden",
+        "representation.type",
+        "target_refresh",
+        "update_freq",
+        "seed",
+        "id"
+      ],
+      "sqlite_id_seed_rows": [
+        [
+          2000001,
+          2000001
+        ]
+      ]
+    }
+  },
+  "qualification_evidence_created": false,
+  "qualifier_rejection": {
+    "check": {
+      "accepted": false,
+      "error": "qualification archives contain no result NPZ",
+      "function": "qualify_v4_runs",
+      "loaded_source_sha256": "f6d35b946ff1289a8728fa824f41315e0d687b4d6a5b71ea8e02075aeda14309",
+      "source_unmodified": true
+    },
+    "code_locations": [
+      "2551-2559",
+      "2578-2579"
+    ],
+    "result_npz_regex": "official-results/result/data/[0-9]+\\.npz",
+    "source_path": "alberta_framework/benchmarks/official_foragax_oci.py",
+    "source_sha256": "f6d35b946ff1289a8728fa824f41315e0d687b4d6a5b71ea8e02075aeda14309",
+    "sqlite_exact_path": "official-results/result/results.db"
+  },
+  "requested_backend": "cpu",
+  "required_fix": {
+    "approach": "derive exactly one canonical experiment result root from the validated member set",
+    "forbidden_repairs": [
+      "archive rewriting",
+      "wildcard-only broadening",
+      "trust or endorsement mutation",
+      "validation weakening"
+    ],
+    "invariants": [
+      "require exactly one <canonical-root>/data/<effective-seed>.npz",
+      "require exactly one sibling <canonical-root>/results.db",
+      "bind both members to the same canonical root",
+      "reject duplicate roots, duplicate seed payloads, traversal, aliases, symlinks, and unexpected result members",
+      "apply the same derived-root rule in schema-1.4 trusted invocation/member validation",
+      "retain strict NPZ, SQLite, member-order, byte-bound, seed, config, source, image, and sandbox checks"
+    ]
+  },
+  "schema_version": "alberta.official_foragax.cpu_qualification_blocker.v1",
+  "second_workload_run_started": false,
+  "seed_class": "consumed_open_development_nonpromoting",
+  "state": "blocked_internal_qualifier_path_contract",
+  "trust_profile_created": false,
+  "workload": {
+    "config_path": "/opt/continual-foragax-agents/experiments/E138-two-biome-large/foragax/ForagaxTwoBiomeLarge-v1/9/DQN.json",
+    "config_sha256": "ee01cb9616d4bf06a4d8f6927a79a510aeeba5f6ca1613c4d4d3eacccdd0ec25",
+    "cpu_isolation_probe_sha256": "656aa9f1a387421d0af3b6e10c8576852268ab808332cdde36a142d6bef31466",
+    "cpu_seed_resolution_probe_sha256": "ce9b2ab9f57ce884d48e7bf9da34cae3f5f60b4b59628ad7dfa75f98ce9843e4",
+    "entrypoint_path": "/opt/continual-foragax-agents/src/continuing_main.py",
+    "entrypoint_sha256": "681c2dae9569a0bbd72c8f47a3a63d51176071308f9762f3d81855da79c3aebf",
+    "environment_profile_sha256": "7170418e8082babbf17ebfbbb639ee75fcd8b5ae3931d35b3fb9199ea2bfd9b3",
+    "exact_launch_argv_sha256": "4a8c573e03189bc8836b50ada268f9eaddae60a4f4168a5a5884c2cb2cf8095e",
+    "seed_resolution": {
+      "backend": "cpu",
+      "config_path": "/opt/continual-foragax-agents/experiments/E138-two-biome-large/foragax/ForagaxTwoBiomeLarge-v1/9/DQN.json",
+      "config_sha256": "ee01cb9616d4bf06a4d8f6927a79a510aeeba5f6ca1613c4d4d3eacccdd0ec25",
+      "configured_total_steps": 10000,
+      "device_kinds": [
+        "cpu"
+      ],
+      "device_platforms": [
+        "cpu"
+      ],
+      "effective_seed": 2000001,
+      "entrypoint_path": "/opt/continual-foragax-agents/src/continuing_main.py",
+      "entrypoint_sha256": "681c2dae9569a0bbd72c8f47a3a63d51176071308f9762f3d81855da79c3aebf",
+      "index": 2000001,
+      "jax_key_words": [
+        0,
+        2000001
+      ],
+      "nested_seed_offset": 0,
+      "num_permutations": 1,
+      "nvidia_device_paths": [],
+      "official_agent": "DQN",
+      "official_problem": "Foragax",
+      "requested_backend": "cpu",
+      "requested_max_steps": 1,
+      "stored_seed": 2000001,
+      "top_level_seed_offset": 0
+    }
+  },
+  "workload_runs_completed": 1
+}

@@ -1,6 +1,7 @@
 """Tests for Step 2 fixed-budget feature discovery."""
 
 from pathlib import Path
+from typing import Any
 
 import chex
 import jax
@@ -32,6 +33,7 @@ from alberta_framework.core.future_utility import (
 from alberta_framework.core.interaction_features import (
     RELEVANCE_PROBE_MODE_CONDITIONAL_V1,
     RELEVANCE_PROBE_MODE_TARGET_ONLY_V1,
+    InteractionCurationPriorityOverride,
     load_interaction_feature_checkpoint,
     save_interaction_feature_checkpoint,
 )
@@ -347,9 +349,52 @@ def test_interaction_update_contract_is_static_and_dynamic_failure_is_atomic() -
     for result in (invalid_observation, invalid_target):
         assert bool(result.update_rejected)
         chex.assert_trees_all_equal(result.state, state)
+        chex.assert_trees_all_equal(result.pre_curation_state, state)
         assert int(result.replaced_slot) == -1
         assert int(result.promoted_candidate) == -1
+        assert int(result.refreshed_candidate) == -1
         assert int(result.retired_slot) == -1
+
+    compiled_invalid = jax.jit(learner.update)(
+        state,
+        observation.at[0].set(jnp.inf),
+        target,
+    )
+    chex.assert_trees_all_equal(compiled_invalid, invalid_observation)
+
+    invalid_observations = jnp.stack(
+        (
+            observation.at[0].set(jnp.inf),
+            observation.at[1].set(-jnp.inf),
+        )
+    )
+
+    def reject_step(
+        carry: Any,
+        invalid_input: Any,
+    ) -> tuple[Any, tuple[Any, Any]]:
+        rejected = learner.update(carry, invalid_input, target)
+        return rejected.state, (
+            rejected.pre_curation_state,
+            rejected.update_rejected,
+        )
+
+    final_state, (pre_curation_states, rejected) = jax.jit(
+        lambda initial: jax.lax.scan(
+            reject_step,
+            initial,
+            invalid_observations,
+        )
+    )(state)
+    chex.assert_trees_all_equal(final_state, state)
+    chex.assert_trees_all_equal(
+        pre_curation_states,
+        jax.tree_util.tree_map(
+            lambda leaf: jnp.stack((leaf, leaf)),
+            state,
+        ),
+    )
+    chex.assert_trees_all_equal(rejected, jnp.ones((2,), dtype=jnp.bool_))
 
     missing_target = learner.update(
         state,
@@ -358,6 +403,268 @@ def test_interaction_update_contract_is_static_and_dynamic_failure_is_atomic() -
     )
     assert not bool(missing_target.update_rejected)
     assert int(missing_target.state.step_count) == 1
+
+
+def test_curation_priority_override_has_exact_no_cadence_learning_parity() -> None:
+    learner = FixedBudgetInteractionLearner(
+        n_features=2,
+        n_tasks=1,
+        replacement_interval=4,
+        min_feature_age=0,
+        candidate_count=2,
+        candidate_min_age=0,
+        refresh_candidates=True,
+        refresh_promoted_candidate=False,
+        use_obgd=False,
+    )
+    state = learner.init(feature_dim=4, key=jr.key(702)).replace(
+        feature_left=jnp.asarray((0, 0), dtype=jnp.int32),
+        feature_right=jnp.asarray((1, 2), dtype=jnp.int32),
+        candidate_left=jnp.asarray((1, 2), dtype=jnp.int32),
+        candidate_right=jnp.asarray((3, 3), dtype=jnp.int32),
+        utilities=jnp.asarray((0.25, 0.5), dtype=jnp.float32),
+        candidate_utilities=jnp.asarray((2.0, 3.0), dtype=jnp.float32),
+    )
+    active_ranks = jnp.asarray((10.0, -7.0), dtype=jnp.float32)
+    candidate_ranks = jnp.asarray((-50.0, 80.0), dtype=jnp.float32)
+    disabled = InteractionCurationPriorityOverride(
+        enabled=jnp.asarray(False, dtype=jnp.bool_),
+        active_ranks=active_ranks,
+        candidate_ranks=candidate_ranks,
+    )
+    enabled = disabled.replace(enabled=jnp.asarray(True, dtype=jnp.bool_))
+    observation = jnp.ones((4,), dtype=jnp.float32)
+    target = jnp.ones((1,), dtype=jnp.float32)
+
+    full = learner.update(
+        state,
+        observation,
+        target,
+        curation_priority_override=disabled,
+    )
+    random = learner.update(
+        state,
+        observation,
+        target,
+        curation_priority_override=enabled,
+    )
+
+    chex.assert_trees_all_equal(full.pre_curation_state, random.pre_curation_state)
+    chex.assert_trees_all_equal(full.state, random.state)
+    assert not bool(full.curation_attempted)
+    assert not bool(random.curation_attempted)
+    assert not bool(full.curation_priority_override_applied)
+    assert not bool(random.curation_priority_override_applied)
+    assert not bool(jnp.array_equal(random.state.utilities, active_ranks))
+    assert not bool(
+        jnp.array_equal(random.state.candidate_utilities, candidate_ranks)
+    )
+
+
+def test_curation_priority_override_changes_only_forced_transaction_selection() -> None:
+    learner = FixedBudgetInteractionLearner(
+        n_features=2,
+        n_tasks=1,
+        step_size_output=0.0,
+        utility_decay=0.999,
+        replacement_interval=1,
+        min_feature_age=0,
+        candidate_count=2,
+        candidate_min_age=0,
+        promotion_margin=1.0,
+        refresh_candidates=False,
+        refresh_promoted_candidate=False,
+        use_obgd=False,
+    )
+    state = learner.init(feature_dim=4, key=jr.key(703)).replace(
+        feature_left=jnp.asarray((0, 0), dtype=jnp.int32),
+        feature_right=jnp.asarray((1, 2), dtype=jnp.int32),
+        utilities=jnp.asarray((0.0, 10.0), dtype=jnp.float32),
+        ages=jnp.asarray((5, 5), dtype=jnp.int32),
+        candidate_left=jnp.asarray((1, 0), dtype=jnp.int32),
+        candidate_right=jnp.asarray((2, 3), dtype=jnp.int32),
+        candidate_utilities=jnp.asarray((100.0, 20.0), dtype=jnp.float32),
+        candidate_ages=jnp.asarray((5, 5), dtype=jnp.int32),
+    )
+    active_ranks = jnp.asarray((10.0, 0.0), dtype=jnp.float32)
+    candidate_ranks = jnp.asarray((0.0, 10.0), dtype=jnp.float32)
+    full_override = InteractionCurationPriorityOverride(
+        enabled=jnp.asarray(False, dtype=jnp.bool_),
+        active_ranks=active_ranks,
+        candidate_ranks=candidate_ranks,
+    )
+    random_override = full_override.replace(
+        enabled=jnp.asarray(True, dtype=jnp.bool_)
+    )
+    observation = jnp.ones((4,), dtype=jnp.float32)
+    target = jnp.zeros((1,), dtype=jnp.float32)
+
+    full = learner.update(
+        state,
+        observation,
+        target,
+        curation_priority_override=full_override,
+    )
+    random = learner.update(
+        state,
+        observation,
+        target,
+        curation_priority_override=random_override,
+    )
+    compiled_random = jax.jit(learner.update)(
+        state,
+        observation,
+        target,
+        curation_priority_override=random_override,
+    )
+
+    chex.assert_trees_all_equal(full.pre_curation_state, random.pre_curation_state)
+    chex.assert_trees_all_equal(random, compiled_random)
+    assert int(full.curation_selected_active_worst_slot) == 0
+    assert int(random.curation_selected_active_worst_slot) == 1
+    assert int(full.curation_selected_promotion_candidate) == 0
+    assert int(random.curation_selected_promotion_candidate) == 1
+    assert int(full.replaced_slot) == 0
+    assert int(random.replaced_slot) == 1
+    assert int(full.promoted_candidate) == 0
+    assert int(random.promoted_candidate) == 1
+    assert bool(random.curation_priority_override_applied)
+    assert not bool(jnp.array_equal(random.state.utilities, active_ranks))
+    assert not bool(
+        jnp.array_equal(random.state.candidate_utilities, candidate_ranks)
+    )
+
+
+def test_curation_priority_override_controls_candidate_refresh_argmin() -> None:
+    learner = FixedBudgetInteractionLearner(
+        n_features=1,
+        n_tasks=1,
+        step_size_output=0.0,
+        replacement_interval=1,
+        min_feature_age=0,
+        candidate_count=2,
+        candidate_min_age=100,
+        refresh_candidates=True,
+        refresh_promoted_candidate=False,
+        use_obgd=False,
+    )
+    state = learner.init(feature_dim=4, key=jr.key(704)).replace(
+        feature_left=jnp.asarray((0,), dtype=jnp.int32),
+        feature_right=jnp.asarray((1,), dtype=jnp.int32),
+        ages=jnp.asarray((5,), dtype=jnp.int32),
+        candidate_left=jnp.asarray((1, 2), dtype=jnp.int32),
+        candidate_right=jnp.asarray((3, 3), dtype=jnp.int32),
+        candidate_utilities=jnp.asarray((0.0, 10.0), dtype=jnp.float32),
+        candidate_ages=jnp.asarray((0, 0), dtype=jnp.int32),
+    )
+    ranks = InteractionCurationPriorityOverride(
+        enabled=jnp.asarray(False, dtype=jnp.bool_),
+        active_ranks=jnp.asarray((0.0,), dtype=jnp.float32),
+        candidate_ranks=jnp.asarray((10.0, 0.0), dtype=jnp.float32),
+    )
+    observation = jnp.ones((4,), dtype=jnp.float32)
+    target = jnp.zeros((1,), dtype=jnp.float32)
+
+    full = learner.update(
+        state,
+        observation,
+        target,
+        curation_priority_override=ranks,
+    )
+    random = learner.update(
+        state,
+        observation,
+        target,
+        curation_priority_override=ranks.replace(
+            enabled=jnp.asarray(True, dtype=jnp.bool_)
+        ),
+    )
+
+    chex.assert_trees_all_equal(full.pre_curation_state, random.pre_curation_state)
+    assert int(full.refreshed_candidate) == 0
+    assert int(random.refreshed_candidate) == 1
+    assert int(full.curation_selected_refresh_candidate) == 0
+    assert int(random.curation_selected_refresh_candidate) == 1
+
+
+def test_nonfinite_curation_priority_override_rejects_atomically_in_all_modes() -> None:
+    learner = _conditional_probe_learner()
+    state = learner.init(feature_dim=3, key=jr.key(705))
+    observation = jnp.ones((3,), dtype=jnp.float32)
+    target = jnp.ones((1,), dtype=jnp.float32)
+    invalid_override = InteractionCurationPriorityOverride(
+        enabled=jnp.asarray(True, dtype=jnp.bool_),
+        active_ranks=jnp.asarray((0.0, jnp.nan), dtype=jnp.float32),
+        candidate_ranks=jnp.asarray((0.0,), dtype=jnp.float32),
+    )
+
+    eager = learner.update(
+        state,
+        observation,
+        target,
+        curation_priority_override=invalid_override,
+    )
+    compiled = jax.jit(learner.update)(
+        state,
+        observation,
+        target,
+        curation_priority_override=invalid_override,
+    )
+    chex.assert_trees_all_equal(eager, compiled)
+    chex.assert_trees_all_equal(eager.state, state)
+    chex.assert_trees_all_equal(eager.pre_curation_state, state)
+    assert bool(eager.update_rejected)
+    assert not bool(eager.curation_priority_override_applied)
+
+    def reject_step(carry: Any, _: Any) -> tuple[Any, Any]:
+        result = learner.update(
+            carry,
+            observation,
+            target,
+            curation_priority_override=invalid_override,
+        )
+        return result.state, (
+            result.pre_curation_state,
+            result.update_rejected,
+        )
+
+    final_state, (pre_curation_states, rejected) = jax.jit(
+        lambda initial: jax.lax.scan(reject_step, initial, xs=None, length=2)
+    )(state)
+    chex.assert_trees_all_equal(final_state, state)
+    chex.assert_trees_all_equal(
+        pre_curation_states,
+        jax.tree_util.tree_map(lambda leaf: jnp.stack((leaf, leaf)), state),
+    )
+    chex.assert_trees_all_equal(rejected, jnp.ones((2,), dtype=jnp.bool_))
+
+    with pytest.raises(ValueError, match="active_ranks"):
+        learner.update(
+            state,
+            observation,
+            target,
+            curation_priority_override=invalid_override.replace(
+                active_ranks=jnp.zeros((3,), dtype=jnp.float32)
+            ),
+        )
+    with pytest.raises(TypeError, match="candidate_ranks"):
+        learner.update(
+            state,
+            observation,
+            target,
+            curation_priority_override=invalid_override.replace(
+                candidate_ranks=jnp.zeros((1,), dtype=jnp.int32)
+            ),
+        )
+    with pytest.raises(TypeError, match="enabled"):
+        learner.update(
+            state,
+            observation,
+            target,
+            curation_priority_override=invalid_override.replace(
+                enabled=jnp.asarray(1.0, dtype=jnp.float32)
+            ),
+        )
 
 
 def test_conditional_candidate_relevance_rejects_collinear_redundancy() -> None:
@@ -1509,6 +1816,23 @@ class TestFixedBudgetInteractionLearner:
         assert float(result.state.output_weights[0, 0]) == pytest.approx(0.5)
         assert int(result.state.utility_evidence_streak[0]) == 0
         assert not bool(result.state.active_output_memory_committed[0])
+        # The matched lifecycle-freeze control commits this exact learned
+        # snapshot: ordinary active/candidate learning and recurrence advance,
+        # but the promotion transaction has not changed identities or reset
+        # either bank yet.
+        pre_curation = result.pre_curation_state
+        chex.assert_trees_all_equal(pre_curation.feature_left, state.feature_left)
+        chex.assert_trees_all_equal(pre_curation.feature_right, state.feature_right)
+        chex.assert_trees_all_equal(pre_curation.candidate_left, state.candidate_left)
+        chex.assert_trees_all_equal(pre_curation.candidate_right, state.candidate_right)
+        assert float(pre_curation.output_weights[0, 0]) == 0.0
+        assert float(pre_curation.candidate_output_weights[0, 0]) == pytest.approx(0.5)
+        assert int(pre_curation.utility_evidence_streak[0]) == 0
+        assert bool(pre_curation.active_output_memory_committed[0])
+        assert int(pre_curation.ages[0]) == 5
+        assert int(pre_curation.candidate_ages[0]) == 5
+        assert int(pre_curation.step_count) == int(state.step_count) + 1
+        assert not bool(jnp.array_equal(pre_curation.key, state.key))
 
     def test_conditional_probe_signal_tracks_the_deployed_durable_bank(self) -> None:
         learner = FixedBudgetInteractionLearner(
@@ -2067,8 +2391,30 @@ class TestFixedBudgetInteractionLearner:
         assert bool(refreshed.candidate_reacquisition_required_pre[0])
         assert int(refreshed.candidate_promotion_evidence_streak_updated[0]) == 2
         assert int(refreshed.promoted_candidate) == -1
+        assert int(refreshed.refreshed_candidate) == 0
         assert not bool(refreshed.state.candidate_reacquisition_required[0])
         assert int(refreshed.state.candidate_promotion_evidence_streak[0]) == 0
+        pre_curation = refreshed.pre_curation_state
+        chex.assert_trees_all_equal(pre_curation.feature_left, base.feature_left)
+        chex.assert_trees_all_equal(pre_curation.feature_right, base.feature_right)
+        chex.assert_trees_all_equal(pre_curation.candidate_left, base.candidate_left)
+        chex.assert_trees_all_equal(pre_curation.candidate_right, base.candidate_right)
+        chex.assert_trees_all_equal(
+            pre_curation.candidate_parent_a,
+            base.candidate_parent_a,
+        )
+        chex.assert_trees_all_equal(
+            pre_curation.candidate_parent_b,
+            base.candidate_parent_b,
+        )
+        chex.assert_trees_all_equal(
+            pre_curation.candidate_generator,
+            base.candidate_generator,
+        )
+        assert float(pre_curation.candidate_output_weights[0, 0]) == 0.5
+        assert int(pre_curation.candidate_promotion_evidence_streak[0]) == 2
+        assert bool(pre_curation.candidate_reacquisition_required[0])
+        assert int(pre_curation.candidate_ages[0]) == 5
 
         invalid = jitted_update(
             base.replace(
@@ -2281,7 +2627,7 @@ class TestFixedBudgetInteractionLearner:
                 candidate_reacquisition_confirmation_steps=value,  # type: ignore[arg-type]
             )
 
-    def test_candidate_reacquisition_confirmation_requires_probe_and_retirement(
+    def test_candidate_reacquisition_confirmation_requires_probe_not_retirement(
         self,
     ) -> None:
         common = {
@@ -2299,12 +2645,17 @@ class TestFixedBudgetInteractionLearner:
                 retire_stale_features=True,
                 candidate_reacquisition_confirmation_steps=2,
             )
-        with pytest.raises(ValueError, match="requires independent_relevance_probe"):
-            FixedBudgetInteractionLearner(
-                **common,
-                independent_relevance_probe=True,
-                candidate_reacquisition_confirmation_steps=2,
-            )
+        no_retirement = FixedBudgetInteractionLearner(
+            **common,
+            independent_relevance_probe=True,
+            candidate_reacquisition_confirmation_steps=2,
+        )
+        no_retirement_state = no_retirement.init(feature_dim=3, key=jr.key(618))
+        assert no_retirement.to_config()["retire_stale_features"] is False
+        chex.assert_trees_all_equal(
+            no_retirement_state.candidate_reacquisition_required,
+            jnp.zeros_like(no_retirement_state.candidate_reacquisition_required),
+        )
 
         configured = FixedBudgetInteractionLearner(
             **common,
@@ -2718,6 +3069,7 @@ class TestFixedBudgetInteractionLearner:
         assert int(result.retired_right) == 1
         assert int(result.replaced_slot) == -1
         assert int(result.promoted_candidate) == -1
+        assert int(result.refreshed_candidate) == -1
         assert int(result.live_feature_count) == 1
         chex.assert_trees_all_equal(
             result.state.feature_left,
@@ -2773,6 +3125,19 @@ class TestFixedBudgetInteractionLearner:
             jnp.zeros((int(jnp.sum(~matching)),), dtype=jnp.bool_),
         )
         assert not bool(jnp.any(result.candidate_reacquisition_confirmed))
+        pre_curation = result.pre_curation_state
+        chex.assert_trees_all_equal(pre_curation.feature_left, state.feature_left)
+        chex.assert_trees_all_equal(pre_curation.feature_right, state.feature_right)
+        chex.assert_trees_all_equal(pre_curation.feature_parent_a, state.feature_parent_a)
+        chex.assert_trees_all_equal(pre_curation.feature_parent_b, state.feature_parent_b)
+        chex.assert_trees_all_equal(pre_curation.feature_generator, state.feature_generator)
+        chex.assert_trees_all_equal(pre_curation.candidate_left, state.candidate_left)
+        chex.assert_trees_all_equal(pre_curation.candidate_right, state.candidate_right)
+        assert float(pre_curation.candidate_output_weights[0, matching][0]) != 0.0
+        assert int(pre_curation.ages[0]) == 11
+        assert int(pre_curation.candidate_ages[matching][0]) == 11
+        assert int(pre_curation.candidate_promotion_evidence_streak[matching][0]) == 3
+        assert not bool(pre_curation.candidate_reacquisition_required[matching][0])
 
     @pytest.mark.parametrize(
         "kwargs",

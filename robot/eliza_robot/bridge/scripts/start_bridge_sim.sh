@@ -6,7 +6,7 @@ cd "$ROOT_DIR"
 
 export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
 TRACE_LOG_PATH="${TRACE_LOG_PATH:-}"
-exec python -m bridge.server \
+exec python -m eliza_robot.bridge.server \
   --backend ros_sim \
   --host 0.0.0.0 \
   --port 9100 \
@@ -14,4 +14,3 @@ exec python -m bridge.server \
   --max-commands-per-sec 30 \
   --deadman-timeout-sec 1.0 \
   --trace-log-path "$TRACE_LOG_PATH"
-

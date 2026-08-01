@@ -1,11 +1,12 @@
 """Autonomous OpenPI policy loop with integrated perception.
 
 Runs the perception pipeline in a background thread and queries an OpenPI
-policy server at a fixed rate, sending actions to the AiNex bridge server.
+policy server at a fixed rate. The CLI logs decoded commands only; callers
+that dispatch commands must provide a supervised bridge callback.
 
 Usage:
-    python3 -m eliza_robot.bridge.openpi_loop --backend mock
-    python3 -m eliza_robot.bridge.openpi_loop --backend ros_real --camera-device 0
+    python3 -m eliza_robot.bridge.openpi_loop --no-perception
+    python3 -m eliza_robot.bridge.openpi_loop --camera-device 0
     python3 -m eliza_robot.bridge.openpi_loop --policy-url http://localhost:8000/infer
 """
 

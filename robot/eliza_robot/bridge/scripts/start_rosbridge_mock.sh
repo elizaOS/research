@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
 export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
-exec python -m bridge.launch \
+exec python -m eliza_robot.bridge.launch \
   --target mock \
   --rosbridge \
   "$@"

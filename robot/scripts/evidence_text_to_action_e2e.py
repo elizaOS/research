@@ -28,7 +28,9 @@ Outputs in `--out`:
 
 This script is intended to be run AFTER training completes (locally or
 on Nebius) and the checkpoint has been rsynced back. For sim-only
-verification (no real robot in the loop), pass `--no-real`.
+verification (no real robot in the loop), pass `--no-real`. The legacy
+physical path is quarantined and fails before connecting until it is
+implemented as an authenticated unified-bridge client.
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ from eliza_robot.bridge.backends.asimov_mujoco import AsimovMujocoBackend
 from eliza_robot.bridge.backends.asimov_remote import AsimovRemoteBackend
 from eliza_robot.bridge.backends.dual_target import DualTargetBackend
 from eliza_robot.bridge.backends.mujoco_backend import MuJocoBackend
+from eliza_robot.bridge.physical_execution import reject_unsupervised_physical_motion
 from eliza_robot.perception.calibration import CameraIntrinsics
 from eliza_robot.perception.detectors.aruco_detector import ArucoDetector
 from eliza_robot.rl.text_conditioned.inference_loop import (
@@ -85,6 +88,10 @@ def _resolve_profile(args) -> str:
 
 async def _build_backend(args) -> tuple:
     """Return (backend, env-or-None) for the chosen topology."""
+    if not args.no_real:
+        reject_unsupervised_physical_motion(
+            "scripts/evidence_text_to_action_e2e.py _build_backend"
+        )
     if args.profile == "asimov-1":
         if args.no_real:
             backend = AsimovMujocoBackend(profile_id=args.profile)
@@ -112,6 +119,8 @@ async def _build_backend(args) -> tuple:
 
 
 async def _run(args) -> int:
+    if not args.no_real:
+        reject_unsupervised_physical_motion("scripts/evidence_text_to_action_e2e.py")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     profile_id = _resolve_profile(args)

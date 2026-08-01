@@ -437,6 +437,7 @@ def test_exact_payload_database_and_pinned_scorer_records_are_required(
         payload,
         protocol.seeds,
         protocol.horizon,
+        entrypoint=config.entrypoint,
         result_root=_result_root(config),
         metadata_contract=metadata,
         scorer_records=records,
@@ -450,17 +451,88 @@ def test_exact_payload_database_and_pinned_scorer_records_are_required(
             payload,
             protocol.seeds,
             protocol.horizon,
+            entrypoint=config.entrypoint,
             result_root=_result_root(config),
             metadata_contract=metadata,
             scorer_records=records,
         )
     empty.rmdir()
 
+    videos = payload / _result_root(config) / "videos"
+    videos.mkdir()
+    with pytest.raises(screen.ScreenError, match="unexpected or missing result directory"):
+        screen.validate_reward_archives(
+            payload,
+            protocol.seeds,
+            protocol.horizon,
+            entrypoint="src/continuing_main.py",
+            result_root=_result_root(config),
+            metadata_contract=metadata,
+            scorer_records=records,
+        )
+    assert screen.validate_reward_archives(
+        payload,
+        protocol.seeds,
+        protocol.horizon,
+        entrypoint="src/rtu_ppo.py",
+        result_root=_result_root(config),
+        metadata_contract=metadata,
+        scorer_records=records,
+    )
+    nested_video_directory = videos / "nested"
+    nested_video_directory.mkdir()
+    with pytest.raises(screen.ScreenError, match="unexpected or missing result directory"):
+        screen.validate_reward_archives(
+            payload,
+            protocol.seeds,
+            protocol.horizon,
+            entrypoint="src/rtu_ppo.py",
+            result_root=_result_root(config),
+            metadata_contract=metadata,
+            scorer_records=records,
+        )
+    nested_video_directory.rmdir()
+    video_file = videos / "unexpected.mp4"
+    video_file.write_bytes(b"not a video")
+    with pytest.raises(screen.ScreenError, match="contain only"):
+        screen.validate_reward_archives(
+            payload,
+            protocol.seeds,
+            protocol.horizon,
+            entrypoint="src/rtu_ppo.py",
+            result_root=_result_root(config),
+            metadata_contract=metadata,
+            scorer_records=records,
+        )
+    video_file.unlink()
+    videos.rmdir()
+    with pytest.raises(screen.ScreenError, match="unexpected or missing result directory"):
+        screen.validate_reward_archives(
+            payload,
+            protocol.seeds,
+            protocol.horizon,
+            entrypoint="src/rtu_ppo.py",
+            result_root=_result_root(config),
+            metadata_contract=metadata,
+            scorer_records=records,
+        )
+    with pytest.raises(screen.ScreenError, match="entrypoint is unsupported"):
+        screen.validate_reward_archives(
+            payload,
+            protocol.seeds,
+            protocol.horizon,
+            entrypoint="src/other.py",
+            result_root=_result_root(config),
+            metadata_contract=metadata,
+            scorer_records=records,
+        )
+
     with pytest.raises(screen.ScreenError, match="pinned-image scorer"):
         screen.validate_reward_archives(
             payload,
             protocol.seeds,
             protocol.horizon,
+            entrypoint=config.entrypoint,
             result_root=_result_root(config),
             metadata_contract=metadata,
         )
@@ -472,6 +544,7 @@ def test_exact_payload_database_and_pinned_scorer_records_are_required(
             payload,
             protocol.seeds,
             protocol.horizon,
+            entrypoint=config.entrypoint,
             result_root=_result_root(config),
             metadata_contract=metadata,
             scorer_records=records,
@@ -492,6 +565,7 @@ def test_exact_payload_database_and_pinned_scorer_records_are_required(
             payload,
             protocol.seeds,
             protocol.horizon,
+            entrypoint=config.entrypoint,
             result_root=_result_root(config),
             metadata_contract=metadata,
             scorer_records=records,
@@ -519,6 +593,7 @@ def test_exact_payload_database_and_pinned_scorer_records_are_required(
             payload,
             protocol.seeds,
             protocol.horizon,
+            entrypoint=config.entrypoint,
             result_root=_result_root(config),
             metadata_contract=metadata,
             scorer_records=records,
@@ -543,6 +618,7 @@ def test_exact_payload_database_and_pinned_scorer_records_are_required(
             payload,
             protocol.seeds,
             protocol.horizon,
+            entrypoint=config.entrypoint,
             result_root=_result_root(config),
             metadata_contract=metadata,
             scorer_records=records,
@@ -560,6 +636,7 @@ def test_exact_payload_database_and_pinned_scorer_records_are_required(
             payload,
             protocol.seeds,
             protocol.horizon,
+            entrypoint=config.entrypoint,
             result_root=_result_root(config),
             metadata_contract=metadata,
             scorer_records=records,
@@ -582,6 +659,7 @@ def test_exact_payload_database_and_pinned_scorer_records_are_required(
             payload,
             protocol.seeds,
             protocol.horizon,
+            entrypoint=config.entrypoint,
             result_root=_result_root(config),
             metadata_contract=metadata,
             scorer_records=records,
@@ -594,6 +672,7 @@ def test_exact_payload_database_and_pinned_scorer_records_are_required(
             payload,
             protocol.seeds,
             protocol.horizon,
+            entrypoint=config.entrypoint,
             result_root=_result_root(config),
             metadata_contract=metadata,
             scorer_records=list(reversed(records)),
@@ -605,6 +684,7 @@ def test_exact_payload_database_and_pinned_scorer_records_are_required(
             payload,
             protocol.seeds,
             protocol.horizon,
+            entrypoint=config.entrypoint,
             result_root=_result_root(config),
             metadata_contract=metadata,
             scorer_records=records,

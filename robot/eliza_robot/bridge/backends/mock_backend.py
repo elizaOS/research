@@ -9,7 +9,12 @@ from random import random
 import numpy as np
 
 from eliza_robot.bridge.backends.base import BridgeBackend
-from eliza_robot.bridge.protocol import CommandEnvelope, EventEnvelope, ResponseEnvelope, utc_now_iso
+from eliza_robot.bridge.protocol import (
+    CommandEnvelope,
+    EventEnvelope,
+    ResponseEnvelope,
+    utc_now_iso,
+)
 from eliza_robot.bridge.types import JsonDict
 
 
@@ -58,6 +63,23 @@ class MockBackend(BridgeBackend):
             "servo_set": True,
             "camera_stream_passthrough": False,
             "camera_snapshot": True,
+            # This backend is explicitly nonphysical. Torque enforcement is
+            # not claimed; the capability contract marks it not applicable.
+            "motion_safety": {
+                "imu_roll": True,
+                "imu_pitch": True,
+                "battery_mv": True,
+                "environment": "nonphysical",
+                "torque_limit_status": "not_applicable",
+                "all_motion_stop": True,
+                "stop_out_of_band": True,
+                "walk_stop": True,
+                "known_joint_pose_at_connect": True,
+                "pose_remains_trusted_after_stop": True,
+                # Workspace/self-collision geometry is not part of the current
+                # RobotProfile contract, so this is never a promotion claim.
+                "hard_envelope_complete": False,
+            },
         }
 
     def snapshot_camera(self, _camera: str = "head") -> np.ndarray | None:
@@ -88,7 +110,7 @@ class MockBackend(BridgeBackend):
             r, g, b = x, 0.0, c
         else:
             r, g, b = c, 0.0, x
-        base = np.zeros((height, width, 3), dtype=np.uint8)
+        base: np.ndarray = np.zeros((height, width, 3), dtype=np.uint8)
         # Per-row vertical gradient so the frame is non-uniform.
         for row in range(height):
             shade = 0.5 + 0.5 * math.sin(row / height * math.pi + self._state.angle)
@@ -141,7 +163,10 @@ class MockBackend(BridgeBackend):
                 self._joint_positions.update(jp)
             positions = cmd.payload.get("positions", [])
             if isinstance(positions, list):
-                from eliza_robot.bridge.isaaclab.joint_map import servo_id_to_joint_name, pulse_to_radians
+                from eliza_robot.bridge.isaaclab.joint_map import (
+                    pulse_to_radians,
+                    servo_id_to_joint_name,
+                )
                 for item in positions:
                     if isinstance(item, dict) and "id" in item and "position" in item:
                         name = servo_id_to_joint_name(int(item["id"]))
@@ -163,6 +188,19 @@ class MockBackend(BridgeBackend):
                 "is_walking": self._state.is_walking,
             },
         )
+
+    async def handle_emergency_stop(
+        self,
+        cmd: CommandEnvelope,
+    ) -> ResponseEnvelope:
+        """Dedicated endpoint used concurrently with ordinary mock motion.
+
+        The in-memory backend has no transport or command queue, so this path
+        is genuinely independent of ``handle_command`` serialization at the
+        bridge boundary.  Physical backends must not advertise the matching
+        capability until they provide an equally independent actuator path.
+        """
+        return await self.handle_command(cmd)
 
     async def poll_events(self) -> list[EventEnvelope]:
         self._battery_mv = max(10400, self._battery_mv - int(1 + 2 * random()))
@@ -204,4 +242,3 @@ class MockBackend(BridgeBackend):
             },
         )
         return [telemetry, perception]
-

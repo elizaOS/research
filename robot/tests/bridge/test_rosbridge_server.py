@@ -9,7 +9,14 @@ import unittest
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import Server, serve
 
-from eliza_robot.bridge.rosbridge_server import RuntimeConfig, _handler
+from eliza_robot.bridge.rosbridge_server import (
+    RuntimeConfig,
+    _build_backend,
+    _handle_message,
+    _handler,
+    _validate_bind_security,
+)
+from eliza_robot.bridge.safety import CommandRateLimiter
 from eliza_robot.bridge.types import JsonDict
 
 
@@ -219,6 +226,74 @@ class RosbridgeServerTests(unittest.IsolatedAsyncioTestCase):
                 lambda item: item.get("op") == "status" and item.get("id") == "adv-1",
             )
             self.assertEqual(advertise_response.get("level"), "info")
+
+
+class _RecordingSocket:
+    def __init__(self) -> None:
+        self.messages: list[JsonDict] = []
+
+    async def send(self, raw: str) -> None:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            self.messages.append(parsed)
+
+
+class _RejectingServiceBackend:
+    async def call_service(self, _service: str, _args: JsonDict) -> JsonDict:
+        return {"result": False}
+
+
+class RosbridgeSafetyAckTests(unittest.IsolatedAsyncioTestCase):
+    def test_physical_compatibility_backend_is_unconditionally_disabled(self) -> None:
+        for host in ("0.0.0.0", "127.0.0.1", "localhost", "::1"):
+            with self.assertRaisesRegex(ValueError, "disabled"):
+                _validate_bind_security(host, "ros_real")
+        with self.assertRaisesRegex(ValueError, "disabled"):
+            _build_backend("ros_real")
+        _validate_bind_security("0.0.0.0", "mock")
+
+    async def test_false_walking_service_ack_is_not_reported_as_success(self) -> None:
+        socket = _RecordingSocket()
+        await _handle_message(
+            socket,  # type: ignore[arg-type]
+            _RejectingServiceBackend(),  # type: ignore[arg-type]
+            {
+                "op": "call_service",
+                "id": "stop-false",
+                "service": "/walking/command",
+                "args": {"command": "stop"},
+            },
+            set(),
+            CommandRateLimiter(1),
+            lambda: None,
+        )
+
+        self.assertEqual(len(socket.messages), 1)
+        self.assertIs(socket.messages[0]["result"], False)
+        values = socket.messages[0]["values"]
+        self.assertIsInstance(values, dict)
+        if isinstance(values, dict):
+            self.assertIs(values["result"], False)
+
+    async def test_stop_service_bypasses_saturated_rate_limiter(self) -> None:
+        socket = _RecordingSocket()
+        limiter = CommandRateLimiter(1)
+        self.assertTrue(limiter.check().allowed)
+        await _handle_message(
+            socket,  # type: ignore[arg-type]
+            _RejectingServiceBackend(),  # type: ignore[arg-type]
+            {
+                "op": "call_service",
+                "id": "stop-priority",
+                "service": "/walking/command",
+                "args": {"command": "stop"},
+            },
+            set(),
+            limiter,
+            lambda: None,
+        )
+
+        self.assertEqual(socket.messages[0]["op"], "service_response")
 
 
 if __name__ == "__main__":

@@ -52,8 +52,9 @@ this working tree.
 | Stationary Forager causal map | observation/action/reward history builds a relative toroidal map and learns channel rewards and respawn timings; privilege isolation, serialization, JIT, chunk, batch, and short installed-environment mechanics are tested | L0 task-specific mechanism; uses public 15×15 movement structure, has no performance artifact, and is not learned recurrent state, nonstationary retention, or a SOTA result | `test_causal_map_forager.py` |
 | Forager field-of-view protocol | a stage-conformant 10k-step tuning matrix on five disjoint seeds selected `step3e3`; the old 30×500k evaluation produced no batch or report and is inactive, while its official-DQN and relearning companions are explicitly quarantined | benchmark execution only; no registered performance claim, paired comparison, or promotion | `outputs/forager/fov_tuning_10k_seeds1000000_1000004/report.json` |
 | Forager RTU-RTRL development run | four open development seeds completed 500k GPU steps with FOV tail-EMA AUC mean 1.550, sample SD 0.324, and range 1.167–1.936; an unsealed DQN comparator gives a descriptive RTU-minus-DQN mean of +0.331 on the same four seeds | nonpromoting development receipts; no preregistered selection, held-out seeds, admissible paired baseline, matched runtime/resources, complete source closure, or SOTA claim | `outputs/forager/rtu_rtrl_500k_dev4/receipt.v1.json`, `outputs/forager/dqn_fov_500k_dev_seeds2000001_2000004_reconciled/receipt.v1.json`, `test_forager_development_receipts.py` |
+| Forager open candidate screens and RNG parity | complete two-seed CPU screens rank DQN-LN first within the feed-forward set (mean 1.49084) and PPO-RTU-LN first within the stateful set (mean 1.78110); a fixed-action direct/wrapper content trace matches exactly | nonpromoting development diagnostics; consumed seeds, candidate budgets not necessarily matched, retained RTU-PPO RNG confound, and an externally unverified parity receipt with promotion explicitly unauthorized | `outputs/forager/fov_baseline_screening_cpu_v3_execution/aggregate.json`, `outputs/forager/fov_stateful_baseline_screening_cpu_v3_corrected_v4_execution/aggregate.json`, `outputs/forager/rng_parity_live_qualification_v1_execution/receipt.json` |
 | Typed surprise/progress/change | hand-checked ensemble disagreement and uncertainty stay separate; high modeled aleatoric noise does not create epistemic surprise/change, while a sustained calibrated residual shift exceeds an isolated outlier | L0/development mechanism; internal frozen calibration, no routing-consumer benefit | `test_learning_signals.py` |
-| Gradient-level joy audit and application | candidate updates are accepted only with complete finite objective/retention/safety evidence and a trust-bound pass; the effective stored delta is re-audited after dtype cast/addition, and the atomic result separately reports both verdicts and whether a parameter change was actually applied | L0 mechanism; detached local first-order probes and fail-closed application boundary, not realized improvement or a DG reproduction | `test_delight.py` |
+| Gradient-level joy audit and application | candidate updates are accepted only with complete finite objective/retention/safety evidence, fresh roundoff-resolved dot/norm certificates for both the candidate and actual elementwise-rounded tentative tree, conservative magnitude/alignment endpoints, and a certified trust-bound pass; the effective stored delta is re-audited after dtype cast/addition, and the atomic result separately reports both verdicts and whether a parameter change was actually applied | L0 mechanism; detached local first-order probes and fail-closed application boundary, not realized improvement or a DG reproduction | `test_delight.py` |
 | Bounded experiential retrieval | fixed-capacity query-before-write memory rejects stale/wrong-version, unsafe, uncertain, distant, and non-finite entries; deterministic eviction and exact byte/checkpoint parity hold | L0 mechanism; no held-out forward-transfer benefit | `test_experiential_memory.py` |
 | Sparse-world-model decision fidelity | historical held-out normalized six-step regret 0.000877 vs 0.294800 untrained and 0.049557 raw ridge | accepted narrow L2 historical result through an immutable-artifact plus exact consumed-seed compatibility chain; replay is nonpromoting and the unarchived old builder source prevents a full source-recoverability claim | `test_ftl_decision_artifact.py`, `test_historical_ftl_evidence_chain.py` |
 | Planning diagnostic (Steps 7/9) | Dyna planning=4: +965 cumulative reward vs planning=0 on eight calibration seeds; guarded dreaming: +798; corruption gate closes ≤4 steps | development integration diagnostic; no held-out artifact or matched update-count claim | `test_planning_benefit.py` |
@@ -84,7 +85,10 @@ freeze · off-policy horde ρ² trace composition + GTD correction missing ρ ·
 `reset_dormant_neurons` optimizer-pytree corruption · baseline optimizers
 missing from the config registry · prototype-basis recycled slots inheriting
 stale readouts · compositional raw-index aliasing · UPGD-memory blend-logit
-gradient bias · Mann-Whitney rank-biserial sign inversion.
+gradient bias · Mann-Whitney rank-biserial sign inversion · Prototype
+double-advanced recurrent action queries + observation/action ABA transition
+ownership + lossy uint64 action aliases + truncation selecting on the wrong
+observation · online-gated state learning committing non-finite gradients.
 
 ## New capabilities
 
@@ -98,7 +102,9 @@ semantics, analytic fixed points, all-1024-demons-learn, and generous time
 bounds) ·
 `core/option_value_duration.py` (separate conventional option-return and
 remaining-duration TD heads) ·
-`core/state_builder.py` (causal identity/fixed-trace/trainable state contract) ·
+`core/state_builder.py` (causal identity/fixed-trace/trainable state contract,
+episode-local reset with lifetime counters, and fail-closed scale-safe online
+learning) ·
 `core/learning_signals.py` (typed ensemble uncertainty/progress/change producer) ·
 `core/experiential_memory.py` (fixed-capacity versioned episodic retrieval) ·
 `core/behavior_model.py` (bounded online partner-action prediction and

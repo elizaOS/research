@@ -222,15 +222,10 @@ python -m eliza_robot.bridge.server \
   --port 19101
 ```
 
-The real robot pass should be run only after the sim-only validation is clean:
-
-```bash
-python scripts/evidence_text_to_action_e2e.py \
-  --checkpoint checkpoints/asimov_1_alberta_h200 \
-  --host 192.168.1.218 \
-  --port 9090 \
-  --obsbot-device 4
-```
+The legacy real-robot path in `evidence_text_to_action_e2e.py` is quarantined
+because it instantiated the physical transport directly. It fails before
+connecting. A real pass requires an authenticated command-envelope client for
+`eliza_robot.bridge.server`; do not repurpose the simulation evidence command.
 
 ## Baselines
 

@@ -136,7 +136,12 @@ def _cmd(command: str, payload: dict[str, Any]) -> CommandEnvelope:
 
 
 async def validate_asimov_livekit_dry_run_async() -> dict[str, Any]:
-    """Exercise the real ASIMOV backend path with dry-run LiveKit/protobuf objects."""
+    """Exercise ASIMOV serialization with deterministic dry-run transport objects.
+
+    The injected transport is deliberately nonphysical. Real-mode construction
+    requires a stable actuator identity and supervised hard-envelope dispatch;
+    this serializer diagnostic must not impersonate either guarantee.
+    """
     room = DryRunLiveKitRoom()
     transport = LiveKitAsimovTransport(
         url="wss://asimov.dry-run.invalid",
@@ -144,7 +149,7 @@ async def validate_asimov_livekit_dry_run_async() -> dict[str, Any]:
         room=room,
         edge_pb2=DryRunAsimovEdgePb2,
     )
-    backend = AsimovRemoteBackend(mock=False, transport=transport)
+    backend = AsimovRemoteBackend(mock=True, transport=transport)
     await backend.connect()
 
     positions = [0.01 * idx for idx in range(ASIMOV1_FULL_ACTION_DIM)]

@@ -107,9 +107,30 @@ This framework provides the following implementation surfaces:
 
 Cross-cutting mechanism surfaces include causal `StateBuilder` variants,
 `LearningSignalEstimator`, the gradient-level `assess_gradient_joy` audit and
-effective-delta-audited atomic `apply_gradient_joy_update` boundary, fixed-capacity
-`ExperientialMemory`, and the explicit `PrototypeTransition` boundary. L0
-integration substrates now also include `BehaviorModel`, a bounded
+effective-delta-audited atomic `apply_gradient_joy_update` boundary,
+fixed-capacity `DualReplayMemory` and `ExperientialMemory`, and the explicit
+`PrototypeTransition` boundary. A bounded `ShallowRidgeWorldModel` supplies the
+interpretable action-conditioned regularized-FTL reference with grounded
+one-step targets and a diagnostic planner; it has no efficacy claim. The
+Prototype path now consumes an opt-in identity, fixed-trace, or online-gated
+builder causally, caches the dispatched decision, and rejects stale transition
+generations atomically. An opt-in bounded ensemble now produces one causal
+world-model representation gradient, and the online-gated builder proposes
+from its source sensitivity before committing into the advanced recurrent
+state. An optional decision-bound audit stores that delta only when the literal
+`sparks_joy` candidate verdict and effective finite-precision audit both pass.
+An alternative opt-in `ModelReplayRehearsal` world-model lane atomically joins
+the real ensemble update to fixed-capacity dual replay and model-member-only
+rehearsal. Its replay updates have isolated RNG/counters and cannot train the
+actor, critic, builder, signal calibrator, or joy gate; only the real causal
+gradient is exposed downstream.
+This is integration evidence, not evidence that the online-gated representation
+improves control: balanced prediction/control gradients and the matched
+Forager result remain absent. A separate `DelightfulActorCriticAgent` development
+surface provides matched ordinary and paper-specific delightful categorical
+policy-gradient modes plus nonpromoting contextual-gambling and RiverSwim A/B/A
+diagnostics; it has no validated control-benefit claim.
+L0 integration substrates now also include `BehaviorModel`, a bounded
 external-belief joint outcome model, `FeatureBankRouter`, and an uncued
 recurring hidden-partner stream. A bounded L0 kernel composes these with
 learned state, online pair discovery, joint-model planning, and differential
@@ -241,9 +262,16 @@ from alberta_framework.core.options import STOMPConfig, SubtaskSpec
 ```
 
 New integrations should pass each environment reward, next observation, and
-continuation discount through `PrototypeAgent.update_transition`; every
-enabled bootstrapping path, including the IA exo-cortex, then receives explicit
-continuation. The older `update` method remains a compatibility wrapper.
+continuation discount through `PrototypeAgent.update_transition`. Carry the
+complete `agent.decision(state)` record across the environment boundary: its
+four-word lifecycle/generation token prevents an old observation/action pair
+from being replayed after the pair recurs. `next_observation` is the final
+observation used for learning and bootstrapping;
+`next_decision_observation` is the post-reset observation used for the next
+command. They must match on a non-boundary transition. Every enabled
+bootstrapping path, including the IA exo-cortex, receives explicit
+continuation. The older `update` method remains a compatibility wrapper and is
+unavailable with a canonical `state_builder`.
 
 ## Streams & testbeds
 

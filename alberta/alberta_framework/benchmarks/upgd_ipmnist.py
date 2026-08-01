@@ -64,13 +64,17 @@ complete published-protocol exactness):
   aligned with the permutation schedule; the difference is 1 step in 5,000.
 - Bias corrections are computed in float32 (upstream mixes float64 Python
   scalars into float32 tensors).
-- The inner loop uses :func:`lean_upgd_w_update`, a scan-optimized
+- Exact ``upgd_w`` runs use :func:`lean_upgd_w_update`, a scan-optimized
   restatement of the ``CanonicalUPGD`` ``official_experiment_global``
   protecting profile (the canonical transform's finiteness/mask bookkeeping
   triples CPU step time on this all-finite protocol). A supplied-noise parity
   unit test pins it to the canonical implementation exactly. Perturbations
   are drawn as one flat ``N(0, sigma^2)`` vector per step and sliced per
   parameter -- same distribution as upstream's per-tensor ``randn_like``.
+- ``run_ipmnist(noise_mode="pool")`` is a screening-only fast mode that
+  replaces the dominant per-step perturbation generation with random slices
+  of a per-task noise pool (see the noise-pool section below); pool results
+  are refused by :func:`partial_payload` and never enter v2/v3 artifacts.
 
 MNIST arrives through the same OpenML plumbing the step2 runners use
 (``sklearn.datasets.fetch_openml("mnist_784", version=1)``); the loader
@@ -422,6 +426,53 @@ def lean_upgd_w_update(
     return new_params, LeanUPGDState(utility=utility, step=count)  # type: ignore[call-arg]
 
 
+# =============================================================================
+# Screening-only noise pool (OpenAI-ES-style shared noise table)
+# =============================================================================
+#
+# ``noise_mode="pool"`` replaces the dominant per-step cost of the UPGD-W
+# lane -- generating a fresh 282,160-element ``N(0, sigma^2)`` perturbation
+# vector every step (~80%+ of single-core step time; threefry bits + erfinv
+# have no cheaper bit-exact implementation on CPU) -- with one pool of
+# ``noise_pool_steps`` steps' worth of normals regenerated per task and a
+# random contiguous slice per step. Per-step marginals stay exactly
+# ``N(0, sigma^2)`` and elements within a step stay independent, but values
+# are REUSED across steps at random alignments, so pool trajectories are a
+# screening-only approximation: :func:`partial_payload` refuses them and they
+# must never feed the v2/v3 artifact lifecycle. The update equations are the
+# unchanged parity-tested :func:`lean_upgd_w_update` consuming supplied noise.
+
+
+#: Learners whose update consumes a perturbation (pool mode applies to these;
+#: for the rest, pool mode falls back to the exact deterministic step).
+_STOCHASTIC_LEARNERS: frozenset[str] = frozenset({"upgd_w"})
+
+
+def _sorted_param_shapes(config: IPMNISTConfig) -> dict[str, tuple[int, ...]]:
+    """Parameter shapes of the protocol MLP keyed by name."""
+    return {
+        "b1": (config.hidden1,),
+        "b2": (config.hidden2,),
+        "b3": (config.n_classes,),
+        "w1": (config.input_dim, config.hidden1),
+        "w2": (config.hidden1, config.hidden2),
+        "w3": (config.hidden2, config.n_classes),
+    }
+
+
+def _split_flat_noise(
+    flat: Array, shapes: Mapping[str, tuple[int, ...]]
+) -> dict[str, Array]:
+    """Slice one flat noise vector per sorted parameter name (the lane's order)."""
+    out: dict[str, Array] = {}
+    offset = 0
+    for name in sorted(shapes):
+        count = int(np.prod(shapes[name]))
+        out[name] = flat[offset:offset + count].reshape(shapes[name])
+        offset += count
+    return out
+
+
 def _make_upgd_w_learner(hp: dict[str, float]) -> tuple[LearnerInitFn, LearnerStepFn]:
     """UPGD-W (``FirstOrderGlobalUPGD``) via the lean parity-tested step."""
     noise_std = hp["noise_std"]
@@ -512,6 +563,7 @@ class IPMNISTRunResult:
     initial_params: dict[str, np.ndarray] | None = None
     permutations: np.ndarray | None = None
     example_indices: np.ndarray | None = None
+    noise_mode: str = "step"
 
 
 def resolve_hyperparameters(
@@ -539,8 +591,14 @@ def run_ipmnist(
     hyperparameters: dict[str, float] | None = None,
     return_per_step: bool = False,
     progress_every: int | None = None,
+    noise_mode: Literal["step", "pool"] = "step",
+    noise_pool_steps: int = 64,
 ) -> IPMNISTRunResult:
     """Run the online Input-permuted MNIST protocol for one learner.
+
+    Under the default ``noise_mode="step"`` the inner loop is the historical
+    dict-based loop (bit-compatible with the completed lane results, modulo
+    XLA version); ``noise_mode="pool"`` swaps only the noise source.
 
     Args:
         data_x: ``(n_train, input_dim)`` float32 inputs, already normalized
@@ -554,14 +612,31 @@ def run_ipmnist(
             parameters and schedules (debug/testing scale only -- the full
             protocol would materialize ``n_seeds x 1e6`` floats).
         progress_every: Log progress every N tasks (None = silent).
+        noise_mode: ``"step"`` (default, protocol-exact: one fresh
+            ``N(0, sigma^2)`` vector per step) or ``"pool"`` -- a
+            SCREENING-ONLY approximation that regenerates a noise pool of
+            ``noise_pool_steps`` steps' worth of normals once per task and
+            slices each step's perturbation at a random offset (OpenAI-ES
+            style shared noise table). Per-step marginals stay exactly
+            ``N(0, sigma^2)`` but values are reused across steps, so pool
+            results are refused by :func:`partial_payload` and must never
+            feed the v2/v3 artifact lifecycle.
+        noise_pool_steps: Pool size in steps (>= 2) for ``noise_mode="pool"``;
+            memory is ``noise_pool_steps * n_params * 4`` bytes per seed.
 
     Returns:
         Host-side result arrays; see :class:`IPMNISTRunResult`.
     """
     if config is None:
         config = IPMNISTConfig()
+    if noise_mode not in ("step", "pool"):
+        raise ValueError(f"noise_mode must be 'step' or 'pool', got {noise_mode!r}")
+    if noise_mode == "pool" and noise_pool_steps < 2:
+        raise ValueError(f"noise_pool_steps must be >= 2, got {noise_pool_steps}")
     hp = resolve_hyperparameters(learner, hyperparameters)
     init_fn, step_fn = _LEARNER_FACTORIES[learner](hp)
+    shapes = _sorted_param_shapes(config)
+    n_flat = int(sum(np.prod(shape) for shape in shapes.values()))
 
     data_x = jnp.asarray(data_x, dtype=jnp.float32)
     data_y = jnp.asarray(data_y, dtype=jnp.int32)
@@ -579,6 +654,10 @@ def run_ipmnist(
     if not seed_tuple:
         raise ValueError("at least one seed is required")
     seeds_array = jnp.asarray(seed_tuple, dtype=jnp.uint32)
+
+    use_pool = noise_mode == "pool" and learner in _STOCHASTIC_LEARNERS
+    pool_len = int(noise_pool_steps) * n_flat if use_pool else 0
+    pool_noise_std = float(hp["noise_std"]) if use_pool else 0.0
 
     def init_seed(seed: Array) -> tuple[dict[str, Array], Any, IPMNISTSchedule, Array]:
         root = jr.key(seed)
@@ -599,6 +678,10 @@ def run_ipmnist(
         permutation: Array,
         examples: Array,
     ) -> tuple[dict[str, Array], Any, Array, Array, Array, Array]:
+        if use_pool:
+            noise_key, pool_key = jr.split(noise_key)
+            pool = jr.normal(pool_key, (pool_len,), jnp.float32) * pool_noise_std
+
         def one_step(
             carry: tuple[dict[str, Array], Any, Array], example: Array
         ) -> tuple[tuple[dict[str, Array], Any, Array], tuple[Array, Array, Array]]:
@@ -610,7 +693,15 @@ def run_ipmnist(
             )
             accuracy = (jnp.argmax(logits) == y).astype(jnp.float32)
             key, step_key = jr.split(key)
-            new_params, new_state = step_fn(step_params, step_state, grads, step_key)
+            if use_pool:
+                offset = jr.randint(step_key, (), 0, pool_len - n_flat + 1)
+                flat_noise = jax.lax.dynamic_slice(pool, (offset,), (n_flat,))
+                noise = _split_flat_noise(flat_noise, shapes)
+                new_params, new_state = lean_upgd_w_update(
+                    step_params, step_state, grads, noise, hp
+                )
+            else:
+                new_params, new_state = step_fn(step_params, step_state, grads, step_key)
             loss_after, _ = cross_entropy_loss(new_params, x, y)
             plasticity = jnp.clip(
                 1.0 - loss_after / jnp.maximum(loss, _PLASTICITY_LOSS_FLOOR), 0.0, 1.0
@@ -622,7 +713,7 @@ def run_ipmnist(
         )
         return params, opt_state, noise_key, accuracies, losses, plasticities
 
-    run_task_batched = jax.jit(jax.vmap(run_task))
+    run_task_batched = jax.jit(jax.vmap(run_task), donate_argnums=(0, 1, 2))
 
     task_accuracy: list[np.ndarray] = []
     task_loss: list[np.ndarray] = []
@@ -670,6 +761,7 @@ def run_ipmnist(
         initial_params=initial_params_host,
         permutations=np.asarray(schedules.permutations) if return_per_step else None,
         example_indices=np.asarray(schedules.example_indices) if return_per_step else None,
+        noise_mode=noise_mode,
     )
 
 
@@ -982,6 +1074,11 @@ def partial_payload(result: IPMNISTRunResult) -> dict[str, Any]:
     """Serialize one run shard with the strict, nonpromoting v2 schema."""
     if len(result.seeds) != 1:
         raise ValueError("a v2 partial must contain exactly one seed")
+    if result.noise_mode != "step":
+        raise ValueError(
+            "only exact per-step noise results may become v2 shards; got "
+            f"noise_mode={result.noise_mode!r} (screening-only approximation)"
+        )
     return {
         "schema": PARTIAL_SCHEMA,
         "schema_version": 2,

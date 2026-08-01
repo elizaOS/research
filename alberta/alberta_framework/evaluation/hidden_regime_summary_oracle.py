@@ -239,17 +239,32 @@ def _d_short_non_displacement(
         if indices.size == 0:
             raise ValueError("D-short segment has no trace rows")
         first = int(indices[0])
-        last = int(indices[-1])
         for role in ("helper", "beneficiary"):
-            if not np.array_equal(
-                np.asarray(getattr(trace, f"{role}_status_pre"))[first],
-                np.asarray(getattr(trace, f"{role}_status_post"))[last],
-            ):
+            committed = np.asarray(getattr(trace, f"{role}_committed_slot"), dtype=np.int32)
+            retired = np.asarray(getattr(trace, f"{role}_retired_slot"), dtype=np.int32)
+            if np.any(committed[indices] >= 0) or np.any(retired[indices] >= 0):
                 return True, False
-            if not np.array_equal(
-                np.asarray(getattr(trace, f"{role}_generation_pre"))[first],
-                np.asarray(getattr(trace, f"{role}_generation_post"))[last],
-            ):
+            for field in ("status", "generation"):
+                pre = np.asarray(getattr(trace, f"{role}_{field}_pre"), dtype=np.int32)
+                post = np.asarray(getattr(trace, f"{role}_{field}_post"), dtype=np.int32)
+                baseline = pre[first]
+                expected = np.broadcast_to(baseline, pre[indices].shape)
+                if not np.array_equal(pre[indices], expected) or not np.array_equal(
+                    post[indices], expected
+                ):
+                    return True, False
+            next_generation_pre = np.asarray(
+                getattr(trace, f"{role}_next_generation_pre"),
+                dtype=np.int32,
+            )
+            next_generation_post = np.asarray(
+                getattr(trace, f"{role}_next_generation_post"),
+                dtype=np.int32,
+            )
+            baseline_next_generation = next_generation_pre[first]
+            if not np.all(
+                next_generation_pre[indices] == baseline_next_generation
+            ) or not np.all(next_generation_post[indices] == baseline_next_generation):
                 return True, False
     return True, True
 

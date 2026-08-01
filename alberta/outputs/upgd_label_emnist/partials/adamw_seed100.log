@@ -1,0 +1,23 @@
+WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-07-31 11:53:57,061 INFO shard learner=adamw seed=100 tasks=400 task_length=2500
+2026-07-31 11:54:43,907 INFO adamw task 20/400 online_acc=0.2156 elapsed=44.1s
+2026-07-31 11:55:01,882 INFO adamw task 40/400 online_acc=0.2280 elapsed=62.0s
+2026-07-31 11:55:19,492 INFO adamw task 60/400 online_acc=0.2296 elapsed=79.6s
+2026-07-31 11:55:42,299 INFO adamw task 80/400 online_acc=0.2288 elapsed=102.4s
+2026-07-31 11:56:06,116 INFO adamw task 100/400 online_acc=0.2580 elapsed=126.3s
+2026-07-31 11:56:29,059 INFO adamw task 120/400 online_acc=0.1856 elapsed=149.2s
+2026-07-31 11:56:47,686 INFO adamw task 140/400 online_acc=0.2664 elapsed=167.8s
+2026-07-31 11:57:11,901 INFO adamw task 160/400 online_acc=0.1832 elapsed=192.0s
+2026-07-31 11:57:34,101 INFO adamw task 180/400 online_acc=0.1836 elapsed=214.2s
+2026-07-31 11:57:56,291 INFO adamw task 200/400 online_acc=0.1924 elapsed=236.4s
+2026-07-31 11:58:13,401 INFO adamw task 220/400 online_acc=0.2052 elapsed=253.5s
+2026-07-31 11:58:34,068 INFO adamw task 240/400 online_acc=0.2188 elapsed=274.2s
+2026-07-31 11:58:54,934 INFO adamw task 260/400 online_acc=0.1828 elapsed=295.1s
+2026-07-31 11:59:13,862 INFO adamw task 280/400 online_acc=0.1892 elapsed=314.0s
+2026-07-31 11:59:34,484 INFO adamw task 300/400 online_acc=0.1816 elapsed=334.6s
+2026-07-31 11:59:57,315 INFO adamw task 320/400 online_acc=0.1688 elapsed=357.5s
+2026-07-31 12:00:19,782 INFO adamw task 340/400 online_acc=0.1516 elapsed=379.9s
+2026-07-31 12:00:38,807 INFO adamw task 360/400 online_acc=0.1884 elapsed=399.0s
+2026-07-31 12:00:58,752 INFO adamw task 380/400 online_acc=0.1384 elapsed=418.9s
+2026-07-31 12:01:15,980 INFO adamw task 400/400 online_acc=0.1300 elapsed=436.1s
+2026-07-31 12:01:16,158 INFO wrote shard outputs/upgd_label_emnist/partials/adamw_seed100.json (avg online acc 0.2002, wall 436.1s)

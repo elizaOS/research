@@ -181,11 +181,19 @@ async def _drive_autonomous_policy_start(port: int) -> dict:
         await ws.send(json.dumps(cmd_start))
         start_response = None
         completed = None
-        for _ in range(40):
-            raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        deadman = None
+        error = None
+        deadline = asyncio.get_running_loop().time() + 30.0
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0.0:
+                break
+            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
             msg = json.loads(raw)
             if msg.get("type") == "response" and msg.get("request_id") == "test-autonomous-start":
                 start_response = msg
+            if msg.get("type") == "event" and msg.get("event") == "safety.deadman_triggered":
+                deadman = msg
             if (
                 msg.get("type") == "event"
                 and msg.get("event") == "policy.status"
@@ -193,7 +201,19 @@ async def _drive_autonomous_policy_start(port: int) -> dict:
             ):
                 completed = msg
                 break
-        return {"start": start_response, "completed": completed}
+            if (
+                msg.get("type") == "event"
+                and msg.get("event") == "policy.status"
+                and msg.get("data", {}).get("reason") == "error"
+            ):
+                error = msg
+                break
+        return {
+            "start": start_response,
+            "completed": completed,
+            "deadman": deadman,
+            "error": error,
+        }
 
 
 @pytest.mark.asyncio
@@ -267,6 +287,8 @@ async def test_policy_start_can_run_alberta_checkpoint_server_side(
     assert result["start"] is not None
     assert result["start"]["ok"] is True
     assert result["start"]["data"]["server_side_policy"] is True
+    assert result["deadman"] is None
+    assert result["error"] is None
     assert result["completed"] is not None
     data = result["completed"]["data"]
     assert data["steps_completed"] == 1

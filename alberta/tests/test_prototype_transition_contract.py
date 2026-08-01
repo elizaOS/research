@@ -23,6 +23,7 @@ from alberta_framework.core.prototype_agent import (
     PrototypeAgentConfig,
     PrototypeAgentState,
     PrototypeTransition,
+    PrototypeUpdateResult,
     _sample_one_hot_dream_observation,
 )
 from alberta_framework.core.types import DemonType, GVFSpec, create_horde_spec
@@ -31,6 +32,7 @@ from alberta_framework.core.world_model import ActionConditionedWorldModelConfig
 
 def test_transition_and_checkpoint_helpers_are_publicly_exported() -> None:
     assert alberta.PrototypeTransition is core.PrototypeTransition
+    assert alberta.PrototypeDecision is core.PrototypeDecision
     assert alberta.PrototypeAgent is core.PrototypeAgent
     assert (
         alberta.PROTOTYPE_CHECKPOINT_SCHEMA
@@ -133,6 +135,34 @@ def _materialize_typed_keys(tree: object) -> object:
         return value
 
     return jax.tree.map(convert, tree)
+
+
+def _explicit_transition(
+    state: PrototypeAgentState,
+    *,
+    reward: object,
+    next_observation: object,
+    discount: object,
+    terminated: object | None = None,
+    truncated: object = False,
+    horde_cumulants: object | None = None,
+    horde_discounts: object | None = None,
+) -> PrototypeTransition:
+    """Build an owned explicit transition from the state's decision cache."""
+    discount_array = jnp.asarray(discount, dtype=jnp.float32)
+    return PrototypeTransition(
+        observation=state.current_raw_observation,
+        action=state.current_action,
+        decision_id=state.current_decision_id,
+        reward=reward,
+        discount=discount,
+        terminated=(discount_array == 0.0 if terminated is None else terminated),
+        truncated=truncated,
+        next_observation=next_observation,
+        next_decision_observation=next_observation,
+        horde_cumulants=horde_cumulants,
+        horde_discounts=horde_discounts,
+    )
 
 
 @pytest.mark.parametrize("discount", [0.0, 0.25])
@@ -267,7 +297,8 @@ def test_world_model_error_uses_supplied_discount_target() -> None:
 
     result = agent.update_transition(
         state,
-        PrototypeTransition(
+        _explicit_transition(
+            state,
             reward=reward,
             next_observation=next_obs,
             discount=discount,
@@ -332,7 +363,8 @@ def test_horde_explicit_discounts_and_default_horizons() -> None:
     explicit_discounts = jnp.array([0.0, 0.4], dtype=jnp.float32)
     explicit = agent.update_transition(
         initial,
-        PrototypeTransition(
+        _explicit_transition(
+            initial,
             reward=0.0,
             next_observation=next_obs,
             discount=0.5,
@@ -348,7 +380,8 @@ def test_horde_explicit_discounts_and_default_horizons() -> None:
 
     defaults = agent.update_transition(
         initial,
-        PrototypeTransition(
+        _explicit_transition(
+            initial,
             reward=0.0,
             next_observation=next_obs,
             discount=0.5,
@@ -364,7 +397,8 @@ def test_horde_explicit_discounts_and_default_horizons() -> None:
 
     terminal = agent.update_transition(
         initial,
-        PrototypeTransition(
+        _explicit_transition(
+            initial,
             reward=0.0,
             next_observation=next_obs,
             discount=0.0,
@@ -668,7 +702,8 @@ def test_explicit_scan_matches_repeated_transition_updates() -> None:
     ):
         result = agent.update_transition(
             loop_state,
-            PrototypeTransition(
+            _explicit_transition(
+                loop_state,
                 reward=reward,
                 next_observation=observation,
                 discount=discount,
@@ -705,33 +740,49 @@ def test_explicit_transition_rejects_invalid_discount(discount: float) -> None:
     agent = PrototypeAgent(_prototype_config())
     state = agent.start(agent.init(jr.key(8)), jnp.zeros(2, dtype=jnp.float32))
 
-    with pytest.raises(ValueError, match=r"finite and in \[0, 1\]"):
-        agent.update_transition(
+    result = agent.update_transition(
+        state,
+        _explicit_transition(
             state,
-            PrototypeTransition(
+            reward=0.0,
+            next_observation=jnp.ones(2, dtype=jnp.float32),
+            discount=discount,
+        ),
+    )
+
+    chex.assert_trees_all_equal(
+        _materialize_typed_keys(result.state),
+        _materialize_typed_keys(state),
+    )
+    assert not bool(result.transition_diagnostics.valid)
+    assert bool(result.transition_diagnostics.rejected)
+    assert float(result.oak_td_error) == 0.0
+
+
+def test_traced_invalid_discount_is_an_atomic_noop() -> None:
+    agent = PrototypeAgent(_prototype_config())
+    state = agent.start(agent.init(jr.key(9)), jnp.zeros(2, dtype=jnp.float32))
+
+    @jax.jit
+    def update(discount: jax.Array) -> PrototypeUpdateResult:
+        return agent.update_transition(
+            state,
+            _explicit_transition(
+                state,
                 reward=0.0,
                 next_observation=jnp.ones(2, dtype=jnp.float32),
                 discount=discount,
             ),
         )
 
-
-def test_traced_invalid_discount_is_not_silently_clipped() -> None:
-    agent = PrototypeAgent(_prototype_config())
-    state = agent.start(agent.init(jr.key(9)), jnp.zeros(2, dtype=jnp.float32))
-
-    @jax.jit
-    def update(discount: jax.Array) -> jax.Array:
-        return agent.update_transition(
-            state,
-            PrototypeTransition(
-                reward=0.0,
-                next_observation=jnp.ones(2, dtype=jnp.float32),
-                discount=discount,
-            ),
-        ).oak_td_error
-
-    assert bool(jnp.isnan(update(jnp.array(1.5, dtype=jnp.float32))))
+    result = update(jnp.array(1.5, dtype=jnp.float32))
+    chex.assert_trees_all_equal(
+        _materialize_typed_keys(result.state),
+        _materialize_typed_keys(state),
+    )
+    assert not bool(result.transition_diagnostics.valid)
+    assert bool(result.transition_diagnostics.rejected)
+    assert float(result.oak_td_error) == 0.0
 
 
 def test_stomp_config_rejects_nonfinite_or_out_of_range_option_gamma() -> None:

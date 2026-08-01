@@ -22,6 +22,8 @@ Outputs in `--out`:
 
 Run baseline (no mirror) to A/B:
     --no-mirror
+Physical execution is quarantined until this program is an authenticated
+unified-bridge client; it currently fails before contacting hardware.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ from eliza_robot.bridge.backends.ainex_remote import AinexRemoteBackend
 from eliza_robot.bridge.backends.dual_target import DualTargetBackend
 from eliza_robot.bridge.backends.mujoco_backend import MuJocoBackend
 from eliza_robot.bridge.backends.state_mirror import StateMirrorBackend
+from eliza_robot.bridge.physical_execution import reject_unsupervised_physical_motion
 from eliza_robot.rl.text_conditioned.inference_loop import (
     InferenceLoopConfig,
     run_inference,
@@ -92,6 +95,7 @@ async def _read_sim_joints(sim_env) -> dict[str, float]:
 
 
 async def _run(args) -> int:
+    reject_unsupervised_physical_motion("scripts/evidence_state_mirror_e2e.py")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     manifest = _validate_checkpoint_profile(Path(args.checkpoint))

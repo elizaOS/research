@@ -46,7 +46,7 @@ SHARD_SCHEMA = "alberta.continual_ia.seed_shard.v2"
 ARTIFACT_SCHEMA = "alberta.continual_ia.evidence.v2"
 TRACE_SCHEMA = "alberta.continual_ia.primitive_trace.v2"
 SOURCE_SCHEMA = "alberta.continual_ia.source_closure.v2"
-RUNTIME_SCHEMA = "alberta.continual_ia.runtime.v2"
+RUNTIME_SCHEMA = "alberta.continual_ia.runtime.v3"
 RESERVATION_SCHEMA = "alberta.continual_ia.seed_reservation.v2"
 NAMESPACE = "continual_ia_v2_seed_60_89"
 PROTOCOL_VERSION = "step12-hidden-phase-causal-ia.v2"
@@ -100,15 +100,39 @@ _RUNTIME_ENVIRONMENT_NAMES = (
 )
 _RUNTIME_DISTRIBUTIONS = (
     "absl-py",
+    "aiofiles",
     "chex",
+    "cloudpickle",
+    "etils",
+    "humanize",
     "jax",
     "jaxlib",
+    "jaxtyping",
     "ml-dtypes",
+    "msgpack",
     "numpy",
     "opt-einsum",
+    "orbax-checkpoint",
+    "prometheus-client",
+    "protobuf",
+    "psutil",
+    "pygments",
+    "pyyaml",
     "scipy",
+    "simplejson",
+    "tensorstore",
     "toolz",
     "typing-extensions",
+    "uvloop",
+    "wadler-lindig",
+)
+_RUNTIME_DISTRIBUTION_CONTENT_SCOPE = (
+    "explicit_clean_import_observed_plus_required_dependency_set"
+)
+_UNBOUND_RUNTIME_SCOPE = (
+    "system_shared_libraries_loaded_by_python_or_extension_modules",
+    "device_drivers_and_firmware",
+    "dynamically_loaded_code_outside_distribution_file_manifests",
 )
 
 _EVIDENCE_POLICY: dict[str, object] = {
@@ -818,6 +842,18 @@ def _runtime_json_value(value: object) -> str | int | float | bool | None:
 def _build_runtime_manifest() -> dict[str, Any]:
     executable_path = Path(sys.executable).resolve()
     executable_raw = _read_regular_bytes(executable_path, require_immutable=False)
+    distribution_content = {
+        name: _distribution_content_identity(name) for name in _RUNTIME_DISTRIBUTIONS
+    }
+    missing_distributions = sorted(
+        name
+        for name, identity in distribution_content.items()
+        if identity["status"] != "content_hashed"
+    )
+    _require(
+        not missing_distributions,
+        f"required runtime distributions are not installed: {missing_distributions}",
+    )
     flag_names = (
         "debug",
         "inspect",
@@ -860,10 +896,9 @@ def _build_runtime_manifest() -> dict[str, Any]:
             "alberta-framework": _distribution_version("alberta-framework"),
             **{name: _distribution_version(name) for name in _RUNTIME_DISTRIBUTIONS},
         },
-        "distribution_content": {
-            name: _distribution_content_identity(name)
-            for name in _RUNTIME_DISTRIBUTIONS
-        },
+        "distribution_content_scope": _RUNTIME_DISTRIBUTION_CONTENT_SCOPE,
+        "distribution_content": distribution_content,
+        "unbound_runtime_scope": list(_UNBOUND_RUNTIME_SCOPE),
         "module_origins": {
             name: _module_content_identity(name) for name in ("jax", "jaxlib", "numpy")
         },
@@ -1244,13 +1279,28 @@ def _validate_runtime_manifest_shape(value: object) -> dict[str, Any]:
             "python",
             "platform",
             "dependencies",
+            "distribution_content_scope",
             "distribution_content",
+            "unbound_runtime_scope",
             "module_origins",
             "jax",
         },
         "plan.runtime_manifest",
     )
     _require(manifest["schema"] == RUNTIME_SCHEMA, "runtime schema differs")
+    _require(
+        manifest["distribution_content_scope"]
+        == _RUNTIME_DISTRIBUTION_CONTENT_SCOPE,
+        "runtime distribution-content scope differs",
+    )
+    unbound_runtime_scope = _expect_list(
+        manifest["unbound_runtime_scope"],
+        "runtime.unbound_runtime_scope",
+    )
+    _require(
+        unbound_runtime_scope == list(_UNBOUND_RUNTIME_SCOPE),
+        "runtime unbound-runtime scope differs",
+    )
     python = _expect_dict(manifest["python"], "plan.runtime_manifest.python")
     _expect_exact_keys(
         python,

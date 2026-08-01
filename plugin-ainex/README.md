@@ -50,9 +50,18 @@ The plugin ships 15 programmatic locomotion actions by default:
 | Environment variable | Default | Purpose |
 |---|---|---|
 | `ELIZA_AINEX_BRIDGE_URL` | `ws://localhost:9100` | WebSocket URL for the AiNex bridge server |
+| `ELIZA_AINEX_BRIDGE_AUTH_TOKEN` | unset | 32–4096-character visible-ASCII bearer secret for an authenticated bridge; required for physical backends and never placed in the URL or logs |
 | `ELIZA_AINEX_MODE` | `programmatic` | Action surface: `programmatic`, `rl`, or `both` |
 
-`ELIZA_AINEX_BRIDGE_URL` and `ELIZA_AINEX_MODE` are the only settings the plugin reads. (`ELIZA_AINEX_PROFILE` and `ELIZA_AINEX_CAMERA_FPS` are declared as plugin parameters but not consumed here; the active profile is resolved bridge-side.)
+When a bearer token is configured, the client requires 32–4096 visible ASCII
+characters and accepts only `wss://` or a
+loopback `ws://` root endpoint; it rejects URL userinfo, query strings, and
+fragments so credentials cannot be silently sent in the URL or over a remote
+plaintext connection. Logs retain only the endpoint scheme, host, and port.
+For a physical bridge, use the same secret value as its server-side
+`ELIZA_ROBOT_BRIDGE_AUTH_TOKEN`.
+
+These three settings are the only ones the plugin reads. (`ELIZA_AINEX_PROFILE` and `ELIZA_AINEX_CAMERA_FPS` are declared as plugin parameters but not consumed here; the active profile is resolved bridge-side.)
 
 ## Auto-enable
 

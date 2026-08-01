@@ -15,34 +15,51 @@ completion of the Alberta Plan.
 Causal ordering
 ---------------
 ``start`` consumes one initial raw observation, constructs a fixed-width
-representation, evaluates all four joint-action cells once, selects an action
-with the SARSA exploration RNG, and stores the exact decision record.
+representation, evaluates the four table-world cells and four optional
+grounded-world cells once, selects an action with the SARSA exploration RNG,
+and stores the exact decision record.
 
 ``update`` accepts the resulting environment transition and performs:
 
-1. score the stored pre-action behavior/world decision and executed world cell;
-2. differentiate pre-update partner cross entropy through pair products;
-3. learn the recurrent state parameters before advancing recurrence;
+1. score the stored pre-action behavior decision, executed table-world cell,
+   and (when configured) the representation-conditioned grounded world model;
+2. mix the pre-update behavior and grounded-world representation gradients,
+   then chain the named behavior-only and mixed gradients through pair products
+   in one batched derivative call;
+3. learn the recurrent state parameters exactly once before advancing recurrence;
 4. update partner prediction and the shadow feature-discovery learner;
 5. advance the state builder exactly once with the next observation and the
    preceding action/reward/discount;
 6. update only the executed joint-world cell;
-7. atomically route behavior and control feature columns by pair identity;
+7. atomically route behavior, control, and optional grounded-world feature
+   columns by pair identity;
 8. construct the next representation under the deployed descriptor bank;
-9. predict the partner and marginalize all four joint cells exactly once;
+9. predict the partner and evaluate all four table-world cells plus all four
+   optional grounded-world cells under a static planner-source mask;
 10. select the next external planner action while advancing SARSA's RNG; and
 11. update differential SARSA with that explicit next action.
 
 All ablations keep the same fixed shapes.  ``planning_enabled=False`` masks
 only the centered additive model term; partner and world predictions are still
 computed. ``state_learning_enabled=False`` computes but discards the recurrent
-parameter update while recurrence still advances. ``feature_lifecycle_enabled
-=False`` lets discovery learn in shadow but keeps the deployed birth bank.
+parameter update while recurrence still advances. ``feature_lifecycle_enabled=False``
+computes and diagnoses the complete curation proposal, then commits the exact
+learned pre-curation snapshot. Both interaction and router descriptor banks
+therefore remain coherent and frozen while ordinary online learning, evidence,
+moments, ages, counters, and RNG advancement continue.
 ``uniform_partner_belief=True`` still predicts and learns the partner model but
 applies a uniform belief to the joint-world marginalization.
 ``random_feature_curation=True`` still computes the complete utility-learning
-path but replaces only its active/candidate rankings with seeded random
-priorities before each fixed-cadence curation decision.
+path from untouched learned state and supplies deterministic transient ranks
+only to active-worst, candidate-best, and candidate-worst transaction choices.
+The grounded-world and representation-gradient mixer lane is an opt-in L0
+mechanism. Its absence preserves the legacy state leaves, resource accounting,
+and transition path. When present, its four predictions are evaluated even if
+``grounded_world_planning_enabled=False``; that static flag selects only which
+reward surface reaches planning.
+``grounded_world_learning_enabled=False`` is its matched-compute control: the
+complete proposed update and representation gradient are still computed, but
+the old grounded parameters are selected before consumer gating and routing.
 ``carry_survivors=False`` preserves learned columns between descriptor
 transactions and zeros the entire discovered tail only when the deployed bank
 actually changes. ``memory_masked=True`` zeros the four learned hidden
@@ -129,16 +146,28 @@ from alberta_framework.core.feature_bank_router import (
     FeatureBankRouterConfig,
     FeatureBankRouterState,
 )
+from alberta_framework.core.grounded_joint_world_model import (
+    GroundedJointWorldModel,
+    GroundedJointWorldModelConfig,
+    GroundedJointWorldModelState,
+    GroundedJointWorldUpdateResult,
+)
 from alberta_framework.core.interaction_features import (
     RELEVANCE_PROBE_MODE_CONDITIONAL_V1,
     RELEVANCE_PROBE_MODES,
     FixedBudgetInteractionLearner,
+    InteractionCurationPriorityOverride,
     InteractionFeatureState,
 )
 from alberta_framework.core.joint_partner_world import (
     BoundedJointOutcomeConfig,
     BoundedJointOutcomeModel,
     BoundedJointOutcomeState,
+)
+from alberta_framework.core.representation_gradient_mixer import (
+    RepresentationGradientMixerConfig,
+    RepresentationGradientMixResult,
+    mix_representation_gradients,
 )
 from alberta_framework.core.state_builder import (
     OnlineGatedStateBuilder,
@@ -147,7 +176,7 @@ from alberta_framework.core.state_builder import (
     StateBuilderLearningDiagnostics,
 )
 
-INTEGRATED_HIDDEN_PARTNER_SCHEMA_VERSION = "alberta.integrated-hidden-partner.l0.v10"
+INTEGRATED_HIDDEN_PARTNER_SCHEMA_VERSION = "alberta.integrated-hidden-partner.l0.v14"
 DEVELOPMENT_LEVEL = "L0"
 
 RAW_OBSERVATION_DIM = 8
@@ -192,9 +221,7 @@ def _require_array_contract(
         raise ValueError(f"{name} must have shape {shape}, got {array.shape}")
     expected_dtype = jnp.dtype(dtype)
     if array.dtype != expected_dtype:
-        raise TypeError(
-            f"{name} must have dtype {expected_dtype}, got {array.dtype}"
-        )
+        raise TypeError(f"{name} must have dtype {expected_dtype}, got {array.dtype}")
     return array
 
 
@@ -204,6 +231,17 @@ def _saturating_int32_increment(value: Array) -> Array:
     maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
     counter = jnp.asarray(value, dtype=jnp.int32)
     return jnp.minimum(jnp.maximum(counter, 0), maximum - 1) + 1
+
+
+def _numeric_tree_finite(tree: Any) -> Array:
+    """Return whether every numeric PyTree leaf is finite, ignoring typed keys."""
+
+    checks: list[Array] = []
+    for leaf in jax.tree_util.tree_leaves(tree):
+        value = jnp.asarray(leaf)
+        if jax.dtypes.issubdtype(value.dtype, jnp.number):
+            checks.append(jnp.all(jnp.isfinite(value)))
+    return jnp.all(jnp.stack(checks)) if checks else jnp.asarray(True, dtype=jnp.bool_)
 
 
 class HiddenPartnerTransition(Protocol):
@@ -238,6 +276,11 @@ class IntegratedHiddenPartnerConfig:
     consumer_evidence_confirmation_steps: int = 1
     consumer_read_confirmation_steps: int = 1
     consumer_read_lease_steps: int = 32
+    initial_active_descriptors: tuple[tuple[int, int], ...] = INITIAL_ACTIVE_DESCRIPTORS
+    grounded_world_model: GroundedJointWorldModelConfig | None = None
+    representation_gradient_mixer: RepresentationGradientMixerConfig | None = None
+    grounded_world_learning_enabled: bool = True
+    grounded_world_planning_enabled: bool = False
     # Selected on the explicitly consumed hidden-partner-v0 tuning namespace.
     # These are development defaults, not promoted hyperparameters.
     planner_lambda: float = 2.0
@@ -284,6 +327,8 @@ class IntegratedHiddenPartnerConfig:
             "independent_relevance_probe",
             "evidence_gated_consumer_memory",
             "retire_stale_features",
+            "grounded_world_learning_enabled",
+            "grounded_world_planning_enabled",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be boolean")
@@ -291,10 +336,67 @@ class IntegratedHiddenPartnerConfig:
             not isinstance(self.relevance_probe_mode, str)
             or self.relevance_probe_mode not in RELEVANCE_PROBE_MODES
         ):
+            raise ValueError("relevance_probe_mode must be 'conditional_v1' or 'target_only_v1'")
+        descriptors = self.initial_active_descriptors
+        if not isinstance(descriptors, tuple) or len(descriptors) != ACTIVE_PAIR_SLOTS:
             raise ValueError(
-                "relevance_probe_mode must be 'conditional_v1' or "
-                "'target_only_v1'"
+                f"initial_active_descriptors must be a tuple of exactly {ACTIVE_PAIR_SLOTS} pairs"
             )
+        for pair in descriptors:
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise ValueError("initial_active_descriptors entries must be exact 2-tuples")
+            left, right = pair
+            if (
+                isinstance(left, bool)
+                or not isinstance(left, int)
+                or isinstance(right, bool)
+                or not isinstance(right, int)
+            ):
+                raise ValueError(
+                    "initial_active_descriptors endpoints must be non-boolean integers"
+                )
+            if not 0 <= left < right < BASE_FEATURE_DIM:
+                raise ValueError(
+                    "initial_active_descriptors pairs must satisfy "
+                    f"0 <= left < right < {BASE_FEATURE_DIM}"
+                )
+        if len(set(descriptors)) != ACTIVE_PAIR_SLOTS:
+            raise ValueError("initial_active_descriptors pairs must be unique")
+        grounded_config = self.grounded_world_model
+        mixer_config = self.representation_gradient_mixer
+        if (grounded_config is None) != (mixer_config is None):
+            raise ValueError(
+                "grounded_world_model and representation_gradient_mixer must be configured together"
+            )
+        if grounded_config is not None:
+            if not isinstance(grounded_config, GroundedJointWorldModelConfig):
+                raise ValueError("grounded_world_model must be a GroundedJointWorldModelConfig")
+            if not isinstance(mixer_config, RepresentationGradientMixerConfig):
+                raise ValueError(
+                    "representation_gradient_mixer must be a RepresentationGradientMixerConfig"
+                )
+            if grounded_config.representation_dim != DEPLOYED_FEATURE_DIM:
+                raise ValueError(
+                    f"grounded_world_model representation_dim must be {DEPLOYED_FEATURE_DIM}"
+                )
+            if grounded_config.target_observation_dim != RAW_OBSERVATION_DIM:
+                raise ValueError(
+                    f"grounded_world_model target_observation_dim must be {RAW_OBSERVATION_DIM}"
+                )
+            if (
+                grounded_config.n_focal_actions != N_ACTIONS
+                or grounded_config.n_partner_actions != N_ACTIONS
+            ):
+                raise ValueError(f"grounded_world_model action dimensions must both be {N_ACTIONS}")
+            if mixer_config.representation_dim != DEPLOYED_FEATURE_DIM:
+                raise ValueError(
+                    "representation_gradient_mixer representation_dim must be "
+                    f"{DEPLOYED_FEATURE_DIM}"
+                )
+        if self.grounded_world_planning_enabled and grounded_config is None:
+            raise ValueError("grounded_world_planning_enabled requires grounded_world_model")
+        if not self.grounded_world_learning_enabled and grounded_config is None:
+            raise ValueError("disabling grounded-world learning requires grounded_world_model")
         for name in (
             "planner_lambda",
             "state_step_size",
@@ -318,10 +420,6 @@ class IntegratedHiddenPartnerConfig:
             or not 0.0 <= interaction_utility_decay < 1.0
         ):
             raise ValueError("interaction_utility_decay must lie in [0, 1)")
-        if self.random_feature_curation and interaction_utility_decay <= 0.0:
-            raise ValueError(
-                "interaction_utility_decay must be positive for random feature curation"
-            )
         active_retention = self.active_utility_retention_decay
         if active_retention is not None:
             active_retention = real_value("active_utility_retention_decay")
@@ -349,18 +447,9 @@ class IntegratedHiddenPartnerConfig:
                 "active_utility_evidence_threshold must be positive when a "
                 "retention grace period is enabled"
             )
-        if self.evidence_gated_consumer_memory and not self.feature_lifecycle_enabled:
-            raise ValueError(
-                "evidence_gated_consumer_memory requires feature_lifecycle_enabled"
-            )
-        if self.evidence_gated_feature_memory and not self.feature_lifecycle_enabled:
-            raise ValueError(
-                "evidence_gated_feature_memory requires feature_lifecycle_enabled"
-            )
         if self.evidence_gated_feature_memory and grace is None:
             raise ValueError(
-                "evidence_gated_feature_memory requires "
-                "active_utility_retention_grace_steps"
+                "evidence_gated_feature_memory requires active_utility_retention_grace_steps"
             )
         if self.evidence_gated_feature_memory and evidence_threshold <= 0.0:
             raise ValueError(
@@ -368,19 +457,12 @@ class IntegratedHiddenPartnerConfig:
                 "active_utility_evidence_threshold"
             )
         if self.independent_relevance_probe and not self.evidence_gated_feature_memory:
-            raise ValueError(
-                "independent_relevance_probe requires "
-                "evidence_gated_feature_memory"
-            )
+            raise ValueError("independent_relevance_probe requires evidence_gated_feature_memory")
         if self.independent_relevance_probe and not self.evidence_gated_consumer_memory:
-            raise ValueError(
-                "independent_relevance_probe requires "
-                "evidence_gated_consumer_memory"
-            )
+            raise ValueError("independent_relevance_probe requires evidence_gated_consumer_memory")
         if self.evidence_gated_consumer_memory and grace is None:
             raise ValueError(
-                "evidence_gated_consumer_memory requires "
-                "active_utility_retention_grace_steps"
+                "evidence_gated_consumer_memory requires active_utility_retention_grace_steps"
             )
         if self.evidence_gated_consumer_memory and evidence_threshold <= 0.0:
             raise ValueError(
@@ -420,8 +502,7 @@ class IntegratedHiddenPartnerConfig:
                 )
         if (
             self.evidence_gated_consumer_memory
-            and self.consumer_read_confirmation_steps
-            > self.consumer_evidence_confirmation_steps
+            and self.consumer_read_confirmation_steps > self.consumer_evidence_confirmation_steps
         ):
             raise ValueError(
                 "consumer_read_confirmation_steps must not exceed "
@@ -441,8 +522,7 @@ class IntegratedHiddenPartnerConfig:
             or not 1 <= candidate_confirmation < _INT32_MAX
         ):
             raise ValueError(
-                "candidate_promotion_confirmation_steps must be a positive "
-                "int32-safe integer"
+                "candidate_promotion_confirmation_steps must be a positive int32-safe integer"
             )
         candidate_reacquisition = self.candidate_reacquisition_confirmation_steps
         if (
@@ -451,15 +531,16 @@ class IntegratedHiddenPartnerConfig:
             or not 1 <= candidate_reacquisition < _INT32_MAX
         ):
             raise ValueError(
-                "candidate_reacquisition_confirmation_steps must be a positive "
-                "int32-safe integer"
+                "candidate_reacquisition_confirmation_steps must be a positive int32-safe integer"
             )
-        if candidate_reacquisition > 1 and (
-            not self.independent_relevance_probe or not self.retire_stale_features
-        ):
+        # Retirement is the only native path that raises the per-candidate
+        # reacquisition-required flag. Keeping this threshold above one in the
+        # matched no-retirement arm is therefore inert but preserves the exact
+        # static configuration and compute contract.
+        if candidate_reacquisition > 1 and not self.independent_relevance_probe:
             raise ValueError(
                 "candidate_reacquisition_confirmation_steps greater than one "
-                "requires independent_relevance_probe and retire_stale_features"
+                "requires independent_relevance_probe"
             )
         candidate_retention = real_value("candidate_utility_retention_decay")
         if (
@@ -491,12 +572,24 @@ class IntegratedHiddenPartnerConfig:
 
     def to_config(self) -> dict[str, Any]:
         """Return a strict JSON-compatible development configuration."""
+        values = dataclasses.asdict(self)
+        values["initial_active_descriptors"] = [
+            list(pair) for pair in self.initial_active_descriptors
+        ]
+        values["grounded_world_model"] = (
+            None if self.grounded_world_model is None else self.grounded_world_model.to_config()
+        )
+        values["representation_gradient_mixer"] = (
+            None
+            if self.representation_gradient_mixer is None
+            else self.representation_gradient_mixer.to_config()
+        )
         return {
             "type": type(self).__name__,
             "schema_version": INTEGRATED_HIDDEN_PARTNER_SCHEMA_VERSION,
             "development_level": DEVELOPMENT_LEVEL,
             "accepted_scientific_evidence": False,
-            **dataclasses.asdict(self),
+            **values,
         }
 
     @classmethod
@@ -514,7 +607,7 @@ class IntegratedHiddenPartnerConfig:
         }
         expected = {field.name for field in dataclasses.fields(cls)} | metadata
         if set(values) != expected:
-            raise ValueError("integrated config fields do not match the v10 schema")
+            raise ValueError("integrated config fields do not match the v14 schema")
         if values.pop("type") != cls.__name__:
             raise ValueError("integrated config type is invalid")
         if values.pop("schema_version") != INTEGRATED_HIDDEN_PARTNER_SCHEMA_VERSION:
@@ -523,6 +616,28 @@ class IntegratedHiddenPartnerConfig:
             raise ValueError("integrated kernel must remain development level L0")
         if values.pop("accepted_scientific_evidence") is not False:
             raise ValueError("integrated kernel is not accepted scientific evidence")
+        descriptor_payload = values["initial_active_descriptors"]
+        if (
+            not isinstance(descriptor_payload, list)
+            or len(descriptor_payload) != ACTIVE_PAIR_SLOTS
+            or any(not isinstance(pair, list) or len(pair) != 2 for pair in descriptor_payload)
+        ):
+            raise ValueError("initial_active_descriptors must use exactly 12 ordered JSON lists")
+        values["initial_active_descriptors"] = tuple(tuple(pair) for pair in descriptor_payload)
+        grounded_payload = values["grounded_world_model"]
+        mixer_payload = values["representation_gradient_mixer"]
+        if grounded_payload is not None:
+            if not isinstance(grounded_payload, Mapping):
+                raise ValueError("grounded_world_model must be a config mapping or null")
+            values["grounded_world_model"] = GroundedJointWorldModelConfig.from_config(
+                grounded_payload
+            )
+        if mixer_payload is not None:
+            if not isinstance(mixer_payload, Mapping):
+                raise ValueError("representation_gradient_mixer must be a config mapping or null")
+            values["representation_gradient_mixer"] = RepresentationGradientMixerConfig.from_config(
+                mixer_payload
+            )
         return cls(**values)
 
 
@@ -546,6 +661,10 @@ class IntegratedHiddenPartnerResourceBudget:
     interaction_candidate_reacquisition_required_nbytes: int
     behavior_nbytes: int
     joint_world_nbytes: int
+    grounded_world_nbytes: int
+    grounded_world_parameter_count: int
+    grounded_world_parameters_touched_per_update: int
+    grounded_world_update_counter_nbytes: int
     control_nbytes: int
     router_nbytes: int
     consumer_active_mask_nbytes: int
@@ -553,12 +672,27 @@ class IntegratedHiddenPartnerResourceBudget:
     consumer_read_idle_steps_nbytes: int
     decision_cache_nbytes: int
     total_state_nbytes: int
+    legacy_joint_world_cells_per_decision: int
+    grounded_world_joint_cells_per_decision: int
     planner_cell_evaluations_per_decision: int
     replay_capacity: int
 
     def to_dict(self) -> dict[str, int]:
         """Return a JSON-compatible exact accounting record."""
         return dataclasses.asdict(self)
+
+
+@chex.dataclass(frozen=True)
+class IntegratedGroundedPlannerEvaluation:
+    """Both reward-model surfaces computed for an enabled grounded lane."""
+
+    table_expected_rewards: Float[Array, " 2"]
+    grounded_raw_predictions: Float[Array, "4 10"]
+    grounded_reward_cells: Float[Array, "2 2"]
+    grounded_expected_rewards: Float[Array, " 2"]
+    predictions_valid: Bool[Array, ""]
+    planner_applied: Bool[Array, ""]
+    cell_evaluations: Int[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -578,6 +712,7 @@ class IntegratedPlannerEvaluation:
     planner_scores: Float[Array, " 2"]
     greedy_action: Int[Array, ""]
     cell_evaluations: Int[Array, ""]
+    grounded_world: IntegratedGroundedPlannerEvaluation | None
 
 
 @chex.dataclass(frozen=True)
@@ -606,6 +741,7 @@ class IntegratedHiddenPartnerState:
     interaction: InteractionFeatureState
     behavior: BehaviorModelState
     joint_world: BoundedJointOutcomeState
+    grounded_world: GroundedJointWorldModelState | None
     control: DifferentialSARSAState
     router: FeatureBankRouterState
     raw_observation: Float[Array, " 8"]
@@ -616,6 +752,7 @@ class IntegratedHiddenPartnerState:
     consumer_evidence_streak: Int[Array, " 12"]
     consumer_read_idle_steps: Int[Array, " 12"]
     current_evaluation: IntegratedPlannerEvaluation
+    current_selection: IntegratedPlannerSelection
     step_count: Int[Array, ""]
 
 
@@ -653,15 +790,39 @@ class IntegratedUpdateDiagnostics:
     behavior_correct_preupdate: Float[Array, ""]
     behavior_gradient_chi: Float[Array, " 24"]
     behavior_gradient_phi: Float[Array, " 12"]
+    grounded_world_update: GroundedJointWorldUpdateResult | None
+    grounded_world_learning_enabled: Bool[Array, ""]
+    grounded_world_counter_saturated: Bool[Array, ""]
+    grounded_world_prediction_matches_decision: Bool[Array, ""]
+    gradient_mix: RepresentationGradientMixResult | None
+    mixed_gradient_chi: Float[Array, " 24"] | None
+    mixed_gradient_phi: Float[Array, " 12"] | None
     state_learning: StateBuilderLearningDiagnostics
     interaction_prediction_preupdate: Float[Array, " 1"]
     interaction_error_preupdate: Float[Array, " 1"]
     interaction_metrics: Float[Array, " 7"]
+    # Compatibility fields below report the full, ungated curation proposal.
     interaction_replaced_slot: Int[Array, ""]
     interaction_promoted_candidate: Int[Array, ""]
+    interaction_refreshed_candidate: Int[Array, ""]
     interaction_retired_slot: Int[Array, ""]
     interaction_retired_left: Int[Array, ""]
     interaction_retired_right: Int[Array, ""]
+    # Explicit proposal/applied names make the matched freeze observable.
+    interaction_proposal_replaced_slot: Int[Array, ""]
+    interaction_proposal_promoted_candidate: Int[Array, ""]
+    interaction_proposal_refreshed_candidate: Int[Array, ""]
+    interaction_proposal_retired_slot: Int[Array, ""]
+    interaction_proposal_retired_left: Int[Array, ""]
+    interaction_proposal_retired_right: Int[Array, ""]
+    interaction_lifecycle_proposed: Bool[Array, ""]
+    interaction_lifecycle_applied: Bool[Array, ""]
+    interaction_applied_replaced_slot: Int[Array, ""]
+    interaction_applied_promoted_candidate: Int[Array, ""]
+    interaction_applied_refreshed_candidate: Int[Array, ""]
+    interaction_applied_retired_slot: Int[Array, ""]
+    interaction_applied_retired_left: Int[Array, ""]
+    interaction_applied_retired_right: Int[Array, ""]
     interaction_evidence_refreshed: Bool[Array, " 12"]
     interaction_retention_evidence_refreshed: Bool[Array, " 12"]
     interaction_relevance_probe_scores: Float[Array, " 12"]
@@ -675,9 +836,11 @@ class IntegratedUpdateDiagnostics:
     interaction_candidate_promotion_raw_evidence: Bool[Array, " 66"]
     interaction_candidate_promotion_evidence_streak_pre: Int[Array, " 66"]
     interaction_candidate_promotion_evidence_streak_updated: Int[Array, " 66"]
+    interaction_candidate_promotion_evidence_streak_proposal_post: Int[Array, " 66"]
     interaction_candidate_promotion_evidence_streak_post: Int[Array, " 66"]
     interaction_candidate_promotion_confirmed: Bool[Array, " 66"]
     interaction_candidate_reacquisition_required_pre: Bool[Array, " 66"]
+    interaction_candidate_reacquisition_required_proposal_post: Bool[Array, " 66"]
     interaction_candidate_reacquisition_required_post: Bool[Array, " 66"]
     interaction_candidate_reacquisition_confirmed: Bool[Array, " 66"]
     consumer_evidence_streak_pre: Int[Array, " 12"]
@@ -699,14 +862,29 @@ class IntegratedUpdateDiagnostics:
     consumer_active_mask_post: Bool[Array, " 12"]
     interaction_matching_candidate_reset_mask: Bool[Array, " 66"]
     interaction_matching_candidate_reset_count: Int[Array, ""]
+    interaction_applied_matching_candidate_reset_mask: Bool[Array, " 66"]
+    interaction_applied_matching_candidate_reset_count: Int[Array, ""]
     interaction_live_feature_count: Int[Array, ""]
     interaction_vacancy_count: Int[Array, ""]
     interaction_promoted_into_vacancy: Bool[Array, ""]
+    interaction_proposal_live_feature_count: Int[Array, ""]
+    interaction_proposal_vacancy_count: Int[Array, ""]
+    interaction_proposal_promoted_into_vacancy: Bool[Array, ""]
+    interaction_applied_live_feature_count: Int[Array, ""]
+    interaction_applied_vacancy_count: Int[Array, ""]
+    interaction_applied_promoted_into_vacancy: Bool[Array, ""]
+    random_curation_enabled: Bool[Array, ""]
+    random_curation_attempted: Bool[Array, ""]
     random_curation_applied: Bool[Array, ""]
     random_active_priorities: Float[Array, " 12"]
     random_candidate_priorities: Float[Array, " 66"]
+    curation_selected_active_worst_slot: Int[Array, ""]
+    curation_selected_promotion_candidate: Int[Array, ""]
+    curation_selected_refresh_candidate: Int[Array, ""]
     shadow_descriptors: Int[Array, "12 2"]
     proposed_descriptors: Int[Array, "12 2"]
+    interaction_proposal_descriptors: Int[Array, "12 2"]
+    interaction_applied_descriptors: Int[Array, "12 2"]
     shadow_descriptors_changed: Bool[Array, ""]
     route: FeatureBankRouteDiagnostics
     world_reward_prediction_preupdate: Float[Array, ""]
@@ -726,6 +904,7 @@ class IntegratedUpdateDiagnostics:
     behavior_step_delta: Int[Array, ""]
     interaction_step_delta: Int[Array, ""]
     world_step_delta: Int[Array, ""]
+    grounded_world_step_delta: Int[Array, ""]
     control_step_delta: Int[Array, ""]
     router_route_delta: Int[Array, ""]
     router_generation_delta: Int[Array, ""]
@@ -781,16 +960,12 @@ class IntegratedHiddenPartnerAgent:
             utility_retention_grace_steps=(cfg.active_utility_retention_grace_steps),
             utility_evidence_threshold=cfg.active_utility_evidence_threshold,
             evidence_gated_active_output_memory=cfg.evidence_gated_feature_memory,
-            utility_evidence_confirmation_steps=(
-                cfg.feature_evidence_confirmation_steps
-            ),
+            utility_evidence_confirmation_steps=(cfg.feature_evidence_confirmation_steps),
             independent_relevance_probe=cfg.independent_relevance_probe,
             relevance_probe_mode=cfg.relevance_probe_mode,
             retire_stale_features=cfg.retire_stale_features,
             candidate_promotion_floor=cfg.candidate_promotion_floor,
-            candidate_promotion_confirmation_steps=(
-                cfg.candidate_promotion_confirmation_steps
-            ),
+            candidate_promotion_confirmation_steps=(cfg.candidate_promotion_confirmation_steps),
             candidate_reacquisition_confirmation_steps=(
                 cfg.candidate_reacquisition_confirmation_steps
             ),
@@ -813,6 +988,12 @@ class IntegratedHiddenPartnerAgent:
                 step_size=cfg.world_step_size,
             )
         )
+        self._grounded_world = (
+            None
+            if cfg.grounded_world_model is None
+            else GroundedJointWorldModel(cfg.grounded_world_model)
+        )
+        self._gradient_mixer_config = cfg.representation_gradient_mixer
         self._control = DifferentialSARSAAgent(
             DifferentialSARSAConfig(
                 n_actions=N_ACTIONS,
@@ -838,7 +1019,7 @@ class IntegratedHiddenPartnerAgent:
             )
         )
         self._initial_descriptors = jnp.asarray(
-            INITIAL_ACTIVE_DESCRIPTORS,
+            cfg.initial_active_descriptors,
             dtype=jnp.int32,
         )
 
@@ -868,6 +1049,11 @@ class IntegratedHiddenPartnerAgent:
         return self._joint_world
 
     @property
+    def grounded_world_model(self) -> GroundedJointWorldModel | None:
+        """Optional representation-conditioned grounded world model."""
+        return self._grounded_world
+
+    @property
     def control_agent(self) -> DifferentialSARSAAgent:
         """Differential SARSA controller."""
         return self._control
@@ -886,9 +1072,19 @@ class IntegratedHiddenPartnerAgent:
             "interaction": self._interaction.to_config(),
             "behavior": self._behavior.to_config(),
             "joint_world": self._joint_world.to_config(),
+            "grounded_world": (
+                None if self._grounded_world is None else self._grounded_world.to_config()
+            ),
+            "representation_gradient_mixer": (
+                None
+                if self._gradient_mixer_config is None
+                else self._gradient_mixer_config.to_config()
+            ),
             "control": self._control.to_config(),
             "router": self._router.to_config(),
-            "initial_active_descriptors": [list(pair) for pair in INITIAL_ACTIVE_DESCRIPTORS],
+            "initial_active_descriptors": [
+                list(pair) for pair in self._config.initial_active_descriptors
+            ],
             "development_only": True,
             "accepted_scientific_evidence": False,
         }
@@ -898,7 +1094,19 @@ class IntegratedHiddenPartnerAgent:
         state: IntegratedHiddenPartnerState,
     ) -> IntegratedHiddenPartnerResourceBudget:
         """Return exact persistent array bytes without double-counting consumers."""
-        consumers = self._consumer_arrays(state.behavior, state.control)
+        consumers: tuple[Array, ...]
+        if self._grounded_world is None:
+            if state.grounded_world is not None:
+                raise ValueError("disabled grounded lane must not carry grounded state")
+            consumers = self._consumer_arrays(state.behavior, state.control)
+        else:
+            if state.grounded_world is None:
+                raise ValueError("enabled grounded lane requires grounded state")
+            consumers = self._consumer_arrays_with_grounded(
+                state.behavior,
+                state.control,
+                state.grounded_world,
+            )
         router_budget = self._router.resource_budget(
             state.router,
             consumers,
@@ -908,15 +1116,12 @@ class IntegratedHiddenPartnerAgent:
             + _tree_array_nbytes(state.phi)
             + _tree_array_nbytes(state.chi)
             + _tree_array_nbytes(state.current_evaluation)
+            + _tree_array_nbytes(state.current_selection)
             + _tree_array_nbytes(state.step_count)
         )
         consumer_active_mask_bytes = _tree_array_nbytes(state.consumer_active_mask)
-        consumer_evidence_streak_bytes = _tree_array_nbytes(
-            state.consumer_evidence_streak
-        )
-        consumer_read_idle_steps_bytes = _tree_array_nbytes(
-            state.consumer_read_idle_steps
-        )
+        consumer_evidence_streak_bytes = _tree_array_nbytes(state.consumer_evidence_streak)
+        consumer_read_idle_steps_bytes = _tree_array_nbytes(state.consumer_read_idle_steps)
         builder_bytes = self._state_builder.resource_budget().state_bytes
         # ``start`` is jitted, so the interaction learner's Python timing
         # fields return as scalar array leaves. Count the actual integrated
@@ -924,12 +1129,19 @@ class IntegratedHiddenPartnerAgent:
         interaction_bytes = _tree_array_nbytes(state.interaction)
         behavior_bytes = self._behavior.resource_budget(DEPLOYED_FEATURE_DIM).state_nbytes
         world_bytes = self._joint_world.resource_budget.state_nbytes
+        grounded_bytes = (
+            0 if state.grounded_world is None else _tree_array_nbytes(state.grounded_world)
+        )
+        grounded_budget = (
+            None if self._grounded_world is None else self._grounded_world.resource_budget
+        )
         control_bytes = _tree_array_nbytes(state.control)
         total = (
             builder_bytes
             + interaction_bytes
             + behavior_bytes
             + world_bytes
+            + grounded_bytes
             + control_bytes
             + router_budget.router_state_nbytes
             + consumer_active_mask_bytes
@@ -967,6 +1179,18 @@ class IntegratedHiddenPartnerAgent:
             ),
             behavior_nbytes=behavior_bytes,
             joint_world_nbytes=world_bytes,
+            grounded_world_nbytes=grounded_bytes,
+            grounded_world_parameter_count=(
+                0 if grounded_budget is None else grounded_budget.trainable_float32_scalars
+            ),
+            grounded_world_parameters_touched_per_update=(
+                0
+                if grounded_budget is None
+                else grounded_budget.learned_float32_scalars_touched_per_update
+            ),
+            grounded_world_update_counter_nbytes=(
+                0 if state.grounded_world is None else int(state.grounded_world.update_count.nbytes)
+            ),
             control_nbytes=control_bytes,
             router_nbytes=router_budget.router_state_nbytes,
             consumer_active_mask_nbytes=consumer_active_mask_bytes,
@@ -974,8 +1198,15 @@ class IntegratedHiddenPartnerAgent:
             consumer_read_idle_steps_nbytes=consumer_read_idle_steps_bytes,
             decision_cache_nbytes=cache_bytes,
             total_state_nbytes=total,
+            legacy_joint_world_cells_per_decision=(
+                self._joint_world.resource_budget.planner_cell_evaluations_per_decision
+            ),
+            grounded_world_joint_cells_per_decision=(
+                0 if self._grounded_world is None else N_ACTIONS * N_ACTIONS
+            ),
             planner_cell_evaluations_per_decision=(
                 self._joint_world.resource_budget.planner_cell_evaluations_per_decision
+                + (0 if self._grounded_world is None else N_ACTIONS * N_ACTIONS)
             ),
             replay_capacity=0,
         )
@@ -1112,14 +1343,94 @@ class IntegratedHiddenPartnerAgent:
         return jnp.where(kernel_valid, result, jnp.zeros_like(result))
 
     @functools.partial(jax.jit, static_argnums=(0,))
+    def _chain_behavior_and_mixed_gradients_to_phi(
+        self,
+        phi: Array,
+        descriptors: Array,
+        behavior_gradient: Array,
+        mixed_gradient: Array,
+        consumer_active_mask: Array,
+    ) -> Float[Array, "2 12"]:
+        """Chain both named sources in one fixed two-row product-rule call."""
+        raw_base = _require_array_contract(
+            phi,
+            name="phi",
+            shape=(BASE_FEATURE_DIM,),
+            dtype=jnp.float32,
+        )
+        pairs = _require_array_contract(
+            descriptors,
+            name="descriptors",
+            shape=(ACTIVE_PAIR_SLOTS, 2),
+            dtype=jnp.int32,
+        )
+        gradients = jnp.stack(
+            (
+                _require_array_contract(
+                    behavior_gradient,
+                    name="behavior_gradient",
+                    shape=(DEPLOYED_FEATURE_DIM,),
+                    dtype=jnp.float32,
+                ),
+                _require_array_contract(
+                    mixed_gradient,
+                    name="mixed_gradient",
+                    shape=(DEPLOYED_FEATURE_DIM,),
+                    dtype=jnp.float32,
+                ),
+            )
+        )
+        consumer_mask = _require_array_contract(
+            consumer_active_mask,
+            name="consumer_active_mask",
+            shape=(ACTIVE_PAIR_SLOTS,),
+            dtype=jnp.bool_,
+        )
+        descriptor_validation = self._router.validate_descriptors(pairs)
+        kernel_valid = (
+            jnp.all(jnp.isfinite(raw_base))
+            & jnp.all(jnp.isfinite(gradients))
+            & descriptor_validation.valid
+        )
+        base = jnp.where(jnp.isfinite(raw_base), raw_base, 0.0)
+        deployed = self._deployed_phi(base)
+        safe_gradients = jnp.where(jnp.isfinite(gradients), gradients, 0.0)
+        left = pairs[:, 0]
+        right = pairs[:, 1]
+        live = (
+            (left >= 0)
+            & (right >= 0)
+            & (left < BASE_FEATURE_DIM)
+            & (right < BASE_FEATURE_DIM)
+            & (left < right)
+        )
+        safe_left = jnp.where(live, left, 0)
+        safe_right = jnp.where(live, right, 0)
+        pair_gradients = (
+            safe_gradients[:, BASE_FEATURE_DIM:]
+            * live[None, :].astype(jnp.float32)
+            * consumer_mask[None, :].astype(jnp.float32)
+        )
+        base_gradients = safe_gradients[:, :BASE_FEATURE_DIM]
+        base_gradients = base_gradients.at[:, safe_left].add(
+            pair_gradients * deployed[safe_right][None, :]
+        )
+        base_gradients = base_gradients.at[:, safe_right].add(
+            pair_gradients * deployed[safe_left][None, :]
+        )
+        result = base_gradients * self._deployment_derivative_mask()[None, :]
+        return jnp.where(kernel_valid, result, jnp.zeros_like(result))
+
+    @functools.partial(jax.jit, static_argnums=(0,))
     def evaluate_models(
         self,
         behavior_state: BehaviorModelState,
         world_state: BoundedJointOutcomeState,
         control_state: DifferentialSARSAState,
         chi: Array,
+        grounded_world_state: GroundedJointWorldModelState | None = None,
     ) -> IntegratedPlannerEvaluation:
-        """Evaluate partner, all four world cells, Q, and planner scores."""
+        """Evaluate the table and every enabled grounded joint-action cell."""
         features = jnp.asarray(chi, dtype=jnp.float32).reshape((DEPLOYED_FEATURE_DIM,))
         predicted_probabilities = self._behavior.predict_probabilities(
             behavior_state,
@@ -1134,8 +1445,61 @@ class IntegratedHiddenPartnerAgent:
             world_state,
             applied_probabilities,
         )
+        if self._grounded_world is None:
+            if grounded_world_state is not None:
+                raise ValueError("disabled grounded lane must not receive grounded state")
+            grounded_evaluation = None
+            planning_rewards = marginal.expected_rewards
+            total_cell_evaluations = marginal.cell_evaluations
+        else:
+            if grounded_world_state is None:
+                raise ValueError("enabled grounded lane requires grounded state")
+            grounded_predictions = tuple(
+                self._grounded_world.predict(
+                    grounded_world_state,
+                    features,
+                    jnp.asarray(focal_action, dtype=jnp.int32),
+                    jnp.asarray(partner_action, dtype=jnp.int32),
+                )
+                for focal_action in range(N_ACTIONS)
+                for partner_action in range(N_ACTIONS)
+            )
+            grounded_reward_cells = jnp.stack(
+                tuple(prediction.reward for prediction in grounded_predictions)
+            ).reshape((N_ACTIONS, N_ACTIONS))
+            grounded_raw_predictions = jnp.stack(
+                tuple(prediction.raw_predictions for prediction in grounded_predictions)
+            )
+            grounded_predictions_valid = jnp.all(
+                jnp.stack(tuple(prediction.valid for prediction in grounded_predictions))
+            )
+            grounded_expected_rewards = grounded_reward_cells @ applied_probabilities
+            grounded_planner_applied = jnp.asarray(
+                self._config.grounded_world_planning_enabled and self._config.planning_enabled,
+                dtype=jnp.bool_,
+            )
+            grounded_evaluation = IntegratedGroundedPlannerEvaluation(
+                table_expected_rewards=marginal.expected_rewards,
+                grounded_raw_predictions=grounded_raw_predictions,
+                grounded_reward_cells=grounded_reward_cells,
+                grounded_expected_rewards=grounded_expected_rewards,
+                predictions_valid=grounded_predictions_valid,
+                planner_applied=grounded_planner_applied,
+                cell_evaluations=jnp.asarray(
+                    N_ACTIONS * N_ACTIONS,
+                    dtype=jnp.int32,
+                ),
+            )
+            planning_rewards = (
+                grounded_expected_rewards
+                if self._config.grounded_world_planning_enabled
+                else marginal.expected_rewards
+            )
+            total_cell_evaluations = (
+                marginal.cell_evaluations + grounded_evaluation.cell_evaluations
+            )
         q_values = self._control.q_values(control_state, features)
-        centered = marginal.expected_rewards - jnp.mean(marginal.expected_rewards)
+        centered = planning_rewards - jnp.mean(planning_rewards)
         model_term = jnp.asarray(self._config.planner_lambda, dtype=jnp.float32) * centered
         applied_model_term = (
             model_term if self._config.planning_enabled else jnp.zeros_like(model_term)
@@ -1146,7 +1510,7 @@ class IntegratedHiddenPartnerAgent:
             partner_probabilities=marginal.partner_probabilities,
             partner_probabilities_valid=(marginal.partner_probabilities_valid),
             probability_violation=marginal.probability_violation,
-            expected_rewards=marginal.expected_rewards,
+            expected_rewards=planning_rewards,
             expected_outcomes=marginal.expected_outcomes,
             q_values=q_values,
             centered_expected_rewards=centered,
@@ -1154,7 +1518,8 @@ class IntegratedHiddenPartnerAgent:
             applied_model_term=applied_model_term,
             planner_scores=scores,
             greedy_action=jnp.argmax(scores).astype(jnp.int32),
-            cell_evaluations=marginal.cell_evaluations,
+            cell_evaluations=total_cell_evaluations,
+            grounded_world=grounded_evaluation,
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -1193,6 +1558,118 @@ class IntegratedHiddenPartnerAgent:
             explored=explored,
             rng_key_before=control_state.rng_key,
             rng_key_after=key,
+        )
+
+    def _current_decision_cache_coherent(
+        self,
+        state: IntegratedHiddenPartnerState,
+        fresh: IntegratedPlannerEvaluation,
+    ) -> Bool[Array, ""]:
+        """Validate every reproducible or internally bound decision-cache leaf.
+
+        ``current_evaluation.q_values`` deliberately records the values used to
+        choose the current action *before* the preceding SARSA update, whereas
+        ``state.control`` contains the post-update weights.  Those historical
+        values therefore cannot be recomputed from the current control state.
+        They are instead required to be finite, bound algebraically into the
+        cached planner scores, and replayed through the exact cached selection
+        RNG record.  Every model-derived leaf is recomputed from current model
+        state and compared exactly.
+        """
+
+        cached = state.current_evaluation
+        selection = state.current_selection
+
+        def exact(left: Array, right: Array) -> Array:
+            return jnp.array_equal(jnp.asarray(left), jnp.asarray(right))
+
+        centered = cached.expected_rewards - jnp.mean(cached.expected_rewards)
+        model_term = jnp.asarray(self._config.planner_lambda, dtype=jnp.float32) * centered
+        applied_model_term = (
+            model_term if self._config.planning_enabled else jnp.zeros_like(model_term)
+        )
+        planner_scores = cached.q_values + applied_model_term
+        base_checks = (
+            exact(cached.predicted_partner_probabilities, fresh.predicted_partner_probabilities),
+            exact(cached.partner_probabilities, fresh.partner_probabilities),
+            exact(cached.partner_probabilities_valid, fresh.partner_probabilities_valid),
+            exact(cached.probability_violation, fresh.probability_violation),
+            exact(cached.expected_rewards, fresh.expected_rewards),
+            exact(cached.expected_outcomes, fresh.expected_outcomes),
+            exact(cached.centered_expected_rewards, centered),
+            exact(cached.model_term, model_term),
+            exact(cached.applied_model_term, applied_model_term),
+            exact(cached.planner_scores, planner_scores),
+            exact(cached.greedy_action, jnp.argmax(planner_scores).astype(jnp.int32)),
+            exact(cached.cell_evaluations, fresh.cell_evaluations),
+        )
+
+        if self._grounded_world is None:
+            if cached.grounded_world is not None or fresh.grounded_world is not None:
+                raise ValueError("disabled grounded lane must not carry grounded evaluation")
+            grounded_coherent = jnp.asarray(True, dtype=jnp.bool_)
+        else:
+            if cached.grounded_world is None or fresh.grounded_world is None:
+                raise ValueError("enabled grounded lane requires grounded evaluation")
+            cached_grounded = cached.grounded_world
+            fresh_grounded = fresh.grounded_world
+            grounded_coherent = jnp.all(
+                jnp.stack(
+                    (
+                        exact(
+                            cached_grounded.table_expected_rewards,
+                            fresh_grounded.table_expected_rewards,
+                        ),
+                        exact(
+                            cached_grounded.grounded_raw_predictions,
+                            fresh_grounded.grounded_raw_predictions,
+                        ),
+                        exact(
+                            cached_grounded.grounded_reward_cells,
+                            fresh_grounded.grounded_reward_cells,
+                        ),
+                        exact(
+                            cached_grounded.grounded_expected_rewards,
+                            fresh_grounded.grounded_expected_rewards,
+                        ),
+                        exact(cached_grounded.predictions_valid, fresh_grounded.predictions_valid),
+                        exact(cached_grounded.planner_applied, fresh_grounded.planner_applied),
+                        exact(cached_grounded.cell_evaluations, fresh_grounded.cell_evaluations),
+                    )
+                )
+            )
+
+        replay_control = state.control.replace(rng_key=selection.rng_key_before)
+        replayed_selection = self.select_planner_action(
+            replay_control,
+            cached.planner_scores,
+        )
+        selection_coherent = jnp.all(
+            jnp.stack(
+                (
+                    exact(selection.action, replayed_selection.action),
+                    exact(selection.noisy_greedy_action, replayed_selection.noisy_greedy_action),
+                    exact(selection.random_action, replayed_selection.random_action),
+                    exact(selection.explored, replayed_selection.explored),
+                    exact(
+                        jr.key_data(selection.rng_key_before),
+                        jr.key_data(replayed_selection.rng_key_before),
+                    ),
+                    exact(
+                        jr.key_data(selection.rng_key_after),
+                        jr.key_data(replayed_selection.rng_key_after),
+                    ),
+                    exact(selection.action, state.control.last_action),
+                    exact(jr.key_data(selection.rng_key_after), jr.key_data(state.control.rng_key)),
+                )
+            )
+        )
+        return (
+            _numeric_tree_finite(cached)
+            & _numeric_tree_finite(selection)
+            & jnp.all(jnp.stack(base_checks))
+            & grounded_coherent
+            & selection_coherent
         )
 
     def start(
@@ -1243,6 +1720,11 @@ class IntegratedHiddenPartnerAgent:
             behavior_key,
         )
         world_state = self._joint_world.init()
+        grounded_world_state = (
+            None
+            if self._grounded_world is None
+            else self._grounded_world.init(jr.fold_in(key, jnp.asarray(0x47574D, dtype=jnp.uint32)))
+        )
         control_initial = self._control.init(
             DEPLOYED_FEATURE_DIM,
             control_key,
@@ -1281,7 +1763,18 @@ class IntegratedHiddenPartnerAgent:
             world_state,
             control_state,
             chi,
+            grounded_world_state,
         )
+        grounded_evaluation_valid = (
+            jnp.asarray(True, dtype=jnp.bool_)
+            if evaluation.grounded_world is None
+            else evaluation.grounded_world.predictions_valid
+        )
+        initial_evaluation_valid = (
+            evaluation.partner_probabilities_valid & grounded_evaluation_valid
+        )
+        if not bool(jax.device_get(initial_evaluation_valid)):
+            raise ValueError("initial planner evaluation is invalid")
         selection = self.select_planner_action(
             control_state,
             evaluation.planner_scores,
@@ -1297,6 +1790,7 @@ class IntegratedHiddenPartnerAgent:
             interaction=interaction_state,
             behavior=behavior_state,
             joint_world=world_state,
+            grounded_world=grounded_world_state,
             control=control_started,
             router=router_state,
             raw_observation=raw,
@@ -1306,15 +1800,19 @@ class IntegratedHiddenPartnerAgent:
             consumer_evidence_streak=consumer_evidence_streak,
             consumer_read_idle_steps=consumer_read_idle_steps,
             current_evaluation=evaluation,
+            current_selection=selection,
             step_count=jnp.asarray(0, dtype=jnp.int32),
         )
+        start_finite = self._start_finite(state)
+        if not bool(jax.device_get(start_finite)):
+            raise ValueError("initial integrated state is invalid")
         diagnostics = IntegratedStartDiagnostics(
             evaluation=evaluation,
             selection=selection,
             descriptors=router_state.descriptors,
             descriptors_valid=descriptor_validation.valid,
             state_advances=(builder_state.step_count - builder_initial.step_count),
-            all_finite=self._start_finite(state),
+            all_finite=start_finite,
         )
         return IntegratedStartResult(
             state=state,
@@ -1385,19 +1883,13 @@ class IntegratedHiddenPartnerAgent:
             dtype=jnp.bool_,
         )
 
-        observations_finite = jnp.all(jnp.isfinite(raw_current)) & jnp.all(
-            jnp.isfinite(raw_next)
-        )
+        observations_finite = jnp.all(jnp.isfinite(raw_current)) & jnp.all(jnp.isfinite(raw_next))
         observation_matches = jnp.all(raw_current == state.raw_observation)
         focal_action_valid = (raw_focal_action >= 0) & (raw_focal_action < N_ACTIONS)
-        partner_action_valid = (raw_partner_action >= 0) & (
-            raw_partner_action < N_ACTIONS
-        )
+        partner_action_valid = (raw_partner_action >= 0) & (raw_partner_action < N_ACTIONS)
         action_ids_valid = focal_action_valid & partner_action_valid
         action_matches = raw_focal_action == state.control.last_action
-        outcome_valid = jnp.isfinite(raw_outcome) & (
-            (raw_outcome == -1.0) | (raw_outcome == 1.0)
-        )
+        outcome_valid = jnp.isfinite(raw_outcome) & ((raw_outcome == -1.0) | (raw_outcome == 1.0))
         reward_semantics = jnp.isfinite(raw_reward) & jnp.isclose(
             raw_reward,
             (1.0 + raw_outcome) / 2.0,
@@ -1432,25 +1924,132 @@ class IntegratedHiddenPartnerAgent:
         discount = jnp.where(jnp.isfinite(raw_discount), raw_discount, 1.0)
 
         current_evaluation = state.current_evaluation
+        fresh_current_evaluation = self.evaluate_models(
+            state.behavior,
+            state.joint_world,
+            state.control,
+            state.chi,
+            state.grounded_world,
+        )
+        complete_decision_cache_valid = self._current_decision_cache_coherent(
+            state,
+            fresh_current_evaluation,
+        )
         behavior_gradient = self._behavior.input_loss_gradient(
             state.behavior,
             state.chi,
             partner_action,
+        )
+        behavior_prediction_matches = jnp.array_equal(
+            behavior_gradient.probabilities,
+            current_evaluation.predicted_partner_probabilities,
         )
         world_prediction = self._joint_world.predict_joint(
             state.joint_world,
             focal_action,
             partner_action,
         )
-        representation_gradient = self.chain_chi_gradient_to_phi(
-            state.phi,
-            state.router.descriptors,
-            behavior_gradient.gradient,
-            self._effective_pair_read_mask(
-                state.interaction,
-                state.consumer_active_mask,
-            ),
+        behavior_gradient_valid = (
+            jnp.all(jnp.isfinite(behavior_gradient.gradient))
+            & jnp.all(jnp.isfinite(behavior_gradient.probabilities))
+            & jnp.isfinite(behavior_gradient.loss)
         )
+        if self._grounded_world is None:
+            if state.grounded_world is not None:
+                raise ValueError("disabled grounded lane must not carry grounded state")
+            grounded_world_update = None
+            gradient_mix = None
+            mixed_gradient_chi = behavior_gradient.gradient
+            grounded_world_counter_saturated = jnp.asarray(False, dtype=jnp.bool_)
+            grounded_world_prediction_matches = jnp.asarray(True, dtype=jnp.bool_)
+            grounded_path_valid = jnp.asarray(True, dtype=jnp.bool_)
+        else:
+            if state.grounded_world is None or self._gradient_mixer_config is None:
+                raise ValueError("enabled grounded lane requires model and mixer state")
+            cached_grounded_evaluation = cast(
+                IntegratedGroundedPlannerEvaluation,
+                current_evaluation.grounded_world,
+            )
+            fresh_grounded_evaluation = cast(
+                IntegratedGroundedPlannerEvaluation,
+                fresh_current_evaluation.grounded_world,
+            )
+            grounded_world_prediction_matches = jnp.array_equal(
+                fresh_grounded_evaluation.grounded_raw_predictions,
+                cached_grounded_evaluation.grounded_raw_predictions,
+            ) & (
+                fresh_grounded_evaluation.predictions_valid
+                == cached_grounded_evaluation.predictions_valid
+            )
+            grounded_world_counter_saturated = state.grounded_world.update_count == jnp.asarray(
+                _INT32_MAX, dtype=jnp.int32
+            )
+            grounded_update_input = state.grounded_world.replace(
+                update_count=jnp.where(
+                    grounded_world_counter_saturated,
+                    jnp.asarray(_INT32_MAX - 1, dtype=jnp.int32),
+                    state.grounded_world.update_count,
+                )
+            )
+            grounded_world_update = self._grounded_world.update(
+                grounded_update_input,
+                state.chi,
+                focal_action,
+                partner_action,
+                next_raw,
+                reward,
+                discount,
+            )
+            grounded_world_update = grounded_world_update.replace(
+                state=grounded_world_update.state.replace(
+                    update_count=jnp.where(
+                        grounded_world_counter_saturated,
+                        state.grounded_world.update_count,
+                        grounded_world_update.state.update_count,
+                    )
+                )
+            )
+            gradient_mix = mix_representation_gradients(
+                self._gradient_mixer_config,
+                behavior_gradient.gradient,
+                grounded_world_update.representation_gradient,
+                behavior_valid=behavior_gradient_valid,
+                grounded_world_valid=grounded_world_update.gradient_valid,
+            )
+            mixed_gradient_chi = gradient_mix.gradient
+            grounded_path_valid = (
+                behavior_gradient_valid
+                & grounded_world_update.diagnostics.applied
+                & gradient_mix.valid
+            )
+        decision_cache_valid = (
+            behavior_prediction_matches
+            & grounded_world_prediction_matches
+            & complete_decision_cache_valid
+        )
+        transition_valid = transition_valid & grounded_path_valid & decision_cache_valid
+        current_pair_read_mask = self._effective_pair_read_mask(
+            state.interaction,
+            state.consumer_active_mask,
+        )
+        if grounded_world_update is None:
+            behavior_gradient_phi = self.chain_chi_gradient_to_phi(
+                state.phi,
+                state.router.descriptors,
+                behavior_gradient.gradient,
+                current_pair_read_mask,
+            )
+            representation_gradient = behavior_gradient_phi
+        else:
+            chained_source_gradients = self._chain_behavior_and_mixed_gradients_to_phi(
+                state.phi,
+                state.router.descriptors,
+                behavior_gradient.gradient,
+                mixed_gradient_chi,
+                current_pair_read_mask,
+            )
+            behavior_gradient_phi = chained_source_gradients[0]
+            representation_gradient = chained_source_gradients[1]
 
         learned_builder, state_learning = self._state_builder.learn(
             state.state_builder,
@@ -1465,16 +2064,22 @@ class IntegratedHiddenPartnerAgent:
             partner_action,
         )
         partner_sign_target = 2.0 * partner_action.astype(jnp.float32) - 1.0
-        (
-            interaction_input,
-            random_active_priorities,
-            random_candidate_priorities,
-        ) = self._interaction_curation_input(state.interaction)
+        curation_priority_override = self._interaction_curation_input(
+            state.interaction
+        )
+        random_active_priorities = curation_priority_override.active_ranks
+        random_candidate_priorities = curation_priority_override.candidate_ranks
         interaction_update = self._interaction.update(
-            interaction_input,
+            state.interaction,
             self._deployed_phi(state.phi),
             jnp.reshape(partner_sign_target, (1,)),
             external_read_mask=state.consumer_active_mask,
+            curation_priority_override=curation_priority_override,
+        )
+        committed_interaction = (
+            interaction_update.state
+            if self._config.feature_lifecycle_enabled
+            else interaction_update.pre_curation_state
         )
         (
             consumer_evidence_streak_updated_pre,
@@ -1487,13 +2092,25 @@ class IntegratedHiddenPartnerAgent:
         consumer_read_idle_steps_updated_pre = self._update_consumer_read_idle_steps(
             state.consumer_read_idle_steps,
             interaction_update.evidence_refreshed,
-            (state.router.descriptors[:, 0] >= 0)
-            & (state.router.descriptors[:, 1] >= 0),
+            (state.router.descriptors[:, 0] >= 0) & (state.router.descriptors[:, 1] >= 0),
         )
         committed_behavior = self._commit_behavior_consumer_update(
             state.behavior,
             behavior_update.state,
             consumer_write_gate_pre,
+        )
+        committed_grounded_world = (
+            None
+            if grounded_world_update is None
+            else self._commit_grounded_consumer_update(
+                cast(GroundedJointWorldModelState, state.grounded_world),
+                (
+                    grounded_world_update.state
+                    if self._config.grounded_world_learning_enabled
+                    else cast(GroundedJointWorldModelState, state.grounded_world)
+                ),
+                consumer_write_gate_pre,
+            )
         )
 
         advanced_builder, next_phi = self._state_builder.update(
@@ -1518,22 +2135,43 @@ class IntegratedHiddenPartnerAgent:
             ),
             axis=1,
         ).astype(jnp.int32)
-        proposed_descriptors = (
-            shadow_descriptors
-            if self._config.feature_lifecycle_enabled
-            else state.router.descriptors
-        )
-        (
-            routed_behavior,
-            routed_control,
-            route_diagnostics,
-            router_state,
-        ) = self._route_feature_consumers(
-            state.router,
-            committed_behavior,
-            state.control,
-            proposed_descriptors,
-        )
+        applied_descriptors = jnp.stack(
+            (
+                committed_interaction.feature_left,
+                committed_interaction.feature_right,
+            ),
+            axis=1,
+        ).astype(jnp.int32)
+        # Compatibility name: these are the descriptors proposed to the
+        # router after the lifecycle commit gate, hence the applied bank.
+        proposed_descriptors = applied_descriptors
+        if committed_grounded_world is None:
+            (
+                routed_behavior,
+                routed_control,
+                route_diagnostics,
+                router_state,
+            ) = self._route_feature_consumers(
+                state.router,
+                committed_behavior,
+                state.control,
+                proposed_descriptors,
+            )
+            routed_grounded_world = None
+        else:
+            (
+                routed_behavior,
+                routed_control,
+                routed_grounded_world,
+                route_diagnostics,
+                router_state,
+            ) = self._route_feature_consumers_with_grounded(
+                state.router,
+                committed_behavior,
+                state.control,
+                committed_grounded_world,
+                proposed_descriptors,
+            )
         consumer_evidence_streak_post = self._route_consumer_evidence_streak(
             consumer_evidence_streak_updated_pre,
             route_diagnostics,
@@ -1561,7 +2199,7 @@ class IntegratedHiddenPartnerAgent:
             next_phi,
             router_state.descriptors,
             self._effective_pair_read_mask(
-                interaction_update.state,
+                committed_interaction,
                 consumer_active_mask_post,
             ),
         )
@@ -1570,6 +2208,7 @@ class IntegratedHiddenPartnerAgent:
             world_update.state,
             routed_control,
             next_chi,
+            routed_grounded_world,
         )
         next_selection = self.select_planner_action(
             routed_control,
@@ -1588,12 +2227,32 @@ class IntegratedHiddenPartnerAgent:
             control_update.state,
             consumer_write_gate_post,
         )
+        grounded_evaluations_valid = (
+            jnp.asarray(True, dtype=jnp.bool_)
+            if current_evaluation.grounded_world is None
+            else (
+                current_evaluation.grounded_world.predictions_valid
+                & cast(
+                    IntegratedGroundedPlannerEvaluation,
+                    next_evaluation.grounded_world,
+                ).predictions_valid
+            )
+        )
+        candidate_models_valid = (
+            current_evaluation.partner_probabilities_valid
+            & next_evaluation.partner_probabilities_valid
+            & world_update.target_valid
+            & grounded_path_valid
+            & grounded_evaluations_valid
+        )
+        transition_valid = transition_valid & candidate_models_valid & route_diagnostics.valid
 
         proposed_state = IntegratedHiddenPartnerState(
             state_builder=advanced_builder,
-            interaction=interaction_update.state,
+            interaction=committed_interaction,
             behavior=routed_behavior,
             joint_world=world_update.state,
+            grounded_world=routed_grounded_world,
             control=committed_control,
             router=router_state,
             raw_observation=next_raw,
@@ -1603,33 +2262,56 @@ class IntegratedHiddenPartnerAgent:
             consumer_evidence_streak=consumer_evidence_streak_post,
             consumer_read_idle_steps=consumer_read_idle_steps_post,
             current_evaluation=next_evaluation,
+            current_selection=next_selection,
             step_count=_saturating_int32_increment(state.step_count),
         )
+        candidate_state_finite = self._update_finite(
+            proposed_state,
+            mixed_gradient_chi,
+            representation_gradient,
+            behavior_update.loss,
+            interaction_update.metrics,
+            interaction_update.candidate_promotion_signal,
+            world_update.reward_error,
+            world_update.outcome_error,
+            control_update.td_error,
+        )
+        transition_valid = transition_valid & candidate_state_finite
         next_state = jax.lax.cond(
             transition_valid,
             lambda _: proposed_state,
             lambda _: state,
             operand=None,
         )
-        behavior_prediction_matches = jnp.allclose(
-            behavior_gradient.probabilities,
-            current_evaluation.predicted_partner_probabilities,
-            atol=1e-6,
-            rtol=1e-6,
-        )
-        model_valid = (
-            current_evaluation.partner_probabilities_valid
-            & next_evaluation.partner_probabilities_valid
-            & world_update.target_valid
+        model_valid = candidate_models_valid
+        grounded_world_step_delta = (
+            jnp.asarray(0, dtype=jnp.int32)
+            if state.grounded_world is None
+            else (
+                cast(GroundedJointWorldModelState, next_state.grounded_world).update_count
+                - state.grounded_world.update_count
+            )
         )
         false_active = jnp.zeros((ACTIVE_PAIR_SLOTS,), dtype=jnp.bool_)
         false_candidates = jnp.zeros((CANDIDATE_PAIR_SLOTS,), dtype=jnp.bool_)
         rejected_index = jnp.asarray(-1, dtype=jnp.int32)
-        old_descriptor_validation = self._router.validate_descriptors(
-            state.router.descriptors
-        )
+        old_descriptor_validation = self._router.validate_descriptors(state.router.descriptors)
         old_live_count = jnp.sum(
             old_descriptor_validation.live_mask,
+            dtype=jnp.int32,
+        )
+        lifecycle_enabled = jnp.asarray(
+            self._config.feature_lifecycle_enabled,
+            dtype=jnp.bool_,
+        )
+        lifecycle_proposed = (
+            (interaction_update.replaced_slot >= 0)
+            | (interaction_update.refreshed_candidate >= 0)
+            | (interaction_update.retired_slot >= 0)
+        )
+        lifecycle_apply_gate = transition_valid & lifecycle_enabled
+        applied_live_count = jnp.sum(
+            (applied_descriptors[:, 0] >= 0) & (applied_descriptors[:, 1] >= 0),
             dtype=jnp.int32,
         )
         rejected_route = dataclasses.replace(
@@ -1665,7 +2347,17 @@ class IntegratedHiddenPartnerAgent:
             behavior_loss_preupdate=behavior_update.loss,
             behavior_correct_preupdate=behavior_update.correct,
             behavior_gradient_chi=behavior_gradient.gradient,
-            behavior_gradient_phi=representation_gradient,
+            behavior_gradient_phi=behavior_gradient_phi,
+            grounded_world_update=grounded_world_update,
+            grounded_world_learning_enabled=jnp.asarray(
+                self._config.grounded_world_learning_enabled,
+                dtype=jnp.bool_,
+            ),
+            grounded_world_counter_saturated=grounded_world_counter_saturated,
+            grounded_world_prediction_matches_decision=(grounded_world_prediction_matches),
+            gradient_mix=gradient_mix,
+            mixed_gradient_chi=(None if grounded_world_update is None else mixed_gradient_chi),
+            mixed_gradient_phi=(None if grounded_world_update is None else representation_gradient),
             state_learning=state_learning,
             interaction_prediction_preupdate=(interaction_update.predictions),
             interaction_error_preupdate=interaction_update.errors,
@@ -1680,6 +2372,11 @@ class IntegratedHiddenPartnerAgent:
                 interaction_update.promoted_candidate,
                 rejected_index,
             ),
+            interaction_refreshed_candidate=jnp.where(
+                transition_valid,
+                interaction_update.refreshed_candidate,
+                rejected_index,
+            ),
             interaction_retired_slot=jnp.where(
                 transition_valid,
                 interaction_update.retired_slot,
@@ -1692,6 +2389,70 @@ class IntegratedHiddenPartnerAgent:
             ),
             interaction_retired_right=jnp.where(
                 transition_valid,
+                interaction_update.retired_right,
+                rejected_index,
+            ),
+            interaction_proposal_replaced_slot=jnp.where(
+                transition_valid,
+                interaction_update.replaced_slot,
+                rejected_index,
+            ),
+            interaction_proposal_promoted_candidate=jnp.where(
+                transition_valid,
+                interaction_update.promoted_candidate,
+                rejected_index,
+            ),
+            interaction_proposal_refreshed_candidate=jnp.where(
+                transition_valid,
+                interaction_update.refreshed_candidate,
+                rejected_index,
+            ),
+            interaction_proposal_retired_slot=jnp.where(
+                transition_valid,
+                interaction_update.retired_slot,
+                rejected_index,
+            ),
+            interaction_proposal_retired_left=jnp.where(
+                transition_valid,
+                interaction_update.retired_left,
+                rejected_index,
+            ),
+            interaction_proposal_retired_right=jnp.where(
+                transition_valid,
+                interaction_update.retired_right,
+                rejected_index,
+            ),
+            interaction_lifecycle_proposed=(transition_valid & lifecycle_proposed),
+            interaction_lifecycle_applied=(
+                lifecycle_apply_gate & lifecycle_proposed
+            ),
+            interaction_applied_replaced_slot=jnp.where(
+                lifecycle_apply_gate,
+                interaction_update.replaced_slot,
+                rejected_index,
+            ),
+            interaction_applied_promoted_candidate=jnp.where(
+                lifecycle_apply_gate,
+                interaction_update.promoted_candidate,
+                rejected_index,
+            ),
+            interaction_applied_refreshed_candidate=jnp.where(
+                lifecycle_apply_gate,
+                interaction_update.refreshed_candidate,
+                rejected_index,
+            ),
+            interaction_applied_retired_slot=jnp.where(
+                lifecycle_apply_gate,
+                interaction_update.retired_slot,
+                rejected_index,
+            ),
+            interaction_applied_retired_left=jnp.where(
+                lifecycle_apply_gate,
+                interaction_update.retired_left,
+                rejected_index,
+            ),
+            interaction_applied_retired_right=jnp.where(
+                lifecycle_apply_gate,
                 interaction_update.retired_right,
                 rejected_index,
             ),
@@ -1722,18 +2483,12 @@ class IntegratedHiddenPartnerAgent:
                 )
             ),
             interaction_durable_read_mask=interaction_update.durable_read_mask,
-            interaction_relevance_probe_weights_pre=(
-                state.interaction.relevance_probe_weights
-            ),
+            interaction_relevance_probe_weights_pre=(state.interaction.relevance_probe_weights),
             interaction_relevance_probe_weights_post=(
                 next_state.interaction.relevance_probe_weights
             ),
-            interaction_relevance_probe_biases_pre=(
-                state.interaction.relevance_probe_biases
-            ),
-            interaction_relevance_probe_biases_post=(
-                next_state.interaction.relevance_probe_biases
-            ),
+            interaction_relevance_probe_biases_pre=(state.interaction.relevance_probe_biases),
+            interaction_relevance_probe_biases_post=(next_state.interaction.relevance_probe_biases),
             interaction_candidate_promotion_signal=(
                 jnp.where(
                     transition_valid,
@@ -1758,6 +2513,13 @@ class IntegratedHiddenPartnerAgent:
                     state.interaction.candidate_promotion_evidence_streak,
                 )
             ),
+            interaction_candidate_promotion_evidence_streak_proposal_post=(
+                jnp.where(
+                    transition_valid,
+                    interaction_update.state.candidate_promotion_evidence_streak,
+                    state.interaction.candidate_promotion_evidence_streak,
+                )
+            ),
             interaction_candidate_promotion_evidence_streak_post=(
                 next_state.interaction.candidate_promotion_evidence_streak
             ),
@@ -1770,6 +2532,13 @@ class IntegratedHiddenPartnerAgent:
             ),
             interaction_candidate_reacquisition_required_pre=(
                 interaction_update.candidate_reacquisition_required_pre
+            ),
+            interaction_candidate_reacquisition_required_proposal_post=(
+                jnp.where(
+                    transition_valid,
+                    interaction_update.state.candidate_reacquisition_required,
+                    state.interaction.candidate_reacquisition_required,
+                )
             ),
             interaction_candidate_reacquisition_required_post=(
                 next_state.interaction.candidate_reacquisition_required
@@ -1843,6 +2612,19 @@ class IntegratedHiddenPartnerAgent:
                 ),
                 0,
             ),
+            interaction_applied_matching_candidate_reset_mask=jnp.where(
+                lifecycle_apply_gate,
+                interaction_update.matching_candidate_reset_mask,
+                false_candidates,
+            ),
+            interaction_applied_matching_candidate_reset_count=jnp.where(
+                lifecycle_apply_gate,
+                jnp.sum(
+                    interaction_update.matching_candidate_reset_mask,
+                    dtype=jnp.int32,
+                ),
+                0,
+            ),
             interaction_live_feature_count=jnp.where(
                 transition_valid,
                 interaction_update.live_feature_count,
@@ -1856,12 +2638,39 @@ class IntegratedHiddenPartnerAgent:
             interaction_promoted_into_vacancy=(
                 transition_valid & interaction_update.promoted_into_vacancy
             ),
+            interaction_proposal_live_feature_count=jnp.where(
+                transition_valid,
+                interaction_update.live_feature_count,
+                old_live_count,
+            ),
+            interaction_proposal_vacancy_count=jnp.where(
+                transition_valid,
+                interaction_update.vacancy_count,
+                ACTIVE_PAIR_SLOTS - old_live_count,
+            ),
+            interaction_proposal_promoted_into_vacancy=(
+                transition_valid & interaction_update.promoted_into_vacancy
+            ),
+            interaction_applied_live_feature_count=jnp.where(
+                transition_valid,
+                applied_live_count,
+                old_live_count,
+            ),
+            interaction_applied_vacancy_count=jnp.where(
+                transition_valid,
+                ACTIVE_PAIR_SLOTS - applied_live_count,
+                ACTIVE_PAIR_SLOTS - old_live_count,
+            ),
+            interaction_applied_promoted_into_vacancy=(
+                lifecycle_apply_gate & interaction_update.promoted_into_vacancy
+            ),
+            random_curation_enabled=curation_priority_override.enabled,
+            random_curation_attempted=(
+                transition_valid & interaction_update.curation_attempted
+            ),
             random_curation_applied=(
                 transition_valid
-                & jnp.asarray(
-                    self._config.random_feature_curation,
-                    dtype=jnp.bool_,
-                )
+                & interaction_update.curation_priority_override_applied
             ),
             random_active_priorities=jnp.where(
                 transition_valid,
@@ -1873,6 +2682,21 @@ class IntegratedHiddenPartnerAgent:
                 random_candidate_priorities,
                 jnp.zeros_like(random_candidate_priorities),
             ),
+            curation_selected_active_worst_slot=jnp.where(
+                transition_valid,
+                interaction_update.curation_selected_active_worst_slot,
+                rejected_index,
+            ),
+            curation_selected_promotion_candidate=jnp.where(
+                transition_valid,
+                interaction_update.curation_selected_promotion_candidate,
+                rejected_index,
+            ),
+            curation_selected_refresh_candidate=jnp.where(
+                transition_valid,
+                interaction_update.curation_selected_refresh_candidate,
+                rejected_index,
+            ),
             shadow_descriptors=jnp.where(
                 transition_valid,
                 shadow_descriptors,
@@ -1883,9 +2707,18 @@ class IntegratedHiddenPartnerAgent:
                 proposed_descriptors,
                 state.router.descriptors,
             ),
+            interaction_proposal_descriptors=jnp.where(
+                transition_valid,
+                shadow_descriptors,
+                state.router.descriptors,
+            ),
+            interaction_applied_descriptors=jnp.where(
+                transition_valid,
+                applied_descriptors,
+                state.router.descriptors,
+            ),
             shadow_descriptors_changed=(
-                transition_valid
-                & jnp.any(shadow_descriptors != state.router.descriptors)
+                transition_valid & jnp.any(shadow_descriptors != state.router.descriptors)
             ),
             route=committed_route_diagnostics,
             world_reward_prediction_preupdate=world_prediction.reward,
@@ -1911,6 +2744,7 @@ class IntegratedHiddenPartnerAgent:
                 next_state.interaction.step_count - state.interaction.step_count
             ),
             world_step_delta=(next_state.joint_world.step_count - state.joint_world.step_count),
+            grounded_world_step_delta=grounded_world_step_delta,
             control_step_delta=(next_state.control.step_count - state.control.step_count),
             router_route_delta=(next_state.router.route_count - state.router.route_count),
             router_generation_delta=(
@@ -1921,7 +2755,7 @@ class IntegratedHiddenPartnerAgent:
                 transition_valid
                 & self._update_finite(
                     next_state,
-                    behavior_gradient.gradient,
+                    mixed_gradient_chi,
                     representation_gradient,
                     behavior_update.loss,
                     interaction_update.metrics,
@@ -1954,9 +2788,7 @@ class IntegratedHiddenPartnerAgent:
         consumer_read_mask: Array,
     ) -> Array:
         """Gate downstream products by lease and durable commitment."""
-        consumer = jnp.asarray(consumer_read_mask, dtype=jnp.bool_).reshape(
-            (ACTIVE_PAIR_SLOTS,)
-        )
+        consumer = jnp.asarray(consumer_read_mask, dtype=jnp.bool_).reshape((ACTIVE_PAIR_SLOTS,))
         if not self._config.independent_relevance_probe:
             return consumer
         return consumer & interaction.active_output_memory_committed
@@ -1969,38 +2801,24 @@ class IntegratedHiddenPartnerAgent:
     def _interaction_curation_input(
         self,
         state: InteractionFeatureState,
-    ) -> tuple[InteractionFeatureState, Array, Array]:
-        """Replace only utility rankings for the matched random-curation arm."""
-        if not self._config.random_feature_curation:
-            return (
-                state,
-                jnp.zeros((ACTIVE_PAIR_SLOTS,), dtype=jnp.float32),
-                jnp.zeros((CANDIDATE_PAIR_SLOTS,), dtype=jnp.float32),
-            )
+    ) -> InteractionCurationPriorityOverride:
+        """Derive transient fixed-shape ranks without advancing learner RNG."""
+
         active_key = jr.fold_in(state.key, jnp.uint32(0x43555241))
         candidate_key = jr.fold_in(state.key, jnp.uint32(0x43555243))
-        active_order = jr.permutation(
-            active_key,
-            ACTIVE_PAIR_SLOTS,
-        ).astype(jnp.float32)
-        candidate_order = jr.permutation(
-            candidate_key,
-            CANDIDATE_PAIR_SLOTS,
-        ).astype(jnp.float32)
-        decay = jnp.asarray(
-            self._config.interaction_utility_decay,
-            dtype=jnp.float32,
-        )
-        gap = (2.0 - decay) / decay
-        active_priorities = gap * active_order
-        candidate_priorities = (4.0 / decay) + gap * candidate_order
-        return (
-            state.replace(
-                utilities=active_priorities,
-                candidate_utilities=candidate_priorities,
+        return InteractionCurationPriorityOverride(
+            enabled=jnp.asarray(
+                self._config.random_feature_curation,
+                dtype=jnp.bool_,
             ),
-            active_priorities,
-            candidate_priorities,
+            active_ranks=jr.permutation(
+                active_key,
+                ACTIVE_PAIR_SLOTS,
+            ).astype(jnp.float32),
+            candidate_ranks=jr.permutation(
+                candidate_key,
+                CANDIDATE_PAIR_SLOTS,
+            ).astype(jnp.float32),
         )
 
     def _update_consumer_evidence_streak(
@@ -2009,18 +2827,14 @@ class IntegratedHiddenPartnerAgent:
         evidence_refreshed: Array,
     ) -> tuple[Array, Array, Array]:
         """Return updated streak, read acquisition, and old-bank write confirmation."""
-        previous = jnp.asarray(previous_streak, dtype=jnp.int32).reshape(
-            (ACTIVE_PAIR_SLOTS,)
-        )
+        previous = jnp.asarray(previous_streak, dtype=jnp.int32).reshape((ACTIVE_PAIR_SLOTS,))
         if not self._config.evidence_gated_consumer_memory:
             return (
                 jnp.zeros((ACTIVE_PAIR_SLOTS,), dtype=jnp.int32),
                 jnp.ones((ACTIVE_PAIR_SLOTS,), dtype=jnp.bool_),
                 jnp.ones((ACTIVE_PAIR_SLOTS,), dtype=jnp.bool_),
             )
-        evidence = jnp.asarray(evidence_refreshed, dtype=jnp.bool_).reshape(
-            (ACTIVE_PAIR_SLOTS,)
-        )
+        evidence = jnp.asarray(evidence_refreshed, dtype=jnp.bool_).reshape((ACTIVE_PAIR_SLOTS,))
         cap = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
         incremented = jnp.minimum(jnp.maximum(previous, 0), cap - 1) + 1
         updated = jnp.where(evidence, incremented, 0)
@@ -2063,17 +2877,11 @@ class IntegratedHiddenPartnerAgent:
         live_mask: Array,
     ) -> Array:
         """Advance the read lease from raw evidence independently of feature retention."""
-        previous = jnp.asarray(previous_idle_steps, dtype=jnp.int32).reshape(
-            (ACTIVE_PAIR_SLOTS,)
-        )
+        previous = jnp.asarray(previous_idle_steps, dtype=jnp.int32).reshape((ACTIVE_PAIR_SLOTS,))
         if not self._config.evidence_gated_consumer_memory:
             return jnp.zeros((ACTIVE_PAIR_SLOTS,), dtype=jnp.int32)
-        evidence = jnp.asarray(evidence_refreshed, dtype=jnp.bool_).reshape(
-            (ACTIVE_PAIR_SLOTS,)
-        )
-        live = jnp.asarray(live_mask, dtype=jnp.bool_).reshape(
-            (ACTIVE_PAIR_SLOTS,)
-        )
+        evidence = jnp.asarray(evidence_refreshed, dtype=jnp.bool_).reshape((ACTIVE_PAIR_SLOTS,))
+        live = jnp.asarray(live_mask, dtype=jnp.bool_).reshape((ACTIVE_PAIR_SLOTS,))
         cap = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
         incremented = jnp.minimum(jnp.maximum(previous, 0), cap - 1) + 1
         return jnp.where(live, jnp.where(evidence, 0, incremented), 0)
@@ -2099,6 +2907,30 @@ class IntegratedHiddenPartnerAgent:
         )
         return cast(
             BehaviorModelState,
+            proposed.replace(weights=committed_weights),
+        )
+
+    def _commit_grounded_consumer_update(
+        self,
+        previous: GroundedJointWorldModelState,
+        proposed: GroundedJointWorldModelState,
+        write_gate: Array,
+    ) -> GroundedJointWorldModelState:
+        """Commit grounded base columns and only evidence-backed tail writes."""
+        if not self._config.evidence_gated_consumer_memory:
+            return proposed
+        gate = jnp.asarray(write_gate, dtype=jnp.bool_).reshape((ACTIVE_PAIR_SLOTS,))
+        committed_tail = jnp.where(
+            gate[None, None, :],
+            proposed.weights[..., BASE_FEATURE_DIM:],
+            previous.weights[..., BASE_FEATURE_DIM:],
+        )
+        committed_weights = jnp.concatenate(
+            (proposed.weights[..., :BASE_FEATURE_DIM], committed_tail),
+            axis=-1,
+        )
+        return cast(
+            GroundedJointWorldModelState,
             proposed.replace(weights=committed_weights),
         )
 
@@ -2129,9 +2961,7 @@ class IntegratedHiddenPartnerAgent:
         route: FeatureBankRouteDiagnostics,
     ) -> Array:
         """Route updated consecutive-evidence state; new identities start at zero."""
-        updated = jnp.asarray(updated_streak, dtype=jnp.int32).reshape(
-            (ACTIVE_PAIR_SLOTS,)
-        )
+        updated = jnp.asarray(updated_streak, dtype=jnp.int32).reshape((ACTIVE_PAIR_SLOTS,))
         if not self._config.evidence_gated_consumer_memory:
             return jnp.zeros((ACTIVE_PAIR_SLOTS,), dtype=jnp.int32)
         return self._route_consumer_slot_values(
@@ -2146,9 +2976,7 @@ class IntegratedHiddenPartnerAgent:
         route: FeatureBankRouteDiagnostics,
     ) -> Array:
         """Route raw-evidence read-idle state; new descriptor identities start at zero."""
-        updated = jnp.asarray(updated_idle_steps, dtype=jnp.int32).reshape(
-            (ACTIVE_PAIR_SLOTS,)
-        )
+        updated = jnp.asarray(updated_idle_steps, dtype=jnp.int32).reshape((ACTIVE_PAIR_SLOTS,))
         if not self._config.evidence_gated_consumer_memory:
             return jnp.zeros((ACTIVE_PAIR_SLOTS,), dtype=jnp.int32)
         return self._route_consumer_slot_values(
@@ -2163,9 +2991,7 @@ class IntegratedHiddenPartnerAgent:
         route: FeatureBankRouteDiagnostics,
     ) -> Array:
         """Route the current write permission; new identities cannot inherit it."""
-        confirmed = jnp.asarray(confirmed_write, dtype=jnp.bool_).reshape(
-            (ACTIVE_PAIR_SLOTS,)
-        )
+        confirmed = jnp.asarray(confirmed_write, dtype=jnp.bool_).reshape((ACTIVE_PAIR_SLOTS,))
         if not self._config.evidence_gated_consumer_memory:
             return jnp.where(
                 route.valid,
@@ -2184,9 +3010,7 @@ class IntegratedHiddenPartnerAgent:
         route: FeatureBankRouteDiagnostics,
     ) -> Array:
         """Route current read acquisition; new identities cannot inherit it."""
-        acquire = jnp.asarray(read_acquire, dtype=jnp.bool_).reshape(
-            (ACTIVE_PAIR_SLOTS,)
-        )
+        acquire = jnp.asarray(read_acquire, dtype=jnp.bool_).reshape((ACTIVE_PAIR_SLOTS,))
         if not self._config.evidence_gated_consumer_memory:
             return jnp.where(
                 route.valid,
@@ -2207,18 +3031,14 @@ class IntegratedHiddenPartnerAgent:
         evidence_idle_steps_post: Array | None = None,
     ) -> Array:
         """Route the persistent read lease and close it only after idle expiry."""
-        previous = jnp.asarray(previous_mask, dtype=jnp.bool_).reshape(
-            (ACTIVE_PAIR_SLOTS,)
-        )
+        previous = jnp.asarray(previous_mask, dtype=jnp.bool_).reshape((ACTIVE_PAIR_SLOTS,))
         if not self._config.evidence_gated_consumer_memory:
             return jnp.where(
                 route.valid,
                 route.new_validation.live_mask,
                 previous,
             )
-        acquire = jnp.asarray(read_acquire, dtype=jnp.bool_).reshape(
-            (ACTIVE_PAIR_SLOTS,)
-        )
+        acquire = jnp.asarray(read_acquire, dtype=jnp.bool_).reshape((ACTIVE_PAIR_SLOTS,))
         acquired = previous | acquire
         routed = self._route_consumer_slot_values(
             acquired,
@@ -2292,6 +3112,20 @@ class IntegratedHiddenPartnerAgent:
             control_state.last_observation,
         )
 
+    @staticmethod
+    def _consumer_arrays_with_grounded(
+        behavior_state: BehaviorModelState,
+        control_state: DifferentialSARSAState,
+        grounded_state: GroundedJointWorldModelState,
+    ) -> tuple[Array, Array, Array, Array, Array]:
+        return (
+            behavior_state.weights,
+            control_state.q_weights,
+            control_state.q_trace_weights,
+            control_state.last_observation,
+            grounded_state.weights,
+        )
+
     def _route_feature_consumers(
         self,
         router_state: FeatureBankRouterState,
@@ -2353,24 +3187,78 @@ class IntegratedHiddenPartnerAgent:
             route.state,
         )
 
+    def _route_feature_consumers_with_grounded(
+        self,
+        router_state: FeatureBankRouterState,
+        behavior_state: BehaviorModelState,
+        control_state: DifferentialSARSAState,
+        grounded_state: GroundedJointWorldModelState,
+        proposed_descriptors: Array,
+    ) -> tuple[
+        BehaviorModelState,
+        DifferentialSARSAState,
+        GroundedJointWorldModelState,
+        FeatureBankRouteDiagnostics,
+        FeatureBankRouterState,
+    ]:
+        """Route all legacy consumers and grounded weights in one transaction."""
+        route = self._router.route(
+            router_state,
+            self._consumer_arrays_with_grounded(
+                behavior_state,
+                control_state,
+                grounded_state,
+            ),
+            proposed_descriptors,
+            carry_survivors=True,
+        )
+        routed = cast(tuple[Array, Array, Array, Array, Array], route.consumers)
+        diagnostics = route.diagnostics
+        if not self._config.carry_survivors:
+            descriptors_changed = diagnostics.descriptors_changed
+
+            def reset_dynamic_tail(value: Array) -> Array:
+                reset_value = jnp.concatenate(
+                    (
+                        value[..., :BASE_FEATURE_DIM],
+                        jnp.zeros_like(value[..., BASE_FEATURE_DIM:]),
+                    ),
+                    axis=-1,
+                )
+                return jnp.where(descriptors_changed, reset_value, value)
+
+            routed = cast(
+                tuple[Array, Array, Array, Array, Array],
+                jax.tree_util.tree_map(reset_dynamic_tail, routed),
+            )
+            diagnostics = dataclasses.replace(
+                diagnostics,
+                carry_survivors=~descriptors_changed,
+            )
+        return (
+            behavior_state.replace(weights=routed[0]),
+            control_state.replace(
+                q_weights=routed[1],
+                q_trace_weights=routed[2],
+                last_observation=routed[3],
+            ),
+            grounded_state.replace(weights=routed[4]),
+            diagnostics,
+            route.state,
+        )
+
     @staticmethod
     def _start_finite(state: IntegratedHiddenPartnerState) -> Array:
-        values = (
-            state.raw_observation,
-            state.phi,
-            state.chi,
-            state.interaction.relevance_probe_weights,
-            state.interaction.relevance_probe_biases,
-            state.interaction.candidate_promotion_evidence_streak,
-            state.interaction.candidate_reacquisition_required,
-            state.current_evaluation.partner_probabilities,
-            state.current_evaluation.predicted_partner_probabilities,
-            state.current_evaluation.expected_rewards,
-            state.current_evaluation.expected_outcomes,
-            state.current_evaluation.q_values,
-            state.current_evaluation.planner_scores,
+        grounded_valid = (
+            jnp.asarray(True, dtype=jnp.bool_)
+            if state.current_evaluation.grounded_world is None
+            else state.current_evaluation.grounded_world.predictions_valid
         )
-        return jnp.all(jnp.stack([jnp.all(jnp.isfinite(value)) for value in values]))
+        return (
+            _numeric_tree_finite(state)
+            & state.current_evaluation.partner_probabilities_valid
+            & grounded_valid
+        )
 
     @staticmethod
     def _update_finite(
@@ -2384,32 +3272,7 @@ class IntegratedHiddenPartnerAgent:
         world_outcome_error: Array,
         td_error: Array,
     ) -> Array:
-        values = (
-            state.raw_observation,
-            state.phi,
-            state.chi,
-            state.interaction.output_weights,
-            state.interaction.relevance_probe_weights,
-            state.interaction.relevance_probe_biases,
-            state.interaction.output_biases,
-            state.interaction.utilities,
-            state.interaction.candidate_output_weights,
-            state.interaction.candidate_utilities,
-            state.interaction.candidate_promotion_evidence_streak,
-            state.interaction.candidate_reacquisition_required,
-            state.interaction.feature_second_moments,
-            state.interaction.candidate_second_moments,
-            state.interaction.target_second_moments,
-            state.behavior.weights,
-            state.behavior.bias,
-            state.joint_world.reward_predictions,
-            state.joint_world.outcome_predictions,
-            state.control.q_weights,
-            state.control.q_trace_weights,
-            state.current_evaluation.partner_probabilities,
-            state.current_evaluation.predicted_partner_probabilities,
-            state.current_evaluation.expected_rewards,
-            state.current_evaluation.planner_scores,
+        transients: tuple[Array, ...] = (
             chi_gradient,
             phi_gradient,
             behavior_loss,
@@ -2419,4 +3282,6 @@ class IntegratedHiddenPartnerAgent:
             world_outcome_error,
             td_error,
         )
-        return jnp.all(jnp.stack([jnp.all(jnp.isfinite(value)) for value in values]))
+        return _numeric_tree_finite(state) & jnp.all(
+            jnp.stack([jnp.all(jnp.isfinite(value)) for value in transients])
+        )

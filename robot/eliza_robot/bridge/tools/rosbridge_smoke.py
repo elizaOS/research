@@ -1,4 +1,4 @@
-"""Smoke test ROSBridge-compatible endpoint behavior."""
+"""Smoke test a loopback, explicitly nonphysical compatibility endpoint."""
 
 from __future__ import annotations
 
@@ -8,6 +8,10 @@ import json
 
 from websockets.asyncio.client import connect
 
+from eliza_robot.bridge.physical_execution import (
+    reject_unsupervised_physical_motion,
+    require_loopback_simulation_uri,
+)
 from eliza_robot.bridge.types import JsonDict
 
 
@@ -27,10 +31,15 @@ async def _recv_until(
 
 
 async def _run(uri: str) -> int:
+    require_loopback_simulation_uri(uri, entrypoint="rosbridge_smoke")
     async with connect(uri) as ws:
         _ = await _recv_until(ws, lambda item: item.get("op") == "status")
         hello = await _recv_until(ws, lambda item: item.get("op") == "hello")
         backend = hello.get("backend")
+        if backend not in {"mock", "isaac", "ros_sim"}:
+            reject_unsupervised_physical_motion(
+                f"rosbridge_smoke backend {backend!r}"
+            )
         print(f"connected backend={backend}")
 
         await ws.send(

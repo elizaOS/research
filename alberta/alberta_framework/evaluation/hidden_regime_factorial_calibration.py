@@ -7,8 +7,11 @@ readiness ZIP.  The 16,528-row primitive trace is audited while ephemeral; the
 persisted shard contains exact hexadecimal outcome values, complete compact
 metric sources, and audit digests, but never the raw trace.
 
-Calibration shards and aggregates are nonpromoting development records.  They
-cannot freeze thresholds, accept a claim, or support scientific promotion.
+Calibration shards and aggregates are nonpromoting development records.  Once
+an immutable aggregate has been exactly recomputed, this module can ask the
+same certified ZIP to run the separately pure threshold engine and publish its
+one development-only freeze-or-valid-rejection receipt.  No path here accepts
+a claim or supports scientific promotion.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ import base64
 import concurrent.futures
 import dataclasses
 import errno
+import fcntl
 import hashlib
 import json
 import math
@@ -26,7 +30,8 @@ import sys
 import zipfile
 import zipimport
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn, cast
@@ -37,11 +42,15 @@ from scipy.stats import t as student_t
 
 from alberta_framework.core.slot_signaling_agent import SlotSignalingConfig
 from alberta_framework.evaluation.hidden_regime_calibration_readiness import (
+    BoundCalibrationRuntimeBatch,
     ReadinessError,
     ValidatedReadinessBundle,
+    bound_calibration_runtime_batch,
+    build_runtime_execution_identity,
     execute_bound_calibration_worker,
-    require_validated_readiness_receipt,
-    validate_published_readiness_receipt,
+    load_validated_published_readiness_bundle,
+    require_current_full_runtime_identity,
+    runtime_execution_identity_from_receipt,
 )
 from alberta_framework.evaluation.hidden_regime_execution_governance import (
     CALIBRATION_EXECUTION_INVENTORY_SCHEMA,
@@ -49,19 +58,34 @@ from alberta_framework.evaluation.hidden_regime_execution_governance import (
     CALIBRATION_EXECUTION_PRIMITIVE_TRACE_DIGEST_SCHEMA,
     CALIBRATION_EXECUTION_RESOURCE_DIGEST_SCHEMA,
     CALIBRATION_EXECUTION_SUMMARY_DIGEST_SCHEMA,
+    CALIBRATION_ZIP_PROVENANCE_SCHEMA,
     EXECUTION_AUTHORIZATION_ACKNOWLEDGEMENT,
     READINESS_EXECUTION_GOVERNANCE_FIELD,
+    ZIP_PROVENANCE_POLICY,
+    ZIP_PROVENANCE_SOURCE_ARCHIVE_LOCATOR,
+    HiddenRegimeExecutionGovernanceError,
     PublishedCalibrationExecutionLedger,
+    atomic_install_new_immutable,
+    attest_calibration_zip_provenance,
     build_calibration_execution_genesis,
+    calibration_case_attempt_binding,
     calibration_execution_configuration_sha256,
     calibration_execution_primitive_trace_sha256,
     calibration_execution_resource_sha256,
     calibration_execution_summary_sha256,
+    finalize_calibration_case_shard,
     initialize_calibration_execution_ledger,
     issue_calibration_execution_authorization,
+    load_finalized_calibration_case_shard,
     require_valid_calibration_execution_inventory,
     snapshot_calibration_execution_inventory,
     validate_completed_calibration_ledger_snapshot,
+)
+from alberta_framework.evaluation.hidden_regime_factorial_protected_plan import (
+    PROTECTED_PLAN_SCHEMA,
+    ProtectedPlanError,
+    build_hidden_regime_factorial_protected_plan,
+    validate_hidden_regime_factorial_protected_plan,
 )
 from alberta_framework.evaluation.hidden_regime_factorial_protocol import (
     BOUND_DEVELOPMENT_SUMMARY_SCHEMA,
@@ -73,6 +97,7 @@ from alberta_framework.evaluation.hidden_regime_factorial_protocol import (
     N_MATCHED_CASES,
     N_SEED_PAIRS,
     SEED_SNAPSHOT_SHA256,
+    THRESHOLD_FREEZE_RECEIPT_SCHEMA,
     EstimandContract,
     HiddenRegimeFactorialCalibrationDesign,
     MatchedCalibrationCase,
@@ -80,6 +105,16 @@ from alberta_framework.evaluation.hidden_regime_factorial_protocol import (
     build_hidden_regime_factorial_calibration_design,
     canonical_json_bytes,
     canonical_sha256,
+)
+from alberta_framework.evaluation.hidden_regime_factorial_thresholds import (
+    MANDATORY_STATISTICAL_ENDPOINT_COUNT,
+    MANDATORY_STATISTICAL_ENDPOINT_IDENTITIES_SHA256,
+    MANDATORY_STATISTICAL_ENDPOINT_IDS_SHA256,
+    THRESHOLD_FREEZE_DECISION_FROZEN,
+    THRESHOLD_FREEZE_DECISION_REJECTION,
+    ThresholdFreezeError,
+    materialize_hidden_regime_factorial_threshold_freeze_receipt,
+    validate_hidden_regime_factorial_threshold_freeze_receipt,
 )
 from alberta_framework.evaluation.hidden_regime_lineage_oracle import (
     HIDDEN_REGIME_LINEAGE_ORACLE_SCHEMA,
@@ -107,22 +142,39 @@ from alberta_framework.evaluation.hidden_regime_summary_oracle import (
     HIDDEN_REGIME_SUMMARY_ORACLE_SCHEMA,
 )
 from alberta_framework.evaluation.hidden_regime_trace_audit import (
+    EVIDENCE_BOUNDARY,
     HIDDEN_REGIME_TRACE_AUDIT_REPORT_SCHEMA,
     HiddenRegimeTraceAuditReport,
     audit_hidden_regime_run_result,
 )
 from alberta_framework.streams.hidden_regime_signaling import (
     CALIBRATION_ONLY_PARTITION,
+    PROTECTED_CANDIDATE_PARTITION,
     hidden_regime_calibration_manifest,
 )
 
 CALIBRATION_CASE_REQUEST_SCHEMA = "alberta.hidden-regime-factorial.case-request.v1"
+CALIBRATION_CASE_REQUEST_BINDING_SCHEMA = (
+    "alberta.hidden-regime-factorial.case-request-binding.v1"
+)
 CALIBRATION_PREFLIGHT_REQUEST_SCHEMA = "alberta.hidden-regime-factorial.preflight-request.v1"
 CALIBRATION_PREFLIGHT_REPORT_SCHEMA = "alberta.hidden-regime-factorial.preflight-report.v1"
-CALIBRATION_CASE_SHARD_SCHEMA = "alberta.hidden-regime-factorial.case-shard.v1"
+CALIBRATION_CASE_SHARD_SCHEMA = "alberta.hidden-regime-factorial.case-shard.v3"
 CALIBRATION_ATTEMPT_SCHEMA = "alberta.hidden-regime-factorial.case-attempt.v1"
 CALIBRATION_LEDGER_SCHEMA = "alberta.hidden-regime-factorial.case-ledger.v1"
-CALIBRATION_AGGREGATE_SCHEMA = "alberta.hidden-regime-factorial.calibration-aggregate.v1"
+CALIBRATION_AGGREGATE_SCHEMA = "alberta.hidden-regime-factorial.calibration-aggregate.v4"
+CALIBRATION_MANDATORY_AUDIT_SUMMARY_SCHEMA = (
+    "alberta.hidden-regime-factorial.mandatory-audit-summary.v1"
+)
+THRESHOLD_FREEZE_WORKER_RESULT_SCHEMA = (
+    "alberta.hidden-regime-factorial.threshold-freeze-worker-result.v1"
+)
+THRESHOLD_FREEZE_EXACT_INPUT_BINDING_SCHEMA = (
+    "alberta.hidden-regime-factorial.threshold-freeze-exact-input-binding.v1"
+)
+PROTECTED_PLAN_WORKER_RESULT_SCHEMA = (
+    "alberta.hidden-regime-factorial.protected-plan-worker-result.v1"
+)
 PRIMITIVE_TRACE_DIGEST_SCHEMA = "alberta.hidden-regime-factorial.trace-digest.v1"
 
 EXECUTION_ACKNOWLEDGEMENT = EXECUTION_AUTHORIZATION_ACKNOWLEDGEMENT
@@ -131,6 +183,9 @@ PREFLIGHT_ACKNOWLEDGEMENT = (
 )
 WORKER_RESULT_PREFIX = b"ALBERTA_HIDDEN_REGIME_CALIBRATION_SHARD_V1:"
 PREFLIGHT_RESULT_PREFIX = b"ALBERTA_HIDDEN_REGIME_CALIBRATION_PREFLIGHT_V1:"
+AGGREGATE_RESULT_PREFIX = b"ALBERTA_HIDDEN_REGIME_CALIBRATION_AGGREGATE_V1:"
+THRESHOLD_FREEZE_RESULT_PREFIX = b"ALBERTA_HIDDEN_REGIME_THRESHOLD_FREEZE_V1:"
+PROTECTED_PLAN_RESULT_PREFIX = b"ALBERTA_HIDDEN_REGIME_PROTECTED_PLAN_V1:"
 
 EXPECTED_STEPS = 16_528
 EXPECTED_CONDITIONS = 8
@@ -139,12 +194,17 @@ EXPECTED_CASES = 240
 EXPECTED_MANIFEST_CASES = 80
 EXPECTED_MANIFEST_SEED_PAIRS = 10
 
+READINESS_EQUIVALENCE_CERTIFICATION_ID = (
+    "checkpoint_resume_and_decentralized_role_bit_exact_equivalence"
+)
+
 _SHA256_LENGTH = 64
 _MAX_RECEIPT_BYTES = 4 * 1024 * 1024
 _MAX_SOURCE_ZIP_BYTES = 32 * 1024 * 1024
 _MAX_WORKER_OUTPUT_BYTES = 8 * 1024 * 1024
 _MAX_SHARD_BYTES = 8 * 1024 * 1024
 _MAX_AGGREGATE_BYTES = 64 * 1024 * 1024
+_MAX_PROTECTED_PLAN_BYTES = 32 * 1024 * 1024
 _MAX_CALIBRATION_WORKERS = 16
 
 type RecurrenceIdentity = tuple[int, int, int, int]
@@ -284,6 +344,7 @@ def _open_directory_without_symlinks(path: Path, *, label: str) -> tuple[int, Pa
 
 def _read_regular_file(path: Path, *, max_bytes: int, label: str) -> bytes:
     parent_fd, absolute_parent = _open_directory_without_symlinks(path.parent, label=label)
+    parent_status = os.fstat(parent_fd)
     absolute = absolute_parent / path.name
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -311,13 +372,35 @@ def _read_regular_file(path: Path, *, max_bytes: int, label: str) -> bytes:
         after = os.fstat(descriptor)
         locator = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
 
-        def identity(item: os.stat_result) -> tuple[int, int, int, int]:
-            return (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
+        def identity(item: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+            return (
+                item.st_dev,
+                item.st_ino,
+                item.st_mode,
+                item.st_nlink,
+                item.st_size,
+                item.st_mtime_ns,
+                item.st_ctime_ns,
+            )
 
         _require(
             identity(before) == identity(after) == identity(locator),
             f"{label} changed while reading",
         )
+        reopened_parent_fd, reopened_parent = _open_directory_without_symlinks(
+            absolute_parent,
+            label=label,
+        )
+        try:
+            reopened_status = os.fstat(reopened_parent_fd)
+            _require(
+                reopened_parent == absolute_parent
+                and (reopened_status.st_dev, reopened_status.st_ino)
+                == (parent_status.st_dev, parent_status.st_ino),
+                f"{label} parent changed while reading",
+            )
+        finally:
+            os.close(reopened_parent_fd)
         return b"".join(chunks)
     finally:
         os.close(descriptor)
@@ -489,6 +572,96 @@ def _zip_worker_provenance(
         "worker source ZIP digest differs from readiness",
     )
     _require(not any(Path.cwd().iterdir()), "worker cwd was not empty before execution")
+    _require(sys.flags.no_site == 1, "worker did not disable automatic site initialization")
+    _require(
+        all(
+            name not in sys.modules
+            for name in ("_virtualenv", "site", "sitecustomize", "usercustomize")
+        ),
+        "worker loaded a site or pre-bootstrap path-hook module",
+    )
+    readiness_body = _plain_dict(bundle.payload.get("body"), "readiness body")
+    runtime_identity = _plain_dict(
+        readiness_body.get("runtime_identity"),
+        "readiness runtime identity",
+    )
+    runtime_python = _plain_dict(runtime_identity.get("python"), "readiness runtime python")
+    runtime_paths: dict[str, str] = {}
+    for field in ("prefix", "exec_prefix", "purelib", "platlib"):
+        value = runtime_python.get(field)
+        _require(type(value) is str and os.path.isabs(value), f"runtime {field} is invalid")
+        runtime_paths[field] = cast(str, value)
+    no_site_stdlib_search_paths = tuple(
+        _plain_list(
+            runtime_python.get("no_site_stdlib_search_paths"),
+            "readiness no-site stdlib search paths",
+        )
+    )
+    _require(
+        bool(no_site_stdlib_search_paths)
+        and all(
+            type(entry) is str and os.path.isabs(entry)
+            for entry in no_site_stdlib_search_paths
+        )
+        and len(no_site_stdlib_search_paths) == len(set(no_site_stdlib_search_paths)),
+        "readiness no-site stdlib search paths are invalid",
+    )
+    _require(
+        sys.prefix == runtime_paths["prefix"]
+        and sys.exec_prefix == runtime_paths["exec_prefix"],
+        "worker runtime prefix differs from readiness",
+    )
+    expected_site_paths = tuple(
+        dict.fromkeys((runtime_paths["purelib"], runtime_paths["platlib"]))
+    )
+    _require(
+        all(type(entry) is str for entry in sys.path),
+        "worker import search path contains a non-string entry",
+    )
+    expected_import_search_path = (
+        absolute_archive.as_posix(),
+        *cast(tuple[str, ...], no_site_stdlib_search_paths),
+        *expected_site_paths,
+    )
+    _require(
+        len(expected_import_search_path) == len(set(expected_import_search_path)),
+        "readiness-bound import search path contains overlapping entries",
+    )
+    _require(
+        tuple(sys.path) == expected_import_search_path,
+        "worker import search path differs from exact readiness-bound construction",
+    )
+    _require(sys.dont_write_bytecode is True, "worker bytecode writes are not disabled")
+    pycache_value = sys.pycache_prefix
+    _require(
+        type(pycache_value) is str and bool(pycache_value),
+        "worker command-line pycache prefix is missing",
+    )
+    xoptions = getattr(sys, "_xoptions", {})
+    _require(
+        type(xoptions) is dict and xoptions.get("pycache_prefix") == pycache_value,
+        "worker pycache prefix was not supplied on the command line",
+    )
+    pycache_prefix = Path(cast(str, pycache_value)).absolute()
+    pycache_fd, _ = _open_directory_without_symlinks(
+        pycache_prefix,
+        label="worker pycache prefix",
+    )
+    try:
+        _require(not os.listdir(pycache_fd), "worker pycache prefix is not fresh and empty")
+    finally:
+        os.close(pycache_fd)
+
+    def overlaps(first: Path, second: Path) -> bool:
+        common = Path(os.path.commonpath((first.as_posix(), second.as_posix())))
+        return common == first or common == second
+
+    _require(
+        not overlaps(pycache_prefix, Path.cwd().absolute())
+        and not overlaps(pycache_prefix, absolute_archive.parent)
+        and not overlaps(pycache_prefix, absolute_archive),
+        "worker pycache prefix overlaps a bound source or working path",
+    )
     _require(Path(sys.path[0]).resolve(strict=True) == absolute_archive, "source ZIP is not first")
     module_rows: list[dict[str, object]] = []
     archive_prefix = f"{absolute_archive.as_posix()}/"
@@ -526,6 +699,14 @@ def _zip_worker_provenance(
         "source_zip_first": True,
         "mutable_project_path_count": 0,
         "fresh_empty_working_directory": True,
+        "no_site_startup": True,
+        "prebootstrap_pth_hook_absent": True,
+        "receipt_bound_runtime_prefix": True,
+        "exact_receipt_bound_site_search_paths": True,
+        "dont_write_bytecode": True,
+        "command_line_pycache_prefix": True,
+        "pycache_prefix_fresh_empty_nonsymlink": True,
+        "pycache_prefix_outside_bound_paths": True,
         "project_module_count": len(module_rows),
         "project_modules_sha256": canonical_sha256(module_rows),
     }
@@ -1154,35 +1335,122 @@ def _readiness_binding(bundle: ValidatedReadinessBundle) -> dict[str, object]:
     }
 
 
+def _aggregation_readiness_certification_binding(
+    bundle: ValidatedReadinessBundle,
+) -> dict[str, object]:
+    """Bind aggregate-only audit claims to exact passed readiness certifications."""
+
+    body = _plain_dict(bundle.payload.get("body"), "readiness.body")
+    contract = _plain_dict(
+        body.get("certification_contract"),
+        "readiness certification contract",
+    )
+    specifications = _plain_list(
+        contract.get("specifications"),
+        "readiness certification specifications",
+    )
+    records = _plain_list(contract.get("records"), "readiness certification records")
+    specification_ids = [
+        _plain_dict(item, "readiness certification specification").get("certification_id")
+        for item in specifications
+    ]
+    record_ids = [
+        _plain_dict(item, "readiness certification record").get("certification_id")
+        for item in records
+    ]
+    _require(
+        bool(specification_ids)
+        and all(type(item) is str and bool(item) for item in specification_ids)
+        and len(specification_ids) == len(set(specification_ids)),
+        "readiness certification identifiers are invalid",
+    )
+    _require(record_ids == specification_ids, "readiness certification record order differs")
+    _require(
+        all(
+            _plain_dict(item, "readiness certification record").get("status") == "passed"
+            and _plain_dict(item, "readiness certification record").get("exit_code") == 0
+            for item in records
+        ),
+        "readiness certification record is not passed",
+    )
+    _require(
+        READINESS_EQUIVALENCE_CERTIFICATION_ID in specification_ids,
+        "readiness equivalence certification is absent",
+    )
+    _require(
+        contract.get("all_required_certifications_passed") is True,
+        "readiness certifications are incomplete",
+    )
+    _require(
+        contract.get("specifications_sha256") == canonical_sha256(specifications),
+        "readiness certification specification digest differs",
+    )
+    _require(
+        contract.get("records_sha256") == canonical_sha256(records),
+        "readiness certification record digest differs",
+    )
+    return {
+        "readiness_receipt_sha256": bundle.receipt_sha256,
+        "certification_ids": specification_ids,
+        "certification_specifications_sha256": contract["specifications_sha256"],
+        "certification_records_sha256": contract["records_sha256"],
+        "all_required_certifications_passed": True,
+    }
+
+
+def _validate_aggregation_readiness_certification_binding(
+    binding: Mapping[str, object],
+) -> dict[str, object]:
+    normalized = _plain_dict(binding, "aggregation readiness certification binding")
+    _exact_keys(
+        normalized,
+        {
+            "readiness_receipt_sha256",
+            "certification_ids",
+            "certification_specifications_sha256",
+            "certification_records_sha256",
+            "all_required_certifications_passed",
+        },
+        "aggregation readiness certification binding",
+    )
+    for field in (
+        "readiness_receipt_sha256",
+        "certification_specifications_sha256",
+        "certification_records_sha256",
+    ):
+        _require(_is_sha256(normalized[field]), f"aggregation certification {field} invalid")
+    certification_ids = _plain_list(
+        normalized["certification_ids"],
+        "aggregation certification identifiers",
+    )
+    _require(
+        bool(certification_ids)
+        and all(type(item) is str and bool(item) for item in certification_ids)
+        and len(certification_ids) == len(set(certification_ids)),
+        "aggregation certification identifiers are invalid",
+    )
+    _require(
+        READINESS_EQUIVALENCE_CERTIFICATION_ID in certification_ids,
+        "aggregation equivalence certification is absent",
+    )
+    _require(
+        normalized["all_required_certifications_passed"] is True,
+        "aggregation readiness certifications are incomplete",
+    )
+    return normalized
+
+
 def load_validated_readiness_bundle(
     directory: Path,
     *,
     recheck_current: bool = False,
     recheck_runtime: bool = True,
 ) -> ValidatedReadinessBundle:
-    """Load the exact published receipt and ZIP, rejecting mutable-path defects."""
+    """Load one coherent published receipt/ZIP byte pair exactly once."""
 
-    validation = validate_published_readiness_receipt(
-        directory,
-        recheck_current=recheck_current,
-        recheck_runtime=recheck_runtime,
-    )
-    _require(validation.valid, "; ".join(validation.errors))
-    receipt_raw = _read_regular_file(
-        directory / "readiness.json",
-        max_bytes=_MAX_RECEIPT_BYTES,
-        label="readiness receipt",
-    )
-    archive = _read_regular_file(
-        directory / "source.zip",
-        max_bytes=_MAX_SOURCE_ZIP_BYTES,
-        label="readiness source ZIP",
-    )
-    receipt = _strict_json(receipt_raw, "readiness receipt")
     try:
-        bundle = require_validated_readiness_receipt(
-            receipt,
-            archive,
+        bundle = load_validated_published_readiness_bundle(
+            directory,
             recheck_current=recheck_current,
             recheck_runtime=recheck_runtime,
         )
@@ -1257,6 +1525,30 @@ class CalibrationCaseRequest:
                 "explicit_acknowledgement": self.explicit_acknowledgement,
             }
         )
+
+
+def calibration_case_request_binding_sha256(request: CalibrationCaseRequest) -> str:
+    """Hash the immutable request identity without attempt-local replay consent."""
+
+    _require(
+        type(request) is CalibrationCaseRequest,
+        "case request binding requires the exact request type",
+    )
+    body = {
+        "schema": CALIBRATION_CASE_REQUEST_BINDING_SCHEMA,
+        "case_request_schema": request.schema,
+        "development_only": True,
+        "scientific_promotion_allowed": False,
+        "thresholds_frozen": False,
+        "case_index": request.case_index,
+        "case_binding": request.case_binding,
+        "protocol_payload_sha256": CALIBRATION_DESIGN_PAYLOAD_SHA256,
+        "seed_snapshot_sha256": SEED_SNAPSHOT_SHA256,
+        "readiness_binding": request.readiness_binding,
+        "managed_ledger_genesis_sha256": request.managed_ledger_genesis_sha256,
+        "explicit_acknowledgement": request.explicit_acknowledgement,
+    }
+    return canonical_sha256(body)
 
 
 def build_calibration_case_request(
@@ -1375,14 +1667,20 @@ def _require_pristine_execution_inventory(
     for field in (
         "started_case_indices",
         "completed_case_indices",
-        "interrupted_case_indices",
+        "finalized_case_indices",
+        "learner_interrupted_case_indices",
+        "post_audit_unfinalized_case_indices",
         "started_records",
         "completed_records",
+        "finalized_records",
+        "attempt_records",
     ):
         _require(normalized.get(field) == [], f"preflight inventory {field} is not empty")
     for field in (
         "started_record_count",
         "completed_record_count",
+        "finalized_record_count",
+        "managed_execution_attempt_count",
         "protected_started_record_count",
         "protected_completed_record_count",
     ):
@@ -1765,7 +2063,7 @@ def extract_calibration_case_shard(
     runtime_binding = cast(Any, _runtime_binding(design, case.condition)).to_payload()
     manifest_binding = cast(Any, _manifest_binding(design, case.manifest_name)).to_payload()
     recurrence_binding = cast(Any, _recurrence_binding(design, case.manifest_name)).to_payload()
-    request_payload = request.to_payload()
+    case_request_binding_sha256 = calibration_case_request_binding_sha256(request)
     provenance = _plain_dict(_encode_exact(dict(worker_provenance)), "worker provenance")
     _require(
         provenance.get("source_archive_sha256")
@@ -1802,7 +2100,12 @@ def extract_calibration_case_shard(
             "summary_sha256",
             "resource_sha256",
             "primitive_trace_sha256",
+            "final_state_sha256",
             "outcome_sha256",
+            "managed_execution_attempt_count",
+            "attempt_records_sha256",
+            "zip_provenance_binding_sha256",
+            "zip_provenance_attestation_sha256",
         },
         "execution record binding",
     )
@@ -1823,8 +2126,16 @@ def extract_calibration_case_shard(
         "resource_sha256",
         "primitive_trace_sha256",
         "outcome_sha256",
+        "attempt_records_sha256",
+        "zip_provenance_binding_sha256",
+        "zip_provenance_attestation_sha256",
     ):
         _require(_is_sha256(execution_record[field]), f"execution {field} is invalid")
+    _strict_int(
+        execution_record["managed_execution_attempt_count"],
+        "managed execution attempt count",
+        minimum=1,
+    )
     _require(
         execution_record["summary_sha256"] == summary_sha256,
         "summary differs from managed completion",
@@ -1850,7 +2161,7 @@ def extract_calibration_case_shard(
         "recurrence_binding": recurrence_binding,
         "protocol_payload_sha256": CALIBRATION_DESIGN_PAYLOAD_SHA256,
         "seed_snapshot_sha256": SEED_SNAPSHOT_SHA256,
-        "request_payload_sha256": request_payload["payload_sha256"],
+        "case_request_binding_sha256": case_request_binding_sha256,
         "readiness_binding": request.readiness_binding,
         "worker_provenance": provenance,
         "execution_record_binding": execution_record,
@@ -1868,7 +2179,8 @@ def extract_calibration_case_shard(
             "component_outcome": CALIBRATION_EXECUTION_OUTCOME_DIGEST_SCHEMA,
         },
         "executed_steps": EXPECTED_STEPS,
-        "execution_count": 1,
+        "managed_execution_attempt_count": execution_record["managed_execution_attempt_count"],
+        "unique_completed_outcome_count": 1,
         "configuration": config_payload,
         "configuration_sha256": canonical_sha256(config_payload),
         "resource": resource_payload,
@@ -1933,6 +2245,10 @@ def _validate_audit_payload(audit: Mapping[str, object], summary: Mapping[str, o
     _require(audit["mismatch_count"] == 0, "case audit has mismatches")
     _require(audit["mismatches_sha256"] == canonical_sha256([]), "audit mismatch digest differs")
     _require(audit["unobserved_transition_fields"] == [], "case audit leaves fields unobserved")
+    _strict_int(
+        audit["accepted_float32_contraction_count"],
+        "accepted float32 contraction count",
+    )
     for field in (
         "trace_audit_report_sha256",
         "accepted_float32_contractions_sha256",
@@ -1940,6 +2256,11 @@ def _validate_audit_payload(audit: Mapping[str, object], summary: Mapping[str, o
         "lineage_oracle_mismatches_sha256",
     ):
         _require(_is_sha256(audit[field]), f"case audit {field} is invalid")
+    _require(
+        audit["evidence_boundary_sha256"]
+        == hashlib.sha256(EVIDENCE_BOUNDARY.encode("utf-8")).hexdigest(),
+        "case audit evidence boundary differs",
+    )
     _require(
         audit["lineage_oracle_schema"] == HIDDEN_REGIME_LINEAGE_ORACLE_SCHEMA, "lineage schema"
     )
@@ -2003,14 +2324,15 @@ def validate_calibration_case_shard(
         "recurrence_binding",
         "protocol_payload_sha256",
         "seed_snapshot_sha256",
-        "request_payload_sha256",
+        "case_request_binding_sha256",
         "readiness_binding",
         "worker_provenance",
         "execution_record_binding",
         "runtime_schemas",
         "execution_digest_schemas",
         "executed_steps",
-        "execution_count",
+        "managed_execution_attempt_count",
+        "unique_completed_outcome_count",
         "configuration",
         "configuration_sha256",
         "resource",
@@ -2036,7 +2358,10 @@ def validate_calibration_case_shard(
         body["protocol_payload_sha256"] == CALIBRATION_DESIGN_PAYLOAD_SHA256, "protocol digest"
     )
     _require(body["seed_snapshot_sha256"] == SEED_SNAPSHOT_SHA256, "seed digest")
-    _require(_is_sha256(body["request_payload_sha256"]), "request digest invalid")
+    _require(
+        _is_sha256(body["case_request_binding_sha256"]),
+        "case request binding digest invalid",
+    )
     readiness = _plain_dict(body["readiness_binding"], "shard readiness binding")
     _exact_keys(
         readiness,
@@ -2100,6 +2425,14 @@ def validate_calibration_case_shard(
             "source_zip_first",
             "mutable_project_path_count",
             "fresh_empty_working_directory",
+            "no_site_startup",
+            "prebootstrap_pth_hook_absent",
+            "receipt_bound_runtime_prefix",
+            "exact_receipt_bound_site_search_paths",
+            "dont_write_bytecode",
+            "command_line_pycache_prefix",
+            "pycache_prefix_fresh_empty_nonsymlink",
+            "pycache_prefix_outside_bound_paths",
             "project_module_count",
             "project_modules_sha256",
         },
@@ -2120,6 +2453,17 @@ def validate_calibration_case_shard(
         provenance.get("fresh_empty_working_directory") is True,
         "worker cwd provenance mismatch",
     )
+    for field in (
+        "no_site_startup",
+        "prebootstrap_pth_hook_absent",
+        "receipt_bound_runtime_prefix",
+        "exact_receipt_bound_site_search_paths",
+        "dont_write_bytecode",
+        "command_line_pycache_prefix",
+        "pycache_prefix_fresh_empty_nonsymlink",
+        "pycache_prefix_outside_bound_paths",
+    ):
+        _require(provenance.get(field) is True, f"worker provenance {field} differs")
     _require(
         _strict_int(provenance.get("project_module_count"), "project module count", minimum=1) > 0,
         "worker loaded no project modules",
@@ -2139,7 +2483,12 @@ def validate_calibration_case_shard(
             "summary_sha256",
             "resource_sha256",
             "primitive_trace_sha256",
+            "final_state_sha256",
             "outcome_sha256",
+            "managed_execution_attempt_count",
+            "attempt_records_sha256",
+            "zip_provenance_binding_sha256",
+            "zip_provenance_attestation_sha256",
         },
         "execution record binding",
     )
@@ -2148,6 +2497,20 @@ def validate_calibration_case_shard(
     case_index = _strict_int(case_payload.get("case_index"), "case index")
     case = _case(design, case_index)
     _require(case_payload == case.to_payload(), "shard case differs from frozen ledger")
+    expected_request_binding = calibration_case_request_binding_sha256(
+        CalibrationCaseRequest(
+            case_index=case_index,
+            case_binding=case.to_payload(),
+            readiness_binding=readiness,
+            managed_ledger_genesis_sha256=cast(str, governance["genesis_sha256"]),
+            allow_exact_replay=False,
+            explicit_acknowledgement=EXECUTION_ACKNOWLEDGEMENT,
+        )
+    )
+    _require(
+        body["case_request_binding_sha256"] == expected_request_binding,
+        "case request binding differs from replay-invariant request projection",
+    )
     _require(execution_record["case_index"] == case_index, "execution record case differs")
     _require(
         execution_record["genesis_sha256"] == governance["genesis_sha256"],
@@ -2161,8 +2524,16 @@ def validate_calibration_case_shard(
         "resource_sha256",
         "primitive_trace_sha256",
         "outcome_sha256",
+        "attempt_records_sha256",
+        "zip_provenance_binding_sha256",
+        "zip_provenance_attestation_sha256",
     ):
         _require(_is_sha256(execution_record[field]), f"execution record {field} invalid")
+    attempt_count = _strict_int(
+        execution_record["managed_execution_attempt_count"],
+        "managed execution attempt count",
+        minimum=1,
+    )
     _require(
         body["condition_runtime_binding"]
         == cast(Any, _runtime_binding(design, case.condition)).to_payload(),
@@ -2202,7 +2573,11 @@ def validate_calibration_case_shard(
         "execution digest schema binding differs",
     )
     _require(body["executed_steps"] == EXPECTED_STEPS, "case step count differs")
-    _require(body["execution_count"] == 1, "case execution count differs")
+    _require(
+        body["managed_execution_attempt_count"] == attempt_count,
+        "case execution attempt count differs",
+    )
+    _require(body["unique_completed_outcome_count"] == 1, "completed outcome count differs")
     config = _plain_dict(body["configuration"], "configuration")
     _require(canonical_sha256(config) == body["configuration_sha256"], "config digest mismatch")
     expected_config = _plain_dict(
@@ -2275,27 +2650,27 @@ def validate_calibration_case_shard(
     return dict(payload)
 
 
-def _write_new_immutable(parent: Path, name: str, raw: bytes) -> None:
-    _require(
-        bool(name) and name not in {".", ".."} and "/" not in name,
-        "immutable publication member name is invalid",
-    )
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+def _write_new_immutable(
+    parent: Path,
+    name: str,
+    raw: bytes,
+    *,
+    max_bytes: int,
+    label: str,
+) -> None:
+    """Publish through an invisible anonymous inode and one atomic final link."""
+
     directory_fd, _ = _open_directory_without_symlinks(parent, label="publication parent")
     try:
-        descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
-        try:
-            view = memoryview(raw)
-            while view:
-                written = os.write(descriptor, view)
-                _require(written > 0, "short write while publishing case shard")
-                view = view[written:]
-            os.fchmod(descriptor, 0o444)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        os.fsync(directory_fd)
+        atomic_install_new_immutable(
+            directory_fd,
+            name,
+            raw,
+            max_bytes=max_bytes,
+            label=label,
+        )
+    except HiddenRegimeExecutionGovernanceError as exc:
+        raise CalibrationError(str(exc)) from exc
     finally:
         os.close(directory_fd)
 
@@ -2357,17 +2732,47 @@ def calibration_case_shard_path(
     return publication_root.absolute() / readiness_receipt_sha256 / f"case-{case_index:03d}.json"
 
 
+def validate_finalized_calibration_case_shard(
+    payload: Mapping[str, object],
+    *,
+    expected_readiness_binding: Mapping[str, object],
+    managed_ledger_directory: Path,
+) -> dict[str, object]:
+    """Require structural validity and an exact immutable post-audit finalization."""
+
+    validated = validate_calibration_case_shard(
+        payload,
+        expected_readiness_binding=expected_readiness_binding,
+    )
+    body = _validate_payload_digest(validated, "finalized case shard")
+    case_index = _strict_int(_plain_dict(body["case"], "case")["case_index"], "case index")
+    try:
+        recovered = load_finalized_calibration_case_shard(
+            managed_ledger_directory,
+            case_index,
+        )
+    except RuntimeError as exc:
+        raise CalibrationError(str(exc)) from exc
+    _require(
+        canonical_json_bytes(recovered) == canonical_json_bytes(validated),
+        "case shard differs from immutable post-audit finalization",
+    )
+    return validated
+
+
 def publish_calibration_case_shard_new_only(
     publication_root: Path,
     shard: Mapping[str, object],
     *,
     expected_readiness_binding: Mapping[str, object],
+    managed_ledger_directory: Path,
 ) -> Path:
     """Publish one canonical shard once; an existing duplicate must be byte-identical."""
 
-    validated = validate_calibration_case_shard(
+    validated = validate_finalized_calibration_case_shard(
         shard,
         expected_readiness_binding=expected_readiness_binding,
+        managed_ledger_directory=managed_ledger_directory,
     )
     body = _validate_payload_digest(validated, "case shard")
     case_index = _strict_int(_plain_dict(body["case"], "case")["case_index"], "case index")
@@ -2381,13 +2786,20 @@ def publish_calibration_case_shard_new_only(
     _shard_directory(publication_root, receipt_digest)
     raw = canonical_json_bytes(validated)
     try:
-        _write_new_immutable(path.parent, path.name, raw)
+        _write_new_immutable(
+            path.parent,
+            path.name,
+            raw,
+            max_bytes=_MAX_SHARD_BYTES,
+            label="case shard",
+        )
     except FileExistsError:
         existing_raw = _read_regular_file(path, max_bytes=_MAX_SHARD_BYTES, label="case shard")
         existing = _strict_json(existing_raw, "case shard")
-        validate_calibration_case_shard(
+        validate_finalized_calibration_case_shard(
             existing,
             expected_readiness_binding=expected_readiness_binding,
+            managed_ledger_directory=managed_ledger_directory,
         )
         _require(existing_raw == raw, "duplicate case shard is not byte-identical")
     return path
@@ -2397,6 +2809,7 @@ def load_complete_calibration_case_shards(
     publication_root: Path,
     *,
     expected_readiness_binding: Mapping[str, object],
+    managed_ledger_directory: Path,
 ) -> tuple[dict[str, object], ...]:
     """Load the exact 240 unique canonical shards and reject every extra member."""
 
@@ -2414,9 +2827,10 @@ def load_complete_calibration_case_shards(
             label=f"case shard {index}",
         )
         payload = _strict_json(raw, f"case shard {index}")
-        validated = validate_calibration_case_shard(
+        validated = validate_finalized_calibration_case_shard(
             payload,
             expected_readiness_binding=expected_readiness_binding,
+            managed_ledger_directory=managed_ledger_directory,
         )
         body = _validate_payload_digest(validated, f"case shard {index}")
         _require(
@@ -2452,6 +2866,14 @@ def _execution_record_binding(
         completed.get("started_record_sha256") == started.get("started_record_sha256"),
         "case completion does not join its start",
     )
+    try:
+        attempt_binding = calibration_case_attempt_binding(inventory, case_index)
+    except RuntimeError as exc:
+        raise CalibrationError(str(exc)) from exc
+    zip_binding_sha256 = started.get("zip_provenance_binding_sha256")
+    zip_attestation_sha256 = started.get("zip_provenance_attestation_sha256")
+    _require(_is_sha256(zip_binding_sha256), "started ZIP provenance binding is invalid")
+    _require(_is_sha256(zip_attestation_sha256), "started ZIP provenance attestation is invalid")
     return {
         "case_index": case_index,
         "genesis_sha256": inventory["genesis_sha256"],
@@ -2460,7 +2882,12 @@ def _execution_record_binding(
         "summary_sha256": completed["summary_sha256"],
         "resource_sha256": completed["resource_sha256"],
         "primitive_trace_sha256": completed["primitive_trace_sha256"],
+        "final_state_sha256": completed["final_state_sha256"],
         "outcome_sha256": completed["outcome_sha256"],
+        "managed_execution_attempt_count": attempt_binding["managed_execution_attempt_count"],
+        "attempt_records_sha256": attempt_binding["attempt_records_sha256"],
+        "zip_provenance_binding_sha256": zip_binding_sha256,
+        "zip_provenance_attestation_sha256": zip_attestation_sha256,
     }
 
 
@@ -2516,6 +2943,9 @@ def _preflight_case_binding_rows(
                 ),
                 "configuration_sha256": configuration_sha256,
                 "seed_pair_binding_sha256": canonical_sha256(seed_pair.to_dict()),
+                "case_request_binding_sha256": calibration_case_request_binding_sha256(
+                    case_request
+                ),
                 "case_request_payload_sha256": case_request_payload["payload_sha256"],
             }
         )
@@ -2536,6 +2966,14 @@ def _validate_preflight_worker_provenance(
             "source_zip_first",
             "mutable_project_path_count",
             "fresh_empty_working_directory",
+            "no_site_startup",
+            "prebootstrap_pth_hook_absent",
+            "receipt_bound_runtime_prefix",
+            "exact_receipt_bound_site_search_paths",
+            "dont_write_bytecode",
+            "command_line_pycache_prefix",
+            "pycache_prefix_fresh_empty_nonsymlink",
+            "pycache_prefix_outside_bound_paths",
             "project_module_count",
             "project_modules_sha256",
         },
@@ -2556,9 +2994,127 @@ def _validate_preflight_worker_provenance(
         normalized["fresh_empty_working_directory"] is True,
         "preflight working directory was not empty",
     )
+    for field in (
+        "no_site_startup",
+        "prebootstrap_pth_hook_absent",
+        "receipt_bound_runtime_prefix",
+        "exact_receipt_bound_site_search_paths",
+        "dont_write_bytecode",
+        "command_line_pycache_prefix",
+        "pycache_prefix_fresh_empty_nonsymlink",
+        "pycache_prefix_outside_bound_paths",
+    ):
+        _require(normalized[field] is True, f"preflight worker {field} differs")
     _strict_int(normalized["project_module_count"], "project module count", minimum=1)
     _require(_is_sha256(normalized["project_modules_sha256"]), "module digest invalid")
     return normalized
+
+
+def _validate_aggregate_provenance_bindings(
+    aggregate_body: Mapping[str, object],
+    bundle: ValidatedReadinessBundle,
+) -> None:
+    """Bind persisted aggregation provenance to the exact successful ZIP worker."""
+
+    certification_binding = _validate_aggregation_readiness_certification_binding(
+        _plain_dict(
+            aggregate_body.get("aggregation_readiness_certification_binding"),
+            "aggregation readiness certification binding",
+        )
+    )
+    _require(
+        certification_binding == _aggregation_readiness_certification_binding(bundle),
+        "aggregation readiness certification binding differs from receipt",
+    )
+    _require(
+        aggregate_body.get("aggregation_readiness_certification_binding_sha256")
+        == canonical_sha256(certification_binding),
+        "aggregation readiness certification digest differs",
+    )
+
+    worker = _validate_preflight_worker_provenance(
+        _plain_dict(
+            aggregate_body.get("aggregation_worker_provenance"),
+            "aggregation worker provenance",
+        ),
+        bundle,
+    )
+    _require(
+        aggregate_body.get("aggregation_worker_provenance_sha256")
+        == canonical_sha256(worker),
+        "aggregation worker provenance digest differs",
+    )
+    attestation = _plain_dict(
+        aggregate_body.get("aggregation_zip_provenance_attestation"),
+        "aggregation ZIP provenance attestation",
+    )
+    _require(
+        aggregate_body.get("aggregation_zip_provenance_attestation_sha256")
+        == canonical_sha256(attestation),
+        "aggregation ZIP provenance attestation binding differs",
+    )
+    attestation_body = dict(attestation)
+    attestation_sha256 = attestation_body.pop("zip_provenance_attestation_sha256", None)
+    _require(
+        _is_sha256(attestation_sha256)
+        and canonical_sha256(attestation_body) == attestation_sha256,
+        "aggregation ZIP provenance attestation digest differs",
+    )
+    _require(
+        set(attestation_body)
+        == {"schema", "binding", "environment", "zip_provenance_policy"},
+        "aggregation ZIP provenance attestation fields differ",
+    )
+    _require(
+        attestation_body["schema"] == CALIBRATION_ZIP_PROVENANCE_SCHEMA,
+        "aggregation ZIP provenance schema differs",
+    )
+    _require(
+        attestation_body["zip_provenance_policy"] == ZIP_PROVENANCE_POLICY,
+        "aggregation ZIP provenance policy differs",
+    )
+    binding = _plain_dict(attestation_body["binding"], "aggregation ZIP provenance binding")
+    binding_body = dict(binding)
+    binding_sha256 = binding_body.pop("zip_provenance_binding_sha256", None)
+    _require(
+        _is_sha256(binding_sha256) and canonical_sha256(binding_body) == binding_sha256,
+        "aggregation ZIP provenance binding digest differs",
+    )
+    _require(
+        (
+            binding_body.get("readiness_receipt_sha256"),
+            binding_body.get("source_archive_sha256"),
+            binding_body.get("source_manifest_sha256"),
+            binding_body.get("runtime_identity_sha256"),
+        )
+        == (
+            bundle.receipt_sha256,
+            bundle.source_archive_sha256,
+            bundle.source_manifest_sha256,
+            bundle.runtime_identity_sha256,
+        ),
+        "aggregation ZIP provenance binding differs from readiness",
+    )
+    environment = _plain_dict(
+        attestation_body["environment"],
+        "aggregation ZIP provenance environment",
+    )
+    _require(
+        environment.get("source_archive_locator") == ZIP_PROVENANCE_SOURCE_ARCHIVE_LOCATOR,
+        "aggregation ZIP provenance source archive locator differs",
+    )
+    _require(
+        "source_archive_path" not in environment,
+        "aggregation ZIP provenance leaks a physical source archive path",
+    )
+    _require(
+        _is_sha256(environment.get("canonical_runtime_search_paths_sha256")),
+        "aggregation ZIP canonical runtime search-path digest differs",
+    )
+    _require(
+        environment.get("project_modules_sha256") == worker["project_modules_sha256"],
+        "aggregation ZIP provenance module inventory differs",
+    )
 
 
 def _worker_preflight(
@@ -2572,7 +3128,15 @@ def _worker_preflight(
     bundle = load_validated_readiness_bundle(
         readiness_directory,
         recheck_current=False,
-        recheck_runtime=True,
+        recheck_runtime=False,
+    )
+    readiness_body = _plain_dict(bundle.payload.get("body"), "readiness body")
+    expected_runtime_execution_identity = runtime_execution_identity_from_receipt(
+        readiness_body.get("runtime_identity")
+    )
+    _require(
+        build_runtime_execution_identity() == expected_runtime_execution_identity,
+        "worker process runtime execution identity differs before preflight",
     )
     validated_request = validate_calibration_preflight_request(request_payload, bundle)
     request_body = _validate_payload_digest(validated_request, "preflight request")
@@ -2600,6 +3164,11 @@ def _worker_preflight(
         max_bytes=_MAX_SOURCE_ZIP_BYTES,
         label="preflight source ZIP",
     )
+    zip_provenance_capability = attest_calibration_zip_provenance(
+        readiness_bundle=bundle,
+        readiness_source_archive=source_archive,
+        source_archive_path=archive_path,
+    )
     rows = _preflight_case_binding_rows(validated_request, bundle)
     issue_authorizations = cast(bool, request_body["issue_process_local_authorizations"])
     if issue_authorizations:
@@ -2609,11 +3178,19 @@ def _worker_preflight(
                 ledger_directory=ledger_directory,
                 readiness_bundle=bundle,
                 readiness_source_archive=source_archive,
+                zip_provenance_capability=zip_provenance_capability,
                 case_index=case.case_index,
                 condition=case.condition,
                 seed_pair=_seed_pair(case),
                 config=_build_case_config(design, case),
-                request_payload_sha256=cast(str, row["case_request_payload_sha256"]),
+                case_request_binding_sha256=cast(
+                    str,
+                    row["case_request_binding_sha256"],
+                ),
+                attempt_request_payload_sha256=cast(
+                    str,
+                    row["case_request_payload_sha256"],
+                ),
                 explicit_acknowledgement=EXECUTION_AUTHORIZATION_ACKNOWLEDGEMENT,
                 allow_exact_replay=False,
             )
@@ -2627,6 +3204,10 @@ def _worker_preflight(
     except RuntimeError as exc:
         raise CalibrationError(str(exc)) from exc
     _require(inventory_after == inventory_before, "preflight mutated the managed ledger")
+    _require(
+        build_runtime_execution_identity() == expected_runtime_execution_identity,
+        "worker process runtime execution identity drifted during preflight",
+    )
     rows_payload = list(rows)
     return _payload_with_digest(
         {
@@ -2762,7 +3343,15 @@ def _worker_case(
     bundle = load_validated_readiness_bundle(
         readiness_directory,
         recheck_current=False,
-        recheck_runtime=True,
+        recheck_runtime=False,
+    )
+    readiness_body = _plain_dict(bundle.payload.get("body"), "readiness body")
+    expected_runtime_execution_identity = runtime_execution_identity_from_receipt(
+        readiness_body.get("runtime_identity")
+    )
+    _require(
+        build_runtime_execution_identity() == expected_runtime_execution_identity,
+        "worker process runtime execution identity differs before the calibration case",
     )
     request = validate_calibration_case_request(request_payload, bundle)
     inventory_before = snapshot_calibration_execution_inventory(ledger_directory)
@@ -2777,6 +3366,11 @@ def _worker_case(
         max_bytes=_MAX_SOURCE_ZIP_BYTES,
         label="worker source ZIP",
     )
+    zip_provenance_capability = attest_calibration_zip_provenance(
+        readiness_bundle=bundle,
+        readiness_source_archive=source_archive,
+        source_archive_path=archive_path,
+    )
     design = _design()
     case = _case(design, request.case_index)
     seed_pair = _seed_pair(case)
@@ -2785,11 +3379,13 @@ def _worker_case(
         ledger_directory=ledger_directory,
         readiness_bundle=bundle,
         readiness_source_archive=source_archive,
+        zip_provenance_capability=zip_provenance_capability,
         case_index=case.case_index,
         condition=case.condition,
         seed_pair=seed_pair,
         config=config,
-        request_payload_sha256=cast(str, request.to_payload()["payload_sha256"]),
+        case_request_binding_sha256=calibration_case_request_binding_sha256(request),
+        attempt_request_payload_sha256=cast(str, request.to_payload()["payload_sha256"]),
         explicit_acknowledgement=EXECUTION_AUTHORIZATION_ACKNOWLEDGEMENT,
         allow_exact_replay=request.allow_exact_replay,
     )
@@ -2802,20 +3398,987 @@ def _worker_case(
     inventory_after = snapshot_calibration_execution_inventory(ledger_directory)
     execution_record = _execution_record_binding(inventory_after, case.case_index)
     audit = audit_hidden_regime_run_result(run)
-    return extract_calibration_case_shard(
+    shard = extract_calibration_case_shard(
         run,
         request,
         audit,
         worker_provenance=provenance,
         execution_record_binding=execution_record,
     )
+    validated_shard = validate_calibration_case_shard(
+        shard,
+        expected_readiness_binding=request.readiness_binding,
+    )
+    _require(
+        build_runtime_execution_identity() == expected_runtime_execution_identity,
+        "worker process runtime execution identity drifted during the calibration case",
+    )
+    require_current_full_runtime_identity(readiness_body.get("runtime_identity"))
+    finalize_calibration_case_shard(
+        authorization,
+        ledger_directory=ledger_directory,
+        shard_payload=validated_shard,
+        run_result=run,
+    )
+    recovered = load_finalized_calibration_case_shard(
+        ledger_directory,
+        case.case_index,
+    )
+    _require(
+        canonical_json_bytes(recovered) == canonical_json_bytes(validated_shard),
+        "finalized shard recovery differs before worker return",
+    )
+    return validated_shard
+
+
+def _worker_aggregate(
+    *,
+    readiness_directory: Path,
+    ledger_directory: Path,
+    shard_publication_root: Path,
+) -> dict[str, object]:
+    """Compute and validate the completed aggregate inside the certified source ZIP."""
+
+    bundle = load_validated_readiness_bundle(
+        readiness_directory,
+        recheck_current=False,
+        recheck_runtime=False,
+    )
+    readiness_body = _plain_dict(bundle.payload.get("body"), "readiness body")
+    expected_runtime_execution_identity = runtime_execution_identity_from_receipt(
+        readiness_body.get("runtime_identity")
+    )
+    _require(
+        build_runtime_execution_identity() == expected_runtime_execution_identity,
+        "worker process runtime execution identity differs before aggregation",
+    )
+    readiness = _readiness_binding(bundle)
+    readiness_certification_binding = _aggregation_readiness_certification_binding(bundle)
+    archive_path = readiness_directory.absolute() / "source.zip"
+    worker_provenance = _zip_worker_provenance(archive_path, bundle)
+    source_archive = _read_regular_file(
+        archive_path,
+        max_bytes=_MAX_SOURCE_ZIP_BYTES,
+        label="aggregate worker source ZIP",
+    )
+    zip_provenance_capability = attest_calibration_zip_provenance(
+        readiness_bundle=bundle,
+        readiness_source_archive=source_archive,
+        source_archive_path=archive_path,
+    )
+    shards = load_complete_calibration_case_shards(
+        shard_publication_root,
+        expected_readiness_binding=readiness,
+        managed_ledger_directory=ledger_directory,
+    )
+    inventory = snapshot_calibration_execution_inventory(ledger_directory)
+    aggregate = aggregate_hidden_regime_factorial_calibration(
+        shards,
+        managed_ledger_snapshot=inventory,
+        managed_ledger_directory=ledger_directory,
+        aggregation_worker_provenance=worker_provenance,
+        aggregation_zip_provenance_attestation=zip_provenance_capability.payload,
+        aggregation_readiness_certification_binding=readiness_certification_binding,
+    )
+    validated = validate_calibration_aggregate(
+        aggregate,
+        shards,
+        managed_ledger_snapshot=inventory,
+        managed_ledger_directory=ledger_directory,
+        aggregation_worker_provenance=worker_provenance,
+        aggregation_zip_provenance_attestation=zip_provenance_capability.payload,
+        aggregation_readiness_certification_binding=readiness_certification_binding,
+    )
+    _validate_aggregate_provenance_bindings(
+        _validate_payload_digest(validated, "aggregate worker result"),
+        bundle,
+    )
+    _require(
+        build_runtime_execution_identity() == expected_runtime_execution_identity,
+        "worker process runtime execution identity drifted during aggregation",
+    )
+    require_current_full_runtime_identity(readiness_body.get("runtime_identity"))
+    return validated
+
+
+def _threshold_freeze_receipt_body(
+    payload: Mapping[str, object],
+    *,
+    label: str,
+) -> dict[str, object]:
+    """Validate the self-address and fail-closed decision shape of one receipt."""
+
+    try:
+        normalized = dict(payload)
+        canonical_json_bytes(normalized)
+    except (TypeError, ValueError) as exc:
+        raise CalibrationError(f"{label} is not canonical JSON data") from exc
+    digest = normalized.pop("receipt_payload_sha256", None)
+    _require(_is_sha256(digest), f"{label} receipt payload digest is invalid")
+    _require(canonical_sha256(normalized) == digest, f"{label} receipt payload digest differs")
+    _require(
+        normalized.get("receipt_schema") == THRESHOLD_FREEZE_RECEIPT_SCHEMA,
+        f"{label} receipt schema differs",
+    )
+    _require(normalized.get("development_only") is True, f"{label} is not development-only")
+    _require(normalized.get("claim_accepted") is False, f"{label} accepts a claim")
+    _require(
+        normalized.get("scientific_promotion_allowed") is False,
+        f"{label} permits scientific promotion",
+    )
+    _require(normalized.get("amendments_allowed") is False, f"{label} permits amendments")
+    _require(
+        _is_sha256(normalized.get("calibration_outcomes_payload_sha256")),
+        f"{label} aggregate binding is invalid",
+    )
+    _require(
+        _is_sha256(normalized.get("readiness_receipt_sha256")),
+        f"{label} readiness binding is invalid",
+    )
+    decision = normalized.get("decision_status")
+    _require(
+        decision in {THRESHOLD_FREEZE_DECISION_FROZEN, THRESHOLD_FREEZE_DECISION_REJECTION},
+        f"{label} decision status differs",
+    )
+    frozen = _plain_list(normalized.get("frozen_thresholds"), f"{label} frozen thresholds")
+    reasons = _plain_list(normalized.get("rejection_reasons"), f"{label} rejection reasons")
+    if decision == THRESHOLD_FREEZE_DECISION_FROZEN:
+        _require(normalized.get("thresholds_frozen") is True, f"{label} does not freeze")
+        _require(bool(frozen), f"{label} has no frozen thresholds")
+        _require(not reasons, f"{label} success contains rejection reasons")
+    else:
+        _require(normalized.get("thresholds_frozen") is False, f"{label} rejection freezes")
+        _require(not frozen, f"{label} rejection partially freezes thresholds")
+        _require(bool(reasons), f"{label} rejection has no reason")
+    return normalized
+
+
+def _successful_threshold_freeze_receipt_body(
+    payload: Mapping[str, object],
+    *,
+    label: str,
+) -> dict[str, object]:
+    """Require the structural success capability needed for protected planning."""
+
+    body = _threshold_freeze_receipt_body(payload, label=label)
+    _require(
+        body.get("decision_status") == THRESHOLD_FREEZE_DECISION_FROZEN
+        and body.get("thresholds_frozen") is True,
+        f"{label} is not a successful threshold freeze",
+    )
+    _require(body.get("rejection_reasons") == [], f"{label} contains rejection reasons")
+    frozen_thresholds = _plain_list(
+        body.get("frozen_thresholds"),
+        f"{label} frozen thresholds",
+    )
+    _require(
+        body.get("mandatory_statistical_endpoint_count")
+        == MANDATORY_STATISTICAL_ENDPOINT_COUNT
+        and len(frozen_thresholds) == MANDATORY_STATISTICAL_ENDPOINT_COUNT,
+        f"{label} does not bind exactly 35 endpoints",
+    )
+    _require(
+        body.get("mandatory_statistical_endpoint_identities_sha256")
+        == MANDATORY_STATISTICAL_ENDPOINT_IDENTITIES_SHA256,
+        f"{label} endpoint identity digest differs",
+    )
+    _require(
+        body.get("mandatory_statistical_endpoint_ids_sha256")
+        == MANDATORY_STATISTICAL_ENDPOINT_IDS_SHA256,
+        f"{label} endpoint ID digest differs",
+    )
+    return body
+
+
+def _threshold_freeze_exact_input_binding(
+    calibration_aggregate: Mapping[str, object],
+    shards: Sequence[Mapping[str, object]],
+    managed_ledger_snapshot: Mapping[str, object],
+) -> dict[str, object]:
+    """Join the live immutable shards and ledger to the aggregate's exact identities."""
+
+    aggregate_body = _validate_payload_digest(calibration_aggregate, "calibration aggregate")
+    aggregate_payload_sha256 = calibration_aggregate.get("payload_sha256")
+    _require(_is_sha256(aggregate_payload_sha256), "aggregate payload digest is invalid")
+    embedded_inventory = _plain_dict(
+        aggregate_body.get("managed_ledger_snapshot"),
+        "aggregate managed ledger snapshot",
+    )
+    current_inventory = _plain_dict(managed_ledger_snapshot, "current managed ledger snapshot")
+    _require(
+        canonical_sha256(embedded_inventory)
+        == aggregate_body.get("managed_ledger_snapshot_sha256"),
+        "aggregate managed ledger snapshot digest differs",
+    )
+    _require(
+        canonical_json_bytes(current_inventory) == canonical_json_bytes(embedded_inventory),
+        "managed ledger changed after threshold worker recomputation",
+    )
+    inventory_sha256 = current_inventory.get("inventory_sha256")
+    _require(_is_sha256(inventory_sha256), "managed ledger inventory digest is invalid")
+
+    case_ledger = _plain_list(aggregate_body.get("case_ledger"), "aggregate case ledger")
+    _require(
+        canonical_sha256(case_ledger) == aggregate_body.get("case_ledger_sha256"),
+        "aggregate case ledger digest differs",
+    )
+    expected_rows = [
+        {
+            "case_index": _strict_int(
+                _plain_dict(item, "aggregate case ledger row").get("case_index"),
+                "aggregate case index",
+            ),
+            "case_shard_payload_sha256": _plain_dict(
+                item,
+                "aggregate case ledger row",
+            ).get("case_shard_payload_sha256"),
+        }
+        for item in case_ledger
+    ]
+    _require(
+        len(expected_rows) == EXPECTED_CASES
+        and [row["case_index"] for row in expected_rows] == list(range(EXPECTED_CASES)),
+        "aggregate case ledger indices differ",
+    )
+    _require(
+        all(_is_sha256(row["case_shard_payload_sha256"]) for row in expected_rows),
+        "aggregate case shard digest is invalid",
+    )
+    actual_rows: list[dict[str, object]] = []
+    for expected_index, shard in enumerate(shards):
+        shard_body = _validate_payload_digest(shard, f"threshold input shard {expected_index}")
+        case_index = _strict_int(
+            _plain_dict(shard_body.get("case"), "threshold input shard case").get(
+                "case_index"
+            ),
+            "threshold input shard case index",
+        )
+        actual_rows.append(
+            {
+                "case_index": case_index,
+                "case_shard_payload_sha256": shard.get("payload_sha256"),
+            }
+        )
+    _require(actual_rows == expected_rows, "case shards changed after threshold recomputation")
+    body = {
+        "schema": THRESHOLD_FREEZE_EXACT_INPUT_BINDING_SCHEMA,
+        "calibration_aggregate_payload_sha256": aggregate_payload_sha256,
+        "managed_ledger_inventory_sha256": inventory_sha256,
+        "managed_ledger_snapshot_sha256": canonical_sha256(current_inventory),
+        "case_ledger_sha256": aggregate_body["case_ledger_sha256"],
+        "case_shard_payloads_sha256": canonical_sha256(actual_rows),
+        "case_count": len(actual_rows),
+    }
+    return body
+
+
+def _protected_plan_body(
+    payload: Mapping[str, object],
+    *,
+    label: str,
+) -> dict[str, object]:
+    """Structurally validate certified plan bytes without re-deriving protected seeds."""
+
+    body = _validate_payload_digest(payload, label)
+    _exact_keys(
+        body,
+        {
+            "schema",
+            "status_time_scope",
+            "plan_status",
+            "use_partition",
+            "scientific_evidence_eligible_if_validated",
+            "scientific_promotion_allowed",
+            "automatic_promotion_allowed",
+            "amendments_allowed",
+            "thresholds_frozen",
+            "threshold_adjustment_permitted",
+            "protected_namespace_derived",
+            "protected_outcomes_observed",
+            "learner_outcomes_executed",
+            "learner_execution_authorized",
+            "protected_execution_permitted",
+            "execution_issuer_available",
+            "protected_readiness_receipt_sha256",
+            "protected_execution_ledger_genesis_sha256",
+            "calibration_binding",
+            "threshold_freeze_receipt_binding",
+            "frozen_thresholds",
+            "frozen_thresholds_sha256",
+            "protected_seed_snapshot",
+            "protected_seed_snapshot_sha256",
+            "seed_disjointness_proof",
+            "seed_disjointness_proof_sha256",
+            "structural_manifest_order",
+            "structural_manifest_order_sha256",
+            "manifest_bindings",
+            "manifest_bindings_sha256",
+            "recurrence_eligibility_bindings",
+            "recurrence_eligibility_bindings_sha256",
+            "assignment_rule",
+            "assignments",
+            "assignments_sha256",
+            "condition_order",
+            "condition_order_sha256",
+            "cases",
+            "cases_sha256",
+            "seed_pair_count",
+            "condition_count",
+            "matched_case_count",
+            "manifest_seed_pair_counts",
+            "manifest_case_counts",
+            "condition_case_counts",
+            "evaluation_contract",
+            "evaluation_contract_sha256",
+            "protected_decision_rule",
+            "protected_decision_rule_sha256",
+            "claim_scope",
+            "limitations",
+        },
+        label,
+    )
+    _require(body["schema"] == PROTECTED_PLAN_SCHEMA, f"{label} schema differs")
+    _require(body["plan_status"] == "preregistered_unexecuted", f"{label} status differs")
+    _require(body["use_partition"] == PROTECTED_CANDIDATE_PARTITION, f"{label} partition differs")
+    _require(
+        body["scientific_evidence_eligible_if_validated"] is True,
+        f"{label} evidence eligibility differs",
+    )
+    _require(body["thresholds_frozen"] is True, f"{label} thresholds are not frozen")
+    _require(body["protected_namespace_derived"] is True, f"{label} namespace is not derived")
+    for field in (
+        "scientific_promotion_allowed",
+        "automatic_promotion_allowed",
+        "amendments_allowed",
+        "threshold_adjustment_permitted",
+        "protected_outcomes_observed",
+        "learner_outcomes_executed",
+        "learner_execution_authorized",
+        "protected_execution_permitted",
+        "execution_issuer_available",
+    ):
+        _require(body[field] is False, f"{label} {field} must be false")
+    for field in (
+        "protected_readiness_receipt_sha256",
+        "protected_execution_ledger_genesis_sha256",
+    ):
+        _require(body[field] is None, f"{label} {field} must be absent")
+    for value_field, digest_field in (
+        ("frozen_thresholds", "frozen_thresholds_sha256"),
+        ("protected_seed_snapshot", "protected_seed_snapshot_sha256"),
+        ("seed_disjointness_proof", "seed_disjointness_proof_sha256"),
+        ("structural_manifest_order", "structural_manifest_order_sha256"),
+        ("manifest_bindings", "manifest_bindings_sha256"),
+        (
+            "recurrence_eligibility_bindings",
+            "recurrence_eligibility_bindings_sha256",
+        ),
+        ("assignments", "assignments_sha256"),
+        ("condition_order", "condition_order_sha256"),
+        ("cases", "cases_sha256"),
+        ("evaluation_contract", "evaluation_contract_sha256"),
+        ("protected_decision_rule", "protected_decision_rule_sha256"),
+    ):
+        _require(_is_sha256(body[digest_field]), f"{label} {digest_field} is invalid")
+        _require(
+            canonical_sha256(body[value_field]) == body[digest_field],
+            f"{label} {digest_field} differs",
+        )
+    _require(
+        body["seed_pair_count"] == EXPECTED_SEED_PAIRS
+        and body["condition_count"] == EXPECTED_CONDITIONS
+        and body["matched_case_count"] == EXPECTED_CASES,
+        f"{label} factorial counts differ",
+    )
+    assignments = _plain_list(body["assignments"], f"{label} assignments")
+    cases = _plain_list(body["cases"], f"{label} cases")
+    _require(len(assignments) == EXPECTED_SEED_PAIRS, f"{label} assignment count differs")
+    _require(len(cases) == EXPECTED_CASES, f"{label} case count differs")
+    _require(
+        [
+            _plain_dict(item, f"{label} assignment").get("seed_index")
+            for item in assignments
+        ]
+        == list(range(EXPECTED_SEED_PAIRS)),
+        f"{label} assignment order differs",
+    )
+    _require(
+        [_plain_dict(item, f"{label} case").get("case_index") for item in cases]
+        == list(range(EXPECTED_CASES)),
+        f"{label} case order differs",
+    )
+    return body
+
+
+def _validate_protected_plan_bindings(
+    plan_body: Mapping[str, object],
+    *,
+    protected_plan: Mapping[str, object],
+    threshold_receipt: Mapping[str, object],
+    calibration_aggregate: Mapping[str, object],
+) -> None:
+    """Bind certified plan bytes to the exact receipt and aggregate without recomputation."""
+
+    aggregate_digest = calibration_aggregate.get("payload_sha256")
+    receipt_digest = threshold_receipt.get("receipt_payload_sha256")
+    plan_digest = protected_plan.get("payload_sha256")
+    for value, label in (
+        (aggregate_digest, "plan aggregate digest"),
+        (receipt_digest, "plan threshold receipt digest"),
+        (plan_digest, "protected plan digest"),
+    ):
+        _require(_is_sha256(value), f"{label} is invalid")
+    calibration_binding = _plain_dict(
+        plan_body.get("calibration_binding"),
+        "protected plan calibration binding",
+    )
+    receipt_binding = _plain_dict(
+        plan_body.get("threshold_freeze_receipt_binding"),
+        "protected plan threshold receipt binding",
+    )
+    _exact_keys(
+        calibration_binding,
+        {
+            "protocol_payload_sha256",
+            "calibration_seed_snapshot_sha256",
+            "calibration_aggregate_schema",
+            "calibration_aggregate_payload_sha256",
+            "calibration_readiness_receipt_sha256",
+            "calibration_gate_matrix_sha256",
+            "calibration_source_closure_sha256",
+            "calibration_source_archive_sha256",
+            "calibration_environment_identity_sha256",
+            "calibration_managed_ledger_snapshot_sha256",
+            "calibration_managed_ledger_content_address",
+            "calibration_execution_governance_genesis_sha256",
+            "calibration_case_ledger_sha256",
+            "aggregation_readiness_certification_binding_sha256",
+            "mandatory_audit_summary_sha256",
+        },
+        "protected plan calibration binding",
+    )
+    _exact_keys(
+        receipt_binding,
+        {
+            "receipt_schema",
+            "receipt_payload_sha256",
+            "decision_status",
+            "mandatory_statistical_endpoint_count",
+            "mandatory_statistical_endpoint_identities_sha256",
+            "mandatory_statistical_endpoint_ids_sha256",
+        },
+        "protected plan threshold receipt binding",
+    )
+    _require(
+        calibration_binding.get("calibration_aggregate_payload_sha256")
+        == aggregate_digest,
+        "protected plan binds another aggregate",
+    )
+    _require(
+        receipt_binding.get("receipt_payload_sha256") == receipt_digest,
+        "protected plan binds another threshold receipt",
+    )
+    _require(
+        receipt_binding.get("receipt_schema") == THRESHOLD_FREEZE_RECEIPT_SCHEMA
+        and receipt_binding.get("decision_status") == THRESHOLD_FREEZE_DECISION_FROZEN,
+        "protected plan threshold receipt capability differs",
+    )
+    _require(
+        receipt_binding.get("mandatory_statistical_endpoint_count")
+        == MANDATORY_STATISTICAL_ENDPOINT_COUNT
+        and receipt_binding.get("mandatory_statistical_endpoint_identities_sha256")
+        == MANDATORY_STATISTICAL_ENDPOINT_IDENTITIES_SHA256
+        and receipt_binding.get("mandatory_statistical_endpoint_ids_sha256")
+        == MANDATORY_STATISTICAL_ENDPOINT_IDS_SHA256,
+        "protected plan endpoint identity binding differs",
+    )
+    receipt_body = _successful_threshold_freeze_receipt_body(
+        threshold_receipt,
+        label="protected plan threshold-freeze receipt",
+    )
+    _require(
+        receipt_body.get("calibration_outcomes_payload_sha256") == aggregate_digest,
+        "threshold receipt binds another aggregate",
+    )
+    _require(
+        plan_body.get("frozen_thresholds") == receipt_body.get("frozen_thresholds"),
+        "protected plan frozen thresholds differ from threshold receipt",
+    )
+    for plan_field, receipt_field in (
+        ("protocol_payload_sha256", "protocol_payload_sha256"),
+        ("calibration_seed_snapshot_sha256", "seed_snapshot_sha256"),
+        ("calibration_readiness_receipt_sha256", "readiness_receipt_sha256"),
+        ("calibration_gate_matrix_sha256", "gate_matrix_sha256"),
+        ("calibration_source_closure_sha256", "source_closure_sha256"),
+        ("calibration_source_archive_sha256", "source_archive_sha256"),
+        ("calibration_environment_identity_sha256", "environment_identity_sha256"),
+        ("calibration_managed_ledger_snapshot_sha256", "managed_ledger_snapshot_sha256"),
+        ("calibration_managed_ledger_content_address", "managed_ledger_content_address"),
+        (
+            "calibration_execution_governance_genesis_sha256",
+            "execution_governance_genesis_sha256",
+        ),
+        ("calibration_case_ledger_sha256", "case_ledger_sha256"),
+        (
+            "aggregation_readiness_certification_binding_sha256",
+            "aggregation_readiness_certification_binding_sha256",
+        ),
+        ("mandatory_audit_summary_sha256", "mandatory_audit_summary_sha256"),
+    ):
+        _require(
+            calibration_binding.get(plan_field) == receipt_body.get(receipt_field),
+            f"protected plan {plan_field} differs from threshold receipt",
+        )
+    _require(
+        calibration_binding.get("calibration_aggregate_schema")
+        == CALIBRATION_AGGREGATE_SCHEMA,
+        "protected plan aggregate schema binding differs",
+    )
+
+
+def _threshold_freeze_worker_result(
+    *,
+    calibration_aggregate: Mapping[str, object],
+    threshold_freeze_receipt: Mapping[str, object],
+    readiness_receipt_sha256: str,
+    threshold_exact_input_binding: Mapping[str, object],
+    threshold_worker_readiness_certification_binding: Mapping[str, object],
+    threshold_worker_provenance: Mapping[str, object],
+    threshold_zip_provenance_attestation: Mapping[str, object],
+) -> dict[str, object]:
+    """Bind a threshold decision to the certified worker that produced it."""
+
+    aggregate_body = _validate_payload_digest(calibration_aggregate, "calibration aggregate")
+    aggregate_payload_sha256 = calibration_aggregate.get("payload_sha256")
+    _require(_is_sha256(aggregate_payload_sha256), "aggregate payload digest is invalid")
+    _require(_is_sha256(readiness_receipt_sha256), "readiness receipt digest is invalid")
+    receipt = dict(threshold_freeze_receipt)
+    receipt_body = _threshold_freeze_receipt_body(receipt, label="threshold-freeze receipt")
+    _require(
+        receipt_body["calibration_outcomes_payload_sha256"] == aggregate_payload_sha256,
+        "threshold-freeze receipt binds another aggregate",
+    )
+    _require(
+        receipt_body["readiness_receipt_sha256"] == readiness_receipt_sha256,
+        "threshold-freeze receipt binds another readiness receipt",
+    )
+    readiness = _plain_dict(
+        aggregate_body.get("readiness_binding"),
+        "aggregate readiness binding",
+    )
+    _require(
+        readiness.get("readiness_receipt_sha256") == readiness_receipt_sha256,
+        "aggregate and threshold worker readiness bindings differ",
+    )
+    certification = _plain_dict(
+        threshold_worker_readiness_certification_binding,
+        "threshold worker readiness certification binding",
+    )
+    exact_input_binding = _plain_dict(
+        threshold_exact_input_binding,
+        "threshold exact input binding",
+    )
+    _require(
+        exact_input_binding.get("schema") == THRESHOLD_FREEZE_EXACT_INPUT_BINDING_SCHEMA,
+        "threshold exact input binding schema differs",
+    )
+    _require(
+        exact_input_binding.get("calibration_aggregate_payload_sha256")
+        == aggregate_payload_sha256,
+        "threshold exact input binding references another aggregate",
+    )
+    worker = _plain_dict(threshold_worker_provenance, "threshold worker provenance")
+    attestation = _plain_dict(
+        threshold_zip_provenance_attestation,
+        "threshold ZIP provenance attestation",
+    )
+    body = {
+        "schema": THRESHOLD_FREEZE_WORKER_RESULT_SCHEMA,
+        "development_only": True,
+        "scientific_promotion_allowed": False,
+        "claim_accepted": False,
+        "promotion_artifact": False,
+        "calibration_aggregate_payload_sha256": aggregate_payload_sha256,
+        "readiness_receipt_sha256": readiness_receipt_sha256,
+        "threshold_exact_input_binding": exact_input_binding,
+        "threshold_exact_input_binding_sha256": canonical_sha256(exact_input_binding),
+        "threshold_worker_readiness_certification_binding": certification,
+        "threshold_worker_readiness_certification_binding_sha256": canonical_sha256(
+            certification
+        ),
+        "threshold_worker_provenance": worker,
+        "threshold_worker_provenance_sha256": canonical_sha256(worker),
+        "threshold_zip_provenance_attestation": attestation,
+        "threshold_zip_provenance_attestation_sha256": canonical_sha256(attestation),
+        "threshold_freeze_receipt": receipt,
+        "threshold_freeze_receipt_sha256": receipt["receipt_payload_sha256"],
+    }
+    return _payload_with_digest(body)
+
+
+def _protected_plan_worker_result(
+    *,
+    calibration_aggregate: Mapping[str, object],
+    threshold_freeze_receipt: Mapping[str, object],
+    protected_plan: Mapping[str, object],
+    readiness_receipt_sha256: str,
+    exact_input_binding: Mapping[str, object],
+    worker_readiness_certification_binding: Mapping[str, object],
+    worker_provenance: Mapping[str, object],
+    zip_provenance_attestation: Mapping[str, object],
+) -> dict[str, object]:
+    """Bind certified nonauthorizing plan bytes to every authoritative input."""
+
+    aggregate_body = _validate_payload_digest(calibration_aggregate, "calibration aggregate")
+    aggregate_digest = calibration_aggregate.get("payload_sha256")
+    receipt = dict(threshold_freeze_receipt)
+    receipt_body = _successful_threshold_freeze_receipt_body(
+        receipt,
+        label="protected-plan worker threshold receipt",
+    )
+    plan = dict(protected_plan)
+    plan_body = _protected_plan_body(plan, label="protected-plan worker plan")
+    _validate_protected_plan_bindings(
+        plan_body,
+        protected_plan=plan,
+        threshold_receipt=receipt,
+        calibration_aggregate=calibration_aggregate,
+    )
+    _require(_is_sha256(aggregate_digest), "protected-plan aggregate digest is invalid")
+    receipt_digest = receipt.get("receipt_payload_sha256")
+    plan_digest = plan.get("payload_sha256")
+    _require(_is_sha256(receipt_digest), "protected-plan receipt digest is invalid")
+    _require(_is_sha256(plan_digest), "protected-plan payload digest is invalid")
+    _require(_is_sha256(readiness_receipt_sha256), "protected-plan readiness digest is invalid")
+    _require(
+        receipt_body["calibration_outcomes_payload_sha256"] == aggregate_digest,
+        "protected-plan receipt aggregate binding differs",
+    )
+    readiness = _plain_dict(
+        aggregate_body.get("readiness_binding"),
+        "protected-plan aggregate readiness binding",
+    )
+    _require(
+        readiness.get("readiness_receipt_sha256") == readiness_receipt_sha256,
+        "protected-plan worker readiness binding differs",
+    )
+    input_binding = _plain_dict(exact_input_binding, "protected-plan exact input binding")
+    _require(
+        input_binding.get("schema") == THRESHOLD_FREEZE_EXACT_INPUT_BINDING_SCHEMA
+        and input_binding.get("calibration_aggregate_payload_sha256") == aggregate_digest,
+        "protected-plan exact input binding differs",
+    )
+    certification = _plain_dict(
+        worker_readiness_certification_binding,
+        "protected-plan worker readiness certification binding",
+    )
+    provenance = _plain_dict(worker_provenance, "protected-plan worker provenance")
+    attestation = _plain_dict(
+        zip_provenance_attestation,
+        "protected-plan ZIP provenance attestation",
+    )
+    body = {
+        "schema": PROTECTED_PLAN_WORKER_RESULT_SCHEMA,
+        "nonauthorizing": True,
+        "scientific_promotion_allowed": False,
+        "automatic_promotion_allowed": False,
+        "protected_outcomes_observed": False,
+        "learner_outcomes_executed": False,
+        "learner_execution_authorized": False,
+        "protected_execution_permitted": False,
+        "execution_issuer_available": False,
+        "protected_readiness_created": False,
+        "protected_execution_ledger_created": False,
+        "calibration_aggregate_payload_sha256": aggregate_digest,
+        "threshold_freeze_receipt_payload_sha256": receipt_digest,
+        "readiness_receipt_sha256": readiness_receipt_sha256,
+        "exact_input_binding": input_binding,
+        "exact_input_binding_sha256": canonical_sha256(input_binding),
+        "worker_readiness_certification_binding": certification,
+        "worker_readiness_certification_binding_sha256": canonical_sha256(certification),
+        "worker_provenance": provenance,
+        "worker_provenance_sha256": canonical_sha256(provenance),
+        "zip_provenance_attestation": attestation,
+        "zip_provenance_attestation_sha256": canonical_sha256(attestation),
+        "protected_plan": plan,
+        "protected_plan_payload_sha256": plan_digest,
+    }
+    return _payload_with_digest(body)
+
+
+def _worker_threshold_freeze(
+    *,
+    readiness_directory: Path,
+    ledger_directory: Path,
+    shard_publication_root: Path,
+    aggregate_publication_root: Path,
+    aggregate_payload_sha256: str,
+) -> dict[str, object]:
+    """Recompute an immutable aggregate and freeze thresholds inside its source ZIP."""
+
+    bundle = load_validated_readiness_bundle(
+        readiness_directory,
+        recheck_current=False,
+        recheck_runtime=False,
+    )
+    readiness_body = _plain_dict(bundle.payload.get("body"), "readiness body")
+    expected_runtime_execution_identity = runtime_execution_identity_from_receipt(
+        readiness_body.get("runtime_identity")
+    )
+    _require(
+        build_runtime_execution_identity() == expected_runtime_execution_identity,
+        "worker process runtime execution identity differs before threshold freezing",
+    )
+    readiness = _readiness_binding(bundle)
+    certification = _aggregation_readiness_certification_binding(bundle)
+    archive_path = readiness_directory.absolute() / "source.zip"
+    worker_provenance = _zip_worker_provenance(archive_path, bundle)
+    source_archive = _read_regular_file(
+        archive_path,
+        max_bytes=_MAX_SOURCE_ZIP_BYTES,
+        label="threshold worker source ZIP",
+    )
+    zip_provenance_capability = attest_calibration_zip_provenance(
+        readiness_bundle=bundle,
+        readiness_source_archive=source_archive,
+        source_archive_path=archive_path,
+    )
+    aggregate = _load_content_addressed_calibration_aggregate(
+        aggregate_publication_root,
+        aggregate_payload_sha256,
+    )
+    aggregate_body = _validate_payload_digest(aggregate, "calibration aggregate")
+    _validate_aggregate_provenance_bindings(aggregate_body, bundle)
+    _require(
+        _plain_dict(aggregate_body.get("readiness_binding"), "aggregate readiness binding")
+        == readiness,
+        "threshold worker aggregate readiness binding differs",
+    )
+    with _threshold_input_publication_guard(
+        shard_publication_root=shard_publication_root,
+        readiness_receipt_sha256=bundle.receipt_sha256,
+        managed_ledger_directory=ledger_directory,
+    ):
+        shards = load_complete_calibration_case_shards(
+            shard_publication_root,
+            expected_readiness_binding=readiness,
+            managed_ledger_directory=ledger_directory,
+        )
+        inventory = snapshot_calibration_execution_inventory(ledger_directory)
+        validated_aggregate = validate_calibration_aggregate(
+            aggregate,
+            shards,
+            managed_ledger_snapshot=inventory,
+            managed_ledger_directory=ledger_directory,
+            aggregation_worker_provenance=worker_provenance,
+            aggregation_zip_provenance_attestation=zip_provenance_capability.payload,
+            aggregation_readiness_certification_binding=certification,
+        )
+        exact_input_binding = _threshold_freeze_exact_input_binding(
+            validated_aggregate,
+            shards,
+            inventory,
+        )
+        try:
+            receipt = materialize_hidden_regime_factorial_threshold_freeze_receipt(
+                validated_aggregate
+            )
+            validated_receipt = validate_hidden_regime_factorial_threshold_freeze_receipt(
+                receipt,
+                calibration_aggregate=validated_aggregate,
+            )
+        except ThresholdFreezeError as exc:
+            raise CalibrationError(str(exc)) from exc
+        _require(
+            build_runtime_execution_identity() == expected_runtime_execution_identity,
+            "worker process runtime execution identity drifted during threshold freezing",
+        )
+        require_current_full_runtime_identity(readiness_body.get("runtime_identity"))
+        return _threshold_freeze_worker_result(
+            calibration_aggregate=validated_aggregate,
+            threshold_freeze_receipt=validated_receipt,
+            readiness_receipt_sha256=bundle.receipt_sha256,
+            threshold_exact_input_binding=exact_input_binding,
+            threshold_worker_readiness_certification_binding=certification,
+            threshold_worker_provenance=worker_provenance,
+            threshold_zip_provenance_attestation=zip_provenance_capability.payload,
+        )
+
+
+def _worker_protected_plan(
+    *,
+    readiness_directory: Path,
+    ledger_directory: Path,
+    shard_publication_root: Path,
+    aggregate_publication_root: Path,
+    aggregate_payload_sha256: str,
+    threshold_receipt_publication_root: Path,
+    threshold_receipt_payload_sha256: str,
+) -> dict[str, object]:
+    """Derive one unexecuted, nonauthorizing protected plan inside the certified ZIP."""
+
+    bundle = load_validated_readiness_bundle(
+        readiness_directory,
+        recheck_current=False,
+        recheck_runtime=False,
+    )
+    readiness_body = _plain_dict(bundle.payload.get("body"), "readiness body")
+    expected_runtime_execution_identity = runtime_execution_identity_from_receipt(
+        readiness_body.get("runtime_identity")
+    )
+    _require(
+        build_runtime_execution_identity() == expected_runtime_execution_identity,
+        "worker process runtime execution identity differs before protected planning",
+    )
+    readiness = _readiness_binding(bundle)
+    certification = _aggregation_readiness_certification_binding(bundle)
+    archive_path = readiness_directory.absolute() / "source.zip"
+    worker_provenance = _zip_worker_provenance(archive_path, bundle)
+    source_archive = _read_regular_file(
+        archive_path,
+        max_bytes=_MAX_SOURCE_ZIP_BYTES,
+        label="protected-plan worker source ZIP",
+    )
+    zip_provenance_capability = attest_calibration_zip_provenance(
+        readiness_bundle=bundle,
+        readiness_source_archive=source_archive,
+        source_archive_path=archive_path,
+    )
+    aggregate = _load_content_addressed_calibration_aggregate(
+        aggregate_publication_root,
+        aggregate_payload_sha256,
+    )
+    aggregate_body = _validate_payload_digest(aggregate, "protected-plan calibration aggregate")
+    _validate_aggregate_provenance_bindings(aggregate_body, bundle)
+    _require(
+        _plain_dict(aggregate_body.get("readiness_binding"), "aggregate readiness binding")
+        == readiness,
+        "protected-plan worker aggregate readiness binding differs",
+    )
+    receipt = _load_content_addressed_threshold_freeze_receipt(
+        threshold_receipt_publication_root,
+        threshold_receipt_payload_sha256,
+    )
+    with _threshold_input_publication_guard(
+        shard_publication_root=shard_publication_root,
+        readiness_receipt_sha256=bundle.receipt_sha256,
+        managed_ledger_directory=ledger_directory,
+    ):
+        shards = load_complete_calibration_case_shards(
+            shard_publication_root,
+            expected_readiness_binding=readiness,
+            managed_ledger_directory=ledger_directory,
+        )
+        inventory = snapshot_calibration_execution_inventory(ledger_directory)
+        validated_aggregate = validate_calibration_aggregate(
+            aggregate,
+            shards,
+            managed_ledger_snapshot=inventory,
+            managed_ledger_directory=ledger_directory,
+            aggregation_worker_provenance=worker_provenance,
+            aggregation_zip_provenance_attestation=zip_provenance_capability.payload,
+            aggregation_readiness_certification_binding=certification,
+        )
+        exact_input_binding = _threshold_freeze_exact_input_binding(
+            validated_aggregate,
+            shards,
+            inventory,
+        )
+        try:
+            validated_receipt = validate_hidden_regime_factorial_threshold_freeze_receipt(
+                receipt,
+                calibration_aggregate=validated_aggregate,
+            )
+        except ThresholdFreezeError as exc:
+            raise CalibrationError("protected-plan threshold receipt validation failed") from exc
+        _successful_threshold_freeze_receipt_body(
+            validated_receipt,
+            label="protected-plan validated threshold receipt",
+        )
+        try:
+            plan = build_hidden_regime_factorial_protected_plan(
+                validated_receipt,
+                calibration_aggregate=validated_aggregate,
+            )
+            validated_plan = validate_hidden_regime_factorial_protected_plan(
+                plan,
+                threshold_receipt=validated_receipt,
+                calibration_aggregate=validated_aggregate,
+            )
+        except ProtectedPlanError as exc:
+            raise CalibrationError(str(exc)) from exc
+        _require(
+            build_runtime_execution_identity() == expected_runtime_execution_identity,
+            "worker process runtime execution identity drifted during protected planning",
+        )
+        require_current_full_runtime_identity(readiness_body.get("runtime_identity"))
+        return _protected_plan_worker_result(
+            calibration_aggregate=validated_aggregate,
+            threshold_freeze_receipt=validated_receipt,
+            protected_plan=validated_plan,
+            readiness_receipt_sha256=bundle.receipt_sha256,
+            exact_input_binding=exact_input_binding,
+            worker_readiness_certification_binding=certification,
+            worker_provenance=worker_provenance,
+            zip_provenance_attestation=zip_provenance_capability.payload,
+        )
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
     """ZIP-only worker entry point bound by the readiness receipt."""
 
     argv = tuple(sys.argv[1:] if arguments is None else arguments)
-    _require(len(argv) == 4, "worker arguments are not exact")
+    _require(bool(argv), "worker arguments are not exact")
+    if argv[0] == "--worker-protected-plan-v1":
+        _require(len(argv) == 8, "protected-plan worker arguments are not exact")
+        result = _worker_protected_plan(
+            readiness_directory=Path(argv[1]).absolute(),
+            ledger_directory=Path(argv[2]).absolute(),
+            shard_publication_root=Path(argv[3]).absolute(),
+            aggregate_publication_root=Path(argv[4]).absolute(),
+            aggregate_payload_sha256=argv[5],
+            threshold_receipt_publication_root=Path(argv[6]).absolute(),
+            threshold_receipt_payload_sha256=argv[7],
+        )
+        raw = canonical_json_bytes(result)
+        _require(
+            len(raw) <= _MAX_PROTECTED_PLAN_BYTES,
+            "protected-plan worker result exceeds output limit",
+        )
+        sys.stdout.buffer.write(PROTECTED_PLAN_RESULT_PREFIX + base64.b64encode(raw))
+        sys.stdout.buffer.flush()
+        return 0
+    if argv[0] == "--worker-threshold-freeze-v1":
+        _require(len(argv) == 6, "threshold-freeze worker arguments are not exact")
+        result = _worker_threshold_freeze(
+            readiness_directory=Path(argv[1]).absolute(),
+            ledger_directory=Path(argv[2]).absolute(),
+            shard_publication_root=Path(argv[3]).absolute(),
+            aggregate_publication_root=Path(argv[4]).absolute(),
+            aggregate_payload_sha256=argv[5],
+        )
+        raw = canonical_json_bytes(result)
+        _require(
+            len(raw) <= _MAX_WORKER_OUTPUT_BYTES,
+            "threshold-freeze worker result exceeds output limit",
+        )
+        sys.stdout.buffer.write(THRESHOLD_FREEZE_RESULT_PREFIX + base64.b64encode(raw))
+        sys.stdout.buffer.flush()
+        return 0
+    if argv[0] == "--worker-aggregate-v1":
+        _require(len(argv) == 4, "aggregate worker arguments are not exact")
+        result = _worker_aggregate(
+            readiness_directory=Path(argv[1]).absolute(),
+            ledger_directory=Path(argv[2]).absolute(),
+            shard_publication_root=Path(argv[3]).absolute(),
+        )
+        prefix = AGGREGATE_RESULT_PREFIX
+        raw = canonical_json_bytes(result)
+        _require(len(raw) <= _MAX_AGGREGATE_BYTES, "aggregate worker result exceeds output limit")
+        sys.stdout.buffer.write(prefix + base64.b64encode(raw))
+        sys.stdout.buffer.flush()
+        return 0
+    _require(len(argv) == 4, "case/preflight worker arguments are not exact")
     readiness_directory = Path(argv[1]).absolute()
     ledger_directory = Path(argv[2]).absolute()
     request_payload = _decode_worker_request(argv[3])
@@ -2873,6 +4436,385 @@ def _parse_preflight_result(stdout: bytes) -> dict[str, object]:
     return _strict_json(raw, "worker preflight report")
 
 
+def _parse_aggregate_worker_result(stdout: bytes) -> dict[str, object]:
+    _require(len(stdout) <= _MAX_AGGREGATE_BYTES * 2, "aggregate worker output exceeds limit")
+    _require(stdout.startswith(AGGREGATE_RESULT_PREFIX), "aggregate worker output prefix differs")
+    encoded = stdout[len(AGGREGATE_RESULT_PREFIX) :]
+    _require(
+        bool(encoded) and b"\n" not in encoded and b"\r" not in encoded,
+        "aggregate worker output differs",
+    )
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except ValueError as exc:
+        raise CalibrationError("aggregate worker result is not strict base64") from exc
+    _require(len(raw) <= _MAX_AGGREGATE_BYTES, "decoded aggregate result exceeds limit")
+    payload = _strict_json(raw, "aggregate worker result")
+    _require(raw == canonical_json_bytes(payload), "aggregate worker result is not canonical")
+    body = _validate_payload_digest(payload, "aggregate worker result")
+    _require(body.get("schema") == CALIBRATION_AGGREGATE_SCHEMA, "aggregate schema differs")
+    _require(body.get("development_only") is True, "aggregate is not development-only")
+    _require(
+        body.get("scientific_promotion_allowed") is False,
+        "aggregate permits scientific promotion",
+    )
+    _require(body.get("claim_accepted") is False, "aggregate accepts a claim")
+    _require(body.get("thresholds_frozen") is False, "aggregate freezes thresholds")
+    _require(body.get("promotion_artifact") is False, "aggregate is a promotion artifact")
+    _require(body.get("case_count") == EXPECTED_CASES, "aggregate case count differs")
+    audit_summary = _plain_dict(
+        body.get("mandatory_audit_summary"),
+        "aggregate mandatory audit summary",
+    )
+    _require(
+        audit_summary.get("schema") == CALIBRATION_MANDATORY_AUDIT_SUMMARY_SCHEMA,
+        "aggregate mandatory audit schema differs",
+    )
+    _require(
+        body.get("mandatory_audit_summary_sha256") == canonical_sha256(audit_summary),
+        "aggregate mandatory audit digest differs",
+    )
+    audit_decision = audit_summary.get("decision")
+    _require(
+        audit_decision in {"passed_nonstatistical", "invalid_calibration"}
+        and body.get("mandatory_audit_decision") == audit_decision,
+        "aggregate mandatory audit decision differs",
+    )
+    expected_gate_status = (
+        "mandatory_audits_passed_statistical_thresholds_unset"
+        if audit_decision == "passed_nonstatistical"
+        else "invalid_calibration_mandatory_audit_failure"
+    )
+    _require(
+        body.get("gate_decision_status") == expected_gate_status,
+        "aggregate gate decision status differs",
+    )
+    _require(
+        _is_sha256(payload.get("payload_sha256")),
+        "aggregate worker payload digest is invalid",
+    )
+    return payload
+
+
+def _validate_threshold_freeze_worker_result_payload(
+    payload: Mapping[str, object],
+) -> dict[str, object]:
+    body = _validate_payload_digest(payload, "threshold-freeze worker result")
+    _exact_keys(
+        body,
+        {
+            "schema",
+            "development_only",
+            "scientific_promotion_allowed",
+            "claim_accepted",
+            "promotion_artifact",
+            "calibration_aggregate_payload_sha256",
+            "readiness_receipt_sha256",
+            "threshold_exact_input_binding",
+            "threshold_exact_input_binding_sha256",
+            "threshold_worker_readiness_certification_binding",
+            "threshold_worker_readiness_certification_binding_sha256",
+            "threshold_worker_provenance",
+            "threshold_worker_provenance_sha256",
+            "threshold_zip_provenance_attestation",
+            "threshold_zip_provenance_attestation_sha256",
+            "threshold_freeze_receipt",
+            "threshold_freeze_receipt_sha256",
+        },
+        "threshold-freeze worker result",
+    )
+    _require(
+        body["schema"] == THRESHOLD_FREEZE_WORKER_RESULT_SCHEMA,
+        "threshold-freeze worker result schema differs",
+    )
+    _require(body["development_only"] is True, "threshold worker result is not development-only")
+    for field in (
+        "scientific_promotion_allowed",
+        "claim_accepted",
+        "promotion_artifact",
+    ):
+        _require(body[field] is False, f"threshold worker result {field} must be false")
+    for field in (
+        "calibration_aggregate_payload_sha256",
+        "readiness_receipt_sha256",
+        "threshold_exact_input_binding_sha256",
+        "threshold_worker_readiness_certification_binding_sha256",
+        "threshold_worker_provenance_sha256",
+        "threshold_zip_provenance_attestation_sha256",
+        "threshold_freeze_receipt_sha256",
+    ):
+        _require(_is_sha256(body[field]), f"threshold worker result {field} is invalid")
+    for value_field, digest_field in (
+        ("threshold_exact_input_binding", "threshold_exact_input_binding_sha256"),
+        (
+            "threshold_worker_readiness_certification_binding",
+            "threshold_worker_readiness_certification_binding_sha256",
+        ),
+        ("threshold_worker_provenance", "threshold_worker_provenance_sha256"),
+        (
+            "threshold_zip_provenance_attestation",
+            "threshold_zip_provenance_attestation_sha256",
+        ),
+    ):
+        value = _plain_dict(body[value_field], f"threshold worker result {value_field}")
+        _require(
+            canonical_sha256(value) == body[digest_field],
+            f"threshold worker result {digest_field} differs",
+        )
+    exact_input_binding = _plain_dict(
+        body["threshold_exact_input_binding"],
+        "threshold exact input binding",
+    )
+    _exact_keys(
+        exact_input_binding,
+        {
+            "schema",
+            "calibration_aggregate_payload_sha256",
+            "managed_ledger_inventory_sha256",
+            "managed_ledger_snapshot_sha256",
+            "case_ledger_sha256",
+            "case_shard_payloads_sha256",
+            "case_count",
+        },
+        "threshold exact input binding",
+    )
+    _require(
+        exact_input_binding["schema"] == THRESHOLD_FREEZE_EXACT_INPUT_BINDING_SCHEMA,
+        "threshold exact input binding schema differs",
+    )
+    for field in (
+        "calibration_aggregate_payload_sha256",
+        "managed_ledger_inventory_sha256",
+        "managed_ledger_snapshot_sha256",
+        "case_ledger_sha256",
+        "case_shard_payloads_sha256",
+    ):
+        _require(_is_sha256(exact_input_binding[field]), f"threshold input {field} is invalid")
+    _require(
+        exact_input_binding["calibration_aggregate_payload_sha256"]
+        == body["calibration_aggregate_payload_sha256"],
+        "threshold exact input aggregate binding differs",
+    )
+    _require(
+        exact_input_binding["case_count"] == EXPECTED_CASES,
+        "threshold exact input case count differs",
+    )
+    receipt = _plain_dict(body["threshold_freeze_receipt"], "threshold-freeze receipt")
+    receipt_body = _threshold_freeze_receipt_body(receipt, label="threshold-freeze receipt")
+    _require(
+        receipt["receipt_payload_sha256"] == body["threshold_freeze_receipt_sha256"],
+        "threshold worker receipt digest binding differs",
+    )
+    _require(
+        receipt_body["calibration_outcomes_payload_sha256"]
+        == body["calibration_aggregate_payload_sha256"],
+        "threshold worker receipt aggregate binding differs",
+    )
+    _require(
+        receipt_body["readiness_receipt_sha256"] == body["readiness_receipt_sha256"],
+        "threshold worker receipt readiness binding differs",
+    )
+    return dict(payload)
+
+
+def _parse_threshold_freeze_worker_result(stdout: bytes) -> dict[str, object]:
+    _require(
+        len(stdout) <= _MAX_WORKER_OUTPUT_BYTES * 2,
+        "threshold-freeze worker output exceeds limit",
+    )
+    _require(
+        stdout.startswith(THRESHOLD_FREEZE_RESULT_PREFIX),
+        "threshold-freeze worker output prefix differs",
+    )
+    encoded = stdout[len(THRESHOLD_FREEZE_RESULT_PREFIX) :]
+    _require(
+        bool(encoded) and b"\n" not in encoded and b"\r" not in encoded,
+        "threshold-freeze worker output differs",
+    )
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except ValueError as exc:
+        raise CalibrationError("threshold-freeze worker result is not strict base64") from exc
+    _require(
+        len(raw) <= _MAX_WORKER_OUTPUT_BYTES,
+        "decoded threshold-freeze worker result exceeds limit",
+    )
+    payload = _strict_json(raw, "threshold-freeze worker result")
+    _require(
+        raw == canonical_json_bytes(payload),
+        "threshold-freeze worker result is not canonical",
+    )
+    return _validate_threshold_freeze_worker_result_payload(payload)
+
+
+def _validate_protected_plan_worker_result_payload(
+    payload: Mapping[str, object],
+) -> dict[str, object]:
+    body = _validate_payload_digest(payload, "protected-plan worker result")
+    _exact_keys(
+        body,
+        {
+            "schema",
+            "nonauthorizing",
+            "scientific_promotion_allowed",
+            "automatic_promotion_allowed",
+            "protected_outcomes_observed",
+            "learner_outcomes_executed",
+            "learner_execution_authorized",
+            "protected_execution_permitted",
+            "execution_issuer_available",
+            "protected_readiness_created",
+            "protected_execution_ledger_created",
+            "calibration_aggregate_payload_sha256",
+            "threshold_freeze_receipt_payload_sha256",
+            "readiness_receipt_sha256",
+            "exact_input_binding",
+            "exact_input_binding_sha256",
+            "worker_readiness_certification_binding",
+            "worker_readiness_certification_binding_sha256",
+            "worker_provenance",
+            "worker_provenance_sha256",
+            "zip_provenance_attestation",
+            "zip_provenance_attestation_sha256",
+            "protected_plan",
+            "protected_plan_payload_sha256",
+        },
+        "protected-plan worker result",
+    )
+    _require(
+        body["schema"] == PROTECTED_PLAN_WORKER_RESULT_SCHEMA,
+        "protected-plan worker result schema differs",
+    )
+    _require(body["nonauthorizing"] is True, "protected-plan worker result authorizes")
+    for field in (
+        "scientific_promotion_allowed",
+        "automatic_promotion_allowed",
+        "protected_outcomes_observed",
+        "learner_outcomes_executed",
+        "learner_execution_authorized",
+        "protected_execution_permitted",
+        "execution_issuer_available",
+        "protected_readiness_created",
+        "protected_execution_ledger_created",
+    ):
+        _require(body[field] is False, f"protected-plan worker result {field} must be false")
+    for field in (
+        "calibration_aggregate_payload_sha256",
+        "threshold_freeze_receipt_payload_sha256",
+        "readiness_receipt_sha256",
+        "exact_input_binding_sha256",
+        "worker_readiness_certification_binding_sha256",
+        "worker_provenance_sha256",
+        "zip_provenance_attestation_sha256",
+        "protected_plan_payload_sha256",
+    ):
+        _require(_is_sha256(body[field]), f"protected-plan result {field} is invalid")
+    for value_field, digest_field in (
+        ("exact_input_binding", "exact_input_binding_sha256"),
+        (
+            "worker_readiness_certification_binding",
+            "worker_readiness_certification_binding_sha256",
+        ),
+        ("worker_provenance", "worker_provenance_sha256"),
+        ("zip_provenance_attestation", "zip_provenance_attestation_sha256"),
+    ):
+        value = _plain_dict(body[value_field], f"protected-plan result {value_field}")
+        _require(
+            canonical_sha256(value) == body[digest_field],
+            f"protected-plan result {digest_field} differs",
+        )
+    exact_input_binding = _plain_dict(
+        body["exact_input_binding"],
+        "protected-plan exact input binding",
+    )
+    _exact_keys(
+        exact_input_binding,
+        {
+            "schema",
+            "calibration_aggregate_payload_sha256",
+            "managed_ledger_inventory_sha256",
+            "managed_ledger_snapshot_sha256",
+            "case_ledger_sha256",
+            "case_shard_payloads_sha256",
+            "case_count",
+        },
+        "protected-plan exact input binding",
+    )
+    _require(
+        exact_input_binding.get("schema") == THRESHOLD_FREEZE_EXACT_INPUT_BINDING_SCHEMA
+        and exact_input_binding.get("calibration_aggregate_payload_sha256")
+        == body["calibration_aggregate_payload_sha256"]
+        and exact_input_binding.get("case_count") == EXPECTED_CASES,
+        "protected-plan exact input binding differs",
+    )
+    for field in (
+        "calibration_aggregate_payload_sha256",
+        "managed_ledger_inventory_sha256",
+        "managed_ledger_snapshot_sha256",
+        "case_ledger_sha256",
+        "case_shard_payloads_sha256",
+    ):
+        _require(
+            _is_sha256(exact_input_binding[field]),
+            f"protected-plan exact input {field} is invalid",
+        )
+    plan = _plain_dict(body["protected_plan"], "protected-plan worker plan")
+    plan_body = _protected_plan_body(plan, label="protected-plan worker plan")
+    _require(
+        plan.get("payload_sha256") == body["protected_plan_payload_sha256"],
+        "protected-plan worker plan digest binding differs",
+    )
+    calibration_binding = _plain_dict(
+        plan_body.get("calibration_binding"),
+        "protected-plan calibration binding",
+    )
+    receipt_binding = _plain_dict(
+        plan_body.get("threshold_freeze_receipt_binding"),
+        "protected-plan threshold receipt binding",
+    )
+    _require(
+        calibration_binding.get("calibration_aggregate_payload_sha256")
+        == body["calibration_aggregate_payload_sha256"],
+        "protected-plan result aggregate binding differs",
+    )
+    _require(
+        receipt_binding.get("receipt_payload_sha256")
+        == body["threshold_freeze_receipt_payload_sha256"],
+        "protected-plan result threshold receipt binding differs",
+    )
+    return dict(payload)
+
+
+def _parse_protected_plan_worker_result(stdout: bytes) -> dict[str, object]:
+    _require(
+        len(stdout) <= _MAX_PROTECTED_PLAN_BYTES * 2,
+        "protected-plan worker output exceeds limit",
+    )
+    _require(
+        stdout.startswith(PROTECTED_PLAN_RESULT_PREFIX),
+        "protected-plan worker output prefix differs",
+    )
+    encoded = stdout[len(PROTECTED_PLAN_RESULT_PREFIX) :]
+    _require(
+        bool(encoded) and b"\n" not in encoded and b"\r" not in encoded,
+        "protected-plan worker output differs",
+    )
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except ValueError as exc:
+        raise CalibrationError("protected-plan worker result is not strict base64") from exc
+    _require(
+        len(raw) <= _MAX_PROTECTED_PLAN_BYTES,
+        "decoded protected-plan worker result exceeds limit",
+    )
+    payload = _strict_json(raw, "protected-plan worker result")
+    _require(
+        raw == canonical_json_bytes(payload),
+        "protected-plan worker result is not canonical",
+    )
+    return _validate_protected_plan_worker_result_payload(payload)
+
+
 def run_calibration_preflight_subprocess(
     *,
     readiness_directory: Path,
@@ -2901,7 +4843,7 @@ def run_calibration_preflight_subprocess(
     bundle = load_validated_readiness_bundle(
         readiness_directory,
         recheck_current=False,
-        recheck_runtime=True,
+        recheck_runtime=False,
     )
     request = build_calibration_preflight_request(
         bundle,
@@ -2910,17 +4852,22 @@ def run_calibration_preflight_subprocess(
         explicit_acknowledgement=explicit_acknowledgement,
     )
     encoded_request = base64.b64encode(canonical_json_bytes(request)).decode("ascii")
-    completed = execute_bound_calibration_worker(
+    with bound_calibration_runtime_batch(
         readiness_directory,
-        (
-            "--worker-preflight-v1",
-            readiness_directory.absolute().as_posix(),
-            managed_ledger_directory.absolute().as_posix(),
-            encoded_request,
-        ),
-        authorize_calibration_execution=True,
-        timeout_seconds=timeout_seconds,
-    )
+        authorize_batch_execution=True,
+    ) as runtime_batch_guard:
+        completed = execute_bound_calibration_worker(
+            readiness_directory,
+            (
+                "--worker-preflight-v1",
+                readiness_directory.absolute().as_posix(),
+                managed_ledger_directory.absolute().as_posix(),
+                encoded_request,
+            ),
+            authorize_calibration_execution=True,
+            timeout_seconds=timeout_seconds,
+            runtime_batch_guard=runtime_batch_guard,
+        )
     if completed.returncode != 0:
         stderr_digest = hashlib.sha256(completed.stderr).hexdigest()
         raise CalibrationError(
@@ -2961,6 +4908,7 @@ def run_calibration_case_subprocess(
     authorize_calibration_execution: bool,
     allow_exact_replay: bool = False,
     timeout_seconds: int | None = None,
+    _runtime_batch_guard: BoundCalibrationRuntimeBatch | None = None,
 ) -> dict[str, object]:
     """Run or resume one exact case through the isolated content-addressed ZIP."""
 
@@ -2979,7 +4927,7 @@ def run_calibration_case_subprocess(
     bundle = load_validated_readiness_bundle(
         readiness_directory,
         recheck_current=False,
-        recheck_runtime=True,
+        recheck_runtime=False,
     )
     readiness_binding = _readiness_binding(bundle)
     existing_path = calibration_case_shard_path(
@@ -3000,9 +4948,10 @@ def run_calibration_case_subprocess(
         existing_raw = None
     if existing_raw is not None:
         existing = _strict_json(existing_raw, "existing case shard")
-        validated_existing = validate_calibration_case_shard(
+        validated_existing = validate_finalized_calibration_case_shard(
             existing,
             expected_readiness_binding=readiness_binding,
+            managed_ledger_directory=managed_ledger_directory,
         )
         existing_body = _validate_payload_digest(validated_existing, "existing case shard")
         _require(
@@ -3016,6 +4965,38 @@ def run_calibration_case_subprocess(
             "existing shard differs from managed completion",
         )
         return validated_existing
+    inventory_before = snapshot_calibration_execution_inventory(managed_ledger_directory)
+    try:
+        inventory_before = require_valid_calibration_execution_inventory(
+            inventory_before,
+            managed_ledger_directory,
+        )
+    except RuntimeError as exc:
+        raise CalibrationError(str(exc)) from exc
+    finalized_indices = _plain_list(
+        inventory_before.get("finalized_case_indices"),
+        "finalized case indices",
+    )
+    if case_index in finalized_indices:
+        try:
+            recovered = load_finalized_calibration_case_shard(
+                managed_ledger_directory,
+                case_index,
+            )
+        except RuntimeError as exc:
+            raise CalibrationError(str(exc)) from exc
+        validated_recovered = validate_finalized_calibration_case_shard(
+            recovered,
+            expected_readiness_binding=readiness_binding,
+            managed_ledger_directory=managed_ledger_directory,
+        )
+        publish_calibration_case_shard_new_only(
+            shard_publication_root,
+            validated_recovered,
+            expected_readiness_binding=readiness_binding,
+            managed_ledger_directory=managed_ledger_directory,
+        )
+        return validated_recovered
     request = build_calibration_case_request(
         case_index,
         bundle,
@@ -3035,6 +5016,7 @@ def run_calibration_case_subprocess(
         ),
         authorize_calibration_execution=True,
         timeout_seconds=timeout_seconds,
+        runtime_batch_guard=_runtime_batch_guard,
     )
     if completed.returncode != 0:
         stderr_digest = hashlib.sha256(completed.stderr).hexdigest()
@@ -3045,9 +5027,10 @@ def run_calibration_case_subprocess(
             "explicit replay is permitted"
         )
     shard = _parse_worker_result(completed.stdout)
-    validated = validate_calibration_case_shard(
+    validated = validate_finalized_calibration_case_shard(
         shard,
         expected_readiness_binding=readiness_binding,
+        managed_ledger_directory=managed_ledger_directory,
     )
     inventory = snapshot_calibration_execution_inventory(managed_ledger_directory)
     expected_record = _execution_record_binding(inventory, case_index)
@@ -3060,6 +5043,7 @@ def run_calibration_case_subprocess(
         shard_publication_root,
         validated,
         expected_readiness_binding=readiness_binding,
+        managed_ledger_directory=managed_ledger_directory,
     )
     return validated
 
@@ -3110,44 +5094,49 @@ def run_calibration_cases_subprocess(
         _strict_int(timeout_seconds, "timeout_seconds", minimum=1)
 
     ordered: dict[int, dict[str, object]] = {}
-    for start in range(0, len(indices), max_workers):
-        batch = indices[start : start + max_workers]
-        failures: list[dict[str, object]] = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                case_index: executor.submit(
-                    run_calibration_case_subprocess,
-                    case_index=case_index,
-                    readiness_directory=readiness_directory,
-                    managed_ledger_directory=managed_ledger_directory,
-                    shard_publication_root=shard_publication_root,
-                    explicit_acknowledgement=cast(str, explicit_acknowledgement),
-                    authorize_calibration_execution=True,
-                    allow_exact_replay=allow_exact_replay,
-                    timeout_seconds=timeout_seconds,
-                )
-                for case_index in batch
-            }
-            for case_index in batch:
-                try:
-                    ordered[case_index] = futures[case_index].result()
-                except Exception as exc:
-                    failure_text = f"{type(exc).__module__}.{type(exc).__qualname__}:{exc}"
-                    failures.append(
-                        {
-                            "case_index": case_index,
-                            "failure_sha256": hashlib.sha256(
-                                failure_text.encode("utf-8")
-                            ).hexdigest(),
-                        }
+    with bound_calibration_runtime_batch(
+        readiness_directory,
+        authorize_batch_execution=True,
+    ) as runtime_batch_guard:
+        for start in range(0, len(indices), max_workers):
+            batch = indices[start : start + max_workers]
+            failures: list[dict[str, object]] = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    case_index: executor.submit(
+                        run_calibration_case_subprocess,
+                        case_index=case_index,
+                        readiness_directory=readiness_directory,
+                        managed_ledger_directory=managed_ledger_directory,
+                        shard_publication_root=shard_publication_root,
+                        explicit_acknowledgement=cast(str, explicit_acknowledgement),
+                        authorize_calibration_execution=True,
+                        allow_exact_replay=allow_exact_replay,
+                        timeout_seconds=timeout_seconds,
+                        _runtime_batch_guard=runtime_batch_guard,
                     )
-        if failures:
-            failure_digest = canonical_sha256(failures)
-            failed_indices = [item["case_index"] for item in failures]
-            raise CalibrationError(
-                "calibration batch failed without retry or substitution; "
-                f"case_indices={failed_indices},failure_manifest_sha256={failure_digest}"
-            )
+                    for case_index in batch
+                }
+                for case_index in batch:
+                    try:
+                        ordered[case_index] = futures[case_index].result()
+                    except Exception as exc:
+                        failure_text = f"{type(exc).__module__}.{type(exc).__qualname__}:{exc}"
+                        failures.append(
+                            {
+                                "case_index": case_index,
+                                "failure_sha256": hashlib.sha256(
+                                    failure_text.encode("utf-8")
+                                ).hexdigest(),
+                            }
+                        )
+            if failures:
+                failure_digest = canonical_sha256(failures)
+                failed_indices = [item["case_index"] for item in failures]
+                raise CalibrationError(
+                    "calibration batch failed without retry or substitution; "
+                    f"case_indices={failed_indices},failure_manifest_sha256={failure_digest}"
+                )
     return tuple(ordered[case_index] for case_index in indices)
 
 
@@ -3631,12 +5620,608 @@ def _aggregate_support_metrics(
     return results
 
 
+def _mandatory_case_audit_reference(
+    design: HiddenRegimeFactorialCalibrationDesign,
+    shard: Mapping[str, object],
+) -> dict[str, object]:
+    """Project one validated shard into deterministic mandatory audit predicates."""
+
+    case = _plain_dict(shard.get("case"), "mandatory audit case")
+    case_index = _strict_int(case.get("case_index"), "mandatory audit case index")
+    expected_case = _case(design, case_index)
+    _require(case == expected_case.to_payload(), "mandatory audit case binding differs")
+    condition = expected_case.condition
+    summary_encoded = _plain_dict(shard.get("summary"), "mandatory audit summary")
+    summary = _plain_dict(_decode_exact(summary_encoded), "decoded mandatory audit summary")
+    audit = _plain_dict(shard.get("audit"), "mandatory case audit")
+    resource = _plain_dict(shard.get("resource"), "mandatory case resource")
+    trace = _plain_dict(shard.get("primitive_trace"), "mandatory primitive trace binding")
+
+    for field in (
+        "payload_sha256",
+        "summary_sha256",
+        "resource_sha256",
+        "configuration_sha256",
+        "case_request_binding_sha256",
+    ):
+        _require(_is_sha256(shard.get(field)), f"mandatory audit shard {field} is invalid")
+    _require(
+        canonical_sha256(summary_encoded) == shard["summary_sha256"],
+        "mandatory audit summary digest differs",
+    )
+    _require(
+        canonical_sha256(resource) == shard["resource_sha256"],
+        "mandatory audit resource digest differs",
+    )
+    _require(_is_sha256(trace.get("sha256")), "mandatory audit trace digest is invalid")
+    _require(
+        audit.get("audited_summary_sha256") == canonical_sha256(_encode_exact(summary)),
+        "mandatory audit summary was not the audited summary",
+    )
+
+    helper_writes = _strict_int(
+        summary.get("helper_value_write_count"),
+        "helper value-write count",
+    )
+    beneficiary_writes = _strict_int(
+        summary.get("beneficiary_value_write_count"),
+        "beneficiary value-write count",
+    )
+    helper_learning = _strict_int(
+        summary.get("helper_effective_learning_update_count"),
+        "helper effective-learning count",
+    )
+    beneficiary_learning = _strict_int(
+        summary.get("beneficiary_effective_learning_update_count"),
+        "beneficiary effective-learning count",
+    )
+    both_roles_learned = _strict_bool(
+        summary.get("both_roles_learned"),
+        "both_roles_learned",
+    )
+    both_roles_learning = (
+        helper_writes > 0
+        and beneficiary_writes > 0
+        and helper_learning > 0
+        and beneficiary_learning > 0
+        and both_roles_learned
+    )
+
+    replacement_count = _strict_int(
+        summary.get("c_old_to_c_new_replacement_count"),
+        "C-old to C-new replacement count",
+    )
+    replacement_slots = tuple(
+        _strict_int(item, "C-old to C-new target slot")
+        for item in _plain_list(
+            summary.get("c_old_to_c_new_target_slots"),
+            "C-old to C-new target slots",
+        )
+    )
+    generation_pairs: list[tuple[int, int]] = []
+    for raw_pair in _plain_list(
+        summary.get("c_old_to_c_new_generation_pairs"),
+        "C-old to C-new generation pairs",
+    ):
+        pair = _plain_list(raw_pair, "C-old to C-new generation pair")
+        _require(len(pair) == 2, "C-old to C-new generation pair is not exact")
+        generation_pairs.append(
+            (
+                _strict_int(pair[0], "retired C-old generation"),
+                _strict_int(pair[1], "committed C-new generation"),
+            )
+        )
+    exactly_one_target = _strict_bool(
+        summary.get("c_old_to_c_new_exactly_one_target"),
+        "C-old to C-new exactly-one-target flag",
+    )
+    lifecycle_synchronized = _strict_bool(
+        summary.get("lifecycle_synchronized_every_step"),
+        "lifecycle synchronized-every-step flag",
+    )
+    atomic_replacement = (
+        exactly_one_target
+        and lifecycle_synchronized
+        and replacement_count == 1
+        and len(replacement_slots) == 1
+        and replacement_slots[0] in (1, 2, 3)
+        and len(generation_pairs) == 1
+        and 0 < generation_pairs[0][0] < generation_pairs[0][1]
+    )
+
+    d_short_checked = _strict_bool(summary.get("d_short_checked"), "D-short checked flag")
+    d_short_non_displacement = _strict_bool(
+        summary.get("d_short_non_displacement"),
+        "D-short non-displacement flag",
+    )
+    d_short_lifecycle_passed = (
+        d_short_checked and d_short_non_displacement and lifecycle_synchronized
+    )
+
+    immutability_applicable = condition not in {"writable_evidence", "writable_lru"}
+    recorded_immutability_applicable = _strict_bool(
+        summary.get("selective_immutability_applicable"),
+        "selective immutability applicability",
+    )
+    helper_mutations = _strict_int(
+        summary.get("helper_selective_mutation_violations"),
+        "helper selective mutation violations",
+    )
+    beneficiary_mutations = _strict_int(
+        summary.get("beneficiary_selective_mutation_violations"),
+        "beneficiary selective mutation violations",
+    )
+    selective_immutable = _strict_bool(
+        summary.get("selective_durable_bit_immutable_until_atomic_replacement"),
+        "selective durable immutability flag",
+    )
+    immutability_applicability_exact = recorded_immutability_applicable is immutability_applicable
+    selective_immutability = (
+        immutability_applicability_exact
+        and helper_mutations == 0
+        and beneficiary_mutations == 0
+        and (selective_immutable if immutability_applicable else not selective_immutable)
+    )
+    d_short_passed = d_short_lifecycle_passed and selective_immutability
+
+    resource_constant = (
+        _strict_bool(resource.get("resource_constant"), "resource constant flag")
+        and _strict_bool(resource.get("resource_matched"), "resource matched flag")
+        and _strict_int(resource.get("initial_state_scalars"), "initial state scalars") == 138
+        and _strict_int(resource.get("final_state_scalars"), "final state scalars") == 138
+        and _strict_int(resource.get("initial_state_bytes"), "initial state bytes") == 552
+        and _strict_int(resource.get("final_state_bytes"), "final state bytes") == 552
+        and _strict_int(resource.get("expected_state_bytes"), "expected state bytes") == 552
+    )
+
+    trace_valid = _strict_bool(audit.get("valid"), "case trace audit valid flag")
+    transition_counts_complete = all(
+        _strict_int(audit.get(field), f"case audit {field}") == EXPECTED_STEPS
+        for field in (
+            "expected_steps",
+            "rows_checked",
+            "helper_transitions_checked",
+            "beneficiary_transitions_checked",
+            "world_transitions_checked",
+        )
+    )
+    lineage_valid = _strict_bool(
+        audit.get("lineage_oracle_valid"),
+        "case lineage audit valid flag",
+    ) and audit.get("lineage_oracle_mismatches_sha256") == canonical_sha256([])
+    no_trace_mismatches = (
+        _strict_int(audit.get("mismatch_count"), "case audit mismatch count") == 0
+        and audit.get("mismatches_sha256") == canonical_sha256([])
+        and audit.get("unobserved_transition_fields") == []
+    )
+    complete_trace_audit = trace_valid and transition_counts_complete and no_trace_mismatches
+    complete_role_lifecycle = (
+        complete_trace_audit and lifecycle_synchronized and selective_immutability
+    )
+    complete_world = complete_trace_audit
+
+    frozen_role_control = True
+    if condition == "helper_frozen":
+        frozen_role_control = (
+            helper_writes == 0
+            and helper_learning == 0
+            and _strict_int(summary.get("helper_commit_count"), "helper commit count") == 0
+            and _strict_int(
+                summary.get("helper_replacement_count"),
+                "helper replacement count",
+            )
+            == 0
+            and resource_constant
+        )
+    elif condition == "beneficiary_frozen":
+        frozen_role_control = (
+            beneficiary_writes == 0
+            and beneficiary_learning == 0
+            and _strict_int(
+                summary.get("beneficiary_commit_count"),
+                "beneficiary commit count",
+            )
+            == 0
+            and _strict_int(
+                summary.get("beneficiary_replacement_count"),
+                "beneficiary replacement count",
+            )
+            == 0
+            and resource_constant
+        )
+
+    source_bound_trace = (
+        trace.get("schema") == HIDDEN_REGIME_TRACE_SCHEMA
+        and trace.get("rows") == EXPECTED_STEPS
+        and trace.get("persisted") is False
+        and trace.get("discard_required_after_audit") is True
+    )
+    channel_control = complete_world and resource_constant
+    predicate_results = {
+        "lineage_serialization": lineage_valid and complete_trace_audit,
+        "both_roles_learning": both_roles_learning,
+        "atomic_c_old_to_c_new_replacement": atomic_replacement,
+        "d_short_non_displacement": d_short_passed,
+        "constant_resource": resource_constant,
+        "complete_role_lifecycle_oracle": complete_role_lifecycle,
+        "complete_world_oracle": complete_world,
+        "source_bound_trace_contract": source_bound_trace and complete_trace_audit,
+        "frozen_role_causal_controls": frozen_role_control,
+        "channel_causal_controls": channel_control,
+        "selective_immutability_where_applicable": selective_immutability,
+    }
+    _require(
+        all(type(value) is bool for value in predicate_results.values()),
+        "mandatory case predicate result is not boolean",
+    )
+    reference_body = {
+        "case_index": case_index,
+        "seed_index": expected_case.seed_index,
+        "condition": condition,
+        "manifest_name": expected_case.manifest_name,
+        "case_shard_payload_sha256": shard["payload_sha256"],
+        "case_request_binding_sha256": shard["case_request_binding_sha256"],
+        "configuration_sha256": shard["configuration_sha256"],
+        "summary_sha256": shard["summary_sha256"],
+        "resource_sha256": shard["resource_sha256"],
+        "audit_sha256": canonical_sha256(audit),
+        "primitive_trace_sha256": trace["sha256"],
+        "predicate_results": predicate_results,
+    }
+    return {
+        **reference_body,
+        "case_audit_reference_sha256": canonical_sha256(reference_body),
+    }
+
+
+def _case_predicate_reference(
+    case_reference: Mapping[str, object],
+    predicate_id: str,
+    *,
+    descriptive_only: bool,
+) -> dict[str, object]:
+    predicates = _plain_dict(case_reference.get("predicate_results"), "case predicates")
+    observed = _strict_bool(
+        predicates.get(predicate_id),
+        f"case predicate {predicate_id}",
+    )
+    return {
+        "kind": "descriptive_case_audit" if descriptive_only else "required_case_audit",
+        "case_index": case_reference["case_index"],
+        "seed_index": case_reference["seed_index"],
+        "condition": case_reference["condition"],
+        "case_audit_reference_sha256": case_reference["case_audit_reference_sha256"],
+        "predicate_observed": observed,
+        "decision_effect": "descriptive_only" if descriptive_only else "mandatory",
+    }
+
+
+def _case_requirement_result(
+    requirement: object,
+    case_references: Sequence[Mapping[str, object]],
+    *,
+    predicate_id: str,
+    required_conditions: tuple[str, ...],
+    descriptive_conditions: tuple[str, ...] = (),
+) -> dict[str, object]:
+    requirement_payload = cast(Any, requirement).to_payload()
+    required = [
+        _case_predicate_reference(item, predicate_id, descriptive_only=False)
+        for item in case_references
+        if item.get("condition") in required_conditions
+    ]
+    descriptive = [
+        _case_predicate_reference(item, predicate_id, descriptive_only=True)
+        for item in case_references
+        if item.get("condition") in descriptive_conditions
+    ]
+    _require(bool(required), f"mandatory audit {predicate_id} has no required references")
+    failed = [
+        _strict_int(item["case_index"], "failed mandatory audit case")
+        for item in required
+        if item["predicate_observed"] is False
+    ]
+    result_body = {
+        **requirement_payload,
+        "evaluation_mode": "case_outcome_or_validated_case_invariant",
+        "threshold_independent": True,
+        "thresholds_consulted": False,
+        "decision": "passed_nonstatistical" if not failed else "invalid_calibration",
+        "required_reference_count": len(required),
+        "required_references": required,
+        "required_references_sha256": canonical_sha256(required),
+        "descriptive_reference_count": len(descriptive),
+        "descriptive_references": descriptive,
+        "descriptive_references_sha256": canonical_sha256(descriptive),
+        "failed_case_indices": failed,
+    }
+    return {
+        **result_body,
+        "requirement_result_sha256": canonical_sha256(result_body),
+    }
+
+
+def _readiness_requirement_result(
+    requirement: object,
+    certification_binding: Mapping[str, object],
+) -> dict[str, object]:
+    requirement_payload = cast(Any, requirement).to_payload()
+    certification_binding_sha256 = canonical_sha256(certification_binding)
+    reference = {
+        "kind": "readiness_certification",
+        "certification_id": READINESS_EQUIVALENCE_CERTIFICATION_ID,
+        "readiness_receipt_sha256": certification_binding["readiness_receipt_sha256"],
+        "certification_binding_sha256": certification_binding_sha256,
+        "predicate_observed": True,
+        "decision_effect": "mandatory",
+    }
+    result_body = {
+        **requirement_payload,
+        "evaluation_mode": "readiness_certification_not_per_case_execution",
+        "threshold_independent": True,
+        "thresholds_consulted": False,
+        "decision": "passed_nonstatistical",
+        "required_reference_count": 1,
+        "required_references": [reference],
+        "required_references_sha256": canonical_sha256([reference]),
+        "descriptive_reference_count": 0,
+        "descriptive_references": [],
+        "descriptive_references_sha256": canonical_sha256([]),
+        "failed_case_indices": [],
+    }
+    return {
+        **result_body,
+        "requirement_result_sha256": canonical_sha256(result_body),
+    }
+
+
+def _build_mandatory_audit_summary(
+    design: HiddenRegimeFactorialCalibrationDesign,
+    shards_by_case: Mapping[int, Mapping[str, object]],
+    aggregation_readiness_certification_binding: Mapping[str, object],
+) -> dict[str, object]:
+    """Evaluate all frozen non-statistical requirements without thresholds."""
+
+    _require(
+        set(shards_by_case) == set(range(EXPECTED_CASES)),
+        "mandatory audit requires the exact 240-case ledger",
+    )
+    certification_binding = _validate_aggregation_readiness_certification_binding(
+        aggregation_readiness_certification_binding
+    )
+    case_references = [
+        _mandatory_case_audit_reference(design, shards_by_case[index])
+        for index in range(EXPECTED_CASES)
+    ]
+    requirements = {item.requirement_id: item for item in design.audits}
+    _require(
+        len(requirements) == len(design.audits),
+        "mandatory audit requirement identifiers are not unique",
+    )
+    factor_conditions = (
+        "selective_full",
+        "writable_evidence",
+        "selective_lru",
+        "writable_lru",
+    )
+    all_conditions = tuple(CANONICAL_CONDITION_ORDER)
+    results_by_id = {
+        "lineage_serialization": _case_requirement_result(
+            requirements["lineage_serialization"],
+            case_references,
+            predicate_id="lineage_serialization",
+            required_conditions=all_conditions,
+        ),
+        "both_roles_learning": _case_requirement_result(
+            requirements["both_roles_learning"],
+            case_references,
+            predicate_id="both_roles_learning",
+            required_conditions=factor_conditions,
+        ),
+        "atomic_c_old_to_c_new_replacement": _case_requirement_result(
+            requirements["atomic_c_old_to_c_new_replacement"],
+            case_references,
+            predicate_id="atomic_c_old_to_c_new_replacement",
+            required_conditions=("selective_full",),
+            descriptive_conditions=factor_conditions[1:],
+        ),
+        "d_short_non_displacement": _case_requirement_result(
+            requirements["d_short_non_displacement"],
+            case_references,
+            predicate_id="d_short_non_displacement",
+            required_conditions=("selective_full",),
+            descriptive_conditions=factor_conditions[1:],
+        ),
+        "constant_resource": _case_requirement_result(
+            requirements["constant_resource"],
+            case_references,
+            predicate_id="constant_resource",
+            required_conditions=all_conditions,
+        ),
+        "complete_role_lifecycle_oracle": _case_requirement_result(
+            requirements["complete_role_lifecycle_oracle"],
+            case_references,
+            predicate_id="complete_role_lifecycle_oracle",
+            required_conditions=all_conditions,
+        ),
+        "complete_world_oracle": _case_requirement_result(
+            requirements["complete_world_oracle"],
+            case_references,
+            predicate_id="complete_world_oracle",
+            required_conditions=all_conditions,
+        ),
+        "source_bound_trace_contract": _case_requirement_result(
+            requirements["source_bound_trace_contract"],
+            case_references,
+            predicate_id="source_bound_trace_contract",
+            required_conditions=all_conditions,
+        ),
+        "decentralized_role_equivalence": _readiness_requirement_result(
+            requirements["decentralized_role_equivalence"],
+            certification_binding,
+        ),
+        "checkpoint_resume_equivalence": _readiness_requirement_result(
+            requirements["checkpoint_resume_equivalence"],
+            certification_binding,
+        ),
+        "frozen_role_causal_controls": _case_requirement_result(
+            requirements["frozen_role_causal_controls"],
+            case_references,
+            predicate_id="frozen_role_causal_controls",
+            required_conditions=("helper_frozen", "beneficiary_frozen"),
+        ),
+        "channel_causal_controls": _case_requirement_result(
+            requirements["channel_causal_controls"],
+            case_references,
+            predicate_id="channel_causal_controls",
+            required_conditions=("constant_channel_0", "shuffled_channel"),
+        ),
+    }
+    requirement_results = [results_by_id[item.requirement_id] for item in design.audits]
+    applicable_immutability = [
+        _case_predicate_reference(
+            item,
+            "selective_immutability_where_applicable",
+            descriptive_only=False,
+        )
+        for item in case_references
+        if item["condition"] not in {"writable_evidence", "writable_lru"}
+    ]
+    immutability_failures = [
+        _strict_int(item["case_index"], "selective immutability failure case")
+        for item in applicable_immutability
+        if item["predicate_observed"] is False
+    ]
+    selective_immutability_result = {
+        "subpredicate_id": "selective_immutability_where_applicable",
+        "scope": "every non-writable selective-policy case",
+        "threshold_independent": True,
+        "thresholds_consulted": False,
+        "decision": (
+            "passed_nonstatistical" if not immutability_failures else "invalid_calibration"
+        ),
+        "required_reference_count": len(applicable_immutability),
+        "required_references": applicable_immutability,
+        "required_references_sha256": canonical_sha256(applicable_immutability),
+        "failed_case_indices": immutability_failures,
+    }
+    failed_requirement_ids = [
+        cast(str, item["requirement_id"])
+        for item in requirement_results
+        if item["decision"] == "invalid_calibration"
+    ]
+    if immutability_failures and "complete_role_lifecycle_oracle" not in failed_requirement_ids:
+        _fail("selective immutability failure escaped the lifecycle requirement")
+    decision = "passed_nonstatistical" if not failed_requirement_ids else "invalid_calibration"
+    return {
+        "schema": CALIBRATION_MANDATORY_AUDIT_SUMMARY_SCHEMA,
+        "threshold_independent": True,
+        "thresholds_consulted": False,
+        "integrity_status": "passed_before_mechanism_decision",
+        "decision": decision,
+        "case_audit_reference_count": len(case_references),
+        "case_audit_references": case_references,
+        "case_audit_references_sha256": canonical_sha256(case_references),
+        "selective_immutability_result": selective_immutability_result,
+        "selective_immutability_result_sha256": canonical_sha256(
+            selective_immutability_result
+        ),
+        "requirement_result_count": len(requirement_results),
+        "requirement_results": requirement_results,
+        "requirement_results_sha256": canonical_sha256(requirement_results),
+        "failed_requirement_ids": failed_requirement_ids,
+        "readiness_certification_binding_sha256": canonical_sha256(certification_binding),
+    }
+
+
 def _gate_result_matrix(
     design: HiddenRegimeFactorialCalibrationDesign,
     levels: Sequence[Mapping[str, object]],
     estimands: Sequence[Mapping[str, object]],
     supports: Sequence[Mapping[str, object]],
+    mandatory_audit_summary: Mapping[str, object],
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    audit_summary = _plain_dict(mandatory_audit_summary, "mandatory audit summary")
+    _require(
+        audit_summary.get("schema") == CALIBRATION_MANDATORY_AUDIT_SUMMARY_SCHEMA,
+        "mandatory audit summary schema differs",
+    )
+    audit_decision = audit_summary.get("decision")
+    _require(
+        audit_decision in {"passed_nonstatistical", "invalid_calibration"},
+        "mandatory audit decision differs",
+    )
+    _require(
+        audit_summary.get("threshold_independent") is True
+        and audit_summary.get("thresholds_consulted") is False,
+        "mandatory audit decision is not threshold-independent",
+    )
+    audit_requirement_results = [
+        _plain_dict(item, "mandatory audit requirement result")
+        for item in _plain_list(
+            audit_summary.get("requirement_results"),
+            "mandatory audit requirement results",
+        )
+    ]
+    _require(
+        [item.get("requirement_id") for item in audit_requirement_results]
+        == [item.requirement_id for item in design.audits],
+        "mandatory audit requirement result order differs",
+    )
+    _require(
+        audit_summary.get("requirement_results_sha256")
+        == canonical_sha256(audit_requirement_results),
+        "mandatory audit requirement result digest differs",
+    )
+    for item in audit_requirement_results:
+        result_body = dict(item)
+        result_sha256 = result_body.pop("requirement_result_sha256", None)
+        _require(
+            _is_sha256(result_sha256) and canonical_sha256(result_body) == result_sha256,
+            "mandatory audit requirement content digest differs",
+        )
+        _require(
+            item.get("decision") in {"passed_nonstatistical", "invalid_calibration"},
+            "mandatory audit requirement decision differs",
+        )
+        requirement_references = _plain_list(
+            item.get("required_references"),
+            "audit references",
+        )
+        _require(
+            item.get("required_references_sha256")
+            == canonical_sha256(requirement_references),
+            "mandatory audit required-reference digest differs",
+        )
+    expected_audit_decision = (
+        "invalid_calibration"
+        if any(item["decision"] == "invalid_calibration" for item in audit_requirement_results)
+        else "passed_nonstatistical"
+    )
+    _require(
+        audit_decision == expected_audit_decision,
+        "mandatory audit family decision differs from requirement results",
+    )
+    audit_gate_references = [
+        {
+            "kind": "threshold_independent_audit_requirement",
+            "requirement_id": item["requirement_id"],
+            "decision": item["decision"],
+            "requirement_result_sha256": item["requirement_result_sha256"],
+            "required_references_sha256": item["required_references_sha256"],
+        }
+        for item in audit_requirement_results
+    ]
+    _require(
+        bool(audit_gate_references)
+        and all(
+            _strict_int(item.get("required_reference_count"), "audit reference count", minimum=1)
+            > 0
+            and bool(_plain_list(item.get("required_references"), "audit references"))
+            for item in audit_requirement_results
+        ),
+        "mandatory audit gate has an empty requirement reference",
+    )
     level_index = {(item["condition"], item["metric_id"]): item for item in levels}
     estimand_index: dict[tuple[object, object], Mapping[str, object]] = {}
     for estimand in estimands:
@@ -3647,6 +6232,17 @@ def _gate_result_matrix(
     mandatory: list[dict[str, object]] = []
     descriptive: list[dict[str, object]] = []
     for family in design.gate_families:
+        if family.gate_family_id == "mandatory_trace_and_lifecycle_audits":
+            mandatory.append(
+                {
+                    "gate_family_id": family.gate_family_id,
+                    "mandatory": True,
+                    "threshold_status": "not_applicable_nonstatistical",
+                    "decision": audit_decision,
+                    "references": audit_gate_references,
+                }
+            )
+            continue
         references: list[dict[str, object]] = []
         if family.estimand_ids:
             for estimand_id in family.estimand_ids:
@@ -3770,6 +6366,9 @@ def aggregate_hidden_regime_factorial_calibration(
     *,
     managed_ledger_snapshot: Mapping[str, object],
     managed_ledger_directory: Path,
+    aggregation_worker_provenance: Mapping[str, object],
+    aggregation_zip_provenance_attestation: Mapping[str, object],
+    aggregation_readiness_certification_binding: Mapping[str, object],
 ) -> dict[str, object]:
     """Aggregate the exact 240-case ledger without setting or evaluating thresholds."""
 
@@ -3783,7 +6382,37 @@ def aggregate_hidden_regime_factorial_calibration(
     levels = _aggregate_levels(design, shards_by_case)
     estimands = _aggregate_estimands(design, shards_by_case)
     supports = _aggregate_support_metrics(design, shards_by_case)
-    mandatory, descriptive = _gate_result_matrix(design, levels, estimands, supports)
+    certification_binding = _validate_aggregation_readiness_certification_binding(
+        aggregation_readiness_certification_binding
+    )
+    mandatory_audit_summary = _build_mandatory_audit_summary(
+        design,
+        shards_by_case,
+        certification_binding,
+    )
+    mandatory, descriptive = _gate_result_matrix(
+        design,
+        levels,
+        estimands,
+        supports,
+        mandatory_audit_summary,
+    )
+    worker_provenance = _plain_dict(
+        aggregation_worker_provenance,
+        "aggregation worker provenance",
+    )
+    zip_provenance_attestation = _plain_dict(
+        aggregation_zip_provenance_attestation,
+        "aggregation ZIP provenance attestation",
+    )
+    finalized_by_case = {
+        _strict_int(item.get("case_index"), "finalized case index"): item
+        for item in (
+            _plain_dict(raw, "finalized inventory record")
+            for raw in _plain_list(ledger.get("finalized_records"), "finalized records")
+        )
+    }
+    _require(set(finalized_by_case) == set(shards_by_case), "finalized case ledger differs")
     case_ledger = [
         {
             "case_index": case_index,
@@ -3791,11 +6420,13 @@ def aggregate_hidden_regime_factorial_calibration(
             "condition": _plain_dict(shard["case"], "case")["condition"],
             "manifest_name": _plain_dict(shard["case"], "case")["manifest_name"],
             "case_shard_payload_sha256": shard["payload_sha256"],
-            "request_payload_sha256": shard["request_payload_sha256"],
+            "case_request_binding_sha256": shard["case_request_binding_sha256"],
             "summary_sha256": shard["summary_sha256"],
             "resource_sha256": shard["resource_sha256"],
             "worker_provenance_sha256": canonical_sha256(shard["worker_provenance"]),
             "execution_record_binding": shard["execution_record_binding"],
+            "finalized_record_sha256": finalized_by_case[case_index]["finalized_record_sha256"],
+            "shard_canonical_sha256": finalized_by_case[case_index]["shard_canonical_sha256"],
             "primitive_trace_sha256": _plain_dict(shard["primitive_trace"], "trace")["sha256"],
         }
         for case_index, shard in sorted(shards_by_case.items())
@@ -3816,6 +6447,16 @@ def aggregate_hidden_regime_factorial_calibration(
         "managed_ledger_snapshot": ledger,
         "managed_ledger_snapshot_sha256": canonical_sha256(ledger),
         "managed_ledger_content_address": ledger["genesis_sha256"],
+        "aggregation_readiness_certification_binding": certification_binding,
+        "aggregation_readiness_certification_binding_sha256": canonical_sha256(
+            certification_binding
+        ),
+        "aggregation_worker_provenance": worker_provenance,
+        "aggregation_worker_provenance_sha256": canonical_sha256(worker_provenance),
+        "aggregation_zip_provenance_attestation": zip_provenance_attestation,
+        "aggregation_zip_provenance_attestation_sha256": canonical_sha256(
+            zip_provenance_attestation
+        ),
         "case_count": EXPECTED_CASES,
         "seed_pair_count": EXPECTED_SEED_PAIRS,
         "condition_count": EXPECTED_CONDITIONS,
@@ -3827,9 +6468,16 @@ def aggregate_hidden_regime_factorial_calibration(
         "estimand_summaries_sha256": canonical_sha256(estimands),
         "paired_population_support_summaries": supports,
         "paired_population_support_summaries_sha256": canonical_sha256(supports),
+        "mandatory_audit_summary": mandatory_audit_summary,
+        "mandatory_audit_summary_sha256": canonical_sha256(mandatory_audit_summary),
+        "mandatory_audit_decision": mandatory_audit_summary["decision"],
         "mandatory_gate_results": mandatory,
         "descriptive_only_results": descriptive,
-        "gate_decision_status": "not_evaluated_thresholds_unset",
+        "gate_decision_status": (
+            "mandatory_audits_passed_statistical_thresholds_unset"
+            if mandatory_audit_summary["decision"] == "passed_nonstatistical"
+            else "invalid_calibration_mandatory_audit_failure"
+        ),
         "scipy_version_for_student_t_quantiles": scipy_version,
         "float_serialization": "canonical_python_float_hex_exact_ieee754_binary64",
         "comparison_rounding": "none_precomparison_display_rounding_forbidden",
@@ -3846,6 +6494,9 @@ def validate_calibration_aggregate(
     *,
     managed_ledger_snapshot: Mapping[str, object],
     managed_ledger_directory: Path,
+    aggregation_worker_provenance: Mapping[str, object],
+    aggregation_zip_provenance_attestation: Mapping[str, object],
+    aggregation_readiness_certification_binding: Mapping[str, object],
 ) -> dict[str, object]:
     """Recompute an aggregate from its exact shards and managed ledger."""
 
@@ -3853,6 +6504,11 @@ def validate_calibration_aggregate(
         shards,
         managed_ledger_snapshot=managed_ledger_snapshot,
         managed_ledger_directory=managed_ledger_directory,
+        aggregation_worker_provenance=aggregation_worker_provenance,
+        aggregation_zip_provenance_attestation=aggregation_zip_provenance_attestation,
+        aggregation_readiness_certification_binding=(
+            aggregation_readiness_certification_binding
+        ),
     )
     if canonical_json_bytes(dict(payload)) != canonical_json_bytes(expected):
         _fail("calibration aggregate differs from exact recomputation")
@@ -3873,71 +6529,95 @@ def calibration_aggregate_path(publication_root: Path, payload_sha256: str) -> P
     return publication_root.absolute() / f"{payload_sha256}.json"
 
 
-def publish_calibration_aggregate_new_only(
+def _load_content_addressed_calibration_aggregate(
     publication_root: Path,
-    payload: Mapping[str, object],
-    shards: Sequence[Mapping[str, object]],
-    *,
-    managed_ledger_snapshot: Mapping[str, object],
-    managed_ledger_directory: Path,
-    authorize_publication: bool = False,
-) -> PublishedCalibrationAggregate:
-    """Validate and publish a canonical aggregate once under its payload digest."""
+    payload_sha256: str,
+) -> dict[str, object]:
+    """Read one immutable aggregate only from its declared content address."""
 
-    _require(authorize_publication is True, "aggregate publication requires authorization")
-    validated = validate_calibration_aggregate(
-        payload,
-        shards,
-        managed_ledger_snapshot=managed_ledger_snapshot,
-        managed_ledger_directory=managed_ledger_directory,
-    )
-    payload_sha256 = cast(str, validated["payload_sha256"])
     path = calibration_aggregate_path(publication_root, payload_sha256)
-    raw = canonical_json_bytes(validated)
+    raw = _read_regular_file(
+        path,
+        max_bytes=_MAX_AGGREGATE_BYTES,
+        label="content-addressed calibration aggregate",
+    )
+    payload = _strict_json(raw, "content-addressed calibration aggregate")
+    body = _validate_payload_digest(payload, "content-addressed calibration aggregate")
+    _require(payload["payload_sha256"] == payload_sha256, "aggregate content address differs")
+    _require(body.get("schema") == CALIBRATION_AGGREGATE_SCHEMA, "aggregate schema differs")
+    _require(body.get("development_only") is True, "aggregate is not development-only")
+    _require(
+        body.get("scientific_promotion_allowed") is False,
+        "aggregate permits scientific promotion",
+    )
+    _require(body.get("claim_accepted") is False, "aggregate accepts a claim")
+    _require(body.get("thresholds_frozen") is False, "aggregate already freezes thresholds")
+    _require(body.get("promotion_artifact") is False, "aggregate is a promotion artifact")
+    return payload
+
+
+def _install_verified_aggregate_worker_output_new_only(
+    publication_root: Path,
+    payload: dict[str, object],
+    raw: bytes,
+) -> PublishedCalibrationAggregate:
+    """Install exact post-bootstrap worker bytes without semantic checkout re-evaluation."""
+
+    _require(raw == canonical_json_bytes(payload), "verified aggregate worker bytes differ")
+    payload_sha256 = cast(str, payload["payload_sha256"])
+    path = calibration_aggregate_path(publication_root, payload_sha256)
     _require(len(raw) <= _MAX_AGGREGATE_BYTES, "calibration aggregate exceeds maximum size")
     try:
-        _write_new_immutable(path.parent, path.name, raw)
+        _write_new_immutable(
+            path.parent,
+            path.name,
+            raw,
+            max_bytes=_MAX_AGGREGATE_BYTES,
+            label="calibration aggregate",
+        )
     except FileExistsError:
         existing_raw = _read_regular_file(
             path,
             max_bytes=_MAX_AGGREGATE_BYTES,
             label="calibration aggregate",
         )
-        existing = _strict_json(existing_raw, "calibration aggregate")
-        validate_calibration_aggregate(
-            existing,
-            shards,
-            managed_ledger_snapshot=managed_ledger_snapshot,
-            managed_ledger_directory=managed_ledger_directory,
-        )
         _require(existing_raw == raw, "duplicate aggregate is not byte-identical")
-    return PublishedCalibrationAggregate(path, payload_sha256, validated)
-
-
-def load_published_calibration_aggregate(
-    publication_root: Path,
-    payload_sha256: str,
-    shards: Sequence[Mapping[str, object]],
-    *,
-    managed_ledger_snapshot: Mapping[str, object],
-    managed_ledger_directory: Path,
-) -> dict[str, object]:
-    """Load one immutable content-addressed aggregate and recompute it exactly."""
-
-    path = calibration_aggregate_path(publication_root, payload_sha256)
-    raw = _read_regular_file(
+    installed_raw = _read_regular_file(
         path,
         max_bytes=_MAX_AGGREGATE_BYTES,
-        label="calibration aggregate",
+        label="installed calibration aggregate",
     )
-    payload = _strict_json(raw, "calibration aggregate")
-    _require(payload.get("payload_sha256") == payload_sha256, "aggregate path digest differs")
-    return validate_calibration_aggregate(
-        payload,
-        shards,
-        managed_ledger_snapshot=managed_ledger_snapshot,
-        managed_ledger_directory=managed_ledger_directory,
+    _require(installed_raw == raw, "installed aggregate bytes differ from verified worker output")
+    return PublishedCalibrationAggregate(path, payload_sha256, payload)
+
+
+def _require_disjoint_aggregate_publication_root(
+    aggregate_publication_root: Path,
+    *,
+    readiness_directory: Path,
+    shard_publication_root: Path,
+    managed_ledger_directory: Path,
+) -> None:
+    """Keep aggregate installation outside every exact input/inventory tree."""
+
+    descriptor, aggregate_root = _open_directory_without_symlinks(
+        aggregate_publication_root,
+        label="aggregate publication root",
     )
+    os.close(descriptor)
+    normalized_aggregate = Path(os.path.realpath(aggregate_root))
+    for label, raw_path in (
+        ("readiness publication", readiness_directory),
+        ("shard publication", shard_publication_root),
+        ("managed ledger", managed_ledger_directory),
+    ):
+        normalized_input = Path(os.path.realpath(raw_path.absolute()))
+        overlaps = (
+            normalized_aggregate == normalized_input
+            or normalized_aggregate.is_relative_to(normalized_input)
+            or normalized_input.is_relative_to(normalized_aggregate)
+        )
+        _require(not overlaps, f"aggregate publication root overlaps the {label} tree")
 
 
 def aggregate_and_publish_completed_calibration(
@@ -3947,31 +6627,881 @@ def aggregate_and_publish_completed_calibration(
     managed_ledger_directory: Path,
     aggregate_publication_root: Path,
     authorize_publication: bool = False,
+    timeout_seconds: int | None = None,
 ) -> PublishedCalibrationAggregate:
-    """Load the exact completed ledger, recompute, and publish its aggregate."""
+    """Compute and publish only through the receipt's isolated source ZIP."""
 
     _require(authorize_publication is True, "aggregate publication requires authorization")
+    if timeout_seconds is not None:
+        _strict_int(timeout_seconds, "timeout_seconds", minimum=1)
     bundle = load_validated_readiness_bundle(
         readiness_directory,
         recheck_current=False,
-        recheck_runtime=True,
+        recheck_runtime=False,
     )
+    _require_disjoint_aggregate_publication_root(
+        aggregate_publication_root,
+        readiness_directory=readiness_directory,
+        shard_publication_root=shard_publication_root,
+        managed_ledger_directory=managed_ledger_directory,
+    )
+    completed = execute_bound_calibration_worker(
+        readiness_directory,
+        (
+            "--worker-aggregate-v1",
+            readiness_directory.absolute().as_posix(),
+            managed_ledger_directory.absolute().as_posix(),
+            shard_publication_root.absolute().as_posix(),
+        ),
+        authorize_calibration_execution=True,
+        timeout_seconds=timeout_seconds,
+    )
+    if completed.returncode != 0:
+        stderr_digest = hashlib.sha256(completed.stderr).hexdigest()
+        raise CalibrationError(
+            "isolated calibration aggregation failed; "
+            f"returncode={completed.returncode},stderr_bytes={len(completed.stderr)},"
+            f"stderr_sha256={stderr_digest}"
+        )
+    payload = _parse_aggregate_worker_result(completed.stdout)
+    body = _validate_payload_digest(payload, "aggregate worker result")
+    _validate_aggregate_provenance_bindings(body, bundle)
+    readiness = _plain_dict(body["readiness_binding"], "aggregate readiness binding")
+    _require(
+        readiness == _readiness_binding(bundle),
+        "aggregate worker readiness binding differs",
+    )
+    _require(
+        body["managed_ledger_content_address"] == bundle.execution_genesis_sha256,
+        "aggregate worker ledger binding differs",
+    )
+    readiness_body = _plain_dict(bundle.payload.get("body"), "readiness body")
+    require_current_full_runtime_identity(readiness_body.get("runtime_identity"))
+    _require_disjoint_aggregate_publication_root(
+        aggregate_publication_root,
+        readiness_directory=readiness_directory,
+        shard_publication_root=shard_publication_root,
+        managed_ledger_directory=managed_ledger_directory,
+    )
+    raw = canonical_json_bytes(payload)
+    return _install_verified_aggregate_worker_output_new_only(
+        aggregate_publication_root,
+        payload,
+        raw,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedThresholdFreezeReceipt:
+    """One immutable threshold decision addressed by its exact receipt digest."""
+
+    path: Path
+    receipt_payload_sha256: str
+    payload: dict[str, object]
+
+
+def threshold_freeze_receipt_path(
+    publication_root: Path,
+    receipt_payload_sha256: str,
+) -> Path:
+    _require(_is_sha256(receipt_payload_sha256), "threshold receipt digest is invalid")
+    return publication_root.absolute() / f"{receipt_payload_sha256}.json"
+
+
+def _load_content_addressed_threshold_freeze_receipt(
+    publication_root: Path,
+    receipt_payload_sha256: str,
+) -> dict[str, object]:
+    """Read one immutable threshold receipt only from its declared content address."""
+
+    path = threshold_freeze_receipt_path(publication_root, receipt_payload_sha256)
+    raw = _read_regular_file(
+        path,
+        max_bytes=_MAX_RECEIPT_BYTES,
+        label="content-addressed threshold-freeze receipt",
+    )
+    payload = _strict_json(raw, "content-addressed threshold-freeze receipt")
+    _threshold_freeze_receipt_body(
+        payload,
+        label="content-addressed threshold-freeze receipt",
+    )
+    _require(
+        payload.get("receipt_payload_sha256") == receipt_payload_sha256,
+        "threshold receipt content address differs",
+    )
+    return payload
+
+
+def _install_verified_threshold_freeze_receipt_new_only(
+    publication_root: Path,
+    payload: Mapping[str, object],
+    raw: bytes,
+) -> PublishedThresholdFreezeReceipt:
+    """Install only canonical bytes already checked against the exact aggregate."""
+
+    normalized = dict(payload)
+    _require(raw == canonical_json_bytes(normalized), "verified threshold receipt bytes differ")
+    _threshold_freeze_receipt_body(normalized, label="verified threshold-freeze receipt")
+    digest = normalized.get("receipt_payload_sha256")
+    _require(_is_sha256(digest), "threshold receipt payload digest is invalid")
+    path = threshold_freeze_receipt_path(publication_root, cast(str, digest))
+    _require(len(raw) <= _MAX_RECEIPT_BYTES, "threshold-freeze receipt exceeds maximum size")
+    try:
+        _write_new_immutable(
+            path.parent,
+            path.name,
+            raw,
+            max_bytes=_MAX_RECEIPT_BYTES,
+            label="threshold-freeze receipt",
+        )
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"refusing to overwrite threshold-freeze receipt: {path}"
+        ) from exc
+    installed_raw = _read_regular_file(
+        path,
+        max_bytes=_MAX_RECEIPT_BYTES,
+        label="installed threshold-freeze receipt",
+    )
+    _require(installed_raw == raw, "installed threshold receipt bytes differ")
+    return PublishedThresholdFreezeReceipt(path, cast(str, digest), normalized)
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedCertifiedProtectedPlan:
+    """Certified nonauthorizing plan bytes installed at one immutable content address."""
+
+    path: Path
+    payload_sha256: str
+    payload: dict[str, object]
+
+
+def certified_protected_plan_path(
+    publication_root: Path,
+    payload_sha256: str,
+) -> Path:
+    _require(_is_sha256(payload_sha256), "protected plan payload digest is invalid")
+    return publication_root.absolute() / f"{payload_sha256}.json"
+
+
+def _install_verified_protected_plan_new_only(
+    publication_root: Path,
+    payload: Mapping[str, object],
+    raw: bytes,
+) -> PublishedCertifiedProtectedPlan:
+    """Install exact certified worker bytes without deriving a seed in the checkout."""
+
+    normalized = dict(payload)
+    _require(raw == canonical_json_bytes(normalized), "verified protected plan bytes differ")
+    _protected_plan_body(normalized, label="verified protected plan")
+    digest = normalized.get("payload_sha256")
+    _require(_is_sha256(digest), "protected plan payload digest is invalid")
+    path = certified_protected_plan_path(publication_root, cast(str, digest))
+    _require(len(raw) <= _MAX_PROTECTED_PLAN_BYTES, "protected plan exceeds maximum size")
+    try:
+        _write_new_immutable(
+            path.parent,
+            path.name,
+            raw,
+            max_bytes=_MAX_PROTECTED_PLAN_BYTES,
+            label="certified protected plan",
+        )
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"refusing to overwrite or reuse a protected plan: {path}"
+        ) from exc
+    installed_raw = _read_regular_file(
+        path,
+        max_bytes=_MAX_PROTECTED_PLAN_BYTES,
+        label="installed certified protected plan",
+    )
+    _require(installed_raw == raw, "installed protected plan bytes differ")
+    return PublishedCertifiedProtectedPlan(path, cast(str, digest), normalized)
+
+
+def _require_disjoint_threshold_freeze_publication_root(
+    threshold_receipt_publication_root: Path,
+    *,
+    readiness_directory: Path,
+    shard_publication_root: Path,
+    managed_ledger_directory: Path,
+    aggregate_publication_root: Path,
+) -> None:
+    """Keep the final receipt outside every immutable input and inventory tree."""
+
+    descriptor, threshold_root = _open_directory_without_symlinks(
+        threshold_receipt_publication_root,
+        label="threshold receipt publication root",
+    )
+    os.close(descriptor)
+    normalized_threshold = Path(os.path.realpath(threshold_root))
+    for label, raw_path in (
+        ("readiness publication", readiness_directory),
+        ("shard publication", shard_publication_root),
+        ("managed ledger", managed_ledger_directory),
+        ("aggregate publication", aggregate_publication_root),
+    ):
+        normalized_input = Path(os.path.realpath(raw_path.absolute()))
+        overlaps = (
+            normalized_threshold == normalized_input
+            or normalized_threshold.is_relative_to(normalized_input)
+            or normalized_input.is_relative_to(normalized_threshold)
+        )
+        _require(not overlaps, f"threshold receipt publication root overlaps the {label} tree")
+
+
+def _require_disjoint_protected_plan_publication_root(
+    protected_plan_publication_root: Path,
+    *,
+    readiness_directory: Path,
+    shard_publication_root: Path,
+    managed_ledger_directory: Path,
+    aggregate_publication_root: Path,
+    threshold_receipt_publication_root: Path,
+) -> None:
+    """Keep plan publication outside all certified inputs, including the receipt root."""
+
+    plan_descriptor, plan_root = _open_directory_without_symlinks(
+        protected_plan_publication_root,
+        label="protected plan publication root",
+    )
+    os.close(plan_descriptor)
+    normalized_plan = Path(os.path.realpath(plan_root))
+    for label, raw_path in (
+        ("readiness publication", readiness_directory),
+        ("shard publication", shard_publication_root),
+        ("managed ledger", managed_ledger_directory),
+        ("aggregate publication", aggregate_publication_root),
+        ("threshold receipt publication", threshold_receipt_publication_root),
+    ):
+        descriptor, normalized_input = _open_directory_without_symlinks(
+            raw_path,
+            label=label,
+        )
+        os.close(descriptor)
+        normalized_input = Path(os.path.realpath(normalized_input))
+        overlaps = (
+            normalized_plan == normalized_input
+            or normalized_plan.is_relative_to(normalized_input)
+            or normalized_input.is_relative_to(normalized_plan)
+        )
+        _require(not overlaps, f"protected plan publication root overlaps the {label} tree")
+
+
+@contextmanager
+def _threshold_input_publication_guard(
+    *,
+    shard_publication_root: Path,
+    readiness_receipt_sha256: str,
+    managed_ledger_directory: Path,
+) -> Iterator[None]:
+    """Hold cooperative shard/ledger directory locks through parent recheck and install."""
+
+    _require(_is_sha256(readiness_receipt_sha256), "guard readiness digest is invalid")
+    directories = [
+        (
+            shard_publication_root.absolute() / readiness_receipt_sha256,
+            "threshold input shard directory",
+        ),
+        (managed_ledger_directory.absolute(), "threshold input managed ledger"),
+        (
+            managed_ledger_directory.absolute() / "cases",
+            "threshold input managed cases directory",
+        ),
+        *[
+            (
+                managed_ledger_directory.absolute()
+                / "cases"
+                / f"case-{case_index:03d}",
+                f"threshold input managed case {case_index}",
+            )
+            for case_index in range(EXPECTED_CASES)
+        ],
+    ]
+    descriptors: list[int] = []
+    try:
+        for path, label in directories:
+            descriptor, _ = _open_directory_without_symlinks(path, label=label)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                os.close(descriptor)
+                raise CalibrationError(
+                    f"{label} is locked by an active execution or mutation"
+                ) from exc
+            except BaseException:
+                os.close(descriptor)
+                raise
+            descriptors.append(descriptor)
+        yield
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
+def _validate_threshold_worker_provenance_bindings(
+    result_body: Mapping[str, object],
+    bundle: ValidatedReadinessBundle,
+) -> None:
+    """Validate the threshold worker with the same exact ZIP provenance contract."""
+
+    proxy = {
+        "aggregation_readiness_certification_binding": result_body.get(
+            "threshold_worker_readiness_certification_binding"
+        ),
+        "aggregation_readiness_certification_binding_sha256": result_body.get(
+            "threshold_worker_readiness_certification_binding_sha256"
+        ),
+        "aggregation_worker_provenance": result_body.get("threshold_worker_provenance"),
+        "aggregation_worker_provenance_sha256": result_body.get(
+            "threshold_worker_provenance_sha256"
+        ),
+        "aggregation_zip_provenance_attestation": result_body.get(
+            "threshold_zip_provenance_attestation"
+        ),
+        "aggregation_zip_provenance_attestation_sha256": result_body.get(
+            "threshold_zip_provenance_attestation_sha256"
+        ),
+    }
+    _validate_aggregate_provenance_bindings(proxy, bundle)
+
+
+def _validate_protected_plan_worker_provenance_bindings(
+    result_body: Mapping[str, object],
+    bundle: ValidatedReadinessBundle,
+) -> None:
+    """Validate protected-plan worker identity against the exact current ZIP receipt."""
+
+    proxy = {
+        "aggregation_readiness_certification_binding": result_body.get(
+            "worker_readiness_certification_binding"
+        ),
+        "aggregation_readiness_certification_binding_sha256": result_body.get(
+            "worker_readiness_certification_binding_sha256"
+        ),
+        "aggregation_worker_provenance": result_body.get("worker_provenance"),
+        "aggregation_worker_provenance_sha256": result_body.get(
+            "worker_provenance_sha256"
+        ),
+        "aggregation_zip_provenance_attestation": result_body.get(
+            "zip_provenance_attestation"
+        ),
+        "aggregation_zip_provenance_attestation_sha256": result_body.get(
+            "zip_provenance_attestation_sha256"
+        ),
+    }
+    _validate_aggregate_provenance_bindings(proxy, bundle)
+
+
+def _verify_and_install_threshold_freeze_worker_result(
+    *,
+    result: Mapping[str, object],
+    bundle: ValidatedReadinessBundle,
+    readiness_directory: Path,
+    shard_publication_root: Path,
+    managed_ledger_directory: Path,
+    aggregate_publication_root: Path,
+    aggregate_payload_sha256: str,
+    threshold_receipt_publication_root: Path,
+) -> PublishedThresholdFreezeReceipt:
+    """Recheck all live identities under locks before the one allowed install."""
+
+    result_body = _validate_payload_digest(result, "threshold-freeze worker result")
+    _require(
+        result_body["calibration_aggregate_payload_sha256"] == aggregate_payload_sha256,
+        "threshold worker result binds another aggregate",
+    )
+    _require(
+        result_body["readiness_receipt_sha256"] == bundle.receipt_sha256,
+        "threshold worker result binds another readiness receipt",
+    )
+    aggregate = _load_content_addressed_calibration_aggregate(
+        aggregate_publication_root,
+        aggregate_payload_sha256,
+    )
+    aggregate_body = _validate_payload_digest(aggregate, "calibration aggregate")
+    _validate_aggregate_provenance_bindings(aggregate_body, bundle)
     readiness = _readiness_binding(bundle)
+    _require(
+        _plain_dict(aggregate_body.get("readiness_binding"), "aggregate readiness binding")
+        == readiness,
+        "threshold parent aggregate readiness binding differs",
+    )
+    _require(
+        aggregate_body.get("managed_ledger_content_address")
+        == bundle.execution_genesis_sha256,
+        "threshold parent aggregate ledger binding differs",
+    )
+    _validate_threshold_worker_provenance_bindings(result_body, bundle)
+
+    current_shards = load_complete_calibration_case_shards(
+        shard_publication_root,
+        expected_readiness_binding=readiness,
+        managed_ledger_directory=managed_ledger_directory,
+    )
+    current_inventory = snapshot_calibration_execution_inventory(managed_ledger_directory)
+    current_input_binding = _threshold_freeze_exact_input_binding(
+        aggregate,
+        current_shards,
+        current_inventory,
+    )
+    worker_input_binding = _plain_dict(
+        result_body["threshold_exact_input_binding"],
+        "threshold worker exact input binding",
+    )
+    _require(
+        canonical_json_bytes(current_input_binding) == canonical_json_bytes(worker_input_binding),
+        "threshold inputs changed after certified worker recomputation",
+    )
+
+    receipt = _plain_dict(result_body["threshold_freeze_receipt"], "threshold-freeze receipt")
+    try:
+        validated_receipt = validate_hidden_regime_factorial_threshold_freeze_receipt(
+            receipt,
+            calibration_aggregate=aggregate,
+        )
+    except ThresholdFreezeError as exc:
+        raise CalibrationError(str(exc)) from exc
+    _require(
+        canonical_json_bytes(validated_receipt) == canonical_json_bytes(receipt),
+        "threshold parent receipt validation changed worker bytes",
+    )
+    readiness_body = _plain_dict(bundle.payload.get("body"), "readiness body")
+    require_current_full_runtime_identity(readiness_body.get("runtime_identity"))
+    _require_disjoint_aggregate_publication_root(
+        aggregate_publication_root,
+        readiness_directory=readiness_directory,
+        shard_publication_root=shard_publication_root,
+        managed_ledger_directory=managed_ledger_directory,
+    )
+    _require_disjoint_threshold_freeze_publication_root(
+        threshold_receipt_publication_root,
+        readiness_directory=readiness_directory,
+        shard_publication_root=shard_publication_root,
+        managed_ledger_directory=managed_ledger_directory,
+        aggregate_publication_root=aggregate_publication_root,
+    )
+    aggregate_after = _load_content_addressed_calibration_aggregate(
+        aggregate_publication_root,
+        aggregate_payload_sha256,
+    )
+    current_shards_after = load_complete_calibration_case_shards(
+        shard_publication_root,
+        expected_readiness_binding=readiness,
+        managed_ledger_directory=managed_ledger_directory,
+    )
+    current_inventory_after = snapshot_calibration_execution_inventory(
+        managed_ledger_directory
+    )
+    current_input_binding_after = _threshold_freeze_exact_input_binding(
+        aggregate_after,
+        current_shards_after,
+        current_inventory_after,
+    )
+    _require(
+        canonical_json_bytes(aggregate_after) == canonical_json_bytes(aggregate),
+        "content-addressed aggregate changed before threshold receipt installation",
+    )
+    _require(
+        canonical_json_bytes(current_input_binding_after)
+        == canonical_json_bytes(current_input_binding),
+        "shard or managed-ledger input changed before threshold receipt installation",
+    )
+    raw = canonical_json_bytes(validated_receipt)
+    return _install_verified_threshold_freeze_receipt_new_only(
+        threshold_receipt_publication_root,
+        validated_receipt,
+        raw,
+    )
+
+
+def freeze_and_publish_completed_calibration_thresholds(
+    *,
+    readiness_directory: Path,
+    shard_publication_root: Path,
+    managed_ledger_directory: Path,
+    aggregate_publication_root: Path,
+    aggregate_payload_sha256: str,
+    threshold_receipt_publication_root: Path,
+    authorize_publication: bool = False,
+    timeout_seconds: int | None = None,
+) -> PublishedThresholdFreezeReceipt:
+    """Exact-recompute, decide, recheck, and publish one threshold receipt."""
+
+    _require(authorize_publication is True, "threshold receipt publication requires authorization")
+    _require(_is_sha256(aggregate_payload_sha256), "aggregate payload digest is invalid")
+    if timeout_seconds is not None:
+        _strict_int(timeout_seconds, "timeout_seconds", minimum=1)
+    bundle = load_validated_readiness_bundle(
+        readiness_directory,
+        recheck_current=False,
+        recheck_runtime=False,
+    )
+    _require_disjoint_aggregate_publication_root(
+        aggregate_publication_root,
+        readiness_directory=readiness_directory,
+        shard_publication_root=shard_publication_root,
+        managed_ledger_directory=managed_ledger_directory,
+    )
+    _require_disjoint_threshold_freeze_publication_root(
+        threshold_receipt_publication_root,
+        readiness_directory=readiness_directory,
+        shard_publication_root=shard_publication_root,
+        managed_ledger_directory=managed_ledger_directory,
+        aggregate_publication_root=aggregate_publication_root,
+    )
+    completed = execute_bound_calibration_worker(
+        readiness_directory,
+        (
+            "--worker-threshold-freeze-v1",
+            readiness_directory.absolute().as_posix(),
+            managed_ledger_directory.absolute().as_posix(),
+            shard_publication_root.absolute().as_posix(),
+            aggregate_publication_root.absolute().as_posix(),
+            aggregate_payload_sha256,
+        ),
+        authorize_calibration_execution=True,
+        timeout_seconds=timeout_seconds,
+    )
+    if completed.returncode != 0:
+        stderr_digest = hashlib.sha256(completed.stderr).hexdigest()
+        raise CalibrationError(
+            "isolated calibration threshold freezing failed without publication; "
+            f"returncode={completed.returncode},stderr_bytes={len(completed.stderr)},"
+            f"stderr_sha256={stderr_digest}"
+        )
+    result = _parse_threshold_freeze_worker_result(completed.stdout)
+    with _threshold_input_publication_guard(
+        shard_publication_root=shard_publication_root,
+        readiness_receipt_sha256=bundle.receipt_sha256,
+        managed_ledger_directory=managed_ledger_directory,
+    ):
+        return _verify_and_install_threshold_freeze_worker_result(
+            result=result,
+            bundle=bundle,
+            readiness_directory=readiness_directory,
+            shard_publication_root=shard_publication_root,
+            managed_ledger_directory=managed_ledger_directory,
+            aggregate_publication_root=aggregate_publication_root,
+            aggregate_payload_sha256=aggregate_payload_sha256,
+            threshold_receipt_publication_root=threshold_receipt_publication_root,
+        )
+
+
+def _require_disjoint_protected_plan_workflow_roots(
+    *,
+    readiness_directory: Path,
+    shard_publication_root: Path,
+    managed_ledger_directory: Path,
+    aggregate_publication_root: Path,
+    threshold_receipt_publication_root: Path,
+    protected_plan_publication_root: Path,
+) -> None:
+    """Re-resolve every publication-root separation required by protected planning."""
+
+    _require_disjoint_aggregate_publication_root(
+        aggregate_publication_root,
+        readiness_directory=readiness_directory,
+        shard_publication_root=shard_publication_root,
+        managed_ledger_directory=managed_ledger_directory,
+    )
+    _require_disjoint_threshold_freeze_publication_root(
+        threshold_receipt_publication_root,
+        readiness_directory=readiness_directory,
+        shard_publication_root=shard_publication_root,
+        managed_ledger_directory=managed_ledger_directory,
+        aggregate_publication_root=aggregate_publication_root,
+    )
+    _require_disjoint_protected_plan_publication_root(
+        protected_plan_publication_root,
+        readiness_directory=readiness_directory,
+        shard_publication_root=shard_publication_root,
+        managed_ledger_directory=managed_ledger_directory,
+        aggregate_publication_root=aggregate_publication_root,
+        threshold_receipt_publication_root=threshold_receipt_publication_root,
+    )
+
+
+def _load_and_validate_protected_plan_live_inputs(
+    *,
+    result_body: Mapping[str, object],
+    bundle: ValidatedReadinessBundle,
+    shard_publication_root: Path,
+    managed_ledger_directory: Path,
+    aggregate_publication_root: Path,
+    aggregate_payload_sha256: str,
+    threshold_receipt_publication_root: Path,
+    threshold_receipt_payload_sha256: str,
+) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    """Reload and bind one complete live aggregate/receipt/shard/ledger snapshot."""
+
+    aggregate = _load_content_addressed_calibration_aggregate(
+        aggregate_publication_root,
+        aggregate_payload_sha256,
+    )
+    aggregate_body = _validate_payload_digest(aggregate, "protected-plan calibration aggregate")
+    _validate_aggregate_provenance_bindings(aggregate_body, bundle)
+    readiness = _readiness_binding(bundle)
+    _require(
+        _plain_dict(aggregate_body.get("readiness_binding"), "aggregate readiness binding")
+        == readiness,
+        "protected-plan parent aggregate readiness binding differs",
+    )
+    _require(
+        aggregate_body.get("managed_ledger_content_address")
+        == bundle.execution_genesis_sha256,
+        "protected-plan parent aggregate ledger binding differs",
+    )
+    receipt = _load_content_addressed_threshold_freeze_receipt(
+        threshold_receipt_publication_root,
+        threshold_receipt_payload_sha256,
+    )
+    try:
+        validated_receipt = validate_hidden_regime_factorial_threshold_freeze_receipt(
+            receipt,
+            calibration_aggregate=aggregate,
+        )
+    except (ThresholdFreezeError, TypeError, ValueError) as exc:
+        raise CalibrationError("protected-plan threshold receipt validation failed") from exc
+    _require(
+        canonical_json_bytes(validated_receipt) == canonical_json_bytes(receipt),
+        "protected-plan threshold validation changed persisted receipt bytes",
+    )
+    _successful_threshold_freeze_receipt_body(
+        validated_receipt,
+        label="protected-plan parent threshold receipt",
+    )
     shards = load_complete_calibration_case_shards(
         shard_publication_root,
         expected_readiness_binding=readiness,
+        managed_ledger_directory=managed_ledger_directory,
     )
     inventory = snapshot_calibration_execution_inventory(managed_ledger_directory)
-    aggregate = aggregate_hidden_regime_factorial_calibration(
-        shards,
-        managed_ledger_snapshot=inventory,
-        managed_ledger_directory=managed_ledger_directory,
-    )
-    return publish_calibration_aggregate_new_only(
-        aggregate_publication_root,
+    exact_input_binding = _threshold_freeze_exact_input_binding(
         aggregate,
         shards,
-        managed_ledger_snapshot=inventory,
-        managed_ledger_directory=managed_ledger_directory,
-        authorize_publication=True,
+        inventory,
     )
+    _require(
+        exact_input_binding.get("calibration_aggregate_payload_sha256")
+        == result_body.get("calibration_aggregate_payload_sha256"),
+        "protected-plan live inputs bind another aggregate",
+    )
+    return aggregate, validated_receipt, exact_input_binding
+
+
+def _verify_and_install_protected_plan_worker_result(
+    *,
+    result: Mapping[str, object],
+    bundle: ValidatedReadinessBundle,
+    readiness_directory: Path,
+    shard_publication_root: Path,
+    managed_ledger_directory: Path,
+    aggregate_publication_root: Path,
+    aggregate_payload_sha256: str,
+    threshold_receipt_publication_root: Path,
+    threshold_receipt_payload_sha256: str,
+    protected_plan_publication_root: Path,
+) -> PublishedCertifiedProtectedPlan:
+    """Twice reload all live inputs, then install only certified plan bytes."""
+
+    result_payload = _validate_protected_plan_worker_result_payload(result)
+    result_body = _validate_payload_digest(result_payload, "protected-plan worker result")
+    _require(
+        result_body["calibration_aggregate_payload_sha256"] == aggregate_payload_sha256,
+        "protected-plan worker result binds another aggregate",
+    )
+    _require(
+        result_body["threshold_freeze_receipt_payload_sha256"]
+        == threshold_receipt_payload_sha256,
+        "protected-plan worker result binds another threshold receipt",
+    )
+    _require(
+        result_body["readiness_receipt_sha256"] == bundle.receipt_sha256,
+        "protected-plan worker result binds another readiness receipt",
+    )
+    _validate_protected_plan_worker_provenance_bindings(result_body, bundle)
+    plan = _plain_dict(result_body["protected_plan"], "certified protected plan")
+    plan_body = _protected_plan_body(plan, label="certified protected plan")
+
+    aggregate, receipt, exact_input_binding = _load_and_validate_protected_plan_live_inputs(
+        result_body=result_body,
+        bundle=bundle,
+        shard_publication_root=shard_publication_root,
+        managed_ledger_directory=managed_ledger_directory,
+        aggregate_publication_root=aggregate_publication_root,
+        aggregate_payload_sha256=aggregate_payload_sha256,
+        threshold_receipt_publication_root=threshold_receipt_publication_root,
+        threshold_receipt_payload_sha256=threshold_receipt_payload_sha256,
+    )
+    worker_input_binding = _plain_dict(
+        result_body["exact_input_binding"],
+        "protected-plan worker exact input binding",
+    )
+    _require(
+        canonical_json_bytes(exact_input_binding) == canonical_json_bytes(worker_input_binding),
+        "protected-plan inputs changed after certified worker recomputation",
+    )
+    _validate_protected_plan_bindings(
+        plan_body,
+        protected_plan=plan,
+        threshold_receipt=receipt,
+        calibration_aggregate=aggregate,
+    )
+    readiness_body = _plain_dict(bundle.payload.get("body"), "readiness body")
+    require_current_full_runtime_identity(readiness_body.get("runtime_identity"))
+    _require_disjoint_protected_plan_workflow_roots(
+        readiness_directory=readiness_directory,
+        shard_publication_root=shard_publication_root,
+        managed_ledger_directory=managed_ledger_directory,
+        aggregate_publication_root=aggregate_publication_root,
+        threshold_receipt_publication_root=threshold_receipt_publication_root,
+        protected_plan_publication_root=protected_plan_publication_root,
+    )
+
+    bundle_after = load_validated_readiness_bundle(
+        readiness_directory,
+        recheck_current=False,
+        recheck_runtime=False,
+    )
+    _require(
+        canonical_json_bytes(bundle_after.payload) == canonical_json_bytes(bundle.payload)
+        and bundle_after.receipt_sha256 == bundle.receipt_sha256
+        and bundle_after.source_archive_sha256 == bundle.source_archive_sha256
+        and bundle_after.source_manifest_sha256 == bundle.source_manifest_sha256
+        and bundle_after.runtime_identity_sha256 == bundle.runtime_identity_sha256
+        and bundle_after.execution_genesis_sha256 == bundle.execution_genesis_sha256,
+        "protected-plan readiness bundle changed before publication",
+    )
+    _validate_protected_plan_worker_provenance_bindings(result_body, bundle_after)
+    aggregate_after, receipt_after, exact_input_binding_after = (
+        _load_and_validate_protected_plan_live_inputs(
+            result_body=result_body,
+            bundle=bundle_after,
+            shard_publication_root=shard_publication_root,
+            managed_ledger_directory=managed_ledger_directory,
+            aggregate_publication_root=aggregate_publication_root,
+            aggregate_payload_sha256=aggregate_payload_sha256,
+            threshold_receipt_publication_root=threshold_receipt_publication_root,
+            threshold_receipt_payload_sha256=threshold_receipt_payload_sha256,
+        )
+    )
+    _require(
+        canonical_json_bytes(aggregate_after) == canonical_json_bytes(aggregate),
+        "content-addressed aggregate changed before protected plan installation",
+    )
+    _require(
+        canonical_json_bytes(receipt_after) == canonical_json_bytes(receipt),
+        "content-addressed threshold receipt changed before protected plan installation",
+    )
+    _require(
+        canonical_json_bytes(exact_input_binding_after)
+        == canonical_json_bytes(exact_input_binding),
+        "shard or managed-ledger input changed before protected plan installation",
+    )
+    _validate_protected_plan_bindings(
+        plan_body,
+        protected_plan=plan,
+        threshold_receipt=receipt_after,
+        calibration_aggregate=aggregate_after,
+    )
+    require_current_full_runtime_identity(
+        _plain_dict(bundle_after.payload.get("body"), "readiness body").get(
+            "runtime_identity"
+        )
+    )
+    _require_disjoint_protected_plan_workflow_roots(
+        readiness_directory=readiness_directory,
+        shard_publication_root=shard_publication_root,
+        managed_ledger_directory=managed_ledger_directory,
+        aggregate_publication_root=aggregate_publication_root,
+        threshold_receipt_publication_root=threshold_receipt_publication_root,
+        protected_plan_publication_root=protected_plan_publication_root,
+    )
+    raw = canonical_json_bytes(plan)
+    return _install_verified_protected_plan_new_only(
+        protected_plan_publication_root,
+        plan,
+        raw,
+    )
+
+
+def derive_and_publish_completed_calibration_protected_plan(
+    *,
+    readiness_directory: Path,
+    shard_publication_root: Path,
+    managed_ledger_directory: Path,
+    aggregate_publication_root: Path,
+    aggregate_payload_sha256: str,
+    threshold_receipt_publication_root: Path,
+    threshold_receipt_payload_sha256: str,
+    protected_plan_publication_root: Path,
+    authorize_publication: bool = False,
+    timeout_seconds: int | None = None,
+) -> PublishedCertifiedProtectedPlan:
+    """Derive in the certified ZIP and publish one strictly nonauthorizing plan."""
+
+    _require(authorize_publication is True, "protected plan publication requires authorization")
+    _require(_is_sha256(aggregate_payload_sha256), "aggregate payload digest is invalid")
+    _require(
+        _is_sha256(threshold_receipt_payload_sha256),
+        "threshold receipt payload digest is invalid",
+    )
+    if timeout_seconds is not None:
+        _strict_int(timeout_seconds, "timeout_seconds", minimum=1)
+    bundle = load_validated_readiness_bundle(
+        readiness_directory,
+        recheck_current=False,
+        recheck_runtime=False,
+    )
+    _require_disjoint_protected_plan_workflow_roots(
+        readiness_directory=readiness_directory,
+        shard_publication_root=shard_publication_root,
+        managed_ledger_directory=managed_ledger_directory,
+        aggregate_publication_root=aggregate_publication_root,
+        threshold_receipt_publication_root=threshold_receipt_publication_root,
+        protected_plan_publication_root=protected_plan_publication_root,
+    )
+    completed = execute_bound_calibration_worker(
+        readiness_directory,
+        (
+            "--worker-protected-plan-v1",
+            readiness_directory.absolute().as_posix(),
+            managed_ledger_directory.absolute().as_posix(),
+            shard_publication_root.absolute().as_posix(),
+            aggregate_publication_root.absolute().as_posix(),
+            aggregate_payload_sha256,
+            threshold_receipt_publication_root.absolute().as_posix(),
+            threshold_receipt_payload_sha256,
+        ),
+        authorize_calibration_execution=True,
+        timeout_seconds=timeout_seconds,
+    )
+    if completed.returncode != 0:
+        stderr_digest = hashlib.sha256(completed.stderr).hexdigest()
+        raise CalibrationError(
+            "isolated protected-plan derivation failed without publication; "
+            f"returncode={completed.returncode},stderr_bytes={len(completed.stderr)},"
+            f"stderr_sha256={stderr_digest}"
+        )
+    result = _parse_protected_plan_worker_result(completed.stdout)
+    with _threshold_input_publication_guard(
+        shard_publication_root=shard_publication_root,
+        readiness_receipt_sha256=bundle.receipt_sha256,
+        managed_ledger_directory=managed_ledger_directory,
+    ):
+        return _verify_and_install_protected_plan_worker_result(
+            result=result,
+            bundle=bundle,
+            readiness_directory=readiness_directory,
+            shard_publication_root=shard_publication_root,
+            managed_ledger_directory=managed_ledger_directory,
+            aggregate_publication_root=aggregate_publication_root,
+            aggregate_payload_sha256=aggregate_payload_sha256,
+            threshold_receipt_publication_root=threshold_receipt_publication_root,
+            threshold_receipt_payload_sha256=threshold_receipt_payload_sha256,
+            protected_plan_publication_root=protected_plan_publication_root,
+        )

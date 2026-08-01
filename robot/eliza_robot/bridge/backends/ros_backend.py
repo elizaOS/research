@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from eliza_robot.bridge.async_compat import run_in_thread
-from eliza_robot.bridge.backends.base import BridgeBackend
-from eliza_robot.bridge.protocol import CommandEnvelope, EventEnvelope, ResponseEnvelope, utc_now_iso
+from eliza_robot.bridge.backends.base import (
+    BridgeBackend,
+    _physical_motion_authority_error,
+    canonical_physical_resource_id,
+)
+from eliza_robot.bridge.protocol import (
+    CommandEnvelope,
+    EventEnvelope,
+    ResponseEnvelope,
+    utc_now_iso,
+)
 from eliza_robot.bridge.types import JsonDict
 
 
@@ -39,24 +49,42 @@ class RosBridgeBackend(BridgeBackend):
     - /head_pan_controller/command, /head_tilt_controller/command (ainex_interfaces/HeadState)
     """
 
-    def __init__(self, backend_name: str) -> None:
+    def __init__(
+        self,
+        backend_name: str,
+        *,
+        physical_resource_id: str | None = None,
+    ) -> None:
         if backend_name not in {"ros_real", "ros_sim"}:
             raise ValueError("backend_name must be ros_real or ros_sim")
+        physical_resources: tuple[str, ...]
+        if backend_name == "ros_real":
+            if physical_resource_id is None:
+                raise ValueError("physical_resource_id is required for ros_real")
+            physical_resources = (
+                canonical_physical_resource_id(physical_resource_id),
+            )
+        else:
+            physical_resources = ()
         self._backend_name = backend_name
+        self._physical_resources = physical_resources
         self._state = _RosState()
         self._ready = False
 
-        self._rospy: object | None = None
-        self._walk_param_pub: object | None = None
-        self._action_pub: object | None = None
-        self._head_pan_pub: object | None = None
-        self._head_tilt_pub: object | None = None
-        self._walking_command_srv: object | None = None
-        self._servo_set_position_pub: object | None = None
+        self._rospy: Any = None
+        self._walk_param_pub: Any = None
+        self._action_pub: Any = None
+        self._head_pan_pub: Any = None
+        self._head_tilt_pub: Any = None
+        self._walking_command_srv: Any = None
+        self._servo_set_position_pub: Any = None
 
     @property
     def backend_name(self) -> str:
         return self._backend_name
+
+    def physical_motion_resources(self) -> tuple[str, ...]:
+        return self._physical_resources
 
     def capabilities(self) -> JsonDict:
         return {
@@ -66,6 +94,9 @@ class RosBridgeBackend(BridgeBackend):
             "head_set": True,
             "servo_set": True,
             "camera_stream_passthrough": True,
+            # Verified only for the walking service; direct joint/head/action
+            # motion remains disabled by the supervisor.
+            "motion_safety": {"walk_stop": True},
         }
 
     async def connect(self) -> None:
@@ -73,10 +104,13 @@ class RosBridgeBackend(BridgeBackend):
         self._connect_blocking()
 
     def _connect_blocking(self) -> None:
-        import rospy
-        from ainex_interfaces.msg import AppWalkingParam, HeadState
-        from ainex_interfaces.srv import SetWalkingCommand
-        from std_msgs.msg import Bool, String, UInt16
+        import rospy  # type: ignore[import-not-found]
+        from ainex_interfaces.msg import (  # type: ignore[import-not-found]
+            AppWalkingParam,
+            HeadState,
+        )
+        from ainex_interfaces.srv import SetWalkingCommand  # type: ignore[import-not-found]
+        from std_msgs.msg import Bool, String, UInt16  # type: ignore[import-not-found]
 
         self._rospy = rospy
         if not rospy.core.is_initialized():
@@ -96,7 +130,7 @@ class RosBridgeBackend(BridgeBackend):
             "/walking/command", SetWalkingCommand
         )
 
-        from ros_robot_controller.msg import SetBusServosPosition
+        from ros_robot_controller.msg import SetBusServosPosition  # type: ignore[import-not-found]
         self._servo_set_position_pub = rospy.Publisher(
             "/ros_robot_controller/bus_servo/set_position", SetBusServosPosition, queue_size=1
         )
@@ -136,6 +170,14 @@ class RosBridgeBackend(BridgeBackend):
         self._ready = False
 
     async def handle_command(self, cmd: CommandEnvelope) -> ResponseEnvelope:
+        if self.backend_name == "ros_real":
+            authority_error = _physical_motion_authority_error(
+                self.backend_name,
+                self._physical_resources[0],
+                cmd,
+            )
+            if authority_error is not None:
+                return authority_error
         if not self._ready:
             return ResponseEnvelope(
                 request_id=cmd.request_id,
@@ -170,8 +212,11 @@ class RosBridgeBackend(BridgeBackend):
             )
 
     def _dispatch_blocking(self, cmd: CommandEnvelope) -> None:
-        from ainex_interfaces.msg import AppWalkingParam, HeadState
-        from std_msgs.msg import String
+        from ainex_interfaces.msg import (  # type: ignore[import-not-found]
+            AppWalkingParam,
+            HeadState,
+        )
+        from std_msgs.msg import String  # type: ignore[import-not-found]
 
         if cmd.command == "walk.set":
             msg = AppWalkingParam()
@@ -197,7 +242,12 @@ class RosBridgeBackend(BridgeBackend):
                 raise ValueError("walk.command payload.action must be a string")
             if self._walking_command_srv is None:
                 raise RuntimeError("walking command service not ready")
-            self._walking_command_srv(action_value)
+            result = self._walking_command_srv(action_value)
+            if getattr(result, "result", None) is not True:
+                raise RuntimeError(
+                    "walking command service did not return exact result=true "
+                    "acknowledgement"
+                )
             return
 
         if cmd.command == "action.play":
@@ -228,7 +278,10 @@ class RosBridgeBackend(BridgeBackend):
             return
 
         if cmd.command == "servo.set":
-            from ros_robot_controller.msg import BusServoPosition, SetBusServosPosition
+            from ros_robot_controller.msg import (  # type: ignore[import-not-found]
+                BusServoPosition,
+                SetBusServosPosition,
+            )
 
             duration_ms = float(cmd.payload.get("duration", 0.3))
             positions_value = cmd.payload.get("positions")
@@ -273,4 +326,3 @@ class RosBridgeBackend(BridgeBackend):
                 },
             )
         ]
-

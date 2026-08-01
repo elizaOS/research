@@ -30,8 +30,9 @@ Source-mode selection (auto):
   - `--no-real` skips the real-robot connection entirely; joint
     divergence is reported as `n=0`, only the torso anchor runs.
 
-Walking commands are deliberately *not* sent to the real robot — only
-the head + scripted gestures (`stand still`, `wave hello`).
+The legacy real-robot mode is quarantined because even head/scripted gestures
+bypass the unified supervisor. Use `--no-real`; selecting real mode fails before
+connecting until an authenticated command-envelope client is implemented.
 """
 
 from __future__ import annotations
@@ -49,14 +50,14 @@ from typing import Any
 import cv2
 import numpy as np
 
+from eliza_robot.bridge.physical_execution import reject_unsupervised_physical_motion
 from eliza_robot.perception.calibration import CameraIntrinsics
 from eliza_robot.perception.detectors.aruco_detector import ArucoDetector
 from eliza_robot.sim.mujoco.demo_env import DemoEnv
 from eliza_robot.sim2real.aruco_anchor import (
-    FusedSim2RealAnchor,
     FusedAnchorStats,
+    FusedSim2RealAnchor,
 )
-
 
 # ----------------------------------------------------------------------
 # Obsbot capture (optional)
@@ -150,10 +151,10 @@ def _build_synthetic_frame(
 
 
 async def _try_connect_real(host: str, port: int) -> Any | None:
-    """Connect to AinexRemoteBackend; return None if anything fails.
-
-    Failures here are non-fatal — the script runs in sim-only mode.
-    """
+    """Reject the legacy direct AiNex transport before importing its backend."""
+    reject_unsupervised_physical_motion(
+        "scripts/evidence_aruco_full_anchor_e2e.py _try_connect_real"
+    )
     try:
         from eliza_robot.bridge.backends.ainex_remote import AinexRemoteBackend
     except Exception as exc:  # noqa: BLE001 — informational
@@ -273,6 +274,8 @@ def _draw_hud(
 
 
 async def _run(args: argparse.Namespace) -> int:
+    if not args.no_real:
+        reject_unsupervised_physical_motion("scripts/evidence_aruco_full_anchor_e2e.py")
     out: Path = args.out
     out.mkdir(parents=True, exist_ok=True)
 

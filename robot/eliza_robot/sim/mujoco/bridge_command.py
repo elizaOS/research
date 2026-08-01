@@ -7,7 +7,7 @@ import math
 import jax.numpy as jp
 import numpy as np
 
-from bridge.openpi_adapter import build_observation
+from eliza_robot.bridge.openpi_adapter import build_observation
 from eliza_robot.interfaces import AinexPerceptionObservation
 from eliza_robot.schema.canonical import (
     AINEX_SCHEMA_VERSION,

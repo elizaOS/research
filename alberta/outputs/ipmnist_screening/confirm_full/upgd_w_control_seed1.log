@@ -1,0 +1,14 @@
+WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-07-31 13:40:56,968 INFO loading MNIST from data_home=/home/shaw/milady/alberta/outputs/step2_published_mnist_openml_cache
+2026-07-31 13:41:20,078 INFO running upgd_w_control seed=1 for 200 tasks x 5000 steps (noise_mode=pool)
+2026-07-31 14:14:51,036 INFO upgd_w_control seed=1 task 20/200 online_acc=0.7854 elapsed=1980.9s
+2026-07-31 14:50:45,413 INFO upgd_w_control seed=1 task 40/200 online_acc=0.7652 elapsed=4135.2s
+2026-07-31 15:24:47,571 INFO upgd_w_control seed=1 task 60/200 online_acc=0.7842 elapsed=6177.3s
+2026-07-31 15:55:44,849 INFO upgd_w_control seed=1 task 80/200 online_acc=0.7758 elapsed=8034.6s
+2026-07-31 16:24:19,006 INFO upgd_w_control seed=1 task 100/200 online_acc=0.7818 elapsed=9748.8s
+2026-07-31 16:50:40,138 INFO upgd_w_control seed=1 task 120/200 online_acc=0.7696 elapsed=11329.9s
+2026-07-31 17:16:44,215 INFO upgd_w_control seed=1 task 140/200 online_acc=0.7776 elapsed=12894.0s
+2026-07-31 17:41:09,281 INFO upgd_w_control seed=1 task 160/200 online_acc=0.7694 elapsed=14359.1s
+2026-07-31 18:04:38,536 INFO upgd_w_control seed=1 task 180/200 online_acc=0.7778 elapsed=15768.4s
+2026-07-31 18:27:04,363 INFO upgd_w_control seed=1 task 200/200 online_acc=0.7782 elapsed=17114.2s
+2026-07-31 18:27:10,355 INFO upgd_w_control seed=1 done: avg online acc 0.7788 (wall 17114.3s) -> outputs/ipmnist_screening/confirm_full/upgd_w_control_seed1.json

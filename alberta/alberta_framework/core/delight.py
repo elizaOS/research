@@ -104,15 +104,20 @@ class GradientJoyConfig:
     tolerances, and the update stays inside the norm trust bound. The soft
     weight is the minimum of four named sigmoid factors. Both the raw candidate
     and its tentative soft-weighted update must satisfy the configured
-    objective/retention/safety magnitude gates. It is not a sum over
-    learning-value channels.
+    objective/retention/safety magnitude gates. The tentative update is formed
+    elementwise in float32 and receives fresh norm and dot certificates; scalar
+    multiplication of candidate diagnostics is not accepted as evidence for
+    that rounded tree. It is not a sum over learning-value channels.
 
     All numeric values are consumed as float32. Every nonzero value must be a
     finite normal float32, booleans are rejected, and ``max_update_norm`` must
-    exceed the norm-resolution floor ``diagnostics_epsilon``. Cosine
-    diagnostics are clipped to ``[-1, 1]``; an exact ``1.0`` alignment
-    threshold uses a four-machine-epsilon endpoint tolerance for float32
-    reduction error.
+    exceed the norm-resolution floor ``diagnostics_epsilon``. Probe dots and
+    norms use fixed balanced reductions with conservative accumulated-roundoff
+    intervals; a sign, trust bound, norm floor, or alignment threshold that the
+    intervals cannot certify fails closed. Cosine diagnostics are clipped to
+    ``[-1, 1]``; hard alignment gates and soft factors use a certified lower
+    bound. An exact ``1.0`` threshold applies a four-machine-epsilon endpoint
+    tolerance to that lower bound.
     """
 
     candidate_semantics: GradientCandidateSemantics = "gradient"
@@ -231,6 +236,11 @@ class GradientJoyDiagnostics:
 
     Unqualified update/change fields describe the raw candidate. ``tentative``
     fields describe the soft-weighted candidate before the final hard veto.
+    Dot error bounds are conservative raw-unit radii; their corresponding
+    ``resolved`` flags are false whenever cancellation or underflow leaves the
+    first-order sign uncertain. Norm and alignment bounds are outward-rounded:
+    hard gates and soft factors consume the conservative edge rather than the
+    reported point estimate.
     """
 
     objective_probe_available: Bool[Array, ""]
@@ -242,6 +252,7 @@ class GradientJoyDiagnostics:
     retention_probe_finite: Bool[Array, ""]
     safety_probe_finite: Bool[Array, ""]
     learning_value_complete: Bool[Array, ""]
+    derived_numerics_valid: Bool[Array, ""]
     evidence_complete: Bool[Array, ""]
     nonzero_update: Bool[Array, ""]
     tentative_nonzero_update: Bool[Array, ""]
@@ -250,21 +261,42 @@ class GradientJoyDiagnostics:
     safety_preserved: Bool[Array, ""]
     within_trust_region: Bool[Array, ""]
     update_norm: Float[Array, ""]
+    update_norm_lower_bound: Float[Array, ""]
+    update_norm_upper_bound: Float[Array, ""]
+    update_norm_resolved: Bool[Array, ""]
     objective_probe_norm: Float[Array, ""]
     retention_probe_norm: Float[Array, ""]
     safety_probe_norm: Float[Array, ""]
     predicted_objective_decrease: Float[Array, ""]
     predicted_retention_loss_change: Float[Array, ""]
     predicted_safety_cost_change: Float[Array, ""]
+    objective_dot_error_bound: Float[Array, ""]
+    retention_dot_error_bound: Float[Array, ""]
+    safety_dot_error_bound: Float[Array, ""]
+    objective_dot_resolved: Bool[Array, ""]
+    retention_dot_resolved: Bool[Array, ""]
+    safety_dot_resolved: Bool[Array, ""]
     objective_descent_alignment: Float[Array, ""]
     retention_descent_alignment: Float[Array, ""]
     safety_descent_alignment: Float[Array, ""]
+    objective_descent_alignment_lower_bound: Float[Array, ""]
+    retention_descent_alignment_lower_bound: Float[Array, ""]
+    safety_descent_alignment_lower_bound: Float[Array, ""]
     objective_factor: Float[Array, ""]
     retention_factor: Float[Array, ""]
     safety_factor: Float[Array, ""]
     trust_factor: Float[Array, ""]
     tentative_weight: Float[Array, ""]
     tentative_update_norm: Float[Array, ""]
+    tentative_update_norm_lower_bound: Float[Array, ""]
+    tentative_update_norm_upper_bound: Float[Array, ""]
+    tentative_update_norm_resolved: Bool[Array, ""]
+    tentative_objective_dot_error_bound: Float[Array, ""]
+    tentative_retention_dot_error_bound: Float[Array, ""]
+    tentative_safety_dot_error_bound: Float[Array, ""]
+    tentative_objective_dot_resolved: Bool[Array, ""]
+    tentative_retention_dot_resolved: Bool[Array, ""]
+    tentative_safety_dot_resolved: Bool[Array, ""]
     predicted_tentative_objective_decrease: Float[Array, ""]
     predicted_tentative_retention_loss_change: Float[Array, ""]
     predicted_tentative_safety_cost_change: Float[Array, ""]
@@ -293,7 +325,7 @@ class GradientJoyAssessment:
 
     @property
     def sparks_joy(self) -> Bool[Array, ""]:
-        """Answer the literal question: does this candidate spark joy?"""
+        """Answer literally: does this proposed gradient/update spark joy?"""
         return self.accepted
 
 
@@ -336,6 +368,8 @@ def _detached_float_tree(tree: Any, *, name: str) -> tuple[Any, Any]:
         if not jnp.issubdtype(array.dtype, jnp.floating):
             raise ValueError(f"{name} leaves must have floating dtypes")
         converted.append(jax.lax.stop_gradient(jnp.asarray(array, dtype=jnp.float32)))
+    if sum(array.size for array in converted) == 0:
+        raise ValueError(f"{name} must contain at least one floating value")
     return jax.tree_util.tree_unflatten(structure, converted), structure
 
 
@@ -367,22 +401,351 @@ def _prepare_probe_tree(
     return prepared, jnp.array(True, dtype=jnp.bool_)
 
 
-def _tree_dot(left: Any, right: Any) -> Array:
-    """Return a scalar inner product for two matching float PyTrees."""
+def _pairwise_sum(values: Array) -> Array:
+    """Sum a nonempty flat float32 array through an explicit balanced tree."""
+    level = jnp.ravel(values)
+    level_size = level.size
+    while level_size > 1:
+        if level_size % 2:
+            level = jnp.pad(level, (0, 1))
+            level_size += 1
+        pairs = jnp.reshape(level, (-1, 2))
+        level = pairs[:, 0] + pairs[:, 1]
+        level_size //= 2
+    return level[0]
+
+
+def _tree_product_vector(left: Any, right: Any) -> Array:
+    """Flatten elementwise products from two matching float PyTrees."""
     products = [
-        jnp.vdot(left_leaf, right_leaf)
+        jnp.ravel(left_leaf) * jnp.ravel(right_leaf)
         for left_leaf, right_leaf in zip(
             jax.tree_util.tree_leaves(left),
             jax.tree_util.tree_leaves(right),
             strict=True,
         )
     ]
-    return jnp.sum(jnp.stack(products))
+    return jnp.concatenate(products)
 
 
-def _tree_norm(tree: Any) -> Array:
-    """Return the global L2 norm of a float PyTree."""
-    return jnp.sqrt(jnp.maximum(_tree_dot(tree, tree), 0.0))
+def _tree_dot(left: Any, right: Any) -> Array:
+    """Return a deterministic balanced-tree inner product for float PyTrees."""
+    return _pairwise_sum(_tree_product_vector(left, right))
+
+
+def _tree_norm_certificate(tree: Any) -> tuple[Array, Array, Array, Array]:
+    """Return a scale-safe L2 point, lower/upper bounds, and resolution flag.
+
+    The input leaves are stored float32 values. After max scaling, a fixed
+    balanced sum of squares computes the diagnostic point. A standard
+    ``gamma_n`` bound covers division, squaring, balanced accumulation, square
+    root, and final rescaling; the interval endpoints are then rounded
+    outwards. Nonzero values lost to zero/subnormal intermediates fail closed.
+    A tree with exactly one nonzero element has an exact norm equal to its
+    stored absolute value and therefore receives a zero-width certificate.
+    """
+    absolute_values = jnp.concatenate(
+        [jnp.ravel(jnp.abs(leaf)) for leaf in jax.tree_util.tree_leaves(tree)]
+    )
+    scale = jnp.max(absolute_values)
+    safe_scale = jnp.where(
+        jnp.isfinite(scale) & (scale > 0.0),
+        scale,
+        jnp.array(1.0, dtype=jnp.float32),
+    )
+    scaled_values = absolute_values / safe_scale
+    scaled_squares = scaled_values * scaled_values
+    scaled_square_sum = _pairwise_sum(scaled_squares)
+    point = scale * jnp.sqrt(jnp.maximum(scaled_square_sum, 0.0))
+
+    reduction_depth = max(0, (scaled_values.size - 1).bit_length())
+    roundoff_budget = (reduction_depth + 8) * _FLOAT32_EPSILON
+    if roundoff_budget >= 0.5:
+        relative_error = jnp.array(jnp.inf, dtype=jnp.float32)
+    else:
+        relative_error = jnp.asarray(
+            roundoff_budget / (1.0 - roundoff_budget),
+            dtype=jnp.float32,
+        )
+    negative_infinity = jnp.array(-jnp.inf, dtype=jnp.float32)
+    positive_infinity = jnp.array(jnp.inf, dtype=jnp.float32)
+    lower = jnp.nextafter(
+        point / (jnp.array(1.0, dtype=jnp.float32) + relative_error),
+        negative_infinity,
+    )
+    upper = jnp.nextafter(
+        point / (jnp.array(1.0, dtype=jnp.float32) - relative_error),
+        positive_infinity,
+    )
+    lower = jnp.maximum(lower, scale)
+
+    source_nonzero = absolute_values != 0.0
+    nonzero_count = jnp.sum(source_nonzero.astype(jnp.int32))
+    exactly_one_nonzero = nonzero_count == 1
+    lower = jnp.where(exactly_one_nonzero, scale, lower)
+    upper = jnp.where(exactly_one_nonzero, scale, upper)
+    point = jnp.where(exactly_one_nonzero, scale, point)
+    zero_tree = nonzero_count == 0
+    lower = jnp.where(zero_tree, jnp.array(0.0, dtype=jnp.float32), lower)
+    upper = jnp.where(zero_tree, jnp.array(0.0, dtype=jnp.float32), upper)
+    point = jnp.where(zero_tree, jnp.array(0.0, dtype=jnp.float32), point)
+
+    scaled_underflowed = jnp.any(
+        source_nonzero
+        & (
+            (scaled_values == 0.0)
+            | (
+                (scaled_values != 0.0)
+                & (scaled_values < jnp.asarray(_FLOAT32_TINY, dtype=jnp.float32))
+            )
+        )
+    )
+    square_underflowed = jnp.any(
+        (scaled_values != 0.0)
+        & (
+            (scaled_squares == 0.0)
+            | (
+                (scaled_squares != 0.0)
+                & (scaled_squares < jnp.asarray(_FLOAT32_TINY, dtype=jnp.float32))
+            )
+        )
+    )
+    scale_subnormal = (scale != 0.0) & (
+        scale < jnp.asarray(_FLOAT32_TINY, dtype=jnp.float32)
+    )
+    resolved = (
+        ~scaled_underflowed
+        & ~square_underflowed
+        & ~scale_subnormal
+        & jnp.all(jnp.isfinite(jnp.stack([point, lower, upper])))
+        & (lower >= 0.0)
+        & (upper >= lower)
+        & (zero_tree | (lower > 0.0))
+    )
+    return point, lower, upper, resolved
+
+
+def _tree_has_nonzero(tree: Any) -> Array:
+    """Return whether any PyTree element differs from exact zero."""
+    nonzero = [jnp.any(leaf != 0.0) for leaf in jax.tree_util.tree_leaves(tree)]
+    return jnp.any(jnp.stack(nonzero))
+
+
+def _tree_normalized_dot_certificate(
+    left: Any,
+    right: Any,
+    left_norm: Array,
+    right_norm: Array,
+) -> tuple[Array, Array, Array, Array]:
+    """Return normalized dot, normalized/raw error bounds, and resolution.
+
+    The dot is accumulated through a fixed balanced tree. A conservative
+    float32 roundoff bound covers both normalizations, elementwise products,
+    the tree depth, and positive absolute-product accumulation. A nonzero
+    product lost to underflow or an uncertainty interval containing zero is
+    unresolved. Exact elementwise orthogonality (all source products zero)
+    remains resolved.
+    """
+    safe_left_norm = jnp.where(
+        jnp.isfinite(left_norm) & (left_norm > 0.0),
+        left_norm,
+        jnp.array(1.0, dtype=jnp.float32),
+    )
+    safe_right_norm = jnp.where(
+        jnp.isfinite(right_norm) & (right_norm > 0.0),
+        right_norm,
+        jnp.array(1.0, dtype=jnp.float32),
+    )
+    normalized_left = jax.tree_util.tree_map(
+        lambda leaf: leaf / safe_left_norm,
+        left,
+    )
+    normalized_right = jax.tree_util.tree_map(
+        lambda leaf: leaf / safe_right_norm,
+        right,
+    )
+    normalized_products = _tree_product_vector(normalized_left, normalized_right)
+    normalized_dot = _pairwise_sum(normalized_products)
+    absolute_product_sum = _pairwise_sum(jnp.abs(normalized_products))
+    source_product_mask = jnp.concatenate(
+        [
+            jnp.ravel((left_leaf != 0.0) & (right_leaf != 0.0))
+            for left_leaf, right_leaf in zip(
+                jax.tree_util.tree_leaves(left),
+                jax.tree_util.tree_leaves(right),
+                strict=True,
+            )
+        ]
+    )
+    product_underflowed = jnp.any(
+        source_product_mask
+        & (
+            (normalized_products == 0.0)
+            | (
+                (jnp.abs(normalized_products) < _FLOAT32_TINY)
+                & (normalized_products != 0.0)
+            )
+        )
+    )
+
+    reduction_depth = max(0, (normalized_products.size - 1).bit_length())
+    roundoff_budget = (reduction_depth + 6) * _FLOAT32_EPSILON
+    if roundoff_budget >= 0.5:
+        normalized_error_bound = jnp.array(jnp.inf, dtype=jnp.float32)
+    else:
+        gamma = roundoff_budget / (1.0 - roundoff_budget)
+        # The second factor covers rounding in the positive absolute-product
+        # accumulation used to estimate the first bound.
+        inflated_gamma = gamma / (1.0 - gamma)
+        normalized_error_bound = jnp.asarray(
+            inflated_gamma,
+            dtype=jnp.float32,
+        ) * absolute_product_sum
+    if normalized_products.size == 1:
+        left_value = jnp.concatenate(
+            [jnp.ravel(leaf) for leaf in jax.tree_util.tree_leaves(left)]
+        )[0]
+        right_value = jnp.concatenate(
+            [jnp.ravel(leaf) for leaf in jax.tree_util.tree_leaves(right)]
+        )[0]
+        both_nonzero = (left_value != 0.0) & (right_value != 0.0)
+        same_sign = (left_value > 0.0) == (right_value > 0.0)
+        normalized_dot = jnp.where(
+            both_nonzero,
+            jnp.where(same_sign, 1.0, -1.0),
+            0.0,
+        ).astype(jnp.float32)
+        direction_error_bound = jnp.array(0.0, dtype=jnp.float32)
+    else:
+        direction_error_bound = normalized_error_bound
+    normalized_bound_underflowed = (
+        (absolute_product_sum > 0.0) & (normalized_error_bound == 0.0)
+    )
+
+    smaller_norm = jnp.minimum(left_norm, right_norm)
+    larger_norm = jnp.maximum(left_norm, right_norm)
+    first_scale = normalized_error_bound * smaller_norm
+    raw_error_bound = first_scale * larger_norm
+    raw_error_bound = jnp.where(
+        raw_error_bound > 0.0,
+        jnp.nextafter(raw_error_bound, jnp.array(jnp.inf, dtype=jnp.float32)),
+        raw_error_bound,
+    )
+    bound_underflowed = (
+        (normalized_error_bound > 0.0)
+        & (smaller_norm > 0.0)
+        & (larger_norm > 0.0)
+        & ((first_scale == 0.0) | (raw_error_bound == 0.0))
+    )
+    dot_resolved = (
+        ~product_underflowed
+        & ~normalized_bound_underflowed
+        & ~bound_underflowed
+        & jnp.isfinite(normalized_dot)
+        & jnp.isfinite(normalized_error_bound)
+        & jnp.isfinite(raw_error_bound)
+        & (
+            (absolute_product_sum == 0.0)
+            | (jnp.abs(normalized_dot) > direction_error_bound)
+        )
+    )
+    return normalized_dot, direction_error_bound, raw_error_bound, dot_resolved
+
+
+def _descent_alignment_certificate(
+    normalized_dot: Array,
+    normalized_dot_error: Array,
+    left_norm: Array,
+    left_norm_lower: Array,
+    left_norm_upper: Array,
+    right_norm: Array,
+    right_norm_lower: Array,
+    right_norm_upper: Array,
+    dot_resolved: Array,
+) -> tuple[Array, Array, Array]:
+    """Return point/lower-bound descent cosine and a resolution verdict.
+
+    ``normalized_dot`` is relative to the two computed norm points. Its
+    roundoff interval is expanded by the certified norm intervals before the
+    sign is negated. The lower endpoint is the only alignment value permitted
+    to drive a hard gate or a soft weight.
+    """
+    negative_infinity = jnp.array(-jnp.inf, dtype=jnp.float32)
+    positive_infinity = jnp.array(jnp.inf, dtype=jnp.float32)
+    one = jnp.array(1.0, dtype=jnp.float32)
+    minus_one = jnp.array(-1.0, dtype=jnp.float32)
+    left_nonzero = left_norm_lower > 0.0
+    right_nonzero = right_norm_lower > 0.0
+    norms_nonzero = left_nonzero & right_nonzero
+    safe_left_lower = jnp.where(left_nonzero, left_norm_lower, one)
+    safe_left_upper = jnp.where(left_nonzero, left_norm_upper, one)
+    safe_right_lower = jnp.where(right_nonzero, right_norm_lower, one)
+    safe_right_upper = jnp.where(right_nonzero, right_norm_upper, one)
+
+    dot_lower = jnp.nextafter(
+        normalized_dot - normalized_dot_error,
+        negative_infinity,
+    )
+    dot_upper = jnp.nextafter(
+        normalized_dot + normalized_dot_error,
+        positive_infinity,
+    )
+    left_ratio_lower = jnp.nextafter(left_norm / safe_left_upper, negative_infinity)
+    left_ratio_upper = jnp.nextafter(left_norm / safe_left_lower, positive_infinity)
+    right_ratio_lower = jnp.nextafter(
+        right_norm / safe_right_upper,
+        negative_infinity,
+    )
+    right_ratio_upper = jnp.nextafter(
+        right_norm / safe_right_lower,
+        positive_infinity,
+    )
+    scale_lower = jnp.nextafter(
+        left_ratio_lower * right_ratio_lower,
+        negative_infinity,
+    )
+    scale_upper = jnp.nextafter(
+        left_ratio_upper * right_ratio_upper,
+        positive_infinity,
+    )
+    quotient_endpoints = jnp.stack(
+        [
+            dot_lower * scale_lower,
+            dot_lower * scale_upper,
+            dot_upper * scale_lower,
+            dot_upper * scale_upper,
+        ]
+    )
+    cosine_lower = jnp.nextafter(jnp.min(quotient_endpoints), negative_infinity)
+    cosine_upper = jnp.nextafter(jnp.max(quotient_endpoints), positive_infinity)
+    point = jnp.clip(-normalized_dot, minus_one, one)
+    lower = jnp.clip(jnp.nextafter(-cosine_upper, negative_infinity), minus_one, one)
+    zero_case = (~norms_nonzero) & (normalized_dot == 0.0)
+    point = jnp.where(zero_case, jnp.array(0.0, dtype=jnp.float32), point)
+    lower = jnp.where(zero_case, jnp.array(0.0, dtype=jnp.float32), lower)
+    resolved = dot_resolved & (
+        zero_case
+        | (
+            norms_nonzero
+            & jnp.all(
+                jnp.isfinite(
+                    jnp.stack(
+                        [
+                            point,
+                            lower,
+                            dot_lower,
+                            dot_upper,
+                            scale_lower,
+                            scale_upper,
+                            cosine_lower,
+                            cosine_upper,
+                        ]
+                    )
+                )
+            )
+        )
+    )
+    return point, lower, resolved
 
 
 def _tree_is_finite(tree: Any) -> Array:
@@ -467,22 +830,31 @@ def assess_gradient_joy(
     ``delta_s = <g_s, u>``.
 
     Negative changes improve their corresponding minimization objectives.
-    Candidate alignments and norm produce a tentative weakest-link weight. Hard
-    objective, retention, and safety magnitude gates audit both the raw
-    candidate and that tentative weighted update. This prevents soft scaling
+    Candidate alignments and norm produce a tentative weakest-link weight. The
+    elementwise-rounded tentative update receives fresh norm and dot
+    certificates. Hard objective, retention, and safety magnitude gates audit
+    both the raw candidate and that actual tentative update. This prevents soft scaling
     from silently violating a required improvement and prevents scaling from
     rescuing a raw harmful candidate. Candidate direction and trust gates remain
     valid because a positive weight preserves direction and only shrinks the
     norm. Missing or invalid evidence and any hard-gate failure zero the final
     weight. No learning-value channel is added to another channel.
 
-    Alignment is exact cosine alignment when the candidate update norm exceeds
-    ``diagnostics_epsilon`` and the probe norm and norm product are nonzero and
-    representable. It is clipped to ``[-1, 1]``. Unresolved or underflowed norms
-    report zero alignment and therefore fail any positive alignment
-    requirement. A configured endpoint threshold of exactly ``1.0`` uses a
-    four-machine-epsilon float32 comparison tolerance; other thresholds remain
-    exact.
+    Alignment uses scale-safe global norms and a normalized-coordinate dot
+    accumulated through a fixed balanced tree. Conservative float32 roundoff
+    intervals cover norms, normalization, products, and reduction. Any
+    non-finite derived dot/norm, unresolved norm of a nonzero input, nonzero
+    sign disagreement between raw and normalized-coordinate dots, or interval
+    that cannot resolve a cancellation-sensitive dot invalidates the evidence
+    instead of becoming a passing zero. The trust gate consumes the norm upper
+    bound, the nonzero floor consumes its lower bound, and positive magnitude
+    gates use the conservative edge of the dot interval. At an exact zero
+    threshold, both the raw dot and certified normalized direction must permit
+    the hard verdict; this still permits a raw dot that underflows to exact zero
+    when the normalized sign remains resolved. Alignment gates and their soft
+    factors consume the certified cosine lower bound. A configured endpoint
+    threshold of exactly ``1.0`` applies its four-machine-epsilon float32
+    tolerance to that lower bound; other thresholds remain exact.
 
     All inputs, diagnostics, the decision, and the returned update are detached.
     This is an optimizer control-plane assessment, not a differentiable
@@ -558,7 +930,7 @@ def assess_gradient_joy(
     objective_probe_finite = _tree_is_finite(objective_probe)
     retention_probe_finite = _tree_is_finite(retention_probe)
     safety_probe_finite = _tree_is_finite(safety_probe)
-    evidence_complete = (
+    input_evidence_complete = (
         candidate_finite
         & objective_available
         & retention_available
@@ -570,13 +942,119 @@ def assess_gradient_joy(
         & learning_value_complete
     )
 
-    update_norm_raw = _tree_norm(candidate_update)
-    objective_norm_raw = _tree_norm(objective_probe)
-    retention_norm_raw = _tree_norm(retention_probe)
-    safety_norm_raw = _tree_norm(safety_probe)
+    (
+        update_norm_raw,
+        update_norm_lower_raw,
+        update_norm_upper_raw,
+        update_norm_resolved,
+    ) = _tree_norm_certificate(candidate_update)
+    (
+        objective_norm_raw,
+        objective_norm_lower_raw,
+        objective_norm_upper_raw,
+        objective_norm_resolved,
+    ) = _tree_norm_certificate(objective_probe)
+    (
+        retention_norm_raw,
+        retention_norm_lower_raw,
+        retention_norm_upper_raw,
+        retention_norm_resolved,
+    ) = _tree_norm_certificate(retention_probe)
+    (
+        safety_norm_raw,
+        safety_norm_lower_raw,
+        safety_norm_upper_raw,
+        safety_norm_resolved,
+    ) = _tree_norm_certificate(safety_probe)
     objective_change_raw = _tree_dot(objective_probe, candidate_update)
     retention_change_raw = _tree_dot(retention_probe, candidate_update)
     safety_change_raw = _tree_dot(safety_probe, candidate_update)
+    (
+        objective_direction_raw,
+        objective_direction_error_raw,
+        objective_dot_error_bound_raw,
+        objective_dot_resolved,
+    ) = _tree_normalized_dot_certificate(
+        objective_probe,
+        candidate_update,
+        objective_norm_raw,
+        update_norm_raw,
+    )
+    (
+        retention_direction_raw,
+        retention_direction_error_raw,
+        retention_dot_error_bound_raw,
+        retention_dot_resolved,
+    ) = _tree_normalized_dot_certificate(
+        retention_probe,
+        candidate_update,
+        retention_norm_raw,
+        update_norm_raw,
+    )
+    (
+        safety_direction_raw,
+        safety_direction_error_raw,
+        safety_dot_error_bound_raw,
+        safety_dot_resolved,
+    ) = _tree_normalized_dot_certificate(
+        safety_probe,
+        candidate_update,
+        safety_norm_raw,
+        update_norm_raw,
+    )
+
+    def _dot_signs_are_consistent(raw_dot: Array, normalized_dot: Array) -> Array:
+        """Reject cancellation-sensitive dots whose nonzero signs disagree."""
+        return ~(
+            ((raw_dot > 0.0) & (normalized_dot < 0.0))
+            | ((raw_dot < 0.0) & (normalized_dot > 0.0))
+        )
+
+    derived_numerics_valid = (
+        jnp.all(
+            jnp.isfinite(
+                jnp.stack(
+                    [
+                        update_norm_raw,
+                        objective_norm_raw,
+                        retention_norm_raw,
+                        safety_norm_raw,
+                        objective_change_raw,
+                        retention_change_raw,
+                        safety_change_raw,
+                        objective_direction_raw,
+                        retention_direction_raw,
+                        safety_direction_raw,
+                        objective_dot_error_bound_raw,
+                        retention_dot_error_bound_raw,
+                        safety_dot_error_bound_raw,
+                        objective_direction_error_raw,
+                        retention_direction_error_raw,
+                        safety_direction_error_raw,
+                        update_norm_lower_raw,
+                        update_norm_upper_raw,
+                        objective_norm_lower_raw,
+                        objective_norm_upper_raw,
+                        retention_norm_lower_raw,
+                        retention_norm_upper_raw,
+                        safety_norm_lower_raw,
+                        safety_norm_upper_raw,
+                    ]
+                )
+            )
+        )
+        & update_norm_resolved
+        & objective_norm_resolved
+        & retention_norm_resolved
+        & safety_norm_resolved
+        & _dot_signs_are_consistent(objective_change_raw, objective_direction_raw)
+        & _dot_signs_are_consistent(retention_change_raw, retention_direction_raw)
+        & _dot_signs_are_consistent(safety_change_raw, safety_direction_raw)
+        & objective_dot_resolved
+        & retention_dot_resolved
+        & safety_dot_resolved
+    )
+    evidence_complete = input_evidence_complete & derived_numerics_valid
 
     def _finite_or_zero(value: Array) -> Array:
         return jnp.where(
@@ -586,33 +1064,33 @@ def assess_gradient_joy(
         )
 
     update_norm = _finite_or_zero(update_norm_raw)
+    update_norm_lower = _finite_or_zero(update_norm_lower_raw)
+    update_norm_upper = _finite_or_zero(update_norm_upper_raw)
     objective_norm = _finite_or_zero(objective_norm_raw)
+    objective_norm_lower = _finite_or_zero(objective_norm_lower_raw)
+    objective_norm_upper = _finite_or_zero(objective_norm_upper_raw)
     retention_norm = _finite_or_zero(retention_norm_raw)
+    retention_norm_lower = _finite_or_zero(retention_norm_lower_raw)
+    retention_norm_upper = _finite_or_zero(retention_norm_upper_raw)
     safety_norm = _finite_or_zero(safety_norm_raw)
+    safety_norm_lower = _finite_or_zero(safety_norm_lower_raw)
+    safety_norm_upper = _finite_or_zero(safety_norm_upper_raw)
     objective_change = _finite_or_zero(objective_change_raw)
     retention_change = _finite_or_zero(retention_change_raw)
     safety_change = _finite_or_zero(safety_change_raw)
+    objective_dot_error_bound = _finite_or_zero(objective_dot_error_bound_raw)
+    retention_dot_error_bound = _finite_or_zero(retention_dot_error_bound_raw)
+    safety_dot_error_bound = _finite_or_zero(safety_dot_error_bound_raw)
+    objective_direction = _finite_or_zero(objective_direction_raw)
+    objective_direction_error = _finite_or_zero(objective_direction_error_raw)
+    retention_direction = _finite_or_zero(retention_direction_raw)
+    retention_direction_error = _finite_or_zero(retention_direction_error_raw)
+    safety_direction = _finite_or_zero(safety_direction_raw)
+    safety_direction_error = _finite_or_zero(safety_direction_error_raw)
     epsilon = jnp.asarray(cfg.diagnostics_epsilon, dtype=jnp.float32)
 
-    def _descent_alignment(
-        change: Array,
-        probe_norm: Array,
-    ) -> Array:
-        denominator = update_norm * probe_norm
-        norms_are_resolved = (
-            (update_norm > epsilon)
-            & (probe_norm > 0.0)
-            & jnp.isfinite(denominator)
-            & (denominator > 0.0)
-        )
-        return jnp.where(
-            norms_are_resolved,
-            jnp.clip(-change / denominator, -1.0, 1.0),
-            jnp.array(0.0, dtype=jnp.float32),
-        )
-
     def _meets_alignment_threshold(
-        alignment: Array,
+        certified_lower_bound: Array,
         configured_threshold: float,
     ) -> Array:
         threshold = jnp.asarray(configured_threshold, dtype=jnp.float32)
@@ -625,21 +1103,63 @@ def assess_gradient_joy(
             threshold - endpoint_tolerance,
             threshold,
         )
-        return alignment >= effective_threshold
+        return certified_lower_bound >= effective_threshold
 
-    objective_alignment = _descent_alignment(
-        objective_change,
+    (
+        objective_alignment,
+        objective_alignment_lower,
+        objective_alignment_resolved,
+    ) = _descent_alignment_certificate(
+        objective_direction,
+        objective_direction_error,
         objective_norm,
+        objective_norm_lower,
+        objective_norm_upper,
+        update_norm,
+        update_norm_lower,
+        update_norm_upper,
+        objective_dot_resolved,
     )
-    retention_alignment = _descent_alignment(
-        retention_change,
+    (
+        retention_alignment,
+        retention_alignment_lower,
+        retention_alignment_resolved,
+    ) = _descent_alignment_certificate(
+        retention_direction,
+        retention_direction_error,
         retention_norm,
+        retention_norm_lower,
+        retention_norm_upper,
+        update_norm,
+        update_norm_lower,
+        update_norm_upper,
+        retention_dot_resolved,
     )
-    safety_alignment = _descent_alignment(safety_change, safety_norm)
+    (
+        safety_alignment,
+        safety_alignment_lower,
+        safety_alignment_resolved,
+    ) = _descent_alignment_certificate(
+        safety_direction,
+        safety_direction_error,
+        safety_norm,
+        safety_norm_lower,
+        safety_norm_upper,
+        update_norm,
+        update_norm_lower,
+        update_norm_upper,
+        safety_dot_resolved,
+    )
+    derived_numerics_valid = derived_numerics_valid & (
+        objective_alignment_resolved
+        & retention_alignment_resolved
+        & safety_alignment_resolved
+    )
+    evidence_complete = input_evidence_complete & derived_numerics_valid
     predicted_objective_decrease = -objective_change
-    nonzero_update = update_norm > epsilon
+    nonzero_update = update_norm_lower > epsilon
     within_trust_region = nonzero_update & (
-        update_norm <= jnp.asarray(cfg.max_update_norm, dtype=jnp.float32)
+        update_norm_upper <= jnp.asarray(cfg.max_update_norm, dtype=jnp.float32)
     )
 
     alignment_temperature = jnp.asarray(
@@ -649,7 +1169,7 @@ def assess_gradient_joy(
     norm_temperature = jnp.asarray(cfg.norm_temperature, dtype=jnp.float32)
     objective_factor = jax.nn.sigmoid(
         (
-            objective_alignment
+            objective_alignment_lower
             - jnp.asarray(
                 cfg.min_objective_descent_alignment,
                 dtype=jnp.float32,
@@ -659,7 +1179,7 @@ def assess_gradient_joy(
     )
     retention_factor = jax.nn.sigmoid(
         (
-            retention_alignment
+            retention_alignment_lower
             - jnp.asarray(
                 cfg.min_retention_descent_alignment,
                 dtype=jnp.float32,
@@ -669,7 +1189,7 @@ def assess_gradient_joy(
     )
     safety_factor = jax.nn.sigmoid(
         (
-            safety_alignment
+            safety_alignment_lower
             - jnp.asarray(
                 cfg.min_safety_descent_alignment,
                 dtype=jnp.float32,
@@ -678,7 +1198,8 @@ def assess_gradient_joy(
         / alignment_temperature
     )
     trust_factor = jax.nn.sigmoid(
-        (jnp.asarray(cfg.max_update_norm, dtype=jnp.float32) - update_norm) / norm_temperature
+        (jnp.asarray(cfg.max_update_norm, dtype=jnp.float32) - update_norm_upper)
+        / norm_temperature
     )
     weakest_link_weight = jnp.min(
         jnp.stack(
@@ -691,46 +1212,212 @@ def assess_gradient_joy(
         )
     )
     tentative_weight = jax.lax.stop_gradient(weakest_link_weight)
-    tentative_update_norm = tentative_weight * update_norm
-    tentative_objective_change = tentative_weight * objective_change
-    tentative_retention_change = tentative_weight * retention_change
-    tentative_safety_change = tentative_weight * safety_change
+    safe_update = jax.tree_util.tree_map(
+        lambda leaf: jnp.where(jnp.isfinite(leaf), leaf, jnp.zeros_like(leaf)),
+        candidate_update,
+    )
+    tentative_update = jax.tree_util.tree_map(
+        lambda leaf: jax.lax.stop_gradient(tentative_weight * leaf),
+        safe_update,
+    )
+    (
+        tentative_update_norm_raw,
+        tentative_update_norm_lower_raw,
+        tentative_update_norm_upper_raw,
+        tentative_update_norm_resolved,
+    ) = _tree_norm_certificate(tentative_update)
+    tentative_objective_change_raw = _tree_dot(objective_probe, tentative_update)
+    tentative_retention_change_raw = _tree_dot(retention_probe, tentative_update)
+    tentative_safety_change_raw = _tree_dot(safety_probe, tentative_update)
+    (
+        tentative_objective_direction_raw,
+        _,
+        tentative_objective_dot_error_bound_raw,
+        tentative_objective_dot_resolved,
+    ) = _tree_normalized_dot_certificate(
+        objective_probe,
+        tentative_update,
+        objective_norm_raw,
+        tentative_update_norm_raw,
+    )
+    (
+        tentative_retention_direction_raw,
+        _,
+        tentative_retention_dot_error_bound_raw,
+        tentative_retention_dot_resolved,
+    ) = _tree_normalized_dot_certificate(
+        retention_probe,
+        tentative_update,
+        retention_norm_raw,
+        tentative_update_norm_raw,
+    )
+    (
+        tentative_safety_direction_raw,
+        _,
+        tentative_safety_dot_error_bound_raw,
+        tentative_safety_dot_resolved,
+    ) = _tree_normalized_dot_certificate(
+        safety_probe,
+        tentative_update,
+        safety_norm_raw,
+        tentative_update_norm_raw,
+    )
+
+    tentative_derived_numerics_valid = (
+        jnp.all(
+            jnp.isfinite(
+                jnp.stack(
+                    [
+                        tentative_update_norm_raw,
+                        tentative_update_norm_lower_raw,
+                        tentative_update_norm_upper_raw,
+                        tentative_objective_change_raw,
+                        tentative_retention_change_raw,
+                        tentative_safety_change_raw,
+                        tentative_objective_direction_raw,
+                        tentative_retention_direction_raw,
+                        tentative_safety_direction_raw,
+                        tentative_objective_dot_error_bound_raw,
+                        tentative_retention_dot_error_bound_raw,
+                        tentative_safety_dot_error_bound_raw,
+                    ]
+                )
+            )
+        )
+        & tentative_update_norm_resolved
+        & _dot_signs_are_consistent(
+            tentative_objective_change_raw,
+            tentative_objective_direction_raw,
+        )
+        & _dot_signs_are_consistent(
+            tentative_retention_change_raw,
+            tentative_retention_direction_raw,
+        )
+        & _dot_signs_are_consistent(
+            tentative_safety_change_raw,
+            tentative_safety_direction_raw,
+        )
+        & tentative_objective_dot_resolved
+        & tentative_retention_dot_resolved
+        & tentative_safety_dot_resolved
+    )
+    derived_numerics_valid = derived_numerics_valid & tentative_derived_numerics_valid
+    evidence_complete = input_evidence_complete & derived_numerics_valid
+
+    tentative_update_norm = _finite_or_zero(tentative_update_norm_raw)
+    tentative_update_norm_lower = _finite_or_zero(tentative_update_norm_lower_raw)
+    tentative_update_norm_upper = _finite_or_zero(tentative_update_norm_upper_raw)
+    tentative_objective_change = _finite_or_zero(tentative_objective_change_raw)
+    tentative_retention_change = _finite_or_zero(tentative_retention_change_raw)
+    tentative_safety_change = _finite_or_zero(tentative_safety_change_raw)
+    tentative_objective_direction = _finite_or_zero(tentative_objective_direction_raw)
+    tentative_retention_direction = _finite_or_zero(tentative_retention_direction_raw)
+    tentative_safety_direction = _finite_or_zero(tentative_safety_direction_raw)
+    tentative_objective_dot_error_bound = _finite_or_zero(
+        tentative_objective_dot_error_bound_raw
+    )
+    tentative_retention_dot_error_bound = _finite_or_zero(
+        tentative_retention_dot_error_bound_raw
+    )
+    tentative_safety_dot_error_bound = _finite_or_zero(
+        tentative_safety_dot_error_bound_raw
+    )
     predicted_tentative_objective_decrease = -tentative_objective_change
-    tentative_nonzero_update = tentative_update_norm > epsilon
+    tentative_nonzero_update = tentative_update_norm_lower > epsilon
+
+    def _strict_decrease_exceeds(
+        predicted_decrease: Array,
+        directional_change: Array,
+        dot_error_bound: Array,
+        dot_resolved: Array,
+        configured_threshold: float,
+    ) -> Array:
+        threshold = jnp.asarray(configured_threshold, dtype=jnp.float32)
+        conservative_decrease = jnp.nextafter(
+            predicted_decrease - dot_error_bound,
+            jnp.array(-jnp.inf, dtype=jnp.float32),
+        )
+        return dot_resolved & jnp.where(
+            threshold == 0.0,
+            (predicted_decrease >= 0.0) & (directional_change < 0.0),
+            conservative_decrease > threshold,
+        )
+
+    def _change_within_limit(
+        change: Array,
+        directional_change: Array,
+        dot_error_bound: Array,
+        dot_resolved: Array,
+        configured_limit: float,
+    ) -> Array:
+        limit = jnp.asarray(configured_limit, dtype=jnp.float32)
+        conservative_change = jnp.nextafter(
+            change + dot_error_bound,
+            jnp.array(jnp.inf, dtype=jnp.float32),
+        )
+        return dot_resolved & jnp.where(
+            limit == 0.0,
+            (change <= 0.0) & (directional_change <= 0.0),
+            conservative_change <= limit,
+        )
 
     objective_improves = (
         (objective_norm > 0.0)
-        & (
-            predicted_objective_decrease
-            > jnp.asarray(cfg.min_objective_decrease, dtype=jnp.float32)
+        & _strict_decrease_exceeds(
+            predicted_objective_decrease,
+            objective_direction,
+            objective_dot_error_bound,
+            objective_dot_resolved,
+            cfg.min_objective_decrease,
         )
-        & (
-            predicted_tentative_objective_decrease
-            > jnp.asarray(cfg.min_objective_decrease, dtype=jnp.float32)
+        & _strict_decrease_exceeds(
+            predicted_tentative_objective_decrease,
+            tentative_objective_direction,
+            tentative_objective_dot_error_bound,
+            tentative_objective_dot_resolved,
+            cfg.min_objective_decrease,
         )
         & _meets_alignment_threshold(
-            objective_alignment,
+            objective_alignment_lower,
             cfg.min_objective_descent_alignment,
         )
     )
     retention_preserved = (
-        (retention_change <= jnp.asarray(cfg.max_retention_loss_increase, dtype=jnp.float32))
-        & (
-            tentative_retention_change
-            <= jnp.asarray(cfg.max_retention_loss_increase, dtype=jnp.float32)
+        _change_within_limit(
+            retention_change,
+            retention_direction,
+            retention_dot_error_bound,
+            retention_dot_resolved,
+            cfg.max_retention_loss_increase,
+        )
+        & _change_within_limit(
+            tentative_retention_change,
+            tentative_retention_direction,
+            tentative_retention_dot_error_bound,
+            tentative_retention_dot_resolved,
+            cfg.max_retention_loss_increase,
         )
     ) & _meets_alignment_threshold(
-        retention_alignment,
+        retention_alignment_lower,
         cfg.min_retention_descent_alignment,
     )
     safety_preserved = (
-        (safety_change <= jnp.asarray(cfg.max_safety_cost_increase, dtype=jnp.float32))
-        & (
-            tentative_safety_change
-            <= jnp.asarray(cfg.max_safety_cost_increase, dtype=jnp.float32)
+        _change_within_limit(
+            safety_change,
+            safety_direction,
+            safety_dot_error_bound,
+            safety_dot_resolved,
+            cfg.max_safety_cost_increase,
+        )
+        & _change_within_limit(
+            tentative_safety_change,
+            tentative_safety_direction,
+            tentative_safety_dot_error_bound,
+            tentative_safety_dot_resolved,
+            cfg.max_safety_cost_increase,
         )
     ) & _meets_alignment_threshold(
-        safety_alignment,
+        safety_alignment_lower,
         cfg.min_safety_descent_alignment,
     )
     accepted = (
@@ -749,13 +1436,11 @@ def assess_gradient_joy(
         )
     )
     accepted = jax.lax.stop_gradient(accepted)
-    safe_update = jax.tree_util.tree_map(
-        lambda leaf: jnp.where(jnp.isfinite(leaf), leaf, jnp.zeros_like(leaf)),
-        candidate_update,
-    )
     weighted_update = jax.tree_util.tree_map(
-        lambda leaf: jax.lax.stop_gradient(weight * leaf),
-        safe_update,
+        lambda leaf: jax.lax.stop_gradient(
+            jnp.where(accepted, leaf, jnp.zeros_like(leaf))
+        ),
+        tentative_update,
     )
     safe_update = jax.tree_util.tree_map(jax.lax.stop_gradient, safe_update)
 
@@ -769,6 +1454,7 @@ def assess_gradient_joy(
         retention_probe_finite=jax.lax.stop_gradient(retention_probe_finite),
         safety_probe_finite=jax.lax.stop_gradient(safety_probe_finite),
         learning_value_complete=learning_value_complete,
+        derived_numerics_valid=jax.lax.stop_gradient(derived_numerics_valid),
         evidence_complete=jax.lax.stop_gradient(evidence_complete),
         nonzero_update=jax.lax.stop_gradient(nonzero_update),
         tentative_nonzero_update=jax.lax.stop_gradient(tentative_nonzero_update),
@@ -777,21 +1463,66 @@ def assess_gradient_joy(
         safety_preserved=jax.lax.stop_gradient(safety_preserved),
         within_trust_region=jax.lax.stop_gradient(within_trust_region),
         update_norm=jax.lax.stop_gradient(update_norm),
+        update_norm_lower_bound=jax.lax.stop_gradient(update_norm_lower),
+        update_norm_upper_bound=jax.lax.stop_gradient(update_norm_upper),
+        update_norm_resolved=jax.lax.stop_gradient(update_norm_resolved),
         objective_probe_norm=jax.lax.stop_gradient(objective_norm),
         retention_probe_norm=jax.lax.stop_gradient(retention_norm),
         safety_probe_norm=jax.lax.stop_gradient(safety_norm),
         predicted_objective_decrease=jax.lax.stop_gradient(predicted_objective_decrease),
         predicted_retention_loss_change=jax.lax.stop_gradient(retention_change),
         predicted_safety_cost_change=jax.lax.stop_gradient(safety_change),
+        objective_dot_error_bound=jax.lax.stop_gradient(objective_dot_error_bound),
+        retention_dot_error_bound=jax.lax.stop_gradient(retention_dot_error_bound),
+        safety_dot_error_bound=jax.lax.stop_gradient(safety_dot_error_bound),
+        objective_dot_resolved=jax.lax.stop_gradient(objective_dot_resolved),
+        retention_dot_resolved=jax.lax.stop_gradient(retention_dot_resolved),
+        safety_dot_resolved=jax.lax.stop_gradient(safety_dot_resolved),
         objective_descent_alignment=jax.lax.stop_gradient(objective_alignment),
         retention_descent_alignment=jax.lax.stop_gradient(retention_alignment),
         safety_descent_alignment=jax.lax.stop_gradient(safety_alignment),
+        objective_descent_alignment_lower_bound=jax.lax.stop_gradient(
+            objective_alignment_lower
+        ),
+        retention_descent_alignment_lower_bound=jax.lax.stop_gradient(
+            retention_alignment_lower
+        ),
+        safety_descent_alignment_lower_bound=jax.lax.stop_gradient(
+            safety_alignment_lower
+        ),
         objective_factor=jax.lax.stop_gradient(objective_factor),
         retention_factor=jax.lax.stop_gradient(retention_factor),
         safety_factor=jax.lax.stop_gradient(safety_factor),
         trust_factor=jax.lax.stop_gradient(trust_factor),
         tentative_weight=tentative_weight,
         tentative_update_norm=jax.lax.stop_gradient(tentative_update_norm),
+        tentative_update_norm_lower_bound=jax.lax.stop_gradient(
+            tentative_update_norm_lower
+        ),
+        tentative_update_norm_upper_bound=jax.lax.stop_gradient(
+            tentative_update_norm_upper
+        ),
+        tentative_update_norm_resolved=jax.lax.stop_gradient(
+            tentative_update_norm_resolved
+        ),
+        tentative_objective_dot_error_bound=jax.lax.stop_gradient(
+            tentative_objective_dot_error_bound
+        ),
+        tentative_retention_dot_error_bound=jax.lax.stop_gradient(
+            tentative_retention_dot_error_bound
+        ),
+        tentative_safety_dot_error_bound=jax.lax.stop_gradient(
+            tentative_safety_dot_error_bound
+        ),
+        tentative_objective_dot_resolved=jax.lax.stop_gradient(
+            tentative_objective_dot_resolved
+        ),
+        tentative_retention_dot_resolved=jax.lax.stop_gradient(
+            tentative_retention_dot_resolved
+        ),
+        tentative_safety_dot_resolved=jax.lax.stop_gradient(
+            tentative_safety_dot_resolved
+        ),
         predicted_tentative_objective_decrease=jax.lax.stop_gradient(
             predicted_tentative_objective_decrease
         ),
@@ -829,10 +1560,13 @@ def apply_gradient_joy_update(
 
     Update leaves are cast to their corresponding parameter dtypes before
     addition. The effective stored delta (proposed parameters minus input
-    parameters) is then independently re-audited under ``candidate_semantics =
-    "update"`` with the same evidence and thresholds. This conservative second
-    audit can veto a finite quantized update whose direction, magnitude, or
-    trust-bound status no longer matches the accepted float32 candidate.
+    parameters) is computed after promoting both stored endpoints to at least
+    float32, then independently re-audited under ``candidate_semantics =
+    "update"`` with the same evidence and thresholds. Endpoint promotion
+    prevents float16/bfloat16 subtraction rounding from understating a stored
+    change. This conservative second audit can veto a finite quantized update
+    whose direction, magnitude, or trust-bound status no longer matches the
+    accepted float32 candidate.
 
     The update is applied only when both assessments accept it, every parameter,
     cast update, and proposed parameter is finite, and at least one proposed
@@ -896,8 +1630,16 @@ def apply_gradient_joy_update(
         parameter_tree,
         update_tree,
     )
+    def _stored_endpoint_delta(parameter: Array, proposed: Array) -> Array:
+        """Subtract stored endpoints without low-precision subtraction rounding."""
+        audit_dtype = jnp.promote_types(parameter.dtype, jnp.float32)
+        return jnp.asarray(proposed, dtype=audit_dtype) - jnp.asarray(
+            parameter,
+            dtype=audit_dtype,
+        )
+
     effective_update = jax.tree_util.tree_map(
-        lambda parameter, proposed: proposed - parameter,
+        _stored_endpoint_delta,
         parameter_tree,
         proposed_parameters,
     )

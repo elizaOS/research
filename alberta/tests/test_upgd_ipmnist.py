@@ -19,6 +19,7 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     UPGD_W_PROTOCOL_HYPERPARAMETERS,
     IPMNISTConfig,
     LeanUPGDState,
+    _split_flat_noise,
     build_artifact,
     build_comparison,
     build_schedule,
@@ -306,6 +307,140 @@ class TestLeanUPGDParity:
                     atol=1e-6,
                     err_msg=f"step {step} utility {name}",
                 )
+
+
+class TestSplitFlatNoise:
+    def test_slices_in_sorted_name_order_with_exact_values(self):
+        shapes = {"b1": (5,), "b2": (3,), "w1": (7, 5), "w2": (5, 3)}
+        total = sum(int(np.prod(shape)) for shape in shapes.values())
+        flat = jr.normal(jr.key(0), (total,), jnp.float32)
+        split = _split_flat_noise(flat, shapes)
+        assert set(split) == set(shapes)
+        offset = 0
+        for name in sorted(shapes):
+            count = int(np.prod(shapes[name]))
+            assert split[name].shape == shapes[name]
+            np.testing.assert_array_equal(
+                np.asarray(split[name]).ravel(),
+                np.asarray(flat[offset:offset + count]),
+            )
+            offset += count
+        assert offset == total
+
+
+class TestRunnerTrajectoryExactness:
+    """run_ipmnist's optimized inner loop vs a plain dict-based reference loop.
+
+    The reference reproduces the exact published RNG stream contract: one
+    ``jr.split`` per step of the per-seed noise-key chain, one flat
+    ``N(0, sigma^2)`` draw sliced per sorted parameter name.
+    """
+
+    SMALL = IPMNISTConfig(n_tasks=2, task_length=50, input_dim=16, hidden1=32, hidden2=16)
+
+    @pytest.mark.parametrize("learner", ["upgd_w", "adamw"])
+    def test_matches_reference_loop(self, learner):
+        import jax
+
+        from alberta_framework.benchmarks.upgd_ipmnist import (
+            _LEARNER_FACTORIES,
+            cross_entropy_loss,
+            init_mlp_params,
+        )
+
+        config = self.SMALL
+        data_x, data_y = _synthetic_dataset(11, N_TRAIN, config.input_dim, config.n_classes)
+        result = run_ipmnist(
+            data_x, data_y, learner, seeds=(0,), config=config, return_per_step=True
+        )
+
+        hp = resolve_hyperparameters(learner)
+        init_fn, step_fn = _LEARNER_FACTORIES[learner](hp)
+        root = jr.key(jnp.uint32(0))
+        key_init, key_schedule, key_noise = jr.split(root, 3)
+        params = init_mlp_params(key_init, config)
+        schedule = build_schedule(key_schedule, config, N_TRAIN)
+        state = init_fn(params)
+        key = key_noise
+        xs = jnp.asarray(data_x, jnp.float32)
+        ys = jnp.asarray(data_y, jnp.int32)
+        accuracies = np.zeros((config.n_tasks, config.task_length))
+        for task in range(config.n_tasks):
+            permutation = schedule.permutations[task]
+            for i in range(config.task_length):
+                example = schedule.example_indices[task, i]
+                x = xs[example][permutation]
+                y = ys[example]
+                (_, logits), grads = jax.value_and_grad(
+                    cross_entropy_loss, has_aux=True
+                )(params, x, y)
+                accuracies[task, i] = float(jnp.argmax(logits) == y)
+                key, step_key = jr.split(key)
+                params, state = step_fn(params, state, grads, step_key)
+        np.testing.assert_array_equal(result.per_step_accuracy[0], accuracies)
+
+
+class TestNoisePoolMode:
+    def test_noise_mode_recorded_and_defaults_to_step(self):
+        data_x, data_y = _synthetic_dataset(3, N_TRAIN, TINY.input_dim, TINY.n_classes)
+        exact = run_ipmnist(data_x, data_y, "upgd_w", seeds=(0,), config=TINY)
+        assert exact.noise_mode == "step"
+        pooled = run_ipmnist(
+            data_x, data_y, "upgd_w", seeds=(0,), config=TINY,
+            noise_mode="pool", noise_pool_steps=4,
+        )
+        assert pooled.noise_mode == "pool"
+
+    def test_pool_mode_is_deterministic_and_bounded(self):
+        data_x, data_y = _synthetic_dataset(3, N_TRAIN, TINY.input_dim, TINY.n_classes)
+        first = run_ipmnist(
+            data_x, data_y, "upgd_w", seeds=(2,), config=TINY,
+            noise_mode="pool", noise_pool_steps=4,
+        )
+        second = run_ipmnist(
+            data_x, data_y, "upgd_w", seeds=(2,), config=TINY,
+            noise_mode="pool", noise_pool_steps=4,
+        )
+        np.testing.assert_array_equal(first.per_task_accuracy, second.per_task_accuracy)
+        assert np.all(np.isfinite(first.per_task_loss))
+        assert np.all(first.per_task_accuracy >= 0.0)
+        assert np.all(first.per_task_accuracy <= 1.0)
+
+    def test_pool_mode_changes_upgd_but_not_adamw(self):
+        data_x, data_y = _synthetic_dataset(3, N_TRAIN, TINY.input_dim, TINY.n_classes)
+        upgd_exact = run_ipmnist(data_x, data_y, "upgd_w", seeds=(0,), config=TINY)
+        upgd_pool = run_ipmnist(
+            data_x, data_y, "upgd_w", seeds=(0,), config=TINY,
+            noise_mode="pool", noise_pool_steps=4,
+        )
+        assert not np.array_equal(upgd_exact.per_task_loss, upgd_pool.per_task_loss)
+
+        adamw_exact = run_ipmnist(data_x, data_y, "adamw", seeds=(0,), config=TINY)
+        adamw_pool = run_ipmnist(
+            data_x, data_y, "adamw", seeds=(0,), config=TINY,
+            noise_mode="pool", noise_pool_steps=4,
+        )
+        np.testing.assert_array_equal(
+            adamw_exact.per_task_accuracy, adamw_pool.per_task_accuracy
+        )
+        np.testing.assert_array_equal(adamw_exact.per_task_loss, adamw_pool.per_task_loss)
+
+    def test_pool_mode_rejects_invalid_pool_size(self):
+        data_x, data_y = _synthetic_dataset(3, N_TRAIN, TINY.input_dim, TINY.n_classes)
+        with pytest.raises(ValueError, match="noise_pool_steps"):
+            run_ipmnist(
+                data_x, data_y, "upgd_w", seeds=(0,), config=TINY,
+                noise_mode="pool", noise_pool_steps=1,
+            )
+
+    def test_pool_mode_shard_serialization_fails_closed(self):
+        data_x, data_y = _synthetic_dataset(3, N_TRAIN, TINY.input_dim, TINY.n_classes)
+        pooled = run_ipmnist(
+            data_x, data_y, "upgd_w", seeds=(0,), config=TINY,
+            noise_mode="pool", noise_pool_steps=4,
+        )
+        with pytest.raises(ValueError, match="noise_mode"):
+            partial_payload(pooled)
 
 
 class TestPartialMerge:

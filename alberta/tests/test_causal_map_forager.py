@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import hashlib
+import heapq
+import json
 import math
+import pickle
 from collections import deque
 from collections.abc import Mapping
 from typing import Any, cast
@@ -24,6 +28,7 @@ from alberta_framework.benchmarks.causal_map_forager import (
     CausalMapForagerAgent,
     CausalMapForagerConfig,
     _choose_action,
+    _cost_aware_route_grid,
     _empty_state,
     _estimated_respawn_delay,
     _integrate_observation,
@@ -157,6 +162,7 @@ def _fake_make(self: ForagerEnvConfig) -> tuple[_CausalFakeForagax, None]:
         ("maximum_retry_exponent", -1, "non-negative integer"),
         ("maximum_exact_interval_width", 1, "must be zero"),
         ("exploration_probability", 1.1, r"\[0, 1\]"),
+        ("arrival_aware_readiness", 1, "must be a boolean"),
         ("respawn_safety_quantile", 0.49, r"\[0.5, 1\)"),
         ("respawn_safety_factor", 0.0, "positive"),
         ("distance_cost", 1e100, "positive"),
@@ -265,6 +271,12 @@ def test_config_round_trip_fingerprint_and_variant_spec() -> None:
     )
     assert "impl=prng_impl" in rng_contract["root"]
     assert spec["config_sha256"] == config.fingerprint()
+    assert config.to_dict()["arrival_aware_readiness"] is True
+    assert spec["config"]["arrival_aware_readiness"] is True
+    assert (
+        CausalMapForagerConfig(arrival_aware_readiness=False).fingerprint()
+        != config.fingerprint()
+    )
     with pytest.raises(ValueError, match="unknown"):
         CausalMapForagerConfig.from_dict({**config.to_dict(), "object_delay": 300})
     with pytest.raises(ValueError, match="respawn_quantile_z"):
@@ -281,6 +293,27 @@ def test_agent_rejects_falsey_or_wrong_config_instead_of_defaulting() -> None:
     for invalid in ({}, False, 0):
         with pytest.raises(TypeError, match="CausalMapForagerConfig"):
             CausalMapForagerAgent(invalid)  # type: ignore[arg-type]
+
+
+def test_metadata_declares_arrival_and_exploration_scheduler_semantics() -> None:
+    config = CausalMapForagerConfig(
+        exploration_probability=0.25,
+        arrival_aware_readiness=True,
+    )
+    world_model = CausalMapForagerAgent(config).metadata()["world_model"]
+    assert world_model["arrival_aware_readiness"] is True
+    assert "route_step_distance - 1" in world_model["arrival_readiness_semantics"]
+    assert "never broadens" in world_model["exploration_probability_semantics"]
+    assert "lexicographic" in world_model["negative_avoidance"]
+    assert "never impassable" in world_model["negative_route_semantics"]
+
+    decision_world_model = CausalMapForagerAgent(
+        dataclasses.replace(config, arrival_aware_readiness=False)
+    ).metadata()["world_model"]
+    assert decision_world_model["arrival_aware_readiness"] is False
+    assert decision_world_model["arrival_readiness_semantics"] == (
+        "ready_step <= step_count"
+    )
 
 
 def test_start_infers_aperture_channels_and_builds_relative_map() -> None:
@@ -685,6 +718,88 @@ def test_safe_distance_grid_early_exit_is_legacy_exact_under_jit_vmap() -> None:
     np.testing.assert_array_equal(np.asarray(candidate), np.asarray(legacy))
 
 
+def _host_cost_aware_route_grid(
+    source: tuple[int, int],
+    negative_cells: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Independent lexicographic Dijkstra oracle for public traversable cells."""
+    height, width = negative_cells.shape
+    infinity = height * width + 1
+    risks = np.full((height, width), infinity, dtype=np.int32)
+    distances = np.full((height, width), infinity, dtype=np.int32)
+    source_x, source_y = source
+    risks[source_y, source_x] = 0
+    distances[source_y, source_x] = 0
+    queue: list[tuple[int, int, int, int]] = [(0, 0, source_x, source_y)]
+    while queue:
+        risk, distance, x, y = heapq.heappop(queue)
+        if (risk, distance) != (int(risks[y, x]), int(distances[y, x])):
+            continue
+        for dx, dy in _DIRECTION_STEPS:
+            neighbor_x = (x + dx) % width
+            neighbor_y = (y + dy) % height
+            candidate = (
+                risk + int(negative_cells[neighbor_y, neighbor_x]),
+                distance + 1,
+            )
+            incumbent = (
+                int(risks[neighbor_y, neighbor_x]),
+                int(distances[neighbor_y, neighbor_x]),
+            )
+            if candidate < incumbent:
+                risks[neighbor_y, neighbor_x], distances[neighbor_y, neighbor_x] = (
+                    candidate
+                )
+                heapq.heappush(
+                    queue,
+                    (candidate[0], candidate[1], neighbor_x, neighbor_y),
+                )
+    return risks, distances
+
+
+@pytest.mark.parametrize("world_shape", ((1, 1), (2, 3), (3, 3)))
+def test_cost_aware_route_grid_matches_lexicographic_dijkstra_under_jit_vmap(
+    world_shape: tuple[int, int],
+) -> None:
+    config = CausalMapForagerConfig(world_shape=world_shape)
+    height, width = world_shape
+    cell_count = height * width
+    masks: list[np.ndarray] = []
+    sources: list[tuple[int, int]] = []
+    expected_risks: list[np.ndarray] = []
+    expected_distances: list[np.ndarray] = []
+    for bits in range(1 << cell_count):
+        negative = np.asarray(
+            [(bits >> index) & 1 for index in range(cell_count)],
+            dtype=np.bool_,
+        ).reshape(world_shape)
+        for source_y in range(height):
+            for source_x in range(width):
+                source = (source_x, source_y)
+                expected_risk, expected_distance = _host_cost_aware_route_grid(
+                    source,
+                    negative,
+                )
+                masks.append(negative)
+                sources.append(source)
+                expected_risks.append(expected_risk)
+                expected_distances.append(expected_distance)
+
+    actual_risks, actual_distances = jax.jit(
+        jax.vmap(
+            lambda source, mask: _cost_aware_route_grid(source, mask, config)
+        )
+    )(
+        jnp.asarray(sources, dtype=jnp.int32),
+        jnp.asarray(np.stack(masks), dtype=jnp.bool_),
+    )
+    np.testing.assert_array_equal(np.asarray(actual_risks), np.stack(expected_risks))
+    np.testing.assert_array_equal(
+        np.asarray(actual_distances),
+        np.stack(expected_distances),
+    )
+
+
 def test_safe_toroidal_routing_uses_wrap_and_routes_around_barriers() -> None:
     config = CausalMapForagerConfig(
         world_shape=(5, 5),
@@ -713,7 +828,7 @@ def test_safe_toroidal_routing_uses_wrap_and_routes_around_barriers() -> None:
     assert not bool(negative_mask[destination_y, destination_x])
 
 
-def test_safe_routing_rejects_enclosed_target_and_has_explicit_fallback() -> None:
+def test_safe_grid_marks_enclosure_but_cost_route_can_cross_with_explicit_fallback() -> None:
     config = CausalMapForagerConfig(
         world_shape=(5, 5),
         exploration_probability=0.0,
@@ -728,6 +843,13 @@ def test_safe_routing_rejects_enclosed_target_and_has_explicit_fallback() -> Non
         config,
     )
     assert int(distances[0, 0]) > config.height * config.width
+    crossing_risk, crossing_distance = _cost_aware_route_grid(
+        jnp.asarray((0, 0), dtype=jnp.int32),
+        negative_mask,
+        config,
+    )
+    assert int(crossing_risk[2, 2]) == 1
+    assert int(crossing_distance[2, 2]) == 4
     planned, action = _choose_action(enclosed, config)
     assert 0 <= int(action) < 4
     destination_x, destination_y = map(int, np.asarray(planned.last_target_position))
@@ -743,6 +865,298 @@ def test_safe_routing_rejects_enclosed_target_and_has_explicit_fallback() -> Non
     assert 0 <= int(action) < 4
     destination_x, destination_y = map(int, np.asarray(planned.last_target_position))
     assert bool((trapped.cell_channel == 0)[destination_y, destination_x])
+
+
+def _negative_crossing_state(
+    config: CausalMapForagerConfig,
+    *,
+    sealed: bool,
+    remote_reward: float = 10.0,
+    local_reward: float = 1.0,
+) -> Any:
+    """Return an observed map with remote/local rewards and learned deathcaps."""
+    state = _empty_state(3, config, 41)
+    negative_positions = (
+        tuple((1, y) for y in range(config.height))
+        + tuple((config.width - 1, y) for y in range(config.height))
+        if sealed
+        else ((1, 0),)
+    )
+    channels = state.cell_channel
+    last_absent = jnp.zeros(config.world_shape, dtype=jnp.int32)
+    for x, y in negative_positions:
+        channels = channels.at[y, x].set(0)
+    channels = channels.at[0, 2].set(1).at[1, 0].set(2)
+    active = state.cell_active.at[0, 2].set(True).at[1, 0].set(True)
+    last_absent = last_absent.at[0, 2].set(-1).at[1, 0].set(-1)
+    return state._replace(
+        cell_channel=channels,
+        cell_active=active,
+        cell_last_seen_step=jnp.zeros(config.world_shape, dtype=jnp.int32),
+        cell_last_absent_step=last_absent,
+        reward_sum=(
+            state.reward_sum.at[0]
+            .set(-1.0)
+            .at[1]
+            .set(remote_reward)
+            .at[2]
+            .set(local_reward)
+        ),
+        reward_count=jnp.ones((3,), dtype=jnp.int32),
+    )
+
+
+def test_cost_route_avoids_deathcap_when_clean_detour_exists() -> None:
+    config = CausalMapForagerConfig(
+        world_shape=(5, 5),
+        exploration_probability=0.0,
+        distance_cost=0.01,
+        tie_break_scale=1e-8,
+    )
+    state = _negative_crossing_state(config, sealed=False)
+    planned, action = _choose_action(state, config)
+    assert int(action) == 3
+    destination_x, destination_y = map(int, np.asarray(planned.last_target_position))
+    assert int(state.cell_channel[destination_y, destination_x]) != 0
+
+
+def test_profitable_target_can_cross_minimum_deathcap_barrier_eager_jit_vmap() -> None:
+    config = CausalMapForagerConfig(
+        world_shape=(5, 5),
+        exploration_probability=0.0,
+        distance_cost=0.01,
+        tie_break_scale=1e-8,
+    )
+    clean_detour = _negative_crossing_state(config, sealed=False)
+    sealed = _negative_crossing_state(config, sealed=True)
+
+    def choose(value: Any) -> jax.Array:
+        return _choose_action(value, config)[1]
+
+    assert int(choose(clean_detour)) == 3
+    assert int(choose(sealed)) == 1
+    assert int(jax.jit(choose)(sealed)) == 1
+    batch = jax.tree.map(
+        lambda left, right: jnp.stack((left, right)),
+        clean_detour,
+        sealed,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(jax.jit(jax.vmap(choose))(batch)),
+        np.asarray((3, 1)),
+    )
+
+    planned, _ = _choose_action(sealed, config)
+    destination_x, destination_y = map(int, np.asarray(planned.last_target_position))
+    assert int(sealed.cell_channel[destination_y, destination_x]) == 0
+
+
+def test_negative_entry_price_prefers_safe_local_reward_when_crossing_is_not_worth_it() -> None:
+    config = CausalMapForagerConfig(
+        world_shape=(5, 5),
+        exploration_probability=0.0,
+        distance_cost=0.01,
+        tie_break_scale=1e-8,
+    )
+    state = _negative_crossing_state(
+        config,
+        sealed=True,
+        remote_reward=1.0,
+        local_reward=1.0,
+    )
+    planned, action = _choose_action(state, config)
+    assert int(action) == 0
+    assert tuple(np.asarray(planned.last_target_position)) == (0, 1)
+
+
+def _readiness_routing_state(
+    config: CausalMapForagerConfig,
+    *,
+    step_count: int,
+    pending_ready_step: int,
+) -> Any:
+    """Build a fully observed planner state with opposed pending/active targets."""
+    state = _empty_state(3, config, 29)
+    pending_x = 3
+    active_x = config.width - 1
+    return state._replace(
+        step_count=jnp.asarray(step_count, dtype=jnp.int32),
+        cell_channel=(
+            state.cell_channel.at[0, pending_x].set(1).at[0, active_x].set(2)
+        ),
+        cell_active=state.cell_active.at[0, active_x].set(True),
+        cell_collection_step=state.cell_collection_step.at[0, pending_x].set(1),
+        cell_ready_step=(
+            state.cell_ready_step.at[0, pending_x].set(pending_ready_step)
+        ),
+        # Every cell has genuinely been observed, so exploration_probability
+        # cannot mask which exploitation target passed the readiness gate.
+        cell_last_seen_step=jnp.full(
+            config.world_shape,
+            step_count,
+            dtype=jnp.int32,
+        ),
+        cell_last_absent_step=jnp.full(
+            config.world_shape,
+            step_count,
+            dtype=jnp.int32,
+        ),
+        reward_sum=state.reward_sum.at[1].set(10.0).at[2].set(1.0),
+        reward_count=state.reward_count.at[1].set(1).at[2].set(1),
+    )
+
+
+def test_arrival_readiness_boundary_matches_pre_entry_reward_order_eager_jit_vmap() -> None:
+    config = CausalMapForagerConfig(
+        world_shape=(7, 7),
+        exploration_probability=1.0,
+        arrival_aware_readiness=True,
+        distance_cost=0.01,
+        tie_break_scale=1e-8,
+    )
+    # The pending high-value target is three moves east.  The entry action is
+    # evaluated from step 12, so ready_step=12 is collectible on arrival while
+    # ready_step=13 is one public transition too late.  The active lower-value
+    # target immediately west makes the rejected case unambiguous.
+    on_boundary = _readiness_routing_state(
+        config,
+        step_count=10,
+        pending_ready_step=12,
+    )
+    one_step_late = _readiness_routing_state(
+        config,
+        step_count=10,
+        pending_ready_step=13,
+    )
+
+    def choose(value: Any) -> jax.Array:
+        return _choose_action(value, config)[1]
+
+    assert int(choose(on_boundary)) == 1
+    assert int(choose(one_step_late)) == 3
+    assert int(jax.jit(choose)(on_boundary)) == 1
+    assert int(jax.jit(choose)(one_step_late)) == 3
+
+    batch = jax.tree.map(
+        lambda left, right: jnp.stack((left, right)),
+        on_boundary,
+        one_step_late,
+    )
+    actions = jax.jit(jax.vmap(choose))(batch)
+    np.testing.assert_array_equal(np.asarray(actions), np.asarray((1, 3)))
+
+
+def test_arrival_readiness_can_be_disabled_for_exact_decision_time_semantics() -> None:
+    arrival_config = CausalMapForagerConfig(
+        world_shape=(7, 7),
+        exploration_probability=0.0,
+        arrival_aware_readiness=True,
+        distance_cost=0.01,
+        tie_break_scale=1e-8,
+    )
+    decision_config = dataclasses.replace(
+        arrival_config,
+        arrival_aware_readiness=False,
+    )
+    state = _readiness_routing_state(
+        arrival_config,
+        step_count=10,
+        pending_ready_step=12,
+    )
+    assert int(_choose_action(state, arrival_config)[1]) == 1
+    assert int(_choose_action(state, decision_config)[1]) == 3
+
+
+def test_arrival_readiness_saturates_near_int32_lifetime_instead_of_wrapping() -> None:
+    config = CausalMapForagerConfig(
+        world_shape=(7, 7),
+        exploration_probability=0.0,
+        arrival_aware_readiness=True,
+        distance_cost=0.01,
+        tie_break_scale=1e-8,
+    )
+    maximum = np.iinfo(np.int32).max
+    state = _readiness_routing_state(
+        config,
+        step_count=maximum - 1,
+        pending_ready_step=maximum,
+    )
+    eager = _choose_action(state, config)[1]
+    compiled = jax.jit(lambda value: _choose_action(value, config)[1])(state)
+    assert int(eager) == 1
+    assert int(compiled) == 1
+
+
+def test_exploration_probability_never_redirects_after_reachable_map_is_observed() -> None:
+    config = CausalMapForagerConfig(
+        world_shape=(5, 5),
+        exploration_probability=1.0,
+        tie_break_scale=1e-8,
+    )
+    state = _empty_state(2, config, 7)
+    visits = jnp.full(config.world_shape, 100, dtype=jnp.int32).at[0, 4].set(0)
+    state = state._replace(
+        cell_channel=state.cell_channel.at[0, 1].set(1),
+        cell_active=state.cell_active.at[0, 1].set(True),
+        cell_last_seen_step=jnp.zeros(config.world_shape, dtype=jnp.int32),
+        cell_last_absent_step=jnp.zeros(config.world_shape, dtype=jnp.int32),
+        visit_count=visits,
+        reward_sum=state.reward_sum.at[1].set(5.0),
+        reward_count=state.reward_count.at[1].set(1),
+    )
+    eager_state, eager_action = _choose_action(state, config)
+    compiled_state, compiled_action = jax.jit(
+        lambda value: _choose_action(value, config)
+    )(state)
+    assert int(eager_action) == 1
+    assert int(compiled_action) == 1
+    chex.assert_trees_all_equal(eager_state, compiled_state)
+
+
+def test_exploration_can_cross_deathcap_ring_to_genuinely_unobserved_cell() -> None:
+    config = CausalMapForagerConfig(
+        world_shape=(5, 5),
+        exploration_probability=1.0,
+        tie_break_scale=1e-8,
+    )
+    state = _empty_state(2, config, 7)
+    ring = ((2, 1), (3, 2), (2, 3), (1, 2))
+    channels = state.cell_channel.at[0, 1].set(1)
+    for x, y in ring:
+        channels = channels.at[y, x].set(0)
+    last_seen = jnp.zeros(config.world_shape, dtype=jnp.int32).at[2, 2].set(-1)
+    state = state._replace(
+        cell_channel=channels,
+        cell_active=state.cell_active.at[0, 1].set(True),
+        cell_last_seen_step=last_seen,
+        cell_last_absent_step=jnp.zeros(config.world_shape, dtype=jnp.int32),
+        reward_sum=state.reward_sum.at[0].set(-1.0).at[1].set(5.0),
+        reward_count=state.reward_count.at[0].set(1).at[1].set(1),
+    )
+    # Public deathcaps are costly but traversable, so the ring can no longer
+    # make its unobserved center permanently unreachable.  With exploration
+    # forced, the planner begins the minimum-one-deathcap route instead of
+    # exploiting the adjacent known reward.
+    assert int(_choose_action(state, config)[1]) == 0
+    assert int(jax.jit(lambda value: _choose_action(value, config)[1])(state)) == 0
+
+
+def test_no_target_after_full_coverage_keeps_global_safe_coverage_fail_safe() -> None:
+    config = CausalMapForagerConfig(
+        world_shape=(5, 5),
+        exploration_probability=1.0,
+        tie_break_scale=1e-8,
+    )
+    state = _empty_state(1, config, 7)
+    visits = jnp.full(config.world_shape, 100, dtype=jnp.int32).at[0, 4].set(0)
+    state = state._replace(
+        cell_last_seen_step=jnp.zeros(config.world_shape, dtype=jnp.int32),
+        cell_last_absent_step=jnp.zeros(config.world_shape, dtype=jnp.int32),
+        visit_count=visits,
+    )
+    planned, action = _choose_action(state, config)
+    assert int(action) == 3
+    assert int(planned.last_target_channel) == -1
 
 
 def test_seeded_persistent_coverage_discovers_remote_region_despite_local_target() -> None:
@@ -1180,6 +1594,32 @@ def test_state_serialization_round_trip_and_validation() -> None:
         causal_map_state_from_dict(legacy, config)
 
 
+def test_field_absent_v5_checkpoint_requires_explicit_legacy_readiness_policy() -> None:
+    legacy_config = CausalMapForagerConfig(arrival_aware_readiness=False)
+    state, _ = causal_map_start(
+        _observation((1, 0, 1)),
+        legacy_config,
+        19,
+    )
+    payload = causal_map_state_to_dict(state, legacy_config)
+    del payload["config"]["arrival_aware_readiness"]
+    encoded = json.dumps(
+        payload["config"],
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    payload["config_sha256"] = hashlib.sha256(encoded).hexdigest()
+
+    restored = causal_map_state_from_dict(payload, legacy_config)
+    chex.assert_trees_all_equal(state, restored)
+    with pytest.raises(ValueError, match="different configuration"):
+        causal_map_state_from_dict(
+            payload,
+            dataclasses.replace(legacy_config, arrival_aware_readiness=True),
+        )
+
+
 def test_checkpoint_continuation_is_exact_with_bound_prng_implementation() -> None:
     config = CausalMapForagerConfig()
     source = CausalMapForagerAgent(config, seed=23)
@@ -1194,6 +1634,32 @@ def test_checkpoint_continuation_is_exact_with_bound_prng_implementation() -> No
     chex.assert_trees_all_equal(source.state, restored.state)
 
     for _ in range(10):
+        assert source.step(0.0, _observation()) == restored.step(
+            0.0,
+            _observation(),
+        )
+        chex.assert_trees_all_equal(source.state, restored.state)
+
+
+@pytest.mark.parametrize("arrival_aware_readiness", [False, True])
+def test_agent_pickle_preserves_scheduler_config_and_exact_continuation(
+    arrival_aware_readiness: bool,
+) -> None:
+    config = CausalMapForagerConfig(
+        exploration_probability=0.75,
+        arrival_aware_readiness=arrival_aware_readiness,
+    )
+    source = CausalMapForagerAgent(config, seed=31)
+    source.start(_observation((1, 0, 1)))
+    source.step(0.0, _observation())
+
+    restored = pickle.loads(pickle.dumps(source))
+    assert isinstance(restored, CausalMapForagerAgent)
+    assert restored.config == config
+    assert restored.config.fingerprint() == config.fingerprint()
+    chex.assert_trees_all_equal(source.state, restored.state)
+
+    for _ in range(3):
         assert source.step(0.0, _observation()) == restored.step(
             0.0,
             _observation(),
@@ -2337,6 +2803,97 @@ def test_runner_preflight_defensively_rejects_even_aperture(
     benchmark = ForagerBenchmarkConfig(environment=environment, steps=2)
     with pytest.raises(ValueError, match="odd centered aperture"):
         run_forager(CausalMapForagerAgent(seed=0), benchmark)
+
+
+def test_installed_foragax_ready_observation_precedes_collectible_transition() -> None:
+    """Public observations/rewards pin the arrival-readiness off-by-one."""
+    pytest.importorskip("foragax")
+    from foragax.env import Biome, ForagaxEnv
+    from foragax.objects import DefaultForagaxObject
+
+    food = DefaultForagaxObject(
+        name="deterministic_food",
+        reward=1.0,
+        collectable=True,
+        regen_delay=(2, 2),
+        color=(1, 2, 3),
+    )
+    env = ForagaxEnv(
+        size=(1, 1),
+        aperture_size=-1,
+        objects=(food,),
+        biomes=(
+            Biome(
+                object_frequencies=(1.0,),
+                start=(0, 0),
+                stop=(1, 1),
+            ),
+        ),
+        deterministic_spawn=True,
+        observation_type="color",
+    )
+    params = env.default_params
+    key = jr.key(91)
+    key, reset_key = jr.split(key)
+    observation, env_state = env.reset(reset_key, params)
+    assert float(observation[0, 0, 0]) == 1.0
+
+    rewards: list[float] = []
+    visible: list[bool] = []
+    for _ in range(5):
+        key, step_key = jr.split(key)
+        observation, env_state, reward, _, _ = env.step(
+            step_key,
+            env_state,
+            jnp.asarray(0, dtype=jnp.int32),
+            params,
+        )
+        rewards.append(float(reward))
+        visible.append(bool(observation[0, 0, 0]))
+
+    # Collection occurs first.  On step four the respawn is visible in the
+    # returned public observation, but its transition reward is still zero;
+    # only the action selected from that ready state collects on step five.
+    assert rewards == [1.0, 0.0, 0.0, 0.0, 1.0]
+    assert visible == [False, False, False, True, False]
+
+
+def test_installed_public_deathcap_is_costly_but_traversable() -> None:
+    pytest.importorskip("foragax")
+    from foragax.env import Biome, ForagaxEnv
+    from foragax.objects import LARGE_DEATHCAP
+
+    assert LARGE_DEATHCAP.collectable is True
+    assert LARGE_DEATHCAP.blocking is False
+    env = ForagaxEnv(
+        size=(3, 1),
+        aperture_size=-1,
+        objects=(LARGE_DEATHCAP,),
+        biomes=(
+            Biome(
+                object_frequencies=(1.0,),
+                start=(0, 0),
+                stop=(3, 1),
+            ),
+        ),
+        deterministic_spawn=True,
+        observation_type="color",
+    )
+    params = env.default_params
+    key = jr.key(123)
+    key, reset_key = jr.split(key)
+    _, env_state = env.reset(reset_key, params)
+    initial_position = np.asarray(env_state.pos, dtype=np.int32)
+    key, step_key = jr.split(key)
+    _, next_state, reward, _, _ = env.step(
+        step_key,
+        env_state,
+        jnp.asarray(1, dtype=jnp.int32),
+        params,
+    )
+    expected_position = np.mod(initial_position + np.asarray((1, 0)), (3, 1))
+    np.testing.assert_array_equal(np.asarray(next_state.pos), expected_position)
+    assert float(reward) == -1.0
 
 
 def test_installed_foragax_relative_map_projection_matches_public_mechanics() -> None:

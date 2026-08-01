@@ -20,6 +20,10 @@ SAFETY:
 Usage:
     python scripts/evidence_real_robot_sysid.py \
         --host 192.168.1.218 --port 9090
+
+QUARANTINE: this legacy direct-transport motion path now fails before
+connecting. Reimplement it as an authenticated unified-bridge client before a
+physical run.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from eliza_robot.bridge.backends.ainex_remote import AinexRemoteBackend
+from eliza_robot.bridge.physical_execution import reject_unsupervised_physical_motion
 from eliza_robot.sim2real.sysid import (
     PROBE_ANGLES,
     SAFE_PROBE_JOINTS,
@@ -41,6 +46,7 @@ from eliza_robot.sim2real.sysid import (
 
 
 async def main_async(args) -> int:
+    reject_unsupervised_physical_motion("scripts/evidence_real_robot_sysid.py")
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 

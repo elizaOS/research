@@ -266,6 +266,15 @@ class TestPrototypeAgentConfigRoundtrip:
         restored = PrototypeAgentConfig.from_config(payload)
         assert restored.dream_next_observation_mode == "sample_one_hot"
 
+    def test_from_config_rejects_wrong_type_and_unknown_fields(self) -> None:
+        payload = _minimal_config().to_config()
+        wrong_type = dict(payload, type="NotPrototypeAgentConfig")
+        with pytest.raises(ValueError, match="payload type"):
+            PrototypeAgentConfig.from_config(wrong_type)
+        unknown = dict(payload, unexpected=1)
+        with pytest.raises(ValueError, match="unknown fields: unexpected"):
+            PrototypeAgentConfig.from_config(unknown)
+
 
 # ---------------------------------------------------------------------------
 # Init and start
@@ -605,8 +614,7 @@ class TestPrototypeAgentCurate:
             result = agent.update(state, jnp.array(1.0), jnp.ones(OBS_DIM))
             state = result.state
         new_agent, new_state = agent.curate(state, jr.key(5))
-        primed = new_agent.start(new_state, jnp.zeros(OBS_DIM))
-        result = new_agent.update(primed, jnp.array(0.5), jnp.ones(OBS_DIM))
+        result = new_agent.update(new_state, jnp.array(0.5), jnp.ones(OBS_DIM))
         assert jnp.isfinite(result.oak_td_error)
 
 
@@ -810,6 +818,22 @@ class TestPrototypeAgentSerializationRoundtrip:
             },
         )
         with pytest.raises(ValueError, match="digest"):
+            load_prototype_checkpoint(tmp_path / "not-read")
+
+        noncanonical = dict(config)
+        noncanonical["dream_next_observation_mode"] = "model_prediction"
+        monkeypatch.setattr(
+            prototype_module,
+            "load_checkpoint_metadata",
+            lambda _path: {
+                "schema": PROTOTYPE_CHECKPOINT_SCHEMA,
+                "agent_config": noncanonical,
+                "config_sha256": prototype_module._prototype_config_digest(
+                    noncanonical
+                ),
+            },
+        )
+        with pytest.raises(ValueError, match="not canonical"):
             load_prototype_checkpoint(tmp_path / "not-read")
 
 

@@ -206,6 +206,50 @@ The base `PrototypeAgent` and at least two simple baselines produce one
 versioned report containing all applicable performance, resource, plasticity,
 and component-retention metrics.
 
+**Implementation status (2026-07-31):** the v2 report core and a bounded
+learner-neutral scalar streaming executor are implemented. The executor owns
+regime scheduling and held-out probes, enforces predict-before-update order,
+detects serializer-visible prediction/probe/source-state mutation, rejects
+configuration drift and noncanonical checkpoints, counts deadline misses, and
+keeps safety and per-metric applicability explicitly unavailable when they are
+not measured. Adaptation AUC excludes the initial stationary segment and
+stability is measured at immediate change points. A separate strict bound
+artifact now hashes the complete evaluator config, including stream/probe
+digests and learner snapshots, plus the reconstructing metric core; its loader
+also requires cross-object protocol, budget, condition, trace-length, and
+latency-method agreement. These are evaluator mechanisms only. There is no
+completed `PrototypeAgent` candidate report, the baseline set is incomplete,
+and longitudinal component diagnostics and factorial statistics are absent.
+
+A separate strict continuing-control evaluator now owns independent functional
+environment copies for the candidate and each baseline, binds every dispatched
+action to its exact observation and decision identifier, and rejects dropped,
+duplicated, stale, or learner-visible regime metadata. Its v2 protocol freezes
+metric direction, exposure checkpoints, recovery/stability references, and
+window sizes. Reports reconstruct prequential/lifetime and per-regime return,
+post-change adaptation AUC, sustained recovery, immediate stability, final
+held-out action scores, forgetting, backward/forward transfer, and worst-window
+performance, with explicit applicability when a longitudinal comparison cannot
+be formed. A hardened adapter runs `PrototypeAgent` through that boundary, and
+checkpoint/report loaders bind the environment, probes, learner state, budget,
+condition order, metrics, and reconstructing core by canonical digests. This is
+still development machinery: held-out probes score one action rather than a
+control rollout, the fresh/oracle/multitask references and realized-resource
+matching are missing, and no multi-seed candidate report exists. The WP1 exit
+gate therefore remains open.
+
+A strict paired campaign companion can now execute one complete evaluator per
+declared seed. Explicit seed wrappers bind every learner and environment
+configuration, cross-seed normalization requires identical protocol, budget,
+probe, environment, condition role/order, and learner identity, and each raw
+report remains embedded and reconstructing. It extracts direction-aware scalar
+longitudinal metrics, preserves unavailable pairs, and computes deterministic
+stratified paired-bootstrap intervals from a frozen counter-hash RNG. Campaign
+config, evaluator core, campaign core, reports, comparisons, and intervals are
+SHA-bound and atomically saved. The campaign is always `not-assessed`: no
+Prototype campaign has been run, its declared development seeds cannot promote
+a claim, and intervals add neither a threshold nor matched realized resources.
+
 ## WP2 — Create a faithful plasticity laboratory
 
 ### Purpose
@@ -395,11 +439,35 @@ incomplete 30-seed evaluation lane are execution status, not performance
 evidence until the Alberta and matched-baseline reports and their statistical
 comparison are complete.
 
+The later open two-seed CPU development screens also do not close this gate.
+Their complete frozen candidate sets rank `DQN_LN-common-control` first among
+the feed-forward candidates (mean FOV tail-EMA AUC `1.49084`) and
+`PPO-RTU_LN_128_1_relu` first among the stateful candidates (`1.78110`). The
+aggregates prohibit promotion, superiority, and SOTA claims; budgets are not
+necessarily matched, seeds are consumed development seeds, and the stateful
+RTU-PPO route retains an upstream RNG confound. Exact content parity in the
+fixed-action direct/wrapper probe remains externally unverified and
+nonpromoting. Use these rankings only to choose later open development work,
+never as the required matched held-out comparison.
+
 ### Exit gate
 
 The learned state builder beats raw observation and fixed random recurrence on
 prequential average reward and recovery time, retains the gain when learning is
 frozen, and stays within its declared memory/latency budget.
+
+**Implementation status (2026-07-31):** the causal contract and Prototype
+plumbing are implemented for identity, fixed-trace, and online-gated builders.
+Decision caching, single-advance behavior, episode-local reset, transactional
+invalid-input handling, scan parity, resource accounting, and checkpoint
+configuration binding have contract tests. The online-gated builder has a
+source-bound pure proposal and atomic advanced-destination commit. An opt-in
+Prototype lane now consumes the bounded ensemble's causal pre-update
+representation gradient; an optional decision-bound gradient-joy audit gates
+the actual finite-precision parameter delta. This is one model-loss producer,
+not the balanced prediction/control/Horde gradient set required by 3.3. The
+balanced-gradient ablations and Forager comparison remain open, so the WP3
+exit gate is not met.
 
 ## WP4 — Build a calibrated continual world-model lane
 
@@ -412,12 +480,23 @@ planning, surprise, and safe imagination.
 
 Every real update must receive:
 
-`state, action, reward, discount, terminated/truncated, next_observation`.
+`observation, action, decision_id, reward, discount, terminated/truncated,
+bootstrap_observation, next_decision_observation`.
 
 - Do not synthesize a constant discount inside `PrototypeAgent`.
 - Propagate predicted discount/termination into imagined value targets.
 - Add continuing and episodic/truncation contract tests.
 - Keep environment reward separate from subtask cumulants.
+
+**Implementation status (2026-07-31):** this transition boundary is now
+implemented as `PrototypeTransition`. A checkpointed lifecycle nonce plus a
+64-bit generation prevents within-life ABA replay; caller-owned lifecycle IDs
+provide exact cross-run ownership. Runtime-invalid transitions are atomic
+no-ops in eager/JIT/scan paths. STOMP/OaK learns and bootstraps on the final
+observation but selects on the post-reset observation, while a truncation
+interrupts active option execution without treating censored experience as a
+successful option-model completion. This closes 4.1's mechanism contract, not
+WP4's model/calibration/effectiveness gates.
 
 ### 4.2 Maintain two reference models
 
@@ -430,6 +509,21 @@ The shallow model provides interpretability and a hard-to-forget baseline. The
 latent model earns complexity only when it improves lifetime control or
 prediction under equal resources.
 
+**Implementation status (2026-07-31):** the shallow reference is now a bounded
+action-indexed affine regularized follow-the-leader/ridge model. It predicts
+grounded raw next-observation, reward, and continuation targets before adding
+the transition to per-action Gram/cross sufficient statistics, then solves the
+selected regularized normal equations atomically. Counts, statistics,
+coefficients, numerical bounds, positive-semidefinite Gram structure,
+configuration, RNG-free checkpoints, and exact allocated bytes are validated.
+A pure diagnostic planner scores every action as predicted reward plus predicted
+continuation times a caller-supplied linear successor value. This is L0
+mechanism coverage, not the cited paper's theorem or MPC system: it is fully
+observed, discrete-action, affine, O(feature_dim³) per selected solve, and has
+no uncertainty, replay, recurrence, latency result, or control-benefit result.
+The recurrent latent reference and matched shallow-versus-ensemble comparison
+remain open, so 4.2 is not complete.
+
 ### 4.3 Calibrate uncertainty
 
 - Train ensemble members with genuinely different bootstrap/masking streams.
@@ -439,6 +533,17 @@ prediction under equal resources.
   EMA.
 - Reject dreams for non-finite values, high epistemic uncertainty, poor
   termination calibration, or unsupported rollout depth.
+
+**Implementation status (2026-07-31):** a fixed-size bootstrap ensemble is now
+implemented and integrated as a mutually exclusive Prototype model lane. It
+persists distinct member initialization, bootstrap RNG/masks, member counters,
+the signal estimator, and exact resource accounting; predicts before update;
+and exposes typed warm-up availability plus a causal representation gradient.
+The present variance channel is an explicitly uncalibrated residual proxy, not
+a demonstrated aleatoric model. Ensemble dreaming is disabled, and held-out
+error/OOD calibration, state/action-region calibration, recurrent latent
+dynamics, and the shallow-reference comparison remain open. This does not
+close WP4.
 
 ### 4.4 Add bounded dual replay
 
@@ -452,6 +557,29 @@ learning-progress, and maximally-interfered retrieval. Never prioritize raw high
 error without an aleatoric control. Store old action probabilities/value
 targets for CLEAR/DER-style behavioral rehearsal, and record eviction
 provenance and representation version.
+
+**Implementation status (2026-07-31):** a fixed-shape `DualReplayMemory`
+implements a declared total slot budget split between a recency FIFO and
+long-term reservoir or configured calibrated-priority stratum. Prediction and
+outcome records are structurally separate; stored fields include old behavior
+probability/logit/value availability, uncertainty/progress/safety channels,
+representation/source/provenance, and eviction provenance. Sampling has fixed
+per-stratum quotas, explicit padding, and stale/future representation filters.
+Aleatoric veto/downweight prevents raw-error noisy-TV priority. Exact resource
+accounting, deterministic RNG, counter exhaustion, corruption no-ops, and
+digest-bound checkpoint/JIT/scan parity have mechanism tests. The configured
+priority scales are not empirically calibrated and coverage is raw Euclidean.
+An opt-in `ModelReplayRehearsal` composition now performs one atomic causal
+transaction: real ensemble update, typed-signal record, fixed-quota stratified
+sample, then model-member-only replay updates. Replay has an isolated bootstrap
+key/mask/counter lane and cannot advance the real signal estimator, residual
+statistics, real counters, actor, critic, or builder. The Prototype exposes
+this as a third mutually exclusive world-model lane and routes only the
+commit-gated real representation gradient through builder learning and the joy
+audit. Exact composition state/resources/checkpoints, padding, stale versions,
+rollback, JIT/scan parity, and ensemble v1→v2 migration are tested. Clustering,
+maximally interfered retrieval, actor/critic behavior correction, empirical
+priority calibration, and realized retention/control comparisons remain open.
 
 ### 4.5 Component retention probes
 
@@ -467,6 +595,17 @@ At every regime checkpoint, test separately:
 This localizes whether forgetting is in memory, representation, value, or the
 policy channel.
 
+**Implementation status (2026-07-31):** a development-only evaluator now
+freezes learner snapshots and separately probes representation,
+dynamics/observation, reward, termination/discount, critic/value, actor margin,
+and actor return. Regime IDs and targets remain evaluator-owned; the learner has
+no update surface; snapshot round-trips and live/reconstructed nonmutation are
+checked; applicability and runtime unavailability are explicit; raw per-case
+traces are not retained; and calls, records, snapshots, state bytes, reports,
+and checkpoint/resume are bounded and reconstructing. This is pointwise
+mechanism coverage, not calibration/discrimination or longitudinal retention
+evidence, and it is not yet connected to a Prototype multi-regime report.
+
 ### 4.6 Imagination and rehearsal
 
 Progress in this order:
@@ -481,6 +620,13 @@ Before imagined trajectories train the actor, an offline selection gauge must
 measure realized success, termination correctness, top-quantile purity, and
 real-environment validity. Compare dream imitation with the simpler baseline of
 behavior cloning competent real episodes.
+
+**Implementation status (2026-07-31):** item 4 now has a bounded model-only
+real-transition rehearsal mechanism through the atomic composition in 4.4.
+Items 1–3 and 5 remain absent on the ensemble lane: it performs no imagined
+rollout and replay never updates a policy, critic, state builder, or signal
+calibrator. This is rehearsal plumbing, not evidence that replay retains a
+world model or improves control.
 
 ### Exit gate
 
@@ -551,13 +697,21 @@ a_k=-\frac{\langle g_k,u_c\rangle}
 {\lVert g_k\rVert\lVert u_c\rVert}.
 \]
 
-Alignment is evaluated only when the candidate update clears its configured
-norm-resolution floor and the probe norm and norm product are nonzero and
-representable; otherwise it is zero. The reported cosine is clipped to
-\([-1,1]\), and an exact \(1.0\) threshold uses a
-four-machine-epsilon float32 endpoint tolerance so reduction roundoff cannot
-make collinear vectors nondeterministic. Other alignment thresholds are
-compared exactly. Negative \(\Delta\) predicts a local decrease in the
+Alignment uses scale-safe global norms and a normalized-coordinate dot reduced
+through a fixed balanced tree. Conservative float32 accumulated-roundoff
+intervals cover norms, normalization, products, and reduction. A non-finite
+derived dot/norm, an unresolved norm of a nonzero input, a nonzero sign
+disagreement, or a cancellation interval that crosses zero invalidates the
+evidence rather than becoming a pass. The trust bound uses the norm upper
+endpoint and the nonzero floor uses its lower endpoint. Positive magnitude
+gates compare against the conservative dot-interval edge. At an exact zero
+threshold, both the raw dot and certified normalized direction must permit
+decrease/preservation; an underflowed exact-zero raw dot can still pass when
+the normalized sign remains resolved. The reported cosine is clipped to
+\([-1,1]\), and alignment gates and factors consume its certified lower
+endpoint. An exact \(1.0\) threshold applies a four-machine-epsilon float32
+tolerance to that lower endpoint; other alignment thresholds are compared
+exactly. Negative \(\Delta\) predicts a local decrease in the
 corresponding minimized quantity, while higher \(a_k\) means better descent
 alignment. The candidate factors first define a
 non-circular tentative scale and update:
@@ -582,6 +736,9 @@ clear the update-norm resolution floor. The returned weight and intended
 applied update are \(w=\mathbf 1_{\mathrm{accept}}s\) and
 \(u_{\mathrm{apply}}=w u_c\). Checking both stages prevents soft scaling from
 violating a positive improvement floor or rescuing a raw harmful candidate.
+The elementwise float32 \(\tilde u\) receives fresh norm and dot certificates;
+the implementation does not substitute scalar-scaled candidate diagnostics for
+the actually rounded update tree.
 
 This is deliberately a first-order local audit, not a guarantee of realized
 improvement. Inputs, diagnostics, the decision, and the returned weighted
@@ -596,8 +753,10 @@ are rejected before tracing.
 the assessment internally, requires exact nonempty PyTree structure, leaf
 shape agreement, and real floating dtypes, casts each assessed weighted-update
 leaf to the corresponding parameter dtype, derives the effective stored delta
-after parameter addition, and conservatively re-audits that delta with update
-semantics under the same evidence and thresholds. Its typed result deliberately
+after parameter addition by promoting both stored endpoints to at least float32
+before subtraction, and conservatively re-audits that delta with update
+semantics under the same evidence and thresholds. This prevents low-precision
+subtraction rounding from hiding an out-of-bound stored change. Its typed result deliberately
 separates the formed-candidate `assessment`, `effective_assessment`, and
 `applied`. The last is true only when both audits accept, parameters, cast
 updates, and proposed parameters are all finite, and at least one stored
@@ -606,6 +765,16 @@ parameter, an update wholly lost to finite-precision addition, or quantization
 that changes the update's magnitude or probe verdicts therefore produces an
 auditable atomic no-op. This still does not certify realized post-update
 objective, retention, or safety outcomes.
+
+**Implementation status (2026-07-31):** the standalone assessment and atomic
+application boundary are implemented, and the Prototype's opt-in learned-state
+lane is their first real consumer. Caller evidence is bound to the dispatched
+decision ID; all eight channel availabilities are explicit; paper delight is
+derived internally; and missing, stale, incomplete, or non-finite evidence
+answers `sparks_joy=False` without dropping the environment transition. The
+candidate is stored only after both the literal candidate verdict and the
+finite-precision effective-delta audit pass. These are mechanism contracts,
+not evidence that the accepted updates improve realized objectives or control.
 
 ### 5.4 Paper-specific Delightful Policy Gradient experiment
 
@@ -638,6 +807,25 @@ bandit it preserves expected direction while reducing perpendicular variance.
 Tabular corner-escape guarantees do not transfer automatically to shared
 function approximation; the published counterexample admits a suboptimal
 interior fixed point under parameter coupling.
+
+**Implementation status (2026-07-31):** an isolated categorical, continuing,
+on-policy actor-critic now implements the ordinary and Delightful Policy
+Gradient modes with matched state, critic, differential reward-rate baseline,
+typed RNG, and action sampler. The actor trace is fixed to zero; the delight
+coefficient is detached; critic/baseline and explicitly available external
+safety, model, and representation routes are never gated. Exact action-record
+validation, atomic rejection, JIT/scan/checkpoint parity, effective sample size,
+gate stratification, and logical resource accounting have mechanism tests. A
+strict development-only harness now runs matched ordinary/DG lives on a
+contextual heteroskedastic gamble and uninterrupted six-state RiverSwim A/B/A.
+It pairs initialization and action/environment random-number schedules while
+allowing realized trajectories to diverge, and reconstructs the learner,
+environment, full trace, DG equations, strata, metrics, and logical accounting.
+Its seeds and diagnostic thresholds are not preregistered promotion inputs; it
+has no uncertainty intervals, wall-clock/FLOP/energy accounting, continuous or
+off-policy lane, or higher-benchmark result. Therefore the DG exit gate remains
+open. This paper-specific actor experiment is separate from the literal
+candidate-gradient `sparks_joy` audit in 5.3.
 
 ### 5.5 Kondo compute gate
 

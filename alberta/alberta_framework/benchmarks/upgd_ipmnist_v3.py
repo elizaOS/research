@@ -128,25 +128,30 @@ _RUNTIME_ENVIRONMENT_NAMES = (
 
 # This is an explicit content-bound execution set, not a claim that Python
 # package metadata captures native drivers, the kernel, libc, or every dynamic
-# import.  It covers the benchmark, JAX numerical stack, and the exact pandas
-# OpenML parsing path selected below, including their active Python-level
-# dependencies in the locked environment.
+# import. It covers the benchmark, JAX numerical stack, exact pandas OpenML
+# parsing path, and selected active import-time dependencies in the locked
+# environment. The manifest below remains the complete statement of scope.
 _RUNTIME_CONTENT_DISTRIBUTIONS = (
     "absl-py",
     "chex",
+    "etils",
     "jax",
     "jaxlib",
     "jaxtyping",
     "joblib",
     "ml-dtypes",
+    "msgpack",
     "narwhals",
     "numpy",
     "opt-einsum",
+    "orbax-checkpoint",
     "pandas",
+    "protobuf",
     "python-dateutil",
     "scikit-learn",
     "scipy",
     "six",
+    "tensorstore",
     "threadpoolctl",
     "toolz",
     "typing-extensions",
@@ -646,10 +651,7 @@ def atomic_write_new(path: Path, data: bytes) -> Path:
                 _unlink_if_identity(directory_fd, destination.name, source)
             target_linked = False
             _fail("published output does not identify the descriptor-anchored temporary file")
-        try:
-            os.unlink(temporary_name, dir_fd=directory_fd)
-        except FileNotFoundError:
-            pass
+        _unlink_if_identity(directory_fd, temporary_name, source)
         temporary_name = ""
         os.fsync(directory_fd)
         final_target = os.stat(
@@ -693,13 +695,19 @@ def atomic_write_new(path: Path, data: bytes) -> Path:
                 # still refuse an occupied path, and descriptor ownership
                 # prevents deleting an attacker replacement.
                 pass
-        if file_fd >= 0:
-            os.close(file_fd)
         if temporary_name:
             try:
-                os.unlink(temporary_name, dir_fd=directory_fd)
-            except FileNotFoundError:
+                temporary_source = source
+                if temporary_source is None and file_fd >= 0:
+                    temporary_source = os.fstat(file_fd)
+                if temporary_source is not None:
+                    _unlink_if_identity(directory_fd, temporary_name, temporary_source)
+            except OSError:
+                # Preserve the publication failure and never fall back to an
+                # identity-blind unlink of a concurrently substituted name.
                 pass
+        if file_fd >= 0:
+            os.close(file_fd)
         os.close(directory_fd)
 
 
@@ -1333,6 +1341,7 @@ def _build_plan_payload(
 
     issued = int(time.time()) if issued_unix is None else issued_unix
     _require(_is_int(issued) and issued >= 0, "issued_unix must be nonnegative")
+    _require(issued <= int(time.time()) + 5, "issued_unix cannot be in the future")
     run_spec = build_run_spec(config, learner_ids, seed_ids, hyperparameters)
     data_manifest = _build_data_manifest(data_home, data_archive)
     _load_pinned_mnist(_lexical_absolute(data_home), context="pre-run offline preflight")
@@ -1904,8 +1913,9 @@ def _validate_plan_payload(
         "evidence policy differs",
     )
     _require(
-        _is_int(plan["issued_unix"]) and plan["issued_unix"] >= 0,
-        "issued_unix must be nonnegative",
+        _is_int(plan["issued_unix"])
+        and 0 <= plan["issued_unix"] <= int(time.time()) + 5,
+        "issued_unix must be a nonnegative timestamp no more than five seconds in the future",
     )
     body = _expect_dict(plan["plan"], "run_plan.plan")
     _expect_exact_keys(
@@ -2041,6 +2051,12 @@ def _read_validated_plan(
         data_archive=data_archive,
     )
     _require(raw == canonical_json_bytes(plan), "run plan is not canonically encoded")
+    issuance = cast(dict[str, Any], plan["plan"]["issuance"])
+    prescribed_argv = cast(list[str], issuance["prescribed_argv"])
+    _require(
+        prescribed_argv[2] == _lexical_absolute(path).as_posix(),
+        "run plan locator differs from its prescribed issuance output",
+    )
     return raw, plan
 
 
@@ -2101,7 +2117,7 @@ def validate_plan(
             data_home=data_home,
             data_archive=data_archive,
         )
-    except (OSError, OverflowError, RecursionError, UPGDIPMNISTV3Error) as exc:
+    except Exception as exc:
         return UPGDIPMNISTV3Validation(False, False, (str(exc),))
     return UPGDIPMNISTV3Validation(True, False, ())
 
@@ -2175,7 +2191,9 @@ def _validate_reservation_payload(
     )
     _require(
         _is_int(reservation["reserved_unix"])
-        and reservation["reserved_unix"] >= plan["issued_unix"],
+        and plan["issued_unix"]
+        <= reservation["reserved_unix"]
+        <= int(time.time()) + 5,
         "seed reservation time invalid",
     )
     body = {key: item for key, item in reservation.items() if key != "reservation_sha256"}
@@ -2255,6 +2273,7 @@ def _validate_reservation_binding(
         "execution.seed_reservation_binding.locator",
     )
     raw, reservation = _read_strict_json(Path(locator))
+    _require(raw == canonical_json_bytes(reservation), "seed reservation is not canonical")
     _require(binding["byte_size"] == len(raw), "seed reservation byte_size mismatch")
     _require(binding["sha256"] == sha256_bytes(raw), "seed reservation byte hash mismatch")
     validated = _validate_reservation_payload(
@@ -2265,6 +2284,16 @@ def _validate_reservation_binding(
         learner_id=learner_id,
         seed_id=seed_id,
         partial_locator=partial_locator,
+    )
+    expected_locator = _seed_reservation_path(
+        plan_path,
+        plan,
+        learner_id,
+        seed_id,
+    ).as_posix()
+    _require(
+        locator == expected_locator,
+        "seed reservation locator differs from the exact plan-scoped path",
     )
     _require(
         binding["reservation_sha256"] == validated["reservation_sha256"],
@@ -2558,14 +2587,17 @@ def _validate_plan_binding(
         {"locator", "byte_size", "sha256", "plan_sha256"},
         "plan_binding",
     )
-    _canonical_absolute_locator(binding["locator"], "plan_binding.locator")
+    locator = _canonical_absolute_locator(binding["locator"], "plan_binding.locator")
+    _require(
+        locator == _lexical_absolute(plan_path).as_posix(),
+        "plan binding locator differs from the immutable external plan",
+    )
     _require(
         _is_int(binding["byte_size"]) and binding["byte_size"] == len(plan_raw),
         "plan byte_size mismatch",
     )
     _require(binding["sha256"] == sha256_bytes(plan_raw), "plan byte hash mismatch")
     _require(binding["plan_sha256"] == plan["plan_sha256"], "plan digest mismatch")
-    del plan_path  # The locator aids discovery; it is not the plan's identity.
     return binding
 
 
@@ -2668,7 +2700,9 @@ def _validate_partial_payload(
     )
     _require(
         _is_int(execution["finished_unix"])
-        and execution["finished_unix"] >= execution["started_unix"],
+        and execution["started_unix"]
+        <= execution["finished_unix"]
+        <= int(time.time()) + 5,
         "finished_unix invalid",
     )
     _require(
@@ -2859,7 +2893,7 @@ def validate_partial(
                 data_home=effective_home,
                 data_archive=effective_archive,
             )
-    except (OSError, OverflowError, RecursionError, UPGDIPMNISTV3Error) as exc:
+    except Exception as exc:
         return UPGDIPMNISTV3Validation(False, False, (str(exc),))
     return UPGDIPMNISTV3Validation(True, False, ())
 
@@ -3229,6 +3263,7 @@ def _merge_partials(
     manifest.sort(key=lambda item: (item["learner_id"], item["seed_id"]))
     created = int(time.time()) if created_unix is None else created_unix
     _require(_is_int(created) and created >= 0, "created_unix must be nonnegative")
+    _require(created <= int(time.time()) + 5, "created_unix cannot be in the future")
     latest_finished = max(
         cast(int, partial["execution"]["finished_unix"]) for partial in by_identity.values()
     )
@@ -3392,12 +3427,16 @@ def _validate_artifact_payload(
     artifact: object,
     artifact_path: Path,
     partial_paths: Sequence[Path] | None,
-    plan_path: Path | None,
+    plan_path: Path,
     *,
     verify_current_bindings: bool,
     data_home: Path | None,
     data_archive: Path | None,
 ) -> dict[str, Any]:
+    _require(
+        verify_current_bindings,
+        "artifact validation requires current source/runtime/data bindings",
+    )
     payload = _expect_dict(artifact, "artifact")
     _reject_legacy_marker(payload)
     _expect_exact_keys(
@@ -3425,7 +3464,8 @@ def _validate_artifact_payload(
         "artifact evidence policy differs",
     )
     _require(
-        _is_int(payload["created_unix"]) and payload["created_unix"] >= 0,
+        _is_int(payload["created_unix"])
+        and 0 <= payload["created_unix"] <= int(time.time()) + 5,
         "created_unix invalid",
     )
     plan = _validate_plan_payload(
@@ -3435,21 +3475,22 @@ def _validate_artifact_payload(
         data_archive=data_archive,
     )
     plan_raw = canonical_json_bytes(plan)
-    effective_plan_path = plan_path if plan_path is not None else artifact_path
-    _validate_plan_binding(payload["plan_binding"], effective_plan_path, plan_raw, plan)
-    external_plan_raw: bytes | None = None
-    if plan_path is not None:
-        supplied_raw, supplied_plan = _read_validated_plan(
-            plan_path,
-            verify_current_bindings=verify_current_bindings,
-            data_home=data_home,
-            data_archive=data_archive,
-        )
-        _require(
-            supplied_raw == plan_raw and _json_exact_equal(supplied_plan, plan),
-            "supplied plan differs",
-        )
-        external_plan_raw = supplied_raw
+    plan_binding = _validate_plan_binding(payload["plan_binding"], plan_path, plan_raw, plan)
+    external_plan_raw, external_plan = _read_validated_plan(
+        plan_path,
+        verify_current_bindings=True,
+        data_home=data_home,
+        data_archive=data_archive,
+    )
+    _require(
+        external_plan_raw == plan_raw and _json_exact_equal(external_plan, plan),
+        "supplied external plan differs from the embedded plan",
+    )
+    external_plan_locator = _lexical_absolute(plan_path).as_posix()
+    _require(
+        plan_binding["locator"] == external_plan_locator,
+        "artifact plan binding locator differs from the immutable external plan",
+    )
     run_spec, _, _ = _validate_run_spec(plan["plan"]["run_spec"])
     _validate_coverage(payload["coverage"], run_spec)
     manifest = _validate_partial_manifest(payload["partial_manifest"], run_spec)
@@ -3464,7 +3505,7 @@ def _validate_artifact_payload(
     partial_raw_by_identity: dict[tuple[str, int], bytes] = {}
     partial_path_by_identity: dict[tuple[str, int], Path] = {}
     for path in shard_paths:
-        raw, partial = _read_validated_partial(path, effective_plan_path, plan_raw, plan)
+        raw, partial = _read_validated_partial(path, plan_path, plan_raw, plan)
         identity = _identity(partial)
         _require(identity not in partials, f"duplicate supplied shard identity: {identity}")
         _require(identity in manifest_by_identity, f"supplied shard identity is extra: {identity}")
@@ -3487,6 +3528,10 @@ def _validate_artifact_payload(
         data_home,
         data_archive,
     )
+    effective_data_locators = {
+        "data_home": effective_home.as_posix(),
+        "archive": effective_archive.as_posix(),
+    }
     _replay_partial_measurements(partials, run_spec, effective_home)
     replay = _expect_dict(payload["computational_replay"], "computational_replay")
     _expect_exact_keys(
@@ -3515,7 +3560,7 @@ def _validate_artifact_payload(
         ],
         "runtime_manifest_sha256": plan["plan"]["runtime_manifest_sha256"],
         "data_manifest_sha256": plan["plan"]["data_manifest_sha256"],
-        "data_locators_used": replay_data_locators,
+        "data_locators_used": effective_data_locators,
     }
     _require(
         _json_exact_equal(replay, expected_replay),
@@ -3576,42 +3621,16 @@ def _validate_artifact_payload(
         execution["data_locators_used"],
         "merge_execution.data_locators_used",
     )
-    manifest_end = 4 + len(manifest)
-    _require(
-        len(canonical_merge_argv) == len(manifest) + 10
-        and canonical_merge_argv[:2] == ["merge", "--plan"]
-        and canonical_merge_argv[3] == "--partials"
-        and canonical_merge_argv[manifest_end] == "--output"
-        and canonical_merge_argv[manifest_end + 2] == "--data-home"
-        and canonical_merge_argv[manifest_end + 4] == "--data-archive",
-        "prescribed merge argv shape differs",
-    )
-    merge_plan_locator = _canonical_absolute_locator(
-        canonical_merge_argv[2],
-        "merge_execution.prescribed_merge_argv plan locator",
-    )
-    merge_artifact_locator = _canonical_absolute_locator(
-        canonical_merge_argv[manifest_end + 1],
-        "merge_execution.prescribed_merge_argv artifact locator",
-    )
-    merge_home_locator = _canonical_absolute_locator(
-        canonical_merge_argv[manifest_end + 3],
-        "merge_execution.prescribed_merge_argv data_home locator",
-    )
-    merge_archive_locator = _canonical_absolute_locator(
-        canonical_merge_argv[manifest_end + 5],
-        "merge_execution.prescribed_merge_argv archive locator",
-    )
     expected_merge_argv = _canonical_merge_argv(
-        merge_plan_locator,
+        external_plan_locator,
         manifest,
-        merge_artifact_locator,
-        merge_home_locator,
-        merge_archive_locator,
+        _lexical_absolute(artifact_path).as_posix(),
+        effective_home.as_posix(),
+        effective_archive.as_posix(),
     )
     _require(
         _json_exact_equal(canonical_merge_argv, expected_merge_argv),
-        "prescribed merge argv differs from the manifest",
+        "prescribed merge argv differs from external plan, manifest, output, or data bindings",
     )
     _require(
         execution["runtime_manifest_sha256"] == plan["plan"]["runtime_manifest_sha256"],
@@ -3622,61 +3641,54 @@ def _validate_artifact_payload(
         "merge source digest differs",
     )
     _require(
-        _json_exact_equal(merge_data_locators, replay_data_locators),
-        "merge/replay data locators differ",
-    )
-    _require(
-        merge_home_locator == merge_data_locators["data_home"]
-        and merge_archive_locator == merge_data_locators["archive"],
-        "prescribed merge argv data locators differ from merge execution",
+        _json_exact_equal(replay_data_locators, effective_data_locators)
+        and _json_exact_equal(merge_data_locators, effective_data_locators),
+        "merge/replay data locators differ from the exact effective data cache",
     )
     _require(
         execution["external_execution_attestation_present"] is False,
         "artifact cannot self-assert external execution attestation",
     )
-    if verify_current_bindings:
-        _validate_plan_payload(
-            payload["run_plan"],
-            verify_current_bindings=True,
-            data_home=effective_home,
-            data_archive=effective_archive,
-        )
-        if plan_path is not None:
-            final_plan_raw, final_plan = _read_validated_plan(
-                plan_path,
-                verify_current_bindings=True,
-                data_home=effective_home,
-                data_archive=effective_archive,
-            )
-            _require(
-                final_plan_raw == external_plan_raw,
-                "external plan bytes changed during artifact validation",
-            )
-            _require(
-                _json_exact_equal(final_plan, plan),
-                "external plan changed during artifact validation",
-            )
-        for identity, path in partial_path_by_identity.items():
-            final_raw, final_partial = _read_validated_partial(
-                path,
-                effective_plan_path,
-                plan_raw,
-                plan,
-            )
-            _require(
-                final_raw == partial_raw_by_identity[identity],
-                f"{identity}: shard bytes changed during artifact validation",
-            )
-            _require(
-                _json_exact_equal(final_partial, partials[identity]),
-                f"{identity}: shard changed during artifact validation",
-            )
-        _validate_current_bindings_against_plan(
+    _validate_plan_payload(
+        payload["run_plan"],
+        verify_current_bindings=True,
+        data_home=effective_home,
+        data_archive=effective_archive,
+    )
+    final_plan_raw, final_plan = _read_validated_plan(
+        plan_path,
+        verify_current_bindings=True,
+        data_home=effective_home,
+        data_archive=effective_archive,
+    )
+    _require(
+        final_plan_raw == external_plan_raw,
+        "external plan bytes changed during artifact validation",
+    )
+    _require(
+        _json_exact_equal(final_plan, plan),
+        "external plan changed during artifact validation",
+    )
+    for identity, path in partial_path_by_identity.items():
+        final_raw, final_partial = _read_validated_partial(
+            path,
+            plan_path,
+            plan_raw,
             plan,
-            data_home=effective_home,
-            data_archive=effective_archive,
         )
-    del artifact_path
+        _require(
+            final_raw == partial_raw_by_identity[identity],
+            f"{identity}: shard bytes changed during artifact validation",
+        )
+        _require(
+            _json_exact_equal(final_partial, partials[identity]),
+            f"{identity}: shard changed during artifact validation",
+        )
+    _validate_current_bindings_against_plan(
+        plan,
+        data_home=effective_home,
+        data_archive=effective_archive,
+    )
     return payload
 
 
@@ -3696,6 +3708,11 @@ def validate_artifact(
             verify_current_bindings,
             "public artifact validity requires current source/runtime/data bindings",
         )
+        _require(
+            plan_path is not None,
+            "public artifact validity requires an immutable external plan",
+        )
+        assert plan_path is not None
         raw, artifact = _read_strict_json(path)
         _validate_artifact_payload(
             artifact,
@@ -3719,7 +3736,29 @@ def validate_artifact(
             data_home=data_home,
             data_archive=data_archive,
         )
-    except (OSError, OverflowError, RecursionError, UPGDIPMNISTV3Error) as exc:
+        terminal_plan_raw, terminal_plan = _read_validated_plan(
+            plan_path,
+            verify_current_bindings=True,
+            data_home=data_home,
+            data_archive=data_archive,
+        )
+        _require(
+            terminal_plan_raw == canonical_json_bytes(final_plan)
+            and _json_exact_equal(terminal_plan, final_plan),
+            "external plan differs after the final artifact reread",
+        )
+        _validate_plan_binding(
+            final_artifact["plan_binding"],
+            plan_path,
+            terminal_plan_raw,
+            terminal_plan,
+        )
+        _validate_current_bindings_against_plan(
+            terminal_plan,
+            data_home=data_home,
+            data_archive=data_archive,
+        )
+    except Exception as exc:
         return UPGDIPMNISTV3Validation(False, False, (str(exc),))
     return UPGDIPMNISTV3Validation(True, False, ())
 
@@ -3829,7 +3868,7 @@ def main(argv: Sequence[str] | None = None) -> Path:
                 data_archive=args.data_archive,
                 invocation_origin="cli",
             )
-    except (OSError, OverflowError, RecursionError, UPGDIPMNISTV3Error) as exc:
+    except Exception as exc:
         parser.error(str(exc))
     parser.error("an explicit v3 lifecycle command is required")
 

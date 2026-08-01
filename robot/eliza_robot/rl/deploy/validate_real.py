@@ -1,7 +1,9 @@
 """Validation harness for real robot deployment.
 
 Runs a sequence of progressively more aggressive tests against the real
-robot, recording commanded vs actual joint positions at each stage.
+robot, recording commanded vs actual joint positions at each stage. The
+legacy direct-ROSBridge servo step-response stage is quarantined; physical
+motion must use the authenticated bridge command envelope.
 
 Usage::
 
@@ -13,21 +15,26 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import time
 
 import numpy as np
 
 from eliza_robot.bridge.isaaclab.joint_map import joint_name_to_servo_id, radians_to_pulse
+from eliza_robot.bridge.physical_execution import reject_unsupervised_physical_motion
+from eliza_robot.rl.deploy.preflight_check import (
+    bridge_connect_options,
+    policy_tick_joint_payload,
+)
 from eliza_robot.sim.mujoco.ainex_constants import ALL_JOINT_NAMES, LEG_JOINT_NAMES
-
 
 STAGES = {
     "servo_ping": "Read servo positions (no commands sent)",
     "stand": "Send standing pose for 5 seconds",
     "sway": "Small 0.05 rad hip sway for 5 seconds",
     "walk": "Walk forward at 0.1 m/s for 5 seconds",
-    "servo_step_response": "System-identify each leg servo (step response + tau fit)",
+    "servo_step_response": "Quarantined direct-ROSBridge servo system identification",
 }
 
 # Leg servo IDs for step response identification
@@ -69,7 +76,11 @@ async def run_servo_step_response(
     sample_duration: float = 1.0,
     inertia: float = APPROX_LINK_INERTIA,
 ) -> dict:
-    """System-identify each leg servo by commanding a step and measuring response."""
+    """Reject the legacy raw-ROSBridge servo step-response path."""
+    reject_unsupervised_physical_motion(
+        "eliza_robot.rl.deploy.validate_real servo_step_response"
+    )
+
     import websockets
 
     results: dict = {}
@@ -103,7 +114,7 @@ async def run_servo_step_response(
                     resp = json.loads(raw)
                     if resp.get("id") == call_id:
                         return resp
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     break
             return {"values": {}}
 
@@ -271,7 +282,13 @@ async def run_servo_step_response(
     }
 
 
-async def run_validation(bridge_url: str, stage: str, duration: float = 5.0) -> dict:
+async def run_validation(
+    bridge_url: str,
+    stage: str,
+    duration: float = 5.0,
+    *,
+    physical: bool = True,
+) -> dict:
     """Run a single validation stage and return recorded telemetry."""
     import websockets
 
@@ -287,17 +304,30 @@ async def run_validation(bridge_url: str, stage: str, duration: float = 5.0) -> 
     print(f"\n--- Stage: {stage} ({STAGES[stage]}) ---")
     print(f"Duration: {duration}s")
 
-    async with websockets.connect(bridge_url) as ws:
-        await _send(ws, "policy.start", {"task": f"validate_{stage}", "hz": 20})
-        resp = await _recv(ws)
-        if not resp.get("ok"):
-            print(f"  Failed to start policy: {resp.get('message')}")
+    connect_options = bridge_connect_options(bridge_url, physical=physical)
+    async with websockets.connect(bridge_url, **connect_options) as ws:
+        hello = await _recv_event(ws, "session.hello", timeout=2.0)
+        if hello.get("backend") is None:
             return {
                 "stage": stage,
                 "success": False,
-                "error": resp.get("message"),
+                "error": "bridge did not identify its backend",
                 "log": [],
             }
+
+        policy_started = False
+        if stage != "servo_ping":
+            await _send(ws, "policy.start", {"task": f"validate_{stage}", "hz": 20})
+            resp = await _recv(ws)
+            if not resp.get("ok"):
+                print(f"  Failed to start policy: {resp.get('message')}")
+                return {
+                    "stage": stage,
+                    "success": False,
+                    "error": resp.get("message"),
+                    "log": [],
+                }
+            policy_started = True
 
         start = time.monotonic()
         step = 0
@@ -307,24 +337,60 @@ async def run_validation(bridge_url: str, stage: str, duration: float = 5.0) -> 
                 elapsed = time.monotonic() - start
 
                 if stage == "servo_ping":
-                    await _send(ws, "status.get", {})
+                    telemetry_event = await _recv_event(
+                        ws,
+                        "telemetry.basic",
+                        timeout=2.0,
+                    )
+                    event_data = telemetry_event.get("data", {})
+                    resp = {
+                        "ok": isinstance(event_data, dict),
+                        "data": event_data if isinstance(event_data, dict) else {},
+                        "message": "ok" if isinstance(event_data, dict) else "invalid telemetry",
+                    }
                 elif stage == "stand":
                     cmd = {name: 0.0 for name in LEG_JOINT_NAMES}
-                    await _send(ws, "policy.tick", {"joint_positions": cmd, "duration": 50})
+                    await _send(
+                        ws,
+                        "policy.tick",
+                        policy_tick_joint_payload(cmd, duration_sec=0.05),
+                    )
+                    resp = await _recv(ws)
                 elif stage == "sway":
                     angle = 0.05 * np.sin(elapsed * 2.0 * np.pi * 0.5)
                     cmd = {name: 0.0 for name in LEG_JOINT_NAMES}
                     cmd["r_hip_roll"] = float(angle)
                     cmd["l_hip_roll"] = float(angle)
-                    await _send(ws, "policy.tick", {"joint_positions": cmd, "duration": 50})
+                    await _send(
+                        ws,
+                        "policy.tick",
+                        policy_tick_joint_payload(cmd, duration_sec=0.05),
+                    )
+                    resp = await _recv(ws)
                 elif stage == "walk":
                     await _send(ws, "walk.set", {
                         "x": 0.01, "y": 0.0, "yaw": 0.0,
                         "height": 0.036, "speed": 1,
                     })
+                    resp = await _recv(ws)
+                else:
+                    resp = {"ok": False, "message": f"unsupported stage: {stage}", "data": {}}
 
-                resp = await _recv(ws)
+                if resp.get("ok") is not True:
+                    return {
+                        "stage": stage,
+                        "success": False,
+                        "error": resp.get("message", "bridge command rejected"),
+                        "log": log,
+                    }
                 telemetry = resp.get("data", {})
+                if not isinstance(telemetry, dict):
+                    return {
+                        "stage": stage,
+                        "success": False,
+                        "error": "bridge response data must be an object",
+                        "log": log,
+                    }
                 telemetry["step"] = step
                 telemetry["elapsed"] = elapsed
                 telemetry["stage"] = stage
@@ -340,11 +406,10 @@ async def run_validation(bridge_url: str, stage: str, duration: float = 5.0) -> 
         except KeyboardInterrupt:
             print("  Interrupted!")
         finally:
-            await _send(ws, "policy.stop", {})
-            try:
-                await _recv(ws)
-            except Exception:  # noqa: BLE001
-                pass
+            if policy_started:
+                await _send(ws, "policy.stop", {})
+                with contextlib.suppress(Exception):
+                    await _recv(ws)
 
     print(f"  Completed: {len(log)} frames recorded")
     return {"stage": stage, "success": True, "log": log}
@@ -361,13 +426,36 @@ async def _send(ws, command: str, payload: dict) -> None:
 
 
 async def _recv(ws, timeout: float = 2.0) -> dict:
-    try:
-        raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
-        return json.loads(raw)
-    except asyncio.TimeoutError:
-        return {"ok": False, "message": "timeout"}
-    except Exception as exc:  # noqa: BLE001 — surfaced in result
-        return {"ok": False, "message": f"recv error: {exc}"}
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        try:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0.0:
+                return {"ok": False, "message": "timeout"}
+            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            frame = json.loads(raw)
+            if not isinstance(frame, dict):
+                return {"ok": False, "message": "bridge emitted a non-object frame"}
+            if frame.get("type") == "response":
+                return frame
+        except TimeoutError:
+            return {"ok": False, "message": "timeout"}
+        except Exception as exc:  # noqa: BLE001 — surfaced in result
+            return {"ok": False, "message": f"recv error: {type(exc).__name__}"}
+
+
+async def _recv_event(ws, event_name: str, timeout: float) -> dict:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0.0:
+            raise TimeoutError(f"timed out waiting for {event_name}")
+        raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+        frame = json.loads(raw)
+        if not isinstance(frame, dict):
+            raise RuntimeError("bridge emitted a non-object frame")
+        if frame.get("type") == "event" and frame.get("event") == event_name:
+            return frame
 
 
 def analyze_log(log: list[dict]) -> dict:
@@ -404,13 +492,25 @@ def main() -> None:
         "--profile", default="hiwonder-ainex",
         help="Robot profile id (reserved for future per-profile stages)",
     )
+    parser.add_argument(
+        "--simulation",
+        action="store_true",
+        help="Connect to a nonphysical bridge without sending the hardware bearer token",
+    )
     args = parser.parse_args()
 
     stages = list(STAGES.keys()) if args.all else [args.stage]
     all_results: list[dict] = []
 
     for stage in stages:
-        result = asyncio.run(run_validation(args.bridge, stage, args.duration))
+        result = asyncio.run(
+            run_validation(
+                args.bridge,
+                stage,
+                args.duration,
+                physical=not args.simulation,
+            )
+        )
         analysis = analyze_log(result.get("log", []))
         result["analysis"] = analysis
         all_results.append(result)

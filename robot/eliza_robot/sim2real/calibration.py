@@ -35,6 +35,7 @@ import numpy as np
 from eliza_robot.bridge.backends.base import BridgeBackend
 from eliza_robot.bridge.backends.mujoco_backend import MuJocoBackend
 from eliza_robot.bridge.backends.noise_injector import NoiseInjectorBackend, NoiseProfile
+from eliza_robot.bridge.physical_execution import require_exact_command_ack
 from eliza_robot.bridge.protocol import CommandEnvelope, utc_now_iso
 from eliza_robot.sim.mujoco.demo_env import DemoEnv
 
@@ -103,10 +104,15 @@ async def _record_trajectory(
     t0 = time.time()
     for i, (cmd, payload) in enumerate(commands):
         rid = f"cal-{i}-{time.time_ns()}"
-        await backend.handle_command(CommandEnvelope(
-            request_id=rid, timestamp=utc_now_iso(),
-            command=cmd, payload=payload,
-        ))
+        response = await backend.handle_command(
+            CommandEnvelope(
+                request_id=rid,
+                timestamp=utc_now_iso(),
+                command=cmd,
+                payload=payload,
+            )
+        )
+        require_exact_command_ack(response, command=cmd)
         await asyncio.sleep(pause_s)
         events = await backend.poll_events()
         for e in events:
@@ -388,10 +394,15 @@ async def _record_trajectory_calibrated(
                 send_payload["joint_positions"], joint_order
             )
         rid = f"cal-cln-{i}-{time.time_ns()}"
-        await backend.handle_command(CommandEnvelope(
-            request_id=rid, timestamp=utc_now_iso(),
-            command=cmd, payload=send_payload,
-        ))
+        response = await backend.handle_command(
+            CommandEnvelope(
+                request_id=rid,
+                timestamp=utc_now_iso(),
+                command=cmd,
+                payload=send_payload,
+            )
+        )
+        require_exact_command_ack(response, command=cmd)
         await asyncio.sleep(pause_s)
         events = await backend.poll_events()
         for e in events:

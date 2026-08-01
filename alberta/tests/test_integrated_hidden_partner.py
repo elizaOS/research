@@ -16,6 +16,9 @@ import pytest
 
 import alberta_framework.core.average_reward as average_reward_module
 import alberta_framework.core.interaction_features as interaction_features_module
+from alberta_framework.core.grounded_joint_world_model import (
+    GroundedJointWorldModelConfig,
+)
 from alberta_framework.core.integrated_hidden_partner import (
     ACTIVE_PAIR_SLOTS,
     BASE_FEATURE_DIM,
@@ -32,10 +35,28 @@ from alberta_framework.core.interaction_features import (
     RELEVANCE_PROBE_MODE_CONDITIONAL_V1,
     RELEVANCE_PROBE_MODE_TARGET_ONLY_V1,
 )
+from alberta_framework.core.representation_gradient_mixer import (
+    RepresentationGradientMixerConfig,
+)
 from alberta_framework.streams.hidden_partner_mapping import (
     HiddenPartnerMappingConfig,
     HiddenPartnerMappingTransition,
     HiddenPartnerMappingWorld,
+)
+
+V6_TEST_ACTIVE_DESCRIPTORS: tuple[tuple[int, int], ...] = (
+    (0, 4),
+    (0, 5),
+    (1, 4),
+    (1, 5),
+    (1, 6),
+    (1, 7),
+    (2, 4),
+    (2, 5),
+    (2, 6),
+    (2, 7),
+    (4, 6),
+    (5, 7),
 )
 
 
@@ -47,6 +68,35 @@ def _environment() -> HiddenPartnerMappingWorld:
             partner_flip_probability=0.0,
         )
     )
+
+
+def _grounded_integrated_config(
+    *,
+    mode: str = "full",
+    grounded_planning: bool = False,
+    **overrides: Any,
+) -> IntegratedHiddenPartnerConfig:
+    values: dict[str, Any] = {
+        "grounded_world_model": GroundedJointWorldModelConfig(
+            representation_dim=DEPLOYED_FEATURE_DIM,
+            target_observation_dim=RAW_OBSERVATION_DIM,
+            n_focal_actions=2,
+            n_partner_actions=2,
+            step_size=0.2,
+            initialization_scale=0.05,
+            max_input_magnitude=100.0,
+            max_parameter_magnitude=100.0,
+        ),
+        "representation_gradient_mixer": RepresentationGradientMixerConfig(
+            representation_dim=DEPLOYED_FEATURE_DIM,
+            mode=mode,  # type: ignore[arg-type]
+        ),
+        "grounded_world_planning_enabled": grounded_planning,
+        "feature_lifecycle_enabled": False,
+        "replacement_interval": 0,
+    }
+    values.update(overrides)
+    return IntegratedHiddenPartnerConfig(**values)
 
 
 def _start_and_transition(
@@ -75,19 +125,101 @@ def _tree_array_nbytes(tree: object) -> int:
     return sum(int(getattr(leaf, "nbytes", 0)) for leaf in jax.tree_util.tree_leaves(tree))
 
 
-def _force_next_interaction_promotion(state: Any) -> Any:
-    """Make candidate zero unambiguously replace active slot zero at step 64."""
+def _assert_current_q_value_delta(
+    agent: IntegratedHiddenPartnerAgent,
+    state: Any,
+) -> None:
+    expected = agent.control_agent.q_values(state.control, state.chi) - (
+        state.current_evaluation.q_values
+    )
+    chex.assert_trees_all_equal(state.current_q_value_delta, expected)
+
+
+def _stack_state_trees(states: tuple[Any, ...]) -> Any:
+    return jax.tree_util.tree_map(lambda *leaves: jnp.stack(leaves), *states)
+
+
+def _assert_cache_mutations_reject_in_eager_jit_and_scan(
+    agent: IntegratedHiddenPartnerAgent,
+    transition: Any,
+    states: tuple[Any, ...],
+) -> None:
+    for corrupted in states:
+        eager = agent.update(corrupted, transition)
+        chex.assert_trees_all_equal(eager.state, corrupted)
+        assert bool(eager.diagnostics.transition_rejected)
+        assert not bool(eager.diagnostics.all_finite)
+        assert int(eager.diagnostics.integrated_step_delta) == 0
+
+    batched_states = _stack_state_trees(states)
+
+    def update_summary(state: Any) -> tuple[Any, Any, Any, Any]:
+        result = agent.update(state, transition)
+        return (
+            result.state,
+            result.diagnostics.transition_rejected,
+            result.diagnostics.all_finite,
+            result.diagnostics.integrated_step_delta,
+        )
+
+    compiled_states, compiled_rejected, compiled_finite, compiled_delta = jax.jit(
+        jax.vmap(update_summary)
+    )(batched_states)
+    chex.assert_trees_all_equal(compiled_states, batched_states)
+    chex.assert_trees_all_equal(
+        compiled_rejected,
+        jnp.ones((len(states),), dtype=jnp.bool_),
+    )
+    chex.assert_trees_all_equal(
+        compiled_finite,
+        jnp.zeros((len(states),), dtype=jnp.bool_),
+    )
+    chex.assert_trees_all_equal(
+        compiled_delta,
+        jnp.zeros((len(states),), dtype=jnp.int32),
+    )
+
+    def scan_step(carry: Any, corrupted: Any) -> tuple[Any, tuple[Any, Any, Any, Any]]:
+        result = agent.update(corrupted, transition)
+        return carry, (
+            result.state,
+            result.diagnostics.transition_rejected,
+            result.diagnostics.all_finite,
+            result.diagnostics.integrated_step_delta,
+        )
+
+    _, (scan_states, scan_rejected, scan_finite, scan_delta) = jax.jit(
+        lambda inputs: jax.lax.scan(
+            scan_step,
+            jnp.asarray(0, dtype=jnp.int32),
+            inputs,
+        )
+    )(batched_states)
+    chex.assert_trees_all_equal(scan_states, batched_states)
+    chex.assert_trees_all_equal(scan_rejected, compiled_rejected)
+    chex.assert_trees_all_equal(scan_finite, compiled_finite)
+    chex.assert_trees_all_equal(scan_delta, compiled_delta)
+
+
+def _force_next_interaction_promotion(
+    state: Any,
+    pair: tuple[int, int] = (4, 5),
+) -> Any:
+    """Make one unique native archive identity replace active slot zero at step 64."""
     interaction = state.interaction
+    matching = (interaction.candidate_left == pair[0]) & (
+        interaction.candidate_right == pair[1]
+    )
+    assert int(jnp.sum(matching)) == 1
+    candidate_index = int(jnp.argmax(matching))
     candidate_utilities = (
         jnp.zeros(
             (CANDIDATE_PAIR_SLOTS,),
             dtype=jnp.float32,
         )
-        .at[0]
+        .at[candidate_index]
         .set(10.0)
     )
-    candidate_left = interaction.candidate_left.at[0].set(4)
-    candidate_right = interaction.candidate_right.at[0].set(5)
     return state.replace(
         interaction=interaction.replace(
             step_count=jnp.asarray(63, dtype=jnp.int32),
@@ -106,8 +238,6 @@ def _force_next_interaction_promotion(state: Any) -> Any:
                 dtype=jnp.int32,
             ),
             candidate_utilities=candidate_utilities,
-            candidate_left=candidate_left,
-            candidate_right=candidate_right,
         )
     )
 
@@ -118,6 +248,7 @@ def test_config_round_trip_and_exact_default_composition() -> None:
     restored = IntegratedHiddenPartnerConfig.from_config(config.to_config())
 
     assert restored == config
+    assert config.initial_active_descriptors == INITIAL_ACTIVE_DESCRIPTORS
     assert config.replacement_interval == 64
     assert config.min_feature_age == 256
     assert config.candidate_min_age == 128
@@ -151,10 +282,7 @@ def test_config_round_trip_and_exact_default_composition() -> None:
     assert agent.interaction_learner.to_config()["refresh_promoted_candidate"] is False
     assert agent.interaction_learner.to_config()["utility_retention_decay"] == pytest.approx(0.9999)
     assert agent.interaction_learner.to_config()["utility_retention_grace_steps"] is None
-    assert (
-        agent.interaction_learner.to_config()["evidence_gated_active_output_memory"]
-        is False
-    )
+    assert agent.interaction_learner.to_config()["evidence_gated_active_output_memory"] is False
     assert agent.interaction_learner.to_config()["utility_evidence_confirmation_steps"] == 1
     assert agent.interaction_learner.to_config()["independent_relevance_probe"] is False
     assert (
@@ -162,18 +290,8 @@ def test_config_round_trip_and_exact_default_composition() -> None:
         == RELEVANCE_PROBE_MODE_CONDITIONAL_V1
     )
     assert agent.interaction_learner.to_config()["retire_stale_features"] is False
-    assert (
-        agent.interaction_learner.to_config()[
-            "candidate_promotion_confirmation_steps"
-        ]
-        == 1
-    )
-    assert (
-        agent.interaction_learner.to_config()[
-            "candidate_reacquisition_confirmation_steps"
-        ]
-        == 1
-    )
+    assert agent.interaction_learner.to_config()["candidate_promotion_confirmation_steps"] == 1
+    assert agent.interaction_learner.to_config()["candidate_reacquisition_confirmation_steps"] == 1
     assert agent.behavior_model.config.n_actions == 2
     assert agent.joint_world_model.resource_budget.joint_cells == 4
     assert agent.control_agent.config.n_actions == 2
@@ -181,22 +299,187 @@ def test_config_round_trip_and_exact_default_composition() -> None:
     assert agent.router.config.total_feature_dim == DEPLOYED_FEATURE_DIM == 24
 
     payload = config.to_config()
-    assert payload["schema_version"] == "alberta.integrated-hidden-partner.l0.v10"
+    assert payload["schema_version"] == "alberta.integrated-hidden-partner.l0.v14"
     assert payload["schema_version"] == INTEGRATED_HIDDEN_PARTNER_SCHEMA_VERSION
     assert payload["development_level"] == "L0"
     assert payload["accepted_scientific_evidence"] is False
+    assert payload["initial_active_descriptors"] == [
+        list(pair) for pair in INITIAL_ACTIVE_DESCRIPTORS
+    ]
     extra = copy.deepcopy(payload)
     extra["promoted_evidence"] = True
-    with pytest.raises(ValueError, match="schema"):
+    with pytest.raises(ValueError, match="v14 schema"):
         IntegratedHiddenPartnerConfig.from_config(extra)
     invalid_claim = copy.deepcopy(payload)
     invalid_claim["accepted_scientific_evidence"] = True
     with pytest.raises(ValueError, match="not accepted"):
         IntegratedHiddenPartnerConfig.from_config(invalid_claim)
     old_schema = copy.deepcopy(payload)
-    old_schema["schema_version"] = "alberta.integrated-hidden-partner.l0.v9"
+    old_schema["schema_version"] = "alberta.integrated-hidden-partner.l0.v13"
     with pytest.raises(ValueError, match="unsupported"):
         IntegratedHiddenPartnerConfig.from_config(old_schema)
+
+
+def test_start_binds_exact_pre_td_q_provenance_and_control_invariants() -> None:
+    agent = IntegratedHiddenPartnerAgent()
+    start, _, _ = _start_and_transition(agent, seed=8_400)
+    state = start.state
+
+    chex.assert_shape(state.current_q_value_delta, (2,))
+    assert state.current_q_value_delta.dtype == jnp.float32
+    chex.assert_trees_all_equal(
+        state.current_q_value_delta,
+        jnp.zeros((2,), dtype=jnp.float32),
+    )
+    _assert_current_q_value_delta(agent, state)
+    chex.assert_trees_all_equal(state.control.last_observation, state.chi)
+    chex.assert_trees_all_equal(
+        state.control.epsilon,
+        jnp.asarray(agent.config.epsilon, dtype=jnp.float32),
+    )
+    chex.assert_trees_all_equal(
+        state.control.q_bias,
+        jnp.zeros((2,), dtype=jnp.float32),
+    )
+    chex.assert_trees_all_equal(
+        state.control.q_trace_bias,
+        jnp.zeros((2,), dtype=jnp.float32),
+    )
+    assert int(state.control.step_count) == int(state.step_count) == 0
+
+
+def test_externally_forced_start_is_strict_and_preserves_policy_rng_primitives() -> None:
+    policy = IntegratedHiddenPartnerAgent(
+        IntegratedHiddenPartnerConfig(action_selection_mode="agent")
+    )
+    forced = IntegratedHiddenPartnerAgent(
+        IntegratedHiddenPartnerConfig(action_selection_mode="externally_forced")
+    )
+    environment = _environment()
+    world_state = environment.init(jr.key(8_401))
+    raw = environment.observe(world_state)
+    key = jr.key(18_401)
+    policy_start = policy.start(raw, key)
+    forced_action = jnp.asarray(1 - int(policy_start.action), dtype=jnp.int32)
+
+    with pytest.raises(ValueError, match="externally_forced"):
+        forced.start(raw, key)
+    with pytest.raises(ValueError, match="agent"):
+        policy.start_with_forced_action(raw, key, forced_action)
+    forced_start = forced.start_with_forced_action(raw, key, forced_action)
+
+    assert int(forced_start.action) == int(forced_action)
+    assert int(forced_start.state.control.last_action) == int(forced_action)
+    assert bool(forced_start.state.current_selection.externally_forced)
+    assert not bool(policy_start.state.current_selection.externally_forced)
+    for field in (
+        "noisy_greedy_action",
+        "random_action",
+        "explored",
+        "rng_key_before",
+        "rng_key_after",
+    ):
+        chex.assert_trees_all_equal(
+            getattr(policy_start.state.current_selection, field),
+            getattr(forced_start.state.current_selection, field),
+        )
+    _assert_current_q_value_delta(forced, forced_start.state)
+
+    for invalid in (-1, 2):
+        with pytest.raises(ValueError, match="forced_action"):
+            forced.start_with_forced_action(
+                raw,
+                key,
+                jnp.asarray(invalid, dtype=jnp.int32),
+            )
+    with pytest.raises(ValueError, match="shape"):
+        forced.start_with_forced_action(
+            raw,
+            key,
+            jnp.asarray([0], dtype=jnp.int32),
+        )
+    with pytest.raises(TypeError, match="dtype"):
+        forced.start_with_forced_action(
+            raw,
+            key,
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+
+
+def test_custom_initial_descriptor_config_roundtrips_ordered_json_lists() -> None:
+    config = IntegratedHiddenPartnerConfig(
+        initial_active_descriptors=V6_TEST_ACTIVE_DESCRIPTORS,
+    )
+    payload = config.to_config()
+    restored = IntegratedHiddenPartnerConfig.from_config(payload)
+    agent = IntegratedHiddenPartnerAgent(restored)
+
+    assert payload["initial_active_descriptors"] == [
+        list(pair) for pair in V6_TEST_ACTIVE_DESCRIPTORS
+    ]
+    assert restored.initial_active_descriptors == V6_TEST_ACTIVE_DESCRIPTORS
+    agent_payload = agent.to_config()
+    assert agent_payload["initial_active_descriptors"] == [
+        list(pair) for pair in V6_TEST_ACTIVE_DESCRIPTORS
+    ]
+    assert agent_payload["config"]["initial_active_descriptors"] == [
+        list(pair) for pair in V6_TEST_ACTIVE_DESCRIPTORS
+    ]
+
+    reordered = (
+        V6_TEST_ACTIVE_DESCRIPTORS[1],
+        V6_TEST_ACTIVE_DESCRIPTORS[0],
+        *V6_TEST_ACTIVE_DESCRIPTORS[2:],
+    )
+    reordered_payload = IntegratedHiddenPartnerConfig(
+        initial_active_descriptors=reordered,
+    ).to_config()
+    assert (
+        IntegratedHiddenPartnerConfig.from_config(reordered_payload).initial_active_descriptors
+        == reordered
+    )
+
+    non_json = copy.deepcopy(payload)
+    non_json["initial_active_descriptors"] = V6_TEST_ACTIVE_DESCRIPTORS
+    with pytest.raises(ValueError, match="ordered JSON lists"):
+        IntegratedHiddenPartnerConfig.from_config(non_json)
+
+
+def test_random_curation_accepts_zero_utility_decay_as_selection_only() -> None:
+    config = IntegratedHiddenPartnerConfig(
+        random_feature_curation=True,
+        interaction_utility_decay=0.0,
+    )
+
+    assert IntegratedHiddenPartnerConfig.from_config(config.to_config()) == config
+
+
+@pytest.mark.parametrize(
+    "descriptors",
+    [
+        list(V6_TEST_ACTIVE_DESCRIPTORS),
+        V6_TEST_ACTIVE_DESCRIPTORS[:-1],
+        V6_TEST_ACTIVE_DESCRIPTORS + ((8, 11),),
+        (list(V6_TEST_ACTIVE_DESCRIPTORS[0]),) + V6_TEST_ACTIVE_DESCRIPTORS[1:],
+        ((False, 4),) + V6_TEST_ACTIVE_DESCRIPTORS[1:],
+        ((0.0, 4),) + V6_TEST_ACTIVE_DESCRIPTORS[1:],
+        ((-1, -1),) + V6_TEST_ACTIVE_DESCRIPTORS[1:],
+        ((4, 4),) + V6_TEST_ACTIVE_DESCRIPTORS[1:],
+        ((5, 4),) + V6_TEST_ACTIVE_DESCRIPTORS[1:],
+        ((0, BASE_FEATURE_DIM),) + V6_TEST_ACTIVE_DESCRIPTORS[1:],
+        (V6_TEST_ACTIVE_DESCRIPTORS[1],) + V6_TEST_ACTIVE_DESCRIPTORS[1:],
+    ],
+)
+def test_custom_initial_descriptor_config_rejects_nonexact_banks(
+    descriptors: Any,
+) -> None:
+    with pytest.raises(ValueError, match="initial_active_descriptors"):
+        IntegratedHiddenPartnerConfig(initial_active_descriptors=descriptors)
+
+
+def test_grounded_learning_disable_requires_an_enabled_grounded_model() -> None:
+    with pytest.raises(ValueError, match="grounded_world_model"):
+        IntegratedHiddenPartnerConfig(grounded_world_learning_enabled=False)
 
 
 def test_reacquisition_confirmation_config_reaches_interaction_learner() -> None:
@@ -214,11 +497,58 @@ def test_reacquisition_confirmation_config_reaches_interaction_learner() -> None
     agent = IntegratedHiddenPartnerAgent(restored)
 
     assert restored.candidate_reacquisition_confirmation_steps == 4
-    assert (
-        agent.interaction_learner.to_config()[
-            "candidate_reacquisition_confirmation_steps"
-        ]
-        == 4
+    assert agent.interaction_learner.to_config()["candidate_reacquisition_confirmation_steps"] == 4
+
+
+def test_lifecycle_freeze_accepts_the_full_evidence_gated_configuration() -> None:
+    config = IntegratedHiddenPartnerConfig(
+        feature_lifecycle_enabled=False,
+        evidence_gated_feature_memory=True,
+        feature_evidence_confirmation_steps=2,
+        independent_relevance_probe=True,
+        evidence_gated_consumer_memory=True,
+        consumer_evidence_confirmation_steps=2,
+        consumer_read_confirmation_steps=2,
+        active_utility_retention_grace_steps=8,
+        active_utility_evidence_threshold=0.01,
+        retire_stale_features=True,
+        candidate_promotion_floor=0.01,
+        candidate_promotion_confirmation_steps=2,
+        candidate_reacquisition_confirmation_steps=4,
+    )
+    restored = IntegratedHiddenPartnerConfig.from_config(config.to_config())
+    agent = IntegratedHiddenPartnerAgent(restored)
+
+    assert not restored.feature_lifecycle_enabled
+    assert restored.evidence_gated_feature_memory
+    assert restored.evidence_gated_consumer_memory
+    assert restored.independent_relevance_probe
+    assert agent.interaction_learner.to_config()["retire_stale_features"] is True
+
+
+def test_reacquisition_confirmation_is_a_matched_no_retirement_control() -> None:
+    retiring = IntegratedHiddenPartnerConfig(
+        evidence_gated_feature_memory=True,
+        independent_relevance_probe=True,
+        evidence_gated_consumer_memory=True,
+        active_utility_retention_grace_steps=8,
+        active_utility_evidence_threshold=0.01,
+        retire_stale_features=True,
+        candidate_promotion_floor=0.01,
+        candidate_reacquisition_confirmation_steps=8,
+    )
+    no_retirement = dataclasses.replace(retiring, retire_stale_features=False)
+    restored = IntegratedHiddenPartnerConfig.from_config(no_retirement.to_config())
+    agent = IntegratedHiddenPartnerAgent(restored)
+    interaction = agent.interaction_learner.init(BASE_FEATURE_DIM, jr.key(8812))
+
+    assert not restored.retire_stale_features
+    assert restored.candidate_reacquisition_confirmation_steps == 8
+    assert agent.interaction_learner.to_config()["retire_stale_features"] is False
+    assert agent.interaction_learner.to_config()["candidate_reacquisition_confirmation_steps"] == 8
+    chex.assert_trees_all_equal(
+        interaction.candidate_reacquisition_required,
+        jnp.zeros((CANDIDATE_PAIR_SLOTS,), dtype=jnp.bool_),
     )
 
 
@@ -269,6 +599,7 @@ def test_versioned_probe_mode_round_trip_reaches_agent_with_resource_parity() ->
     [
         {"planning_enabled": 1},
         {"state_learning_enabled": "yes"},
+        {"grounded_world_learning_enabled": 1},
         {"uniform_partner_belief": 1},
         {"random_feature_curation": "yes"},
         {"evidence_gated_feature_memory": "yes"},
@@ -289,7 +620,6 @@ def test_versioned_probe_mode_round_trip_reaches_agent_with_resource_parity() ->
         {"state_step_size": True},
         {"interaction_utility_decay": 1.0},
         {"interaction_utility_decay": True},
-        {"interaction_utility_decay": 0.0, "random_feature_curation": True},
         {"active_utility_retention_decay": 0.9},
         {"active_utility_retention_decay": True},
         {
@@ -328,12 +658,6 @@ def test_versioned_probe_mode_round_trip_reaches_agent_with_resource_parity() ->
             "active_utility_evidence_threshold": 0.01,
         },
         {
-            "evidence_gated_feature_memory": True,
-            "feature_lifecycle_enabled": False,
-            "active_utility_retention_grace_steps": 4,
-            "active_utility_evidence_threshold": 0.01,
-        },
-        {
             "evidence_gated_consumer_memory": True,
             "consumer_evidence_confirmation_steps": 0,
             "active_utility_retention_grace_steps": 4,
@@ -356,12 +680,6 @@ def test_versioned_probe_mode_round_trip_reaches_agent_with_resource_parity() ->
         {
             "evidence_gated_consumer_memory": True,
             "consumer_read_lease_steps": 0,
-            "active_utility_retention_grace_steps": 4,
-            "active_utility_evidence_threshold": 0.01,
-        },
-        {
-            "evidence_gated_consumer_memory": True,
-            "feature_lifecycle_enabled": False,
             "active_utility_retention_grace_steps": 4,
             "active_utility_evidence_threshold": 0.01,
         },
@@ -630,12 +948,7 @@ def test_consumer_gate_routes_streak_write_and_read_by_identity() -> None:
     start, _, _ = _start_and_transition(agent, seed=44)
     old = start.state.router.descriptors
     proposed = (
-        old.at[0]
-        .set(old[2])
-        .at[1]
-        .set(old[0])
-        .at[2]
-        .set(jnp.asarray([4, 5], dtype=jnp.int32))
+        old.at[0].set(old[2]).at[1].set(old[0]).at[2].set(jnp.asarray([4, 5], dtype=jnp.int32))
     )
     _, _, route, _ = agent._route_feature_consumers(  # noqa: SLF001
         start.state.router,
@@ -719,9 +1032,7 @@ def test_consumer_confirmation_and_read_lease_have_distinct_timing() -> None:
         has_evidence: bool,
         idle_steps: int,
     ) -> tuple[Any, Any, Any, Any]:
-        evidence = jnp.zeros((ACTIVE_PAIR_SLOTS,), dtype=jnp.bool_).at[slot].set(
-            has_evidence
-        )
+        evidence = jnp.zeros((ACTIVE_PAIR_SLOTS,), dtype=jnp.bool_).at[slot].set(has_evidence)
         updated, read_acquire_pre, write_pre = agent._update_consumer_evidence_streak(  # noqa: SLF001
             old_streak,
             evidence,
@@ -738,9 +1049,7 @@ def test_consumer_confirmation_and_read_lease_have_distinct_timing() -> None:
             read_acquire_pre,
             route,
         )
-        idle_post = jnp.zeros((ACTIVE_PAIR_SLOTS,), dtype=jnp.int32).at[slot].set(
-            idle_steps
-        )
+        idle_post = jnp.zeros((ACTIVE_PAIR_SLOTS,), dtype=jnp.int32).at[slot].set(idle_steps)
         read_post = agent._route_consumer_active_mask(  # noqa: SLF001
             old_read_mask,
             read_acquire_pre,
@@ -981,10 +1290,7 @@ def test_integrated_transition_acquires_read_before_write_confirmation() -> None
     )
     start, transition, _ = _start_and_transition(agent, seed=47)
     descriptors = start.state.router.descriptors
-    products = (
-        start.state.phi[descriptors[:, 0]]
-        * start.state.phi[descriptors[:, 1]]
-    )
+    products = start.state.phi[descriptors[:, 0]] * start.state.phi[descriptors[:, 1]]
     evidenced_slot = int(jnp.argmax(jnp.abs(products)))
     partner_sign = 2.0 * float(transition.partner_action) - 1.0
     aligned_weight = partner_sign * 0.25 / float(products[evidenced_slot])
@@ -1289,26 +1595,17 @@ def test_independent_probe_commits_then_reacquires_under_consumer_lease() -> Non
         )
     )
     start, transition, next_environment_state = _start_and_transition(agent, seed=67)
-    assert (
-        agent.interaction_learner.to_config()[
-            "candidate_promotion_confirmation_steps"
-        ]
-        == 3
-    )
+    assert agent.interaction_learner.to_config()["candidate_promotion_confirmation_steps"] == 3
     slot = 0
     left, right = INITIAL_ACTIVE_DESCRIPTORS[slot]
     product = float(start.state.phi[left] * start.state.phi[right])
     partner_sign = 2.0 * float(transition.partner_action) - 1.0
-    marginal_residual = partner_sign - float(
-        start.state.interaction.relevance_probe_biases[0]
-    )
+    marginal_residual = partner_sign - float(start.state.interaction.relevance_probe_biases[0])
     preupdate_probe = 0.5 * marginal_residual / product
     interaction = start.state.interaction.replace(
         output_weights=start.state.interaction.output_weights.at[0, slot].set(-0.0),
         relevance_probe_weights=(
-            start.state.interaction.relevance_probe_weights.at[0, slot].set(
-                preupdate_probe
-            )
+            start.state.interaction.relevance_probe_weights.at[0, slot].set(preupdate_probe)
         ),
     )
     first = agent.update(start.state.replace(interaction=interaction), transition)
@@ -1321,23 +1618,17 @@ def test_independent_probe_commits_then_reacquires_under_consumer_lease() -> Non
         first.state.chi[BASE_FEATURE_DIM:],
         jnp.zeros((ACTIVE_PAIR_SLOTS,), dtype=jnp.float32),
     )
-    assert int(
-        np.asarray(first.state.interaction.output_weights[0, slot]).view(np.uint32)
-    ) == 0
+    assert int(np.asarray(first.state.interaction.output_weights[0, slot]).view(np.uint32)) == 0
 
     environment = _environment()
     second_transition, _ = environment.step(next_environment_state, first.action)
     second_product = float(first.state.phi[left] * first.state.phi[right])
     second_sign = 2.0 * float(second_transition.partner_action) - 1.0
-    second_residual = second_sign - float(
-        first.state.interaction.relevance_probe_biases[0]
-    )
+    second_residual = second_sign - float(first.state.interaction.relevance_probe_biases[0])
     second_preupdate_probe = 0.5 * second_residual / second_product
     second_interaction = first.state.interaction.replace(
         relevance_probe_weights=(
-            first.state.interaction.relevance_probe_weights.at[0, slot].set(
-                second_preupdate_probe
-            )
+            first.state.interaction.relevance_probe_weights.at[0, slot].set(second_preupdate_probe)
         )
     )
     second = agent.update(
@@ -1377,18 +1668,13 @@ def test_independent_probe_commits_then_reacquires_under_consumer_lease() -> Non
     )
     assert second.state.interaction.candidate_promotion_evidence_streak.dtype == jnp.int32
     assert bool(
-        jnp.all(
-            second.diagnostics.interaction_candidate_promotion_evidence_streak_updated
-            <= 3
-        )
+        jnp.all(second.diagnostics.interaction_candidate_promotion_evidence_streak_updated <= 3)
     )
     assert float(second.state.interaction.output_weights[0, slot]) == pytest.approx(
         second_preupdate_probe
     )
     assert bool(second.diagnostics.consumer_confirmed_write_pre[slot])
-    expected_next_product = (
-        second.state.phi[left] * second.state.phi[right]
-    )
+    expected_next_product = second.state.phi[left] * second.state.phi[right]
     assert float(second.state.chi[BASE_FEATURE_DIM + slot]) == pytest.approx(
         float(expected_next_product)
     )
@@ -1402,18 +1688,14 @@ def test_independent_probe_commits_then_reacquires_under_consumer_lease() -> Non
     recurrent_probe = 0.5 * recurrent_residual / recurrent_product
     durable = jnp.asarray(7.0, dtype=jnp.float32)
     recurrent_interaction = recurrent_start.state.interaction.replace(
-        output_weights=(
-            recurrent_start.state.interaction.output_weights.at[0, slot].set(durable)
-        ),
+        output_weights=(recurrent_start.state.interaction.output_weights.at[0, slot].set(durable)),
         relevance_probe_weights=(
             recurrent_start.state.interaction.relevance_probe_weights.at[0, slot].set(
                 recurrent_probe
             )
         ),
         active_output_memory_committed=(
-            recurrent_start.state.interaction.active_output_memory_committed.at[slot].set(
-                True
-            )
+            recurrent_start.state.interaction.active_output_memory_committed.at[slot].set(True)
         ),
     )
     reacquired = agent.update(
@@ -1427,9 +1709,7 @@ def test_independent_probe_commits_then_reacquires_under_consumer_lease() -> Non
     assert bool(reacquired.diagnostics.consumer_read_acquire_pre[slot])
     assert bool(reacquired.state.consumer_active_mask[slot])
     assert float(reacquired.state.interaction.output_weights[0, slot]) == 7.0
-    expected_reacquired_product = (
-        reacquired.state.phi[left] * reacquired.state.phi[right]
-    )
+    expected_reacquired_product = reacquired.state.phi[left] * reacquired.state.phi[right]
     assert float(reacquired.state.chi[BASE_FEATURE_DIM + slot]) == pytest.approx(
         float(expected_reacquired_product)
     )
@@ -1699,6 +1979,98 @@ def test_initial_active_descriptors_are_deterministic_unique_and_canonical() -> 
         np.testing.assert_array_equal(bank, banks[0])
 
 
+def test_custom_initial_bank_starts_router_and_interaction_in_exact_order() -> None:
+    custom_agent = IntegratedHiddenPartnerAgent(
+        IntegratedHiddenPartnerConfig(
+            initial_active_descriptors=V6_TEST_ACTIVE_DESCRIPTORS,
+        )
+    )
+    legacy_agent = IntegratedHiddenPartnerAgent()
+    environment = _environment()
+    environment_state = environment.init(jr.key(8701))
+    observation = environment.observe(environment_state)
+    key = jr.key(18701)
+    custom = custom_agent.start(observation, key)
+    legacy = legacy_agent.start(observation, key)
+    expected = np.asarray(V6_TEST_ACTIVE_DESCRIPTORS, dtype=np.int32)
+
+    np.testing.assert_array_equal(custom.state.router.descriptors, expected)
+    np.testing.assert_array_equal(custom.diagnostics.descriptors, expected)
+    np.testing.assert_array_equal(custom.state.interaction.feature_left, expected[:, 0])
+    np.testing.assert_array_equal(custom.state.interaction.feature_right, expected[:, 1])
+    assert bool(custom.diagnostics.descriptors_valid)
+
+    for pair in ((0, 2), (4, 5)):
+        archived = (custom.state.interaction.candidate_left == pair[0]) & (
+            custom.state.interaction.candidate_right == pair[1]
+        )
+        assert int(jnp.sum(archived)) == 1
+
+    custom_budget = custom_agent.resource_budget(custom.state)
+    legacy_budget = legacy_agent.resource_budget(legacy.state)
+    assert custom_budget.total_state_nbytes == legacy_budget.total_state_nbytes == 6748
+    assert jax.tree_util.tree_structure(custom.state) == jax.tree_util.tree_structure(legacy.state)
+    chex.assert_trees_all_equal(
+        custom.diagnostics.selection.rng_key_before,
+        legacy.diagnostics.selection.rng_key_before,
+    )
+    chex.assert_trees_all_equal(
+        custom.diagnostics.selection.rng_key_after,
+        legacy.diagnostics.selection.rng_key_after,
+    )
+    assert int(custom.action) == int(legacy.action)
+
+
+@pytest.mark.parametrize("pair", ((0, 2), (4, 5)))
+def test_custom_initial_bank_routes_a_forced_archive_promotion_by_identity(
+    pair: tuple[int, int],
+) -> None:
+    agent = IntegratedHiddenPartnerAgent(
+        IntegratedHiddenPartnerConfig(
+            initial_active_descriptors=V6_TEST_ACTIVE_DESCRIPTORS,
+        )
+    )
+    start, transition, _ = _start_and_transition(agent, seed=8702)
+    prepared = _force_next_interaction_promotion(start.state, pair)
+    archive = list(
+        zip(
+            np.asarray(prepared.interaction.candidate_left).tolist(),
+            np.asarray(prepared.interaction.candidate_right).tolist(),
+            strict=True,
+        )
+    )
+    assert len(archive) == CANDIDATE_PAIR_SLOTS == len(set(archive))
+    assert archive.count(pair) == 1
+
+    result = agent.update(prepared, transition)
+
+    assert not bool(result.diagnostics.transition_rejected)
+    assert int(result.diagnostics.interaction_replaced_slot) == 0
+    assert int(result.diagnostics.router_generation_delta) == 1
+    assert bool(result.diagnostics.route.valid)
+    assert bool(result.diagnostics.route.descriptors_changed)
+    assert int(result.diagnostics.route.new_count) == 1
+    assert int(result.diagnostics.route.evicted_count) == 1
+    np.testing.assert_array_equal(result.state.router.descriptors[0], pair)
+    np.testing.assert_array_equal(
+        result.state.router.descriptors[1:],
+        np.asarray(V6_TEST_ACTIVE_DESCRIPTORS[1:], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        result.diagnostics.route.source_slots,
+        np.asarray([-1] + list(range(1, ACTIVE_PAIR_SLOTS)), dtype=np.int32),
+    )
+    result_archive = list(
+        zip(
+            np.asarray(result.state.interaction.candidate_left).tolist(),
+            np.asarray(result.state.interaction.candidate_right).tolist(),
+            strict=True,
+        )
+    )
+    assert len(result_archive) == CANDIDATE_PAIR_SLOTS == len(set(result_archive))
+    assert result_archive.count(pair) == 1
+
+
 def test_start_owns_and_advances_sarsa_rng_without_control_update() -> None:
     agent = IntegratedHiddenPartnerAgent()
     start, _, _ = _start_and_transition(agent, seed=2)
@@ -1710,7 +2082,9 @@ def test_start_owns_and_advances_sarsa_rng_without_control_update() -> None:
         start.state.control.rng_key,
         selection.rng_key_after,
     )
+    chex.assert_trees_all_equal(start.state.current_selection, selection)
     assert int(start.action) == int(selection.action)
+    assert int(start.state.current_selection.action) == int(start.state.control.last_action)
     assert int(start.state.control.last_action) == int(start.action)
     assert int(start.state.control.step_count) == 0
     assert int(start.state.state_builder.step_count) == 1
@@ -1879,7 +2253,44 @@ def test_uniform_partner_belief_masks_only_applied_planner_distribution() -> Non
     )
 
 
-def test_random_curation_priorities_replace_only_utility_ranking() -> None:
+def test_random_curation_without_cadence_is_an_exact_matched_state_control() -> None:
+    full = IntegratedHiddenPartnerAgent(
+        IntegratedHiddenPartnerConfig(random_feature_curation=False)
+    )
+    random = IntegratedHiddenPartnerAgent(
+        IntegratedHiddenPartnerConfig(random_feature_curation=True)
+    )
+    full_start, transition, _ = _start_and_transition(full, seed=32)
+
+    full_result = full.update(full_start.state, transition)
+    random_result = random.update(full_start.state, transition)
+
+    chex.assert_trees_all_equal(full_result.state, random_result.state)
+    assert not bool(full_result.diagnostics.random_curation_enabled)
+    assert bool(random_result.diagnostics.random_curation_enabled)
+    assert not bool(full_result.diagnostics.random_curation_attempted)
+    assert not bool(random_result.diagnostics.random_curation_attempted)
+    assert not bool(full_result.diagnostics.random_curation_applied)
+    assert not bool(random_result.diagnostics.random_curation_applied)
+    chex.assert_trees_all_equal(
+        full_result.diagnostics.random_active_priorities,
+        random_result.diagnostics.random_active_priorities,
+    )
+    chex.assert_trees_all_equal(
+        full_result.diagnostics.random_candidate_priorities,
+        random_result.diagnostics.random_candidate_priorities,
+    )
+    assert (
+        jax.tree_util.tree_structure(full_result.state)
+        == jax.tree_util.tree_structure(random_result.state)
+    )
+    assert (
+        full.resource_budget(full_result.state).total_state_nbytes
+        == random.resource_budget(random_result.state).total_state_nbytes
+    )
+
+
+def test_random_curation_priorities_replace_only_transaction_ranking() -> None:
     agent = IntegratedHiddenPartnerAgent(
         IntegratedHiddenPartnerConfig(
             random_feature_curation=True,
@@ -1892,38 +2303,72 @@ def test_random_curation_priorities_replace_only_utility_ranking() -> None:
         step_count=jnp.asarray(63, dtype=jnp.int32),
         ages=jnp.ones((ACTIVE_PAIR_SLOTS,), dtype=jnp.int32),
         candidate_ages=jnp.ones((CANDIDATE_PAIR_SLOTS,), dtype=jnp.int32),
-    )
-    adversarial = interaction.replace(
-        utilities=jnp.linspace(1e3, 2e3, ACTIVE_PAIR_SLOTS, dtype=jnp.float32),
+        utilities=jnp.linspace(1.0, 10.0, ACTIVE_PAIR_SLOTS, dtype=jnp.float32),
         candidate_utilities=jnp.linspace(
-            -2e3,
-            -1e3,
+            1_000.0,
+            2_000.0,
             CANDIDATE_PAIR_SLOTS,
             dtype=jnp.float32,
         ),
     )
-    ranked_a, active_priorities, candidate_priorities = agent._interaction_curation_input(
+    priority_override = agent._interaction_curation_input(
         interaction
     )  # noqa: SLF001
-    ranked_b, active_priorities_b, candidate_priorities_b = agent._interaction_curation_input(
+    active_priorities = priority_override.active_ranks
+    candidate_priorities = priority_override.candidate_ranks
+    adversarial = interaction.replace(
+        utilities=jnp.linspace(10.0, 1.0, ACTIVE_PAIR_SLOTS, dtype=jnp.float32),
+        candidate_utilities=jnp.linspace(
+            2_000.0,
+            1_000.0,
+            CANDIDATE_PAIR_SLOTS,
+            dtype=jnp.float32,
+        ),
+    )
+    repeated_override = agent._interaction_curation_input(
         adversarial
     )  # noqa: SLF001
+    full_override = IntegratedHiddenPartnerAgent(
+        IntegratedHiddenPartnerConfig(random_feature_curation=False)
+    )._interaction_curation_input(interaction)  # noqa: SLF001
 
-    chex.assert_trees_all_equal(active_priorities, active_priorities_b)
-    chex.assert_trees_all_equal(candidate_priorities, candidate_priorities_b)
-    chex.assert_trees_all_equal(ranked_a.utilities, ranked_b.utilities)
+    assert bool(priority_override.enabled)
+    assert not bool(full_override.enabled)
+    chex.assert_trees_all_equal(priority_override.active_ranks, repeated_override.active_ranks)
     chex.assert_trees_all_equal(
-        ranked_a.candidate_utilities,
-        ranked_b.candidate_utilities,
+        priority_override.candidate_ranks,
+        repeated_override.candidate_ranks,
     )
+    chex.assert_trees_all_equal(priority_override.active_ranks, full_override.active_ranks)
+    chex.assert_trees_all_equal(
+        priority_override.candidate_ranks,
+        full_override.candidate_ranks,
+    )
+    chex.assert_shape(priority_override.enabled, ())
+    chex.assert_shape(active_priorities, (ACTIVE_PAIR_SLOTS,))
+    chex.assert_shape(candidate_priorities, (CANDIDATE_PAIR_SLOTS,))
+    assert priority_override.enabled.dtype == jnp.bool_
+    assert active_priorities.dtype == jnp.float32
+    assert candidate_priorities.dtype == jnp.float32
     assert len(np.unique(np.asarray(active_priorities))) == ACTIVE_PAIR_SLOTS
     assert len(np.unique(np.asarray(candidate_priorities))) == CANDIDATE_PAIR_SLOTS
-    assert float(jnp.min(candidate_priorities)) > float(jnp.max(active_priorities)) * 0.0
+
+    candidate_matches_active = jnp.any(
+        (interaction.candidate_left[:, None] == interaction.feature_left[None, :])
+        & (interaction.candidate_right[:, None] == interaction.feature_right[None, :]),
+        axis=1,
+    )
+    expected_active = int(jnp.argmin(active_priorities))
+    expected_candidate = int(
+        jnp.argmax(jnp.where(~candidate_matches_active, candidate_priorities, -jnp.inf))
+    )
 
     state_a = start.state.replace(interaction=interaction)
     state_b = start.state.replace(interaction=adversarial)
     result_a = agent.update(state_a, transition)
     result_b = agent.update(state_b, transition)
+    assert bool(result_a.diagnostics.random_curation_enabled)
+    assert bool(result_a.diagnostics.random_curation_attempted)
     assert bool(result_a.diagnostics.random_curation_applied)
     chex.assert_trees_all_equal(
         result_a.diagnostics.random_active_priorities,
@@ -1934,14 +2379,27 @@ def test_random_curation_priorities_replace_only_utility_ranking() -> None:
         result_b.diagnostics.random_candidate_priorities,
     )
     assert (
-        int(result_a.diagnostics.interaction_replaced_slot)
-        == int(result_b.diagnostics.interaction_replaced_slot)
-        >= 0
+        int(result_a.diagnostics.curation_selected_active_worst_slot)
+        == int(result_b.diagnostics.curation_selected_active_worst_slot)
+        == expected_active
     )
     assert (
-        int(result_a.diagnostics.interaction_promoted_candidate)
-        == int(result_b.diagnostics.interaction_promoted_candidate)
-        >= 0
+        int(result_a.diagnostics.curation_selected_promotion_candidate)
+        == int(result_b.diagnostics.curation_selected_promotion_candidate)
+        == expected_candidate
+    )
+    assert int(result_a.diagnostics.interaction_replaced_slot) == expected_active
+    assert int(result_b.diagnostics.interaction_replaced_slot) == expected_active
+    assert int(result_a.diagnostics.interaction_promoted_candidate) == expected_candidate
+    assert int(result_b.diagnostics.interaction_promoted_candidate) == expected_candidate
+    assert not bool(
+        jnp.array_equal(result_a.state.interaction.utilities, active_priorities)
+    )
+    assert not bool(
+        jnp.array_equal(
+            result_a.state.interaction.candidate_utilities,
+            candidate_priorities,
+        )
     )
 
 
@@ -1993,6 +2451,10 @@ def test_one_update_is_prequential_and_advances_every_online_counter_once() -> N
     chex.assert_trees_all_equal(
         result.state.current_evaluation,
         diagnostics.next_evaluation,
+    )
+    chex.assert_trees_all_equal(
+        result.state.current_selection,
+        diagnostics.next_selection,
     )
     chex.assert_trees_all_equal(
         result.state.control.rng_key,
@@ -2077,7 +2539,10 @@ def test_state_learning_ablation_computes_gradient_but_discards_parameter_update
     )
 
 
-def test_feature_lifecycle_ablation_learns_shadow_without_deploying_replacement() -> None:
+@pytest.mark.parametrize("pair", [(0, 2), (4, 5)], ids=["C", "D"])
+def test_feature_lifecycle_freeze_commits_exact_pre_curation_learning(
+    pair: tuple[int, int],
+) -> None:
     enabled = IntegratedHiddenPartnerAgent(
         IntegratedHiddenPartnerConfig(feature_lifecycle_enabled=True)
     )
@@ -2089,14 +2554,33 @@ def test_feature_lifecycle_ablation_learns_shadow_without_deploying_replacement(
         frozen,
         seed=6,
     )
-    enabled_state = _force_next_interaction_promotion(enabled_start.state)
-    frozen_state = _force_next_interaction_promotion(frozen_start.state)
+    enabled_state = _force_next_interaction_promotion(enabled_start.state, pair)
+    frozen_state = _force_next_interaction_promotion(frozen_start.state, pair)
+    chex.assert_trees_all_equal(enabled_state, frozen_state)
+    target = jnp.reshape(
+        2.0 * transition.partner_action.astype(jnp.float32) - 1.0,
+        (1,),
+    )
+    expected_proposal = frozen.interaction_learner.update(
+        frozen_state.interaction,
+        frozen_state.phi,
+        target,
+        external_read_mask=frozen_state.consumer_active_mask,
+    )
 
     enabled_result = enabled.update(enabled_state, transition)
     frozen_result = frozen.update(frozen_state, frozen_transition)
 
     assert int(enabled_result.diagnostics.interaction_replaced_slot) == 0
     assert int(frozen_result.diagnostics.interaction_replaced_slot) == 0
+    assert int(enabled_result.diagnostics.interaction_proposal_replaced_slot) == 0
+    assert int(frozen_result.diagnostics.interaction_proposal_replaced_slot) == 0
+    assert bool(enabled_result.diagnostics.interaction_lifecycle_proposed)
+    assert bool(frozen_result.diagnostics.interaction_lifecycle_proposed)
+    assert bool(enabled_result.diagnostics.interaction_lifecycle_applied)
+    assert not bool(frozen_result.diagnostics.interaction_lifecycle_applied)
+    assert int(enabled_result.diagnostics.interaction_applied_replaced_slot) == 0
+    assert int(frozen_result.diagnostics.interaction_applied_replaced_slot) == -1
     assert bool(enabled_result.diagnostics.shadow_descriptors_changed)
     assert bool(frozen_result.diagnostics.shadow_descriptors_changed)
     assert bool(enabled_result.diagnostics.route.descriptors_changed)
@@ -2105,19 +2589,58 @@ def test_feature_lifecycle_ablation_learns_shadow_without_deploying_replacement(
     assert int(frozen_result.diagnostics.router_generation_delta) == 0
     np.testing.assert_array_equal(
         enabled_result.state.router.descriptors[0],
-        [4, 5],
+        pair,
     )
     np.testing.assert_array_equal(
         frozen_result.state.router.descriptors,
         frozen_start.state.router.descriptors,
     )
-    np.testing.assert_array_equal(
-        frozen_result.state.interaction.feature_left[0],
-        4,
+    chex.assert_trees_all_equal(
+        frozen_result.state.interaction,
+        expected_proposal.pre_curation_state,
     )
-    np.testing.assert_array_equal(
-        frozen_result.state.interaction.feature_right[0],
-        5,
+    chex.assert_trees_all_equal(
+        frozen_result.state.interaction.feature_left,
+        frozen_state.interaction.feature_left,
+    )
+    chex.assert_trees_all_equal(
+        frozen_result.state.interaction.feature_right,
+        frozen_state.interaction.feature_right,
+    )
+    chex.assert_trees_all_equal(
+        frozen_result.state.interaction.feature_parent_a,
+        frozen_state.interaction.feature_parent_a,
+    )
+    chex.assert_trees_all_equal(
+        frozen_result.state.interaction.feature_parent_b,
+        frozen_state.interaction.feature_parent_b,
+    )
+    chex.assert_trees_all_equal(
+        frozen_result.state.interaction.feature_generator,
+        frozen_state.interaction.feature_generator,
+    )
+    chex.assert_trees_all_equal(
+        frozen_result.state.interaction.candidate_left,
+        frozen_state.interaction.candidate_left,
+    )
+    chex.assert_trees_all_equal(
+        frozen_result.state.interaction.candidate_right,
+        frozen_state.interaction.candidate_right,
+    )
+    assert int(frozen_result.state.interaction.step_count) == 64
+    assert not bool(
+        jnp.array_equal(
+            frozen_result.state.interaction.key,
+            frozen_state.interaction.key,
+        )
+    )
+    assert (
+        jax.tree_util.tree_structure(enabled_result.state)
+        == jax.tree_util.tree_structure(frozen_result.state)
+    )
+    assert (
+        enabled.resource_budget(enabled_result.state).total_state_nbytes
+        == frozen.resource_budget(frozen_result.state).total_state_nbytes
     )
 
 
@@ -2228,6 +2751,79 @@ def test_evidence_lease_retires_then_fills_one_vacancy_atomically() -> None:
     )
 
 
+def test_lifecycle_freeze_diagnoses_retirement_without_committing_resets() -> None:
+    config = IntegratedHiddenPartnerConfig(
+        feature_lifecycle_enabled=False,
+        active_utility_retention_grace_steps=0,
+        active_utility_evidence_threshold=0.99,
+        retire_stale_features=True,
+        candidate_promotion_floor=0.001,
+        replacement_interval=1,
+        min_feature_age=0,
+        candidate_min_age=0,
+    )
+    agent = IntegratedHiddenPartnerAgent(config)
+    start, transition, _ = _start_and_transition(agent, seed=42)
+    target = jnp.reshape(
+        2.0 * transition.partner_action.astype(jnp.float32) - 1.0,
+        (1,),
+    )
+    proposal = agent.interaction_learner.update(
+        start.state.interaction,
+        start.state.phi,
+        target,
+        external_read_mask=start.state.consumer_active_mask,
+    )
+
+    assert int(proposal.retired_slot) == 0
+    result = agent.update(start.state, transition)
+    diagnostics = result.diagnostics
+
+    assert int(diagnostics.interaction_proposal_retired_slot) == 0
+    assert int(diagnostics.interaction_applied_retired_slot) == -1
+    assert bool(diagnostics.interaction_lifecycle_proposed)
+    assert not bool(diagnostics.interaction_lifecycle_applied)
+    assert int(diagnostics.interaction_proposal_live_feature_count) == 11
+    assert int(diagnostics.interaction_applied_live_feature_count) == 12
+    assert int(diagnostics.interaction_matching_candidate_reset_count) == 1
+    assert int(diagnostics.interaction_applied_matching_candidate_reset_count) == 0
+    assert not bool(diagnostics.route.descriptors_changed)
+    assert int(diagnostics.router_generation_delta) == 0
+    chex.assert_trees_all_equal(
+        result.state.interaction,
+        proposal.pre_curation_state,
+    )
+    chex.assert_trees_all_equal(
+        result.state.interaction.feature_left,
+        start.state.interaction.feature_left,
+    )
+    chex.assert_trees_all_equal(
+        result.state.interaction.feature_right,
+        start.state.interaction.feature_right,
+    )
+    chex.assert_trees_all_equal(
+        result.state.interaction.feature_parent_a,
+        start.state.interaction.feature_parent_a,
+    )
+    chex.assert_trees_all_equal(
+        result.state.interaction.feature_parent_b,
+        start.state.interaction.feature_parent_b,
+    )
+    chex.assert_trees_all_equal(
+        result.state.interaction.feature_generator,
+        start.state.interaction.feature_generator,
+    )
+    chex.assert_trees_all_equal(
+        result.state.interaction.candidate_reacquisition_required,
+        proposal.pre_curation_state.candidate_reacquisition_required,
+    )
+    assert int(result.state.interaction.step_count) == 1
+    assert not bool(
+        jnp.array_equal(
+            result.state.interaction.key,
+            start.state.interaction.key,
+        )
+    )
 def test_atomic_route_moves_all_four_downstream_feature_consumers() -> None:
     agent = IntegratedHiddenPartnerAgent()
     start, _, _ = _start_and_transition(agent, seed=7)
@@ -2425,8 +3021,15 @@ def test_resource_accounting_is_exact_and_ablation_shape_matched() -> None:
     assert len(set(totals)) == 1
 
 
-def test_jitted_two_step_scan_preserves_causal_counters_and_finiteness() -> None:
-    agent = IntegratedHiddenPartnerAgent()
+@pytest.mark.parametrize("random_feature_curation", [False, True])
+def test_jitted_two_step_scan_preserves_causal_counters_and_finiteness(
+    random_feature_curation: bool,
+) -> None:
+    agent = IntegratedHiddenPartnerAgent(
+        IntegratedHiddenPartnerConfig(
+            random_feature_curation=random_feature_curation,
+        )
+    )
     environment = _environment()
     environment_state = environment.init(jr.key(40))
     start = agent.start(
@@ -2518,38 +3121,38 @@ def test_natural_candidate_lifecycle_promotes_routes_and_reaches_consumers() -> 
         )
         result = agent.update(state, transition)
         assert not bool(result.diagnostics.transition_rejected)
-        promoted_candidate = int(
-            result.diagnostics.interaction_promoted_candidate
-        )
+        promoted_candidate = int(result.diagnostics.interaction_promoted_candidate)
         if promoted_candidate >= 0 and promoted_slot < 0:
             promoted_slot = int(result.diagnostics.interaction_replaced_slot)
             promoted_descriptor = (
                 int(state.interaction.candidate_left[promoted_candidate]),
                 int(state.interaction.candidate_right[promoted_candidate]),
             )
-            assert abs(
-                float(
-                    state.interaction.candidate_output_weights[
-                        0,
-                        promoted_candidate,
+            assert (
+                abs(
+                    float(
+                        state.interaction.candidate_output_weights[
+                            0,
+                            promoted_candidate,
+                        ]
+                    )
+                )
+                > 0.0
+            )
+            assert bool(
+                result.diagnostics.interaction_candidate_promotion_raw_evidence[promoted_candidate]
+            )
+            assert bool(
+                result.diagnostics.interaction_candidate_promotion_confirmed[promoted_candidate]
+            )
+            assert (
+                int(
+                    result.diagnostics.interaction_candidate_promotion_evidence_streak_updated[
+                        promoted_candidate
                     ]
                 )
-            ) > 0.0
-            assert bool(
-                result.diagnostics.interaction_candidate_promotion_raw_evidence[
-                    promoted_candidate
-                ]
+                >= 2
             )
-            assert bool(
-                result.diagnostics.interaction_candidate_promotion_confirmed[
-                    promoted_candidate
-                ]
-            )
-            assert int(
-                result.diagnostics.interaction_candidate_promotion_evidence_streak_updated[
-                    promoted_candidate
-                ]
-            ) >= 2
             assert bool(result.diagnostics.route.descriptors_changed)
             assert int(result.diagnostics.route.new_count) == 1
             assert tuple(map(int, result.state.router.descriptors[promoted_slot])) == (
@@ -2559,9 +3162,9 @@ def test_natural_candidate_lifecycle_promotes_routes_and_reaches_consumers() -> 
         state = result.state
         if promoted_slot >= 0:
             dynamic_column = BASE_FEATURE_DIM + promoted_slot
-            descriptor_still_routed = tuple(
-                map(int, state.router.descriptors[promoted_slot])
-            ) == promoted_descriptor
+            descriptor_still_routed = (
+                tuple(map(int, state.router.descriptors[promoted_slot])) == promoted_descriptor
+            )
             downstream_use_observed = bool(
                 descriptor_still_routed
                 and state.interaction.active_output_memory_committed[promoted_slot]
@@ -2599,9 +3202,7 @@ def test_natural_candidate_lifecycle_promotes_routes_and_reaches_consumers() -> 
     ),
 )
 def test_invalid_transition_is_an_explicit_atomic_noop(invalid_case: str) -> None:
-    agent = IntegratedHiddenPartnerAgent(
-        IntegratedHiddenPartnerConfig(replacement_interval=0)
-    )
+    agent = IntegratedHiddenPartnerAgent(IntegratedHiddenPartnerConfig(replacement_interval=0))
     start, transition, _ = _start_and_transition(agent, seed=80)
     replacement: dict[str, Any]
     if invalid_case == "observation_mismatch":
@@ -2609,9 +3210,7 @@ def test_invalid_transition_is_an_explicit_atomic_noop(invalid_case: str) -> Non
     elif invalid_case == "observation_nonfinite":
         replacement = {"observation": transition.observation.at[0].set(jnp.nan)}
     elif invalid_case == "next_observation_nonfinite":
-        replacement = {
-            "next_observation": transition.next_observation.at[0].set(jnp.inf)
-        }
+        replacement = {"next_observation": transition.next_observation.at[0].set(jnp.inf)}
     elif invalid_case == "focal_action_mismatch":
         replacement = {
             "focal_action": 1 - start.state.control.last_action,
@@ -2699,16 +3298,12 @@ def test_public_array_contracts_reject_static_shape_and_dtype_errors() -> None:
     with pytest.raises(TypeError, match="transition.focal_action must have dtype int32"):
         agent.update(
             start.state,
-            transition.replace(
-                focal_action=transition.focal_action.astype(jnp.float32)
-            ),
+            transition.replace(focal_action=transition.focal_action.astype(jnp.float32)),
         )
     with pytest.raises(TypeError, match="transition.terminated must have dtype bool"):
         agent.update(
             start.state,
-            transition.replace(
-                terminated=transition.terminated.astype(jnp.int32)
-            ),
+            transition.replace(terminated=transition.terminated.astype(jnp.int32)),
         )
 
 
@@ -2718,9 +3313,7 @@ def test_stateless_public_kernels_return_neutral_output_for_dynamic_invalidity()
     descriptors = jnp.asarray(INITIAL_ACTIVE_DESCRIPTORS, dtype=jnp.int32)
     gradient = jnp.ones((DEPLOYED_FEATURE_DIM,), dtype=jnp.float32)
 
-    invalid_descriptors = descriptors.at[0].set(
-        jnp.asarray((-1, 0), dtype=jnp.int32)
-    )
+    invalid_descriptors = descriptors.at[0].set(jnp.asarray((-1, 0), dtype=jnp.int32))
     chex.assert_trees_all_equal(
         agent.build_chi(phi.at[0].set(jnp.nan), descriptors),
         jnp.zeros((DEPLOYED_FEATURE_DIM,), dtype=jnp.float32),
@@ -2740,9 +3333,7 @@ def test_stateless_public_kernels_return_neutral_output_for_dynamic_invalidity()
 
 
 def test_all_integrated_long_lived_counters_saturate_without_replacement() -> None:
-    agent = IntegratedHiddenPartnerAgent(
-        IntegratedHiddenPartnerConfig(replacement_interval=0)
-    )
+    agent = IntegratedHiddenPartnerAgent(IntegratedHiddenPartnerConfig(replacement_interval=0))
     start, transition, _ = _start_and_transition(agent, seed=83)
     maximum = jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32)
     interaction = start.state.interaction.replace(
@@ -2808,3 +3399,941 @@ def test_all_integrated_long_lived_counters_saturate_without_replacement() -> No
     assert int(result.state.control.step_count) == int(maximum)
     assert int(result.state.router.route_count) == int(maximum)
     assert int(result.state.router.generation_count) == int(maximum)
+
+
+def test_default_grounded_lane_is_absent_and_preserves_legacy_state_bytes() -> None:
+    agent = IntegratedHiddenPartnerAgent()
+    start, _, _ = _start_and_transition(agent, seed=8101)
+    budget = agent.resource_budget(start.state)
+
+    assert start.state.grounded_world is None
+    assert start.state.current_evaluation.grounded_world is None
+    assert agent.grounded_world_model is None
+    assert agent.config.grounded_world_model is None
+    assert agent.config.representation_gradient_mixer is None
+    assert agent.config.grounded_world_learning_enabled
+    assert not agent.config.grounded_world_planning_enabled
+    assert budget.grounded_world_nbytes == 0
+    assert budget.grounded_world_parameter_count == 0
+    assert budget.grounded_world_parameters_touched_per_update == 0
+    assert budget.grounded_world_update_counter_nbytes == 0
+    assert budget.grounded_world_joint_cells_per_decision == 0
+    assert budget.planner_cell_evaluations_per_decision == 4
+    assert budget.decision_cache_nbytes == 294
+    assert budget.total_state_nbytes == _tree_array_nbytes(start.state) == 6748
+
+
+def test_grounded_nested_configs_roundtrip_and_reject_incomplete_or_wrong_shapes() -> None:
+    config = _grounded_integrated_config(
+        mode="world_only",
+        grounded_planning=True,
+        grounded_world_learning_enabled=False,
+    )
+    restored = IntegratedHiddenPartnerConfig.from_config(config.to_config())
+    agent = IntegratedHiddenPartnerAgent(restored)
+
+    assert restored == config
+    assert not restored.grounded_world_learning_enabled
+    assert agent.grounded_world_model is not None
+    assert agent.grounded_world_model.config == config.grounded_world_model
+    assert agent.to_config()["grounded_world"] == agent.grounded_world_model.to_config()
+    assert (
+        agent.to_config()["representation_gradient_mixer"]
+        == config.representation_gradient_mixer.to_config()
+    )
+
+    with pytest.raises(ValueError, match="together"):
+        IntegratedHiddenPartnerConfig(
+            grounded_world_model=config.grounded_world_model,
+        )
+    with pytest.raises(ValueError, match="together"):
+        IntegratedHiddenPartnerConfig(
+            representation_gradient_mixer=config.representation_gradient_mixer,
+        )
+    with pytest.raises(ValueError, match="requires"):
+        IntegratedHiddenPartnerConfig(grounded_world_planning_enabled=True)
+    with pytest.raises(ValueError, match="representation_dim"):
+        IntegratedHiddenPartnerConfig(
+            grounded_world_model=dataclasses.replace(
+                config.grounded_world_model,
+                representation_dim=DEPLOYED_FEATURE_DIM - 1,
+            ),
+            representation_gradient_mixer=config.representation_gradient_mixer,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mode", "behavior_active", "world_active", "mix_applied"),
+    [
+        ("full", True, True, True),
+        ("behavior_only", True, False, True),
+        ("world_only", False, True, True),
+        ("discard", False, False, False),
+    ],
+)
+def test_grounded_update_and_all_gradient_modes_are_prequential_and_shape_matched(
+    mode: str,
+    behavior_active: bool,
+    world_active: bool,
+    mix_applied: bool,
+) -> None:
+    agent = IntegratedHiddenPartnerAgent(_grounded_integrated_config(mode=mode))
+    start, transition, _ = _start_and_transition(agent, seed=8102)
+    before = start.state
+    assert before.grounded_world is not None
+    assert agent.grounded_world_model is not None
+    prediction_before = agent.grounded_world_model.predict(
+        before.grounded_world,
+        before.chi,
+        transition.focal_action,
+        transition.partner_action,
+    )
+    result = agent.update(before, transition)
+    grounded_update = result.diagnostics.grounded_world_update
+    gradient_mix = result.diagnostics.gradient_mix
+
+    assert grounded_update is not None
+    assert gradient_mix is not None
+    assert result.state.grounded_world is not None
+    chex.assert_trees_all_close(
+        grounded_update.prediction,
+        prediction_before,
+        atol=0.0,
+        rtol=0.0,
+    )
+    assert bool(grounded_update.diagnostics.applied)
+    assert int(result.state.grounded_world.update_count) == 1
+    assert int(result.diagnostics.grounded_world_step_delta) == 1
+    assert not bool(
+        jnp.array_equal(
+            result.state.grounded_world.weights,
+            before.grounded_world.weights,
+        )
+    )
+    assert not bool(
+        jnp.array_equal(
+            result.state.grounded_world.bias,
+            before.grounded_world.bias,
+        )
+    )
+    assert bool(gradient_mix.valid)
+    assert bool(gradient_mix.applied) is mix_applied
+    assert bool(gradient_mix.diagnostics.behavior_active) is behavior_active
+    assert bool(gradient_mix.diagnostics.grounded_world_active) is world_active
+    chex.assert_trees_all_equal(
+        result.diagnostics.mixed_gradient_chi,
+        gradient_mix.gradient,
+    )
+    expected_phi_gradient = agent.chain_chi_gradient_to_phi(
+        before.phi,
+        before.router.descriptors,
+        gradient_mix.gradient,
+        agent._effective_pair_read_mask(  # noqa: SLF001
+            before.interaction,
+            before.consumer_active_mask,
+        ),
+    )
+    chex.assert_trees_all_close(
+        result.diagnostics.mixed_gradient_phi,
+        expected_phi_gradient,
+    )
+    expected_behavior_phi = agent.chain_chi_gradient_to_phi(
+        before.phi,
+        before.router.descriptors,
+        result.diagnostics.behavior_gradient_chi,
+        agent._effective_pair_read_mask(  # noqa: SLF001
+            before.interaction,
+            before.consumer_active_mask,
+        ),
+    )
+    chex.assert_trees_all_close(
+        result.diagnostics.behavior_gradient_phi,
+        expected_behavior_phi,
+    )
+    assert int(result.diagnostics.state_builder_learning_delta) == 1
+    assert bool(result.diagnostics.transition_semantics_valid)
+    assert bool(result.diagnostics.model_valid)
+
+
+def test_world_gradient_has_a_causal_path_into_one_state_builder_learn_call() -> None:
+    behavior_agent = IntegratedHiddenPartnerAgent(_grounded_integrated_config(mode="behavior_only"))
+    world_agent = IntegratedHiddenPartnerAgent(_grounded_integrated_config(mode="world_only"))
+    behavior_start, transition, _ = _start_and_transition(behavior_agent, seed=8103)
+    world_start, world_transition, _ = _start_and_transition(world_agent, seed=8103)
+    assert behavior_start.state.grounded_world is not None
+    assert world_start.state.grounded_world is not None
+    selected = int(transition.focal_action) * 2 + int(transition.partner_action)
+    reward_head = RAW_OBSERVATION_DIM
+    seeded_weights = (
+        jnp.zeros_like(behavior_start.state.grounded_world.weights)
+        .at[selected, reward_head, RAW_OBSERVATION_DIM]
+        .set(1.0)
+    )
+    seeded_bias = (
+        jnp.zeros_like(behavior_start.state.grounded_world.bias)
+        .at[
+            selected,
+            reward_head,
+        ]
+        .set(2.0)
+    )
+
+    def seeded(agent: IntegratedHiddenPartnerAgent, state: Any) -> Any:
+        assert state.grounded_world is not None
+        behavior = state.behavior.replace(weights=jnp.zeros_like(state.behavior.weights))
+        grounded = state.grounded_world.replace(
+            weights=seeded_weights,
+            bias=seeded_bias,
+        )
+        evaluation = agent.evaluate_models(
+            behavior,
+            state.joint_world,
+            state.control,
+            state.chi,
+            grounded,
+        )
+        return state.replace(
+            behavior=behavior,
+            grounded_world=grounded,
+            current_evaluation=evaluation,
+        )
+
+    behavior_state = seeded(behavior_agent, behavior_start.state)
+    world_state = seeded(world_agent, world_start.state)
+    behavior_result = behavior_agent.update(behavior_state, transition)
+    world_result = world_agent.update(world_state, world_transition)
+
+    chex.assert_trees_all_equal(
+        behavior_result.diagnostics.behavior_gradient_chi,
+        jnp.zeros((DEPLOYED_FEATURE_DIM,), dtype=jnp.float32),
+    )
+    assert (
+        float(
+            jnp.linalg.norm(world_result.diagnostics.grounded_world_update.representation_gradient)
+        )
+        > 0.0
+    )
+    assert float(jnp.linalg.norm(world_result.diagnostics.mixed_gradient_phi)) > 0.0
+    assert float(world_result.diagnostics.state_learning.parameter_update_norm) > 0.0
+    assert float(behavior_result.diagnostics.state_learning.parameter_update_norm) == 0.0
+    assert not bool(
+        jnp.array_equal(
+            world_result.state.state_builder.parameters,
+            behavior_result.state.state_builder.parameters,
+        )
+    )
+    assert int(world_result.diagnostics.state_builder_learning_delta) == 1
+
+
+def test_grounded_planner_evaluates_four_cells_and_static_mask_selects_reward_source() -> None:
+    grounded_agent = IntegratedHiddenPartnerAgent(
+        _grounded_integrated_config(
+            grounded_planning=True,
+            uniform_partner_belief=True,
+            epsilon=0.0,
+            planner_lambda=1.0,
+        )
+    )
+    shadow_agent = IntegratedHiddenPartnerAgent(
+        _grounded_integrated_config(
+            grounded_planning=False,
+            uniform_partner_belief=True,
+            epsilon=0.0,
+            planner_lambda=1.0,
+        )
+    )
+    start, _, _ = _start_and_transition(grounded_agent, seed=8104)
+    state = start.state
+    assert state.grounded_world is not None
+    reward_head = RAW_OBSERVATION_DIM
+    grounded_rewards = jnp.asarray([[0.0, 0.0], [2.0, 2.0]], dtype=jnp.float32)
+    grounded_state = state.grounded_world.replace(
+        weights=jnp.zeros_like(state.grounded_world.weights),
+        bias=state.grounded_world.bias.at[:, reward_head].set(grounded_rewards.reshape((-1,))),
+    )
+    table_rewards = jnp.asarray([[2.0, 2.0], [0.0, 0.0]], dtype=jnp.float32)
+    table_state = state.joint_world.replace(reward_predictions=table_rewards)
+
+    grounded = grounded_agent.evaluate_models(
+        state.behavior,
+        table_state,
+        state.control,
+        state.chi,
+        grounded_state,
+    )
+    shadow = shadow_agent.evaluate_models(
+        state.behavior,
+        table_state,
+        state.control,
+        state.chi,
+        grounded_state,
+    )
+
+    assert grounded.grounded_world is not None
+    assert shadow.grounded_world is not None
+    chex.assert_trees_all_equal(
+        grounded.grounded_world.table_expected_rewards,
+        jnp.asarray([2.0, 0.0], dtype=jnp.float32),
+    )
+    chex.assert_trees_all_equal(
+        grounded.grounded_world.grounded_expected_rewards,
+        jnp.asarray([0.0, 2.0], dtype=jnp.float32),
+    )
+    chex.assert_trees_all_equal(
+        grounded.expected_rewards,
+        grounded.grounded_world.grounded_expected_rewards,
+    )
+    chex.assert_trees_all_equal(
+        shadow.expected_rewards,
+        shadow.grounded_world.table_expected_rewards,
+    )
+    assert bool(grounded.grounded_world.predictions_valid)
+    assert bool(grounded.grounded_world.planner_applied)
+    assert not bool(shadow.grounded_world.planner_applied)
+    assert int(grounded.grounded_world.cell_evaluations) == 4
+    assert int(grounded.cell_evaluations) == 8
+    assert int(shadow.cell_evaluations) == 8
+    assert int(grounded.greedy_action) == 1
+    assert int(shadow.greedy_action) == 0
+
+
+def test_grounded_weights_join_identity_safe_route_while_bias_and_counter_do_not() -> None:
+    agent = IntegratedHiddenPartnerAgent(_grounded_integrated_config())
+    start, _, _ = _start_and_transition(agent, seed=8105)
+    state = start.state
+    assert state.grounded_world is not None
+    old = state.router.descriptors
+    proposed = (
+        old.at[0].set(old[2]).at[1].set(old[0]).at[2].set(jnp.asarray([4, 5], dtype=jnp.int32))
+    )
+    grounded_weights = jnp.arange(
+        state.grounded_world.weights.size,
+        dtype=jnp.float32,
+    ).reshape(state.grounded_world.weights.shape)
+    grounded = state.grounded_world.replace(
+        weights=grounded_weights,
+        bias=jnp.arange(state.grounded_world.bias.size, dtype=jnp.float32).reshape(
+            state.grounded_world.bias.shape
+        ),
+        update_count=jnp.asarray(7, dtype=jnp.int32),
+    )
+    routed_behavior, routed_control, routed_grounded, diagnostics, _ = (
+        agent._route_feature_consumers_with_grounded(  # noqa: SLF001
+            state.router,
+            state.behavior,
+            state.control,
+            grounded,
+            proposed,
+        )
+    )
+    del routed_behavior, routed_control
+    source = np.asarray([2, 0, -1] + list(range(3, ACTIVE_PAIR_SLOTS)))
+    expected = np.asarray(grounded_weights).copy()
+    expected_tail = np.zeros_like(expected[..., BASE_FEATURE_DIM:])
+    survivor = source >= 0
+    expected_tail[..., survivor] = np.asarray(grounded_weights)[
+        ...,
+        BASE_FEATURE_DIM + source[survivor],
+    ]
+    expected[..., BASE_FEATURE_DIM:] = expected_tail
+
+    np.testing.assert_array_equal(routed_grounded.weights, expected)
+    chex.assert_trees_all_equal(routed_grounded.bias, grounded.bias)
+    chex.assert_trees_all_equal(routed_grounded.update_count, grounded.update_count)
+    np.testing.assert_array_equal(diagnostics.source_slots, source)
+    assert bool(diagnostics.valid)
+
+
+def test_invalid_grounded_model_rejects_the_complete_integrated_transition() -> None:
+    agent = IntegratedHiddenPartnerAgent(_grounded_integrated_config())
+    start, transition, _ = _start_and_transition(agent, seed=8106)
+    assert start.state.grounded_world is not None
+    corrupt = start.state.replace(
+        grounded_world=start.state.grounded_world.replace(
+            weights=start.state.grounded_world.weights.at[0, 0, 0].set(jnp.nan)
+        )
+    )
+    result = jax.jit(agent.update)(corrupt, transition)
+
+    for before, after in zip(
+        jax.tree_util.tree_leaves(corrupt),
+        jax.tree_util.tree_leaves(result.state),
+        strict=True,
+    ):
+        try:
+            before_bytes = np.asarray(before).tobytes()
+            after_bytes = np.asarray(after).tobytes()
+        except TypeError:
+            before_bytes = np.asarray(jr.key_data(before)).tobytes()
+            after_bytes = np.asarray(jr.key_data(after)).tobytes()
+        assert before_bytes == after_bytes
+    assert result.diagnostics.grounded_world_update is not None
+    assert result.diagnostics.gradient_mix is not None
+    assert not bool(result.diagnostics.grounded_world_update.diagnostics.applied)
+    assert bool(result.diagnostics.gradient_mix.rejected)
+    assert bool(result.diagnostics.transition_rejected)
+    assert not bool(result.diagnostics.transition_semantics_valid)
+    assert int(result.diagnostics.grounded_world_step_delta) == 0
+    for delta in (
+        result.diagnostics.state_builder_step_delta,
+        result.diagnostics.state_builder_learning_delta,
+        result.diagnostics.behavior_step_delta,
+        result.diagnostics.interaction_step_delta,
+        result.diagnostics.world_step_delta,
+        result.diagnostics.control_step_delta,
+        result.diagnostics.router_route_delta,
+        result.diagnostics.integrated_step_delta,
+    ):
+        assert int(delta) == 0
+
+
+def test_invalid_unexecuted_grounded_joint_row_rejects_candidate_planner_atomically() -> None:
+    agent = IntegratedHiddenPartnerAgent(_grounded_integrated_config())
+    start, transition, _ = _start_and_transition(agent, seed=8107)
+    assert start.state.grounded_world is not None
+    executed = int(transition.focal_action) * 2 + int(transition.partner_action)
+    unexecuted = (executed + 1) % 4
+    adversarial_row = jnp.broadcast_to(
+        jnp.where(start.state.chi >= 0.0, 100.0, -100.0),
+        start.state.grounded_world.weights[unexecuted].shape,
+    )
+    adversarial = start.state.replace(
+        grounded_world=start.state.grounded_world.replace(
+            weights=start.state.grounded_world.weights.at[unexecuted].set(adversarial_row)
+        )
+    )
+
+    result = agent.update(adversarial, transition)
+
+    chex.assert_trees_all_equal(result.state, adversarial)
+    assert result.diagnostics.grounded_world_update is not None
+    assert result.diagnostics.gradient_mix is not None
+    assert bool(result.diagnostics.grounded_world_update.diagnostics.applied)
+    assert bool(result.diagnostics.gradient_mix.valid)
+    assert result.diagnostics.current_evaluation.grounded_world is not None
+    assert result.diagnostics.next_evaluation.grounded_world is not None
+    assert bool(result.diagnostics.current_evaluation.grounded_world.predictions_valid)
+    assert not bool(result.diagnostics.next_evaluation.grounded_world.predictions_valid)
+    assert bool(result.diagnostics.transition_rejected)
+    assert not bool(result.diagnostics.transition_semantics_valid)
+    assert not bool(result.diagnostics.model_valid)
+    assert int(result.diagnostics.grounded_world_step_delta) == 0
+
+
+def test_enabled_gradient_modes_have_exact_resource_and_shape_parity_under_jit() -> None:
+    totals = []
+    states = []
+    for index, mode in enumerate(("full", "behavior_only", "world_only", "discard")):
+        agent = IntegratedHiddenPartnerAgent(_grounded_integrated_config(mode=mode))
+        start, transition, _ = _start_and_transition(agent, seed=8200 + index)
+        result = jax.jit(agent.update)(start.state, transition)
+        budget = agent.resource_budget(start.state)
+        assert start.state.grounded_world is not None
+        assert budget.grounded_world_nbytes == _tree_array_nbytes(start.state.grounded_world)
+        assert budget.grounded_world_parameter_count == (
+            agent.grounded_world_model.resource_budget.trainable_float32_scalars
+        )
+        assert budget.grounded_world_parameters_touched_per_update == (
+            agent.grounded_world_model.resource_budget.learned_float32_scalars_touched_per_update
+        )
+        assert budget.grounded_world_update_counter_nbytes == 4
+        assert budget.grounded_world_joint_cells_per_decision == 4
+        assert budget.planner_cell_evaluations_per_decision == 8
+        assert budget.decision_cache_nbytes == 492
+        assert budget.total_state_nbytes == 10_950
+        assert budget.total_state_nbytes == _tree_array_nbytes(start.state)
+        assert bool(result.diagnostics.all_finite)
+        totals.append(budget.total_state_nbytes)
+        states.append(jax.tree_util.tree_structure(start.state))
+
+    assert len(set(totals)) == 1
+    assert all(structure == states[0] for structure in states[1:])
+
+
+def test_grounded_learning_freeze_preserves_compute_and_every_other_update() -> None:
+    learning_agent = IntegratedHiddenPartnerAgent(
+        _grounded_integrated_config(grounded_world_learning_enabled=True)
+    )
+    frozen_agent = IntegratedHiddenPartnerAgent(
+        _grounded_integrated_config(grounded_world_learning_enabled=False)
+    )
+    learning_start, transition, _ = _start_and_transition(learning_agent, seed=8301)
+    frozen_start, frozen_transition, _ = _start_and_transition(frozen_agent, seed=8301)
+    chex.assert_trees_all_equal(learning_start.state, frozen_start.state)
+    assert learning_start.state.grounded_world is not None
+
+    learned = learning_agent.update(learning_start.state, transition)
+    frozen = frozen_agent.update(frozen_start.state, frozen_transition)
+    assert learned.diagnostics.grounded_world_update is not None
+    assert frozen.diagnostics.grounded_world_update is not None
+    assert learned.diagnostics.gradient_mix is not None
+    assert frozen.diagnostics.gradient_mix is not None
+    assert learned.state.grounded_world is not None
+    assert frozen.state.grounded_world is not None
+
+    assert bool(learned.diagnostics.grounded_world_learning_enabled)
+    assert not bool(frozen.diagnostics.grounded_world_learning_enabled)
+    assert bool(learned.diagnostics.grounded_world_update.diagnostics.applied)
+    assert bool(frozen.diagnostics.grounded_world_update.diagnostics.applied)
+    chex.assert_trees_all_equal(
+        learned.diagnostics.grounded_world_update,
+        frozen.diagnostics.grounded_world_update,
+    )
+    chex.assert_trees_all_equal(
+        learned.diagnostics.gradient_mix,
+        frozen.diagnostics.gradient_mix,
+    )
+    chex.assert_trees_all_equal(
+        learned.diagnostics.mixed_gradient_phi,
+        frozen.diagnostics.mixed_gradient_phi,
+    )
+    chex.assert_trees_all_equal(
+        frozen.diagnostics.grounded_world_update.state,
+        learned.state.grounded_world,
+    )
+    chex.assert_trees_all_equal(frozen.state.grounded_world, frozen_start.state.grounded_world)
+    assert int(learned.diagnostics.grounded_world_step_delta) == 1
+    assert int(frozen.diagnostics.grounded_world_step_delta) == 0
+    assert int(frozen.diagnostics.grounded_world_update.state.update_count) == 1
+    assert bool(frozen.diagnostics.transition_semantics_valid)
+
+    learned_without_ground = learned.state.replace(
+        grounded_world=None,
+        current_evaluation=learned.state.current_evaluation.replace(grounded_world=None),
+    )
+    frozen_without_ground = frozen.state.replace(
+        grounded_world=None,
+        current_evaluation=frozen.state.current_evaluation.replace(grounded_world=None),
+    )
+    chex.assert_trees_all_equal(learned_without_ground, frozen_without_ground)
+    assert (
+        learning_agent.resource_budget(learning_start.state).total_state_nbytes
+        == frozen_agent.resource_budget(frozen_start.state).total_state_nbytes
+    )
+    assert jax.tree_util.tree_structure(learning_start.state) == jax.tree_util.tree_structure(
+        frozen_start.state
+    )
+
+
+def test_start_rejects_finite_but_invalid_grounded_planner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _grounded_integrated_config()
+    assert config.grounded_world_model is not None
+    config = dataclasses.replace(
+        config,
+        grounded_world_model=dataclasses.replace(
+            config.grounded_world_model,
+            max_input_magnitude=1.0,
+            max_parameter_magnitude=2.0,
+        ),
+    )
+    agent = IntegratedHiddenPartnerAgent(config)
+    model = agent.grounded_world_model
+    assert model is not None
+    original_init = model.init
+
+    def invalid_init(key: Any) -> Any:
+        state = original_init(key)
+        return state.replace(
+            weights=jnp.zeros_like(state.weights),
+            bias=jnp.full_like(state.bias, 2.0),
+        )
+
+    monkeypatch.setattr(model, "init", invalid_init)
+    environment = _environment()
+    environment_state = environment.init(jr.key(8302))
+    with pytest.raises(ValueError, match="initial planner evaluation"):
+        agent.start(environment.observe(environment_state), jr.key(18302))
+
+
+def test_invalid_router_transaction_rejects_every_integrated_update() -> None:
+    agent = IntegratedHiddenPartnerAgent(_grounded_integrated_config())
+    start, transition, _ = _start_and_transition(agent, seed=8303)
+    invalid = start.state.replace(
+        router=dataclasses.replace(
+            start.state.router,
+            route_count=jnp.asarray(-1, dtype=jnp.int32),
+        )
+    )
+
+    result = agent.update(invalid, transition)
+
+    chex.assert_trees_all_equal(result.state, invalid)
+    assert not bool(result.diagnostics.route.valid)
+    assert bool(result.diagnostics.route.counter_invalid)
+    assert bool(result.diagnostics.transition_rejected)
+    assert not bool(result.diagnostics.transition_semantics_valid)
+    assert int(result.diagnostics.integrated_step_delta) == 0
+    assert int(result.diagnostics.grounded_world_step_delta) == 0
+
+
+@pytest.mark.parametrize("checkpoint", ("behavior", "grounded"))
+def test_replaced_checkpoint_must_match_the_cached_behavior_and_grounded_decision(
+    checkpoint: str,
+) -> None:
+    agent = IntegratedHiddenPartnerAgent(_grounded_integrated_config())
+    start, transition, _ = _start_and_transition(agent, seed=8304)
+    assert start.state.grounded_world is not None
+    if checkpoint == "behavior":
+        replaced = start.state.replace(
+            behavior=start.state.behavior.replace(bias=jnp.asarray([4.0, -4.0], dtype=jnp.float32))
+        )
+    else:
+        executed = int(transition.focal_action) * 2 + int(transition.partner_action)
+        unexecuted = (executed + 1) % 4
+        reward_head = RAW_OBSERVATION_DIM
+        replaced = start.state.replace(
+            grounded_world=start.state.grounded_world.replace(
+                bias=start.state.grounded_world.bias.at[unexecuted, reward_head].add(1.0)
+            )
+        )
+
+    result = agent.update(replaced, transition)
+
+    chex.assert_trees_all_equal(result.state, replaced)
+    assert bool(result.diagnostics.transition_rejected)
+    assert bool(result.diagnostics.behavior_prediction_matches_decision) is (
+        checkpoint != "behavior"
+    )
+    assert bool(result.diagnostics.grounded_world_prediction_matches_decision) is (
+        checkpoint != "grounded"
+    )
+
+
+def test_grounded_counter_saturates_without_stopping_continual_updates() -> None:
+    agent = IntegratedHiddenPartnerAgent(_grounded_integrated_config())
+    start, transition, _ = _start_and_transition(agent, seed=8305)
+    assert start.state.grounded_world is not None
+    maximum = jnp.asarray(2**31 - 1, dtype=jnp.int32)
+    saturated = start.state.replace(
+        grounded_world=start.state.grounded_world.replace(update_count=maximum)
+    )
+
+    result = agent.update(saturated, transition)
+
+    assert result.state.grounded_world is not None
+    assert result.diagnostics.grounded_world_update is not None
+    assert bool(result.diagnostics.grounded_world_counter_saturated)
+    assert bool(result.diagnostics.grounded_world_update.diagnostics.applied)
+    assert bool(result.diagnostics.transition_semantics_valid)
+    assert int(result.state.grounded_world.update_count) == int(maximum)
+    assert int(result.diagnostics.grounded_world_step_delta) == 0
+    assert not bool(
+        jnp.array_equal(
+            result.state.grounded_world.weights,
+            saturated.grounded_world.weights,
+        )
+    )
+    assert int(result.diagnostics.integrated_step_delta) == 1
+
+
+def test_global_planning_ablation_reports_grounded_planner_not_applied() -> None:
+    agent = IntegratedHiddenPartnerAgent(
+        _grounded_integrated_config(
+            grounded_planning=True,
+            planning_enabled=False,
+        )
+    )
+    start, _, _ = _start_and_transition(agent, seed=8306)
+    grounded = start.state.current_evaluation.grounded_world
+
+    assert grounded is not None
+    assert not bool(grounded.planner_applied)
+    chex.assert_trees_all_equal(
+        start.state.current_evaluation.applied_model_term,
+        jnp.zeros((2,), dtype=jnp.float32),
+    )
+
+
+def test_nonfinite_non_ground_candidate_is_an_atomic_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = IntegratedHiddenPartnerAgent(_grounded_integrated_config())
+    start, transition, _ = _start_and_transition(agent, seed=8307)
+    original_update = agent.interaction_learner.update
+
+    def nonfinite_update(*args: Any, **kwargs: Any) -> Any:
+        update = original_update(*args, **kwargs)
+        return update.replace(
+            state=update.state.replace(output_biases=update.state.output_biases.at[0].set(jnp.nan))
+        )
+
+    monkeypatch.setattr(agent.interaction_learner, "update", nonfinite_update)
+    result = agent.update(start.state, transition)
+
+    chex.assert_trees_all_equal(result.state, start.state)
+    assert bool(result.diagnostics.transition_rejected)
+    assert not bool(result.diagnostics.all_finite)
+    assert int(result.diagnostics.integrated_step_delta) == 0
+
+
+def test_current_invalid_grounded_cell_is_rejected_even_when_cache_is_coherent() -> None:
+    agent = IntegratedHiddenPartnerAgent(_grounded_integrated_config())
+    start, transition, _ = _start_and_transition(agent, seed=8308)
+    assert start.state.grounded_world is not None
+    executed = int(transition.focal_action) * 2 + int(transition.partner_action)
+    unexecuted = (executed + 1) % 4
+    invalid_grounded = start.state.grounded_world.replace(
+        bias=start.state.grounded_world.bias.at[unexecuted].set(
+            jnp.full_like(start.state.grounded_world.bias[unexecuted], 100.0)
+        )
+    )
+    invalid_evaluation = agent.evaluate_models(
+        start.state.behavior,
+        start.state.joint_world,
+        start.state.control,
+        start.state.chi,
+        invalid_grounded,
+    )
+    assert invalid_evaluation.grounded_world is not None
+    assert not bool(invalid_evaluation.grounded_world.predictions_valid)
+    coherent_invalid = start.state.replace(
+        grounded_world=invalid_grounded,
+        current_evaluation=invalid_evaluation,
+    )
+
+    result = agent.update(coherent_invalid, transition)
+
+    chex.assert_trees_all_equal(result.state, coherent_invalid)
+    assert bool(result.diagnostics.grounded_world_prediction_matches_decision)
+    assert bool(result.diagnostics.transition_rejected)
+    assert not bool(result.diagnostics.model_valid)
+
+
+def test_grounded_evidence_gated_no_carry_route_is_one_atomic_transaction() -> None:
+    agent = IntegratedHiddenPartnerAgent(
+        _grounded_integrated_config(
+            feature_lifecycle_enabled=True,
+            replacement_interval=64,
+            evidence_gated_consumer_memory=True,
+            active_utility_retention_grace_steps=32,
+            active_utility_evidence_threshold=0.01,
+            carry_survivors=False,
+        )
+    )
+    start, _, _ = _start_and_transition(agent, seed=8309)
+    state = start.state
+    assert state.grounded_world is not None
+    behavior = state.behavior.replace(weights=jnp.ones_like(state.behavior.weights))
+    control = state.control.replace(
+        q_weights=jnp.full_like(state.control.q_weights, 2.0),
+        q_trace_weights=jnp.full_like(state.control.q_trace_weights, 3.0),
+        last_observation=jnp.full_like(state.control.last_observation, 4.0),
+    )
+    grounded = state.grounded_world.replace(
+        weights=jnp.full_like(state.grounded_world.weights, 5.0),
+        bias=jnp.full_like(state.grounded_world.bias, 6.0),
+        update_count=jnp.asarray(7, dtype=jnp.int32),
+    )
+    old = state.router.descriptors
+    proposed = (
+        old.at[0].set(old[2]).at[1].set(old[0]).at[2].set(jnp.asarray([4, 5], dtype=jnp.int32))
+    )
+
+    routed_behavior, routed_control, routed_grounded, diagnostics, _ = (
+        agent._route_feature_consumers_with_grounded(  # noqa: SLF001
+            state.router,
+            behavior,
+            control,
+            grounded,
+            proposed,
+        )
+    )
+
+    for routed in (
+        routed_behavior.weights,
+        routed_control.q_weights,
+        routed_control.q_trace_weights,
+        routed_control.last_observation,
+        routed_grounded.weights,
+    ):
+        chex.assert_trees_all_equal(
+            routed[..., BASE_FEATURE_DIM:],
+            jnp.zeros_like(routed[..., BASE_FEATURE_DIM:]),
+        )
+    chex.assert_trees_all_equal(routed_grounded.bias, grounded.bias)
+    chex.assert_trees_all_equal(routed_grounded.update_count, grounded.update_count)
+    assert bool(diagnostics.valid)
+    assert bool(diagnostics.descriptors_changed)
+    assert not bool(diagnostics.carry_survivors)
+
+
+def test_invalid_grounded_transition_has_eager_jit_and_scan_atomic_parity() -> None:
+    agent = IntegratedHiddenPartnerAgent(_grounded_integrated_config())
+    start, transition, _ = _start_and_transition(agent, seed=8310)
+    invalid = transition.replace(reward=1.0 - transition.reward)
+    eager = agent.update(start.state, invalid)
+    compiled = jax.jit(agent.update)(start.state, invalid)
+
+    chex.assert_trees_all_equal(eager, compiled)
+    chex.assert_trees_all_equal(eager.state, start.state)
+
+    def scan_step(state: Any, _: Any) -> tuple[Any, Any]:
+        update = agent.update(state, invalid)
+        return update.state, (
+            update.diagnostics.transition_rejected,
+            update.diagnostics.grounded_world_step_delta,
+            update.diagnostics.integrated_step_delta,
+        )
+
+    final_state, (rejected, grounded_delta, integrated_delta) = jax.jit(
+        lambda state: jax.lax.scan(scan_step, state, xs=None, length=2)
+    )(start.state)
+    chex.assert_trees_all_equal(final_state, start.state)
+    chex.assert_trees_all_equal(rejected, jnp.ones((2,), dtype=jnp.bool_))
+    chex.assert_trees_all_equal(grounded_delta, jnp.zeros((2,), dtype=jnp.int32))
+    chex.assert_trees_all_equal(integrated_delta, jnp.zeros((2,), dtype=jnp.int32))
+
+
+def test_complete_table_decision_cache_and_selection_mutations_fail_closed() -> None:
+    agent = IntegratedHiddenPartnerAgent()
+    start, transition, _ = _start_and_transition(agent, seed=8311)
+    state = start.state
+    evaluation = state.current_evaluation
+    selection = state.current_selection
+    one = jnp.asarray(1, dtype=jnp.int32)
+    mutations = (
+        state.replace(
+            current_evaluation=evaluation.replace(
+                predicted_partner_probabilities=(
+                    evaluation.predicted_partner_probabilities.at[0].add(0.125)
+                )
+            )
+        ),
+        state.replace(
+            current_evaluation=evaluation.replace(
+                partner_probabilities=evaluation.partner_probabilities.at[0].add(0.125)
+            )
+        ),
+        state.replace(
+            current_evaluation=evaluation.replace(
+                partner_probabilities_valid=~evaluation.partner_probabilities_valid
+            )
+        ),
+        state.replace(
+            current_evaluation=evaluation.replace(
+                probability_violation=evaluation.probability_violation + 0.125
+            )
+        ),
+        state.replace(
+            current_evaluation=evaluation.replace(
+                expected_rewards=evaluation.expected_rewards.at[0].set(jnp.nan)
+            )
+        ),
+        state.replace(
+            current_evaluation=evaluation.replace(
+                expected_outcomes=evaluation.expected_outcomes.at[0, 0].add(0.125)
+            )
+        ),
+        state.replace(
+            current_evaluation=evaluation.replace(q_values=evaluation.q_values.at[0].add(0.125))
+        ),
+        state.replace(
+            current_evaluation=evaluation.replace(
+                centered_expected_rewards=evaluation.centered_expected_rewards.at[0].add(0.125)
+            )
+        ),
+        state.replace(
+            current_evaluation=evaluation.replace(model_term=evaluation.model_term.at[0].add(0.125))
+        ),
+        state.replace(
+            current_evaluation=evaluation.replace(
+                applied_model_term=evaluation.applied_model_term.at[0].add(0.125)
+            )
+        ),
+        state.replace(
+            current_evaluation=evaluation.replace(
+                planner_scores=evaluation.planner_scores.at[0].add(0.125)
+            )
+        ),
+        state.replace(
+            current_evaluation=evaluation.replace(greedy_action=one - evaluation.greedy_action)
+        ),
+        state.replace(
+            current_evaluation=evaluation.replace(
+                cell_evaluations=evaluation.cell_evaluations + one
+            )
+        ),
+        state.replace(current_selection=selection.replace(action=one - selection.action)),
+        state.replace(
+            current_selection=selection.replace(
+                noisy_greedy_action=one - selection.noisy_greedy_action
+            )
+        ),
+        state.replace(
+            current_selection=selection.replace(random_action=one - selection.random_action)
+        ),
+        state.replace(current_selection=selection.replace(explored=~selection.explored)),
+        state.replace(
+            current_selection=selection.replace(
+                rng_key_before=jr.fold_in(selection.rng_key_before, 1)
+            )
+        ),
+        state.replace(
+            current_selection=selection.replace(
+                rng_key_after=jr.fold_in(selection.rng_key_after, 1)
+            )
+        ),
+    )
+
+    _assert_cache_mutations_reject_in_eager_jit_and_scan(agent, transition, mutations)
+
+
+def test_complete_grounded_decision_cache_mutations_fail_closed() -> None:
+    agent = IntegratedHiddenPartnerAgent(_grounded_integrated_config(grounded_planning=True))
+    start, transition, _ = _start_and_transition(agent, seed=8312)
+    state = start.state
+    evaluation = state.current_evaluation
+    grounded = evaluation.grounded_world
+    assert grounded is not None
+    one = jnp.asarray(1, dtype=jnp.int32)
+    mutations = (
+        state.replace(
+            current_evaluation=evaluation.replace(
+                grounded_world=grounded.replace(
+                    table_expected_rewards=grounded.table_expected_rewards.at[0].add(0.125)
+                )
+            )
+        ),
+        state.replace(
+            current_evaluation=evaluation.replace(
+                grounded_world=grounded.replace(
+                    grounded_raw_predictions=grounded.grounded_raw_predictions.at[0, 0].set(
+                        jnp.nan
+                    )
+                )
+            )
+        ),
+        state.replace(
+            current_evaluation=evaluation.replace(
+                grounded_world=grounded.replace(
+                    grounded_reward_cells=grounded.grounded_reward_cells.at[0, 0].add(0.125)
+                )
+            )
+        ),
+        state.replace(
+            current_evaluation=evaluation.replace(
+                grounded_world=grounded.replace(
+                    grounded_expected_rewards=(grounded.grounded_expected_rewards.at[0].add(0.125))
+                )
+            )
+        ),
+        state.replace(
+            current_evaluation=evaluation.replace(
+                grounded_world=grounded.replace(predictions_valid=~grounded.predictions_valid)
+            )
+        ),
+        state.replace(
+            current_evaluation=evaluation.replace(
+                grounded_world=grounded.replace(planner_applied=~grounded.planner_applied)
+            )
+        ),
+        state.replace(
+            current_evaluation=evaluation.replace(
+                grounded_world=grounded.replace(cell_evaluations=grounded.cell_evaluations + one)
+            )
+        ),
+    )
+
+    _assert_cache_mutations_reject_in_eager_jit_and_scan(agent, transition, mutations)

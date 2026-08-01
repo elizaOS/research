@@ -8,6 +8,7 @@ import os
 import stat
 import statistics
 import threading
+import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -48,6 +49,7 @@ from alberta_framework.benchmarks.upgd_ipmnist_v3 import (
     write_partial_for_result,
     write_plan,
 )
+from alberta_framework.evaluation.upgd_ipmnist_v3 import main as evaluation_main
 
 REAL_REPLAY_PARTIAL_MEASUREMENTS = v3._replay_partial_measurements
 REAL_LOAD_PINNED_MNIST = v3._load_pinned_mnist
@@ -76,8 +78,21 @@ def _read(path: Path) -> dict[str, Any]:
     return value
 
 
-def _write(path: Path, value: object) -> Path:
-    path.write_bytes(canonical_json_bytes(value))
+def _write(path: Path, value: object, *, bind_artifact_output: bool = True) -> Path:
+    persisted = copy.deepcopy(value)
+    if (
+        bind_artifact_output
+        and isinstance(persisted, dict)
+        and persisted.get("schema") == ARTIFACT_SCHEMA
+        and isinstance(persisted.get("partial_manifest"), list)
+        and isinstance(persisted.get("merge_execution"), dict)
+    ):
+        argv = persisted["merge_execution"].get("prescribed_merge_argv")
+        if isinstance(argv, list):
+            output_index = 5 + len(persisted["partial_manifest"])
+            if output_index < len(argv):
+                argv[output_index] = v3._lexical_absolute(path).as_posix()
+    path.write_bytes(canonical_json_bytes(persisted))
     path.chmod(0o444)
     return path
 
@@ -354,6 +369,7 @@ class TestImmutablePublication:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         real_link = os.link
+        substituted_name = ""
 
         def swap_then_link(
             source: str,
@@ -363,6 +379,8 @@ class TestImmutablePublication:
             dst_dir_fd: int,
             follow_symlinks: bool,
         ) -> None:
+            nonlocal substituted_name
+            substituted_name = source
             os.unlink(source, dir_fd=src_dir_fd)
             replacement_fd = os.open(
                 source,
@@ -389,7 +407,87 @@ class TestImmutablePublication:
             atomic_write_new(target, b"trusted bytes")
         assert target.read_bytes() == b"attacker bytes"
         assert stat.S_IMODE(target.stat().st_mode) == 0o444
-        assert list(tmp_path.iterdir()) == [target]
+        substituted = tmp_path / substituted_name
+        assert substituted.read_bytes() == b"attacker bytes"
+        assert set(tmp_path.iterdir()) == {target, substituted}
+
+    def test_atomic_writer_preserves_temporary_name_substitution_after_link(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real_link = os.link
+        substituted_name = ""
+
+        def link_then_substitute(
+            source: str,
+            destination: str,
+            *,
+            src_dir_fd: int,
+            dst_dir_fd: int,
+            follow_symlinks: bool,
+        ) -> None:
+            nonlocal substituted_name
+            real_link(
+                source,
+                destination,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+            substituted_name = source
+            os.unlink(source, dir_fd=src_dir_fd)
+            replacement_fd = os.open(
+                source,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=src_dir_fd,
+            )
+            try:
+                os.write(replacement_fd, b"attacker replacement")
+            finally:
+                os.close(replacement_fd)
+
+        monkeypatch.setattr(os, "link", link_then_substitute)
+        target = atomic_write_new(tmp_path / "published.json", b"trusted bytes")
+
+        assert target.read_bytes() == b"trusted bytes"
+        substituted = tmp_path / substituted_name
+        assert substituted.read_bytes() == b"attacker replacement"
+
+    def test_atomic_writer_preserves_temporary_name_substitution_on_link_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        substituted_name = ""
+
+        def substitute_then_fail(
+            source: str,
+            _destination: str,
+            *,
+            src_dir_fd: int,
+            **_kwargs: object,
+        ) -> None:
+            nonlocal substituted_name
+            substituted_name = source
+            os.unlink(source, dir_fd=src_dir_fd)
+            replacement_fd = os.open(
+                source,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=src_dir_fd,
+            )
+            try:
+                os.write(replacement_fd, b"attacker replacement")
+            finally:
+                os.close(replacement_fd)
+            raise OSError("simulated link failure after substitution")
+
+        monkeypatch.setattr(os, "link", substitute_then_fail)
+        target = tmp_path / "unpublished.json"
+        with pytest.raises(OSError, match="after substitution"):
+            atomic_write_new(target, b"trusted bytes")
+
+        assert not target.exists()
+        substituted = tmp_path / substituted_name
+        assert substituted.read_bytes() == b"attacker replacement"
 
     def test_atomic_writer_does_not_follow_destination_or_ancestor_symlinks(
         self, tmp_path: Path
@@ -409,6 +507,89 @@ class TestImmutablePublication:
         with pytest.raises(OSError):
             atomic_write_new(parent_link / "escaped.json", b"payload")
         assert not (real_parent / "escaped.json").exists()
+
+    def test_atomic_writer_detects_ancestor_replacement_and_cleans_owned_files(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        parent = tmp_path / "parent"
+        parent.mkdir()
+        moved = tmp_path / "moved"
+        original = v3._assert_parent_locator_stable
+        checks = 0
+
+        def replace_before_link(destination: Path, directory_fd: int) -> None:
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                parent.rename(moved)
+                parent.mkdir()
+            original(destination, directory_fd)
+
+        monkeypatch.setattr(v3, "_assert_parent_locator_stable", replace_before_link)
+        with pytest.raises(UPGDIPMNISTV3Error, match="ancestor directory changed"):
+            atomic_write_new(parent / "evidence.json", b"trusted")
+        assert not (parent / "evidence.json").exists()
+        assert not (moved / "evidence.json").exists()
+        assert not list(moved.glob(".*.tmp"))
+
+    def test_reader_detects_same_byte_locator_substitution(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        target = atomic_write_new(tmp_path / "target.json", b"payload")
+        moved = tmp_path / "moved.json"
+        real_stat = os.stat
+        substituted = False
+
+        def substitute_before_locator_stat(
+            path: object,
+            *args: object,
+            **kwargs: object,
+        ) -> os.stat_result:
+            nonlocal substituted
+            if (
+                not substituted
+                and path == target.name
+                and kwargs.get("dir_fd") is not None
+            ):
+                substituted = True
+                target.rename(moved)
+                target.write_bytes(b"payload")
+                target.chmod(0o444)
+            return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(os, "stat", substitute_before_locator_stat)
+        with pytest.raises(UPGDIPMNISTV3Error, match="locator was replaced"):
+            v3._read_regular_bytes(target, require_immutable=True)
+        assert target.read_bytes() == moved.read_bytes() == b"payload"
+
+    def test_atomic_writer_detects_same_byte_substitution_during_readback(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        target = tmp_path / "target.json"
+        moved = tmp_path / "moved.json"
+        real_reader = v3._read_regular_bytes
+        substituted = False
+
+        def substitute_after_read(path: Path, *, require_immutable: bool) -> bytes:
+            nonlocal substituted
+            raw = real_reader(path, require_immutable=require_immutable)
+            if v3._lexical_absolute(path) == target and not substituted:
+                substituted = True
+                target.rename(moved)
+                target.write_bytes(raw)
+                target.chmod(0o444)
+            return raw
+
+        monkeypatch.setattr(v3, "_read_regular_bytes", substitute_after_read)
+        with pytest.raises(UPGDIPMNISTV3Error, match="changed during byte verification"):
+            atomic_write_new(target, b"payload")
+        assert target.read_bytes() == moved.read_bytes() == b"payload"
 
     def test_strict_reader_rejects_symlink_hardlink_writable_and_nonregular_plan(
         self, bundle: dict[str, Any]
@@ -532,6 +713,13 @@ class TestIssuedPlan:
         assert payload["plan"]["runtime_manifest"]["jax_devices"]
         runtime = payload["plan"]["runtime_manifest"]
         assert set(runtime["distribution_content"]) == set(v3._RUNTIME_CONTENT_DISTRIBUTIONS)
+        assert {
+            "etils",
+            "msgpack",
+            "orbax-checkpoint",
+            "protobuf",
+            "tensorstore",
+        } <= set(runtime["distribution_content"])
         assert runtime["distribution_content_scope"] == {
             "kind": "explicit_python_execution_distribution_set",
             "distribution_names": list(v3._RUNTIME_CONTENT_DISTRIBUTIONS),
@@ -1021,7 +1209,12 @@ class TestSingleSeedPartials:
         )
         report = validate_partial(bundle["partials"][0], other_plan)
         assert not report.valid
-        assert any("plan byte" in error or "plan digest" in error for error in report.errors)
+        assert any(
+            "plan binding locator" in error
+            or "plan byte" in error
+            or "plan digest" in error
+            for error in report.errors
+        )
 
     def test_extra_nested_execution_key_is_rejected(self, bundle: dict[str, Any]) -> None:
         payload = copy.deepcopy(_read(bundle["partials"][0]))
@@ -1095,6 +1288,141 @@ class TestSingleSeedPartials:
         report = validate_partial(path, bundle["plan"])
         assert not report.valid
         assert any("plan byte_size mismatch" in error for error in report.errors)
+
+    def test_reservation_binding_requires_the_exact_plan_scoped_locator(
+        self,
+        bundle: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        learner = "adamw"
+        seed = SEEDS[-1]
+        monkeypatch.setattr(
+            v3,
+            "run_ipmnist",
+            lambda *_args, **_kwargs: _result(learner, seed),
+        )
+        published = v3.run_shard(
+            bundle["plan"],
+            learner,
+            seed,
+            bundle["root"] / "canonical-reservation-partial.json",
+            process_argv=("pytest", "canonical-reservation"),
+        )
+        payload = copy.deepcopy(_read(published))
+        binding = payload["execution"]["seed_reservation_binding"]
+        original = Path(binding["locator"])
+        relocated = bundle["root"] / "relocated-reservation.json"
+        relocated.write_bytes(original.read_bytes())
+        relocated.chmod(0o444)
+        binding["locator"] = relocated.as_posix()
+        path = _write(bundle["root"] / "relocated-reservation-binding.json", payload)
+
+        report = validate_partial(path, bundle["plan"])
+
+        assert not report.valid
+        assert any("exact plan-scoped path" in error for error in report.errors)
+
+    def test_reservation_binding_rejects_noncanonical_immutable_bytes_even_when_rebound(
+        self,
+        bundle: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        learner = "adamw"
+        seed = SEEDS[5]
+        monkeypatch.setattr(
+            v3,
+            "run_ipmnist",
+            lambda *_args, **_kwargs: _result(learner, seed),
+        )
+        published = v3.run_shard(
+            bundle["plan"],
+            learner,
+            seed,
+            bundle["root"] / "noncanonical-reservation-source.json",
+            process_argv=("pytest", "noncanonical-reservation"),
+        )
+        payload = copy.deepcopy(_read(published))
+        binding = payload["execution"]["seed_reservation_binding"]
+        reservation_path = Path(binding["locator"])
+        reservation = _read(reservation_path)
+        noncanonical = json.dumps(reservation, separators=(",", ":")).encode("utf-8")
+        assert noncanonical != canonical_json_bytes(reservation)
+        reservation_path.chmod(0o644)
+        reservation_path.write_bytes(noncanonical)
+        reservation_path.chmod(0o444)
+        binding["byte_size"] = len(noncanonical)
+        binding["sha256"] = v3.sha256_bytes(noncanonical)
+        rebound = _write(bundle["root"] / "noncanonical-reservation-rebound.json", payload)
+
+        report = validate_partial(rebound, bundle["plan"])
+
+        assert not report.valid
+        assert any("seed reservation is not canonical" in error for error in report.errors)
+
+    def test_future_lifecycle_timestamps_fail_closed(
+        self,
+        bundle: dict[str, Any],
+    ) -> None:
+        future = int(time.time()) + 60
+        future_plan = copy.deepcopy(_read(bundle["plan"]))
+        future_plan["issued_unix"] = future
+        future_plan_path = _write(bundle["root"] / "future-plan.json", future_plan)
+        assert not validate_plan(future_plan_path).valid
+
+        future_partial = copy.deepcopy(_read(bundle["partials"][0]))
+        future_partial["execution"]["started_unix"] = future
+        future_partial["execution"]["finished_unix"] = future
+        future_partial["execution"]["duration_seconds"] = 0.0
+        future_partial_path = _write(
+            bundle["root"] / "future-partial.json",
+            future_partial,
+        )
+        assert not validate_partial(future_partial_path, bundle["plan"]).valid
+
+        future_artifact = copy.deepcopy(_read(bundle["artifact"]))
+        future_artifact["created_unix"] = future
+        future_artifact_path = _write(
+            bundle["root"] / "future-artifact.json",
+            future_artifact,
+        )
+        assert not validate_artifact(
+            future_artifact_path,
+            partial_paths=bundle["partials"],
+            plan_path=bundle["plan"],
+        ).valid
+
+    def test_public_validators_wrap_unexpected_failures(
+        self,
+        bundle: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def fail(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("injected validation failure")
+
+        monkeypatch.setattr(v3, "_read_validated_plan", fail)
+        assert not validate_plan(bundle["plan"]).valid
+        monkeypatch.undo()
+
+        monkeypatch.setattr(v3, "_replay_partial_measurements", fail)
+        assert not validate_partial(bundle["partials"][0], bundle["plan"]).valid
+        monkeypatch.undo()
+
+        monkeypatch.setattr(v3, "_validate_artifact_payload", fail)
+        assert not validate_artifact(bundle["artifact"], plan_path=bundle["plan"]).valid
+
+    def test_public_artifact_validation_requires_an_external_plan(
+        self, bundle: dict[str, Any]
+    ) -> None:
+        report = validate_artifact(
+            bundle["artifact"],
+            partial_paths=bundle["partials"],
+        )
+        assert not report.valid
+        assert any("requires an immutable external plan" in error for error in report.errors)
+
+        with pytest.raises(SystemExit) as exc_info:
+            evaluation_main(["artifact", str(bundle["artifact"])])
+        assert exc_info.value.code == 2
 
     def test_duplicate_json_keys_and_nested_nonfinite_values_are_rejected(
         self, bundle: dict[str, Any]
@@ -1187,13 +1515,19 @@ class TestExactMergeAndArtifact:
             data_home=relocated_home,
             data_archive=relocated_archive,
         ).valid
-        assert validate_artifact(
+        mismatched_cache_report = validate_artifact(
             bundle["artifact"],
             partial_paths=bundle["partials"],
             plan_path=bundle["plan"],
             data_home=relocated_home,
             data_archive=relocated_archive,
-        ).valid
+        )
+        assert not mismatched_cache_report.valid
+        assert any(
+            "computational replay receipt" in error
+            or "exact effective data cache" in error
+            for error in mismatched_cache_report.errors
+        )
 
     def test_artifact_recomputes_from_relocated_shards(self, bundle: dict[str, Any]) -> None:
         relocated_dir = bundle["root"] / "relocated-shards"
@@ -1581,8 +1915,7 @@ class TestExactMergeAndArtifact:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         artifact_copy = bundle["root"] / "artifact-final-binding-reread.json"
-        artifact_copy.write_bytes(bundle["artifact"].read_bytes())
-        artifact_copy.chmod(0o444)
+        _write(artifact_copy, _read(bundle["artifact"]))
         expected_source = cast(
             dict[str, Any],
             copy.deepcopy(_read(bundle["plan"])["plan"]["source_import_closure"]),
@@ -1617,14 +1950,48 @@ class TestExactMergeAndArtifact:
         assert any("current source" in error for error in report.errors)
         assert artifact_reads == 2
 
+    def test_artifact_rereads_external_plan_after_its_final_artifact_read(
+        self,
+        bundle: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        plan_path = bundle["plan"]
+        backup = bundle["root"] / "terminal-plan-reread.original"
+        artifact_reads = 0
+        real_read = v3._read_strict_json
+
+        def tracked_read(path: Path) -> tuple[bytes, dict[str, Any]]:
+            nonlocal artifact_reads
+            result = real_read(path)
+            if v3._lexical_absolute(path) == v3._lexical_absolute(bundle["artifact"]):
+                artifact_reads += 1
+                if artifact_reads == 2:
+                    plan_path.rename(backup)
+                    _write(plan_path, {"schema": "changed-after-final-artifact-read"})
+            return result
+
+        monkeypatch.setattr(v3, "_read_strict_json", tracked_read)
+        try:
+            report = validate_artifact(
+                bundle["artifact"],
+                partial_paths=bundle["partials"],
+                plan_path=plan_path,
+            )
+        finally:
+            if plan_path.exists():
+                plan_path.unlink()
+            backup.rename(plan_path)
+
+        assert not report.valid
+        assert artifact_reads == 2
+
     def test_artifact_validator_rereads_artifact_and_external_shards_after_replay(
         self,
         bundle: dict[str, Any],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         artifact_copy = bundle["root"] / "artifact-race-copy.json"
-        artifact_copy.write_bytes(bundle["artifact"].read_bytes())
-        artifact_copy.chmod(0o444)
+        _write(artifact_copy, _read(bundle["artifact"]))
         shard_dir = bundle["root"] / "artifact-race-shards"
         shard_dir.mkdir()
         shards: list[Path] = []
@@ -1651,8 +2018,7 @@ class TestExactMergeAndArtifact:
         assert any("changed during artifact validation" in error for error in shard_report.errors)
 
         artifact_copy_2 = bundle["root"] / "artifact-race-copy-2.json"
-        artifact_copy_2.write_bytes(bundle["artifact"].read_bytes())
-        artifact_copy_2.chmod(0o444)
+        _write(artifact_copy_2, _read(bundle["artifact"]))
 
         def mutate_artifact(*_args: object) -> None:
             replacement = copy.deepcopy(_read(artifact_copy_2))
@@ -1752,7 +2118,84 @@ class TestExactMergeAndArtifact:
             plan_path=bundle["plan"],
         )
         assert not merge_report.valid
-        assert any("must be absolute" in error for error in merge_report.errors)
+        assert any("prescribed merge argv" in error for error in merge_report.errors)
+
+    def test_artifact_rejects_canonical_but_unbound_merge_provenance(
+        self, bundle: dict[str, Any]
+    ) -> None:
+        wrong_plan = copy.deepcopy(_read(bundle["artifact"]))
+        wrong_plan["merge_execution"]["prescribed_merge_argv"][2] = (
+            bundle["root"] / "unbound-plan.json"
+        ).as_posix()
+        wrong_plan_path = _write(bundle["root"] / "wrong-merge-plan.json", wrong_plan)
+        wrong_plan_report = validate_artifact(
+            wrong_plan_path,
+            partial_paths=bundle["partials"],
+            plan_path=bundle["plan"],
+        )
+        assert not wrong_plan_report.valid
+        assert any("prescribed merge argv" in error for error in wrong_plan_report.errors)
+
+        wrong_output = copy.deepcopy(_read(bundle["artifact"]))
+        output_index = 5 + len(wrong_output["partial_manifest"])
+        wrong_output["merge_execution"]["prescribed_merge_argv"][output_index] = (
+            bundle["root"] / "unbound-artifact.json"
+        ).as_posix()
+        wrong_output_path = _write(
+            bundle["root"] / "wrong-merge-output.json",
+            wrong_output,
+            bind_artifact_output=False,
+        )
+        wrong_output_report = validate_artifact(
+            wrong_output_path,
+            partial_paths=bundle["partials"],
+            plan_path=bundle["plan"],
+        )
+        assert not wrong_output_report.valid
+        assert any("prescribed merge argv" in error for error in wrong_output_report.errors)
+
+        wrong_data = copy.deepcopy(_read(bundle["artifact"]))
+        claimed_home = bundle["root"] / "unbound-cache"
+        claimed_archive = claimed_home / v3.MNIST_ARCHIVE_RELATIVE_PATH
+        claimed_locators = {
+            "data_home": claimed_home.as_posix(),
+            "archive": claimed_archive.as_posix(),
+        }
+        wrong_data["computational_replay"]["data_locators_used"] = claimed_locators
+        wrong_data["merge_execution"]["data_locators_used"] = claimed_locators
+        wrong_data["merge_execution"]["prescribed_merge_argv"][-3] = claimed_home.as_posix()
+        wrong_data["merge_execution"]["prescribed_merge_argv"][-1] = (
+            claimed_archive.as_posix()
+        )
+        wrong_data_path = _write(bundle["root"] / "wrong-merge-data.json", wrong_data)
+        wrong_data_report = validate_artifact(
+            wrong_data_path,
+            partial_paths=bundle["partials"],
+            plan_path=bundle["plan"],
+        )
+        assert not wrong_data_report.valid
+        assert any(
+            "computational replay receipt" in error
+            or "exact effective data cache" in error
+            for error in wrong_data_report.errors
+        )
+
+    def test_artifact_rejects_a_relocated_external_plan(self, bundle: dict[str, Any]) -> None:
+        relocated_plan = bundle["root"] / "relocated-plan.json"
+        relocated_plan.write_bytes(bundle["plan"].read_bytes())
+        relocated_plan.chmod(0o444)
+
+        report = validate_artifact(
+            bundle["artifact"],
+            partial_paths=bundle["partials"],
+            plan_path=relocated_plan,
+        )
+
+        assert not report.valid
+        assert any(
+            "plan binding locator" in error or "run plan locator" in error
+            for error in report.errors
+        )
 
     def test_artifact_nested_extra_and_legacy_schemas_are_rejected(
         self, bundle: dict[str, Any]

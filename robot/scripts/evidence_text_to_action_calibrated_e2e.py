@@ -23,6 +23,8 @@ Outputs in `--out`:
   - divergence_plot.png             RMS divergence (calibrated vs uncalibrated)
 
 If no calibration file is given, behaves identically to the raw e2e.
+Physical execution is quarantined until this program is an authenticated
+unified-bridge client; it currently fails before contacting hardware.
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ from eliza_robot.bridge.backends.ainex_remote import AinexRemoteBackend
 from eliza_robot.bridge.backends.calibrated import CalibratedBackend
 from eliza_robot.bridge.backends.dual_target import DualTargetBackend
 from eliza_robot.bridge.backends.mujoco_backend import MuJocoBackend
+from eliza_robot.bridge.physical_execution import reject_unsupervised_physical_motion
 from eliza_robot.rl.text_conditioned.inference_loop import (
     InferenceLoopConfig,
     run_inference,
@@ -74,6 +77,9 @@ def _validate_checkpoint_profile(checkpoint: Path) -> dict:
 
 async def _build_backend(args):
     """Real + (optionally calibrated) sim, wrapped in DualTargetBackend."""
+    reject_unsupervised_physical_motion(
+        "scripts/evidence_text_to_action_calibrated_e2e.py _build_backend"
+    )
     real = AinexRemoteBackend(host=args.host, port=args.port)
     sim_env = DemoEnv(target_position=(2.0, 0.0, 0.05))
     sim = MuJocoBackend(sim_env, profile_id=SUPPORTED_PROFILE_ID)
@@ -136,6 +142,9 @@ async def _read_sim_joints(sim_env) -> dict[str, float]:
 
 
 async def _run(args) -> int:
+    reject_unsupervised_physical_motion(
+        "scripts/evidence_text_to_action_calibrated_e2e.py"
+    )
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     manifest = _validate_checkpoint_profile(Path(args.checkpoint))

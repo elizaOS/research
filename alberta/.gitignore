@@ -14,4 +14,6 @@ outputs/forager/*failed_source_drift*/
 outputs/forager/relearning_logs/
 outputs/forager/**/*.running
 outputs/upgd_ipmnist/reconstructed_openml_cache/
+outputs/upgd_label_emnist/openml_cache/
+outputs/forager/*/sources/
 outputs/**/logs/

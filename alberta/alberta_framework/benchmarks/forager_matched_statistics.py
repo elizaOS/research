@@ -2,7 +2,7 @@
 
 This module deliberately knows nothing about Forager rewards, agents, or execution.  It
 accepts already-computed scalar scores whose metric is declared to be maximized.  Every
-learning arm must carry the same ordered seeds and evidence binding, while privileged
+learning arm must carry the same ordered seeds and evidence binding, while fixed descriptive
 diagnostics are represented separately and can never enter a superiority calculation.
 
 The contract and all result objects are immutable.  Bootstrap and sign-flip randomness is
@@ -26,15 +26,21 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Literal, NoReturn, cast
+from typing import Final, Literal, NoReturn, cast
 
 import numpy as np
 
-CONTRACT_SCHEMA = "alberta.forager_matched_statistics.contract.v2"
-RESULT_SCHEMA = "alberta.forager_matched_statistics.result.v2"
+CONTRACT_SCHEMA = "alberta.forager_matched_statistics.contract.v3"
+RESULT_SCHEMA = "alberta.forager_matched_statistics.result.v3"
 SCORE_VECTOR_SCHEMA = "alberta.forager_matched_statistics.score_vector.v1"
 DIFFERENCE_VECTOR_SCHEMA = "alberta.forager_matched_statistics.difference_vector.v1"
-COMPARISON_INPUT_SCHEMA = "alberta.forager_matched_statistics.comparison_input.v1"
+COMPARISON_INPUT_SCHEMA = "alberta.forager_matched_statistics.comparison_input.v2"
+PRIMARY_BOOTSTRAP_IMPLEMENTATION_SCHEMA = (
+    "alberta.forager_matched_statistics.primary_bootstrap_implementation.v1"
+)
+SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SCHEMA = (
+    "alberta.forager_matched_statistics.secondary_sign_flip_holm_implementation.v1"
+)
 CANONICALIZATION = "utf8-json-sort-keys-compact-no-nan-floats-as-hex"
 DIGEST_ALGORITHM = "sha256"
 RNG_ALGORITHM = "PCG64"
@@ -46,6 +52,9 @@ _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _UINT64_MAX = (1 << 64) - 1
 _BOOTSTRAP_CHUNK_ELEMENTS = 2_000_000
 _SIGN_FLIP_CHUNK_ELEMENTS = 1_000_000
+_MAX_CANONICAL_RESULT_BYTES = 1_048_576
+_MAX_CANONICAL_RESULT_NODES = 50_000
+_MAX_CANONICAL_RESULT_DEPTH = 64
 
 
 class MatchedStatisticsError(ValueError):
@@ -109,8 +118,7 @@ def _require_seed_tuple(value: object, name: str) -> tuple[int, ...]:
     if not seeds:
         raise MatchedStatisticsError(f"{name} must not be empty")
     checked = tuple(
-        _require_exact_int(seed, f"{name}[{index}]")
-        for index, seed in enumerate(seeds)
+        _require_exact_int(seed, f"{name}[{index}]") for index, seed in enumerate(seeds)
     )
     if len(set(checked)) != len(checked):
         raise MatchedStatisticsError(f"{name} must contain unique seeds")
@@ -134,14 +142,25 @@ def _require_exact_tuple(value: object, name: str) -> tuple[object, ...]:
     return cast(tuple[object, ...], value)
 
 
+def _require_exclusion_reasons(value: object, name: str) -> tuple[str, ...]:
+    raw = _require_exact_tuple(value, name)
+    if not raw:
+        raise MatchedStatisticsError(f"{name} must not be empty")
+    reasons = tuple(
+        _require_identifier(reason, f"{name}[{index}]") for index, reason in enumerate(raw)
+    )
+    if len(set(reasons)) != len(reasons):
+        raise MatchedStatisticsError(f"{name} must contain unique reasons")
+    return reasons
+
+
 def _exact_dyadic_components(values: tuple[float, ...]) -> tuple[tuple[int, ...], int]:
     """Return exact integer numerators under one positive power-of-two denominator."""
 
     ratios = tuple(value.as_integer_ratio() for value in values)
     common_denominator = max(denominator for _, denominator in ratios)
     scaled = tuple(
-        numerator * (common_denominator // denominator)
-        for numerator, denominator in ratios
+        numerator * (common_denominator // denominator) for numerator, denominator in ratios
     )
     common_factor = common_denominator
     for value in scaled:
@@ -175,7 +194,7 @@ def _canonical_json_bytes(payload: Mapping[str, object]) -> bytes:
             ensure_ascii=True,
             allow_nan=False,
         )
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
         raise MatchedStatisticsError("payload is not canonical-JSON encodable") from exc
     return text.encode("utf-8")
 
@@ -184,6 +203,109 @@ def canonical_payload_sha256(payload: Mapping[str, object]) -> str:
     """Return the SHA-256 of a mapping under this module's canonical JSON encoding."""
 
     return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+
+
+def primary_bootstrap_implementation_descriptor() -> dict[str, object]:
+    """Return the semantic identity of the frozen primary analysis implementation."""
+
+    return {
+        "schema": PRIMARY_BOOTSTRAP_IMPLEMENTATION_SCHEMA,
+        "method": "paired_percentile_bootstrap_lower_bound",
+        "difference_order": "intervention_minus_comparator",
+        "input_float_contract": "finite_builtin_binary64",
+        "paired_difference_arithmetic": ("binary64_subtraction_then_finite_check"),
+        "downstream_arithmetic": "exact_dyadic_fraction_then_binary64",
+        "statistic": "mean_paired_difference",
+        "resampling_unit": "matched_seed_pair_with_replacement",
+        "resample_size": "n_pairs",
+        "rng": {
+            "api": "numpy.random.Generator",
+            "bit_generator": RNG_ALGORITHM,
+            "draw": "integers(0,n_pairs,size=(rows,n_pairs),dtype=int64)",
+            "stream_order": "sequential_chunk_calls_row_major_within_chunk",
+            "maximum_index_elements_per_chunk": _BOOTSTRAP_CHUNK_ELEMENTS,
+        },
+        "resample_statistic": "exact_dyadic_mean_then_binary64",
+        "interval": {
+            "kind": "one_sided_percentile_lower_bound",
+            "quantile": "1-confidence",
+            "quantile_arithmetic": "binary64_one_minus_confidence",
+            "quantile_method": QUANTILE_METHOD,
+        },
+        "decision_gate": "lower_bound_strictly_greater_than_margin",
+        "distribution_digest": "sha256_little_endian_float64_row_order",
+    }
+
+
+def secondary_sign_flip_holm_implementation_descriptor() -> dict[str, object]:
+    """Return the semantic identity of the frozen secondary family analysis."""
+
+    return {
+        "schema": SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SCHEMA,
+        "method": "paired_sign_flip_with_holm_familywise_adjustment",
+        "difference_order": "intervention_minus_comparator",
+        "input_float_contract": "finite_builtin_binary64",
+        "paired_difference_arithmetic": ("binary64_subtraction_then_finite_check"),
+        "downstream_arithmetic": "common_exact_dyadic_integer_scale",
+        "statistic": "mean_paired_difference",
+        "alternative": "greater",
+        "ties": "inclusive",
+        "exact": {
+            "maximum_pairs": EXACT_SIGN_FLIP_MAX_PAIRS,
+            "assignments": "all_2_power_n_binary_reflected_gray_code",
+            "event": "flipped_mean_greater_than_or_equal_to_observed_mean",
+            "p_value": "exact_extreme_count_over_assignment_count",
+        },
+        "monte_carlo": {
+            "minimum_pairs": EXACT_SIGN_FLIP_MAX_PAIRS + 1,
+            "rng_api": "numpy.random.Generator",
+            "bit_generator": RNG_ALGORITHM,
+            "draw": "integers(0,2,size=(rows,n_pairs),dtype=uint8)",
+            "stream_order": "sequential_chunk_calls_row_major_within_chunk",
+            "maximum_mask_elements_per_chunk": _SIGN_FLIP_CHUNK_ELEMENTS,
+            "p_value": "plus_one_extreme_count_over_draws_plus_one",
+        },
+        "multiplicity": {
+            "method": "holm",
+            "family": "secondary_hypotheses_only",
+            "raw_p_values": "exact_rationals",
+            "ordering": "raw_p_value_then_original_index",
+            "adjustment": "step_down_running_max_capped_at_one",
+            "alpha_conversion": "Fraction.from_float(binary64_alpha)",
+            "decision": "adjusted_p_value_less_than_or_equal_to_familywise_alpha",
+            "output_order": "original_hypothesis_order",
+        },
+    }
+
+
+PRIMARY_BOOTSTRAP_IMPLEMENTATION_SHA256: Final = canonical_payload_sha256(
+    primary_bootstrap_implementation_descriptor()
+)
+SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SHA256: Final = canonical_payload_sha256(
+    secondary_sign_flip_holm_implementation_descriptor()
+)
+
+
+def _validated_analysis_implementation_payload() -> dict[str, object]:
+    primary_descriptor = primary_bootstrap_implementation_descriptor()
+    secondary_descriptor = secondary_sign_flip_holm_implementation_descriptor()
+    if canonical_payload_sha256(primary_descriptor) != PRIMARY_BOOTSTRAP_IMPLEMENTATION_SHA256:
+        raise MatchedStatisticsError("primary analysis implementation descriptor drifted")
+    if (
+        canonical_payload_sha256(secondary_descriptor)
+        != SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SHA256
+    ):
+        raise MatchedStatisticsError("secondary analysis implementation descriptor drifted")
+    return {
+        "primary": {
+            "descriptor": primary_descriptor,
+            "implementation_sha256": PRIMARY_BOOTSTRAP_IMPLEMENTATION_SHA256,
+        },
+        "secondary": {
+            "descriptor": secondary_descriptor,
+            "implementation_sha256": (SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SHA256),
+        },
+    }
 
 
 def _score_vector_sha256(
@@ -222,8 +344,9 @@ def _difference_vector_sha256(
 class EvidenceBinding:
     """Digest-bound evidence identity shared by every inferential learning arm.
 
-    The source and executor digests name externally validated evidence manifests; this pure
-    module does not convert their presence into a trust assertion.
+    The digests retain the sealed selection chain, complete score/execution closure, and
+    externally authenticated binding receipt.  This pure module does not convert their
+    presence into a trust assertion.
     """
 
     horizon: int
@@ -233,7 +356,14 @@ class EvidenceBinding:
     runtime_profile_sha256: str
     source_evidence_sha256: str
     executor_evidence_sha256: str
+    score_evidence_sha256: str
+    execution_closure_sha256: str
+    authenticated_bindings_sha256: str
+    external_verification_subject_sha256: str
+    external_verification_receipt_sha256: str
     sealed_protocol_sha256: str
+    selection_result_sha256: str
+    selection_report_sha256: str
 
     def __post_init__(self) -> None:
         _require_exact_int(self.horizon, "horizon", minimum=1)
@@ -243,17 +373,37 @@ class EvidenceBinding:
         _require_sha256(self.runtime_profile_sha256, "runtime_profile_sha256")
         _require_sha256(self.source_evidence_sha256, "source_evidence_sha256")
         _require_sha256(self.executor_evidence_sha256, "executor_evidence_sha256")
+        _require_sha256(self.score_evidence_sha256, "score_evidence_sha256")
+        _require_sha256(self.execution_closure_sha256, "execution_closure_sha256")
+        _require_sha256(self.authenticated_bindings_sha256, "authenticated_bindings_sha256")
+        _require_sha256(
+            self.external_verification_subject_sha256,
+            "external_verification_subject_sha256",
+        )
+        _require_sha256(
+            self.external_verification_receipt_sha256,
+            "external_verification_receipt_sha256",
+        )
         _require_sha256(self.sealed_protocol_sha256, "sealed_protocol_sha256")
+        _require_sha256(self.selection_result_sha256, "selection_result_sha256")
+        _require_sha256(self.selection_report_sha256, "selection_report_sha256")
 
     def to_payload(self) -> dict[str, object]:
         return {
             "environment_sha256": self.environment_sha256,
+            "authenticated_bindings_sha256": self.authenticated_bindings_sha256,
             "executor_evidence_sha256": self.executor_evidence_sha256,
+            "execution_closure_sha256": self.execution_closure_sha256,
+            "external_verification_subject_sha256": (self.external_verification_subject_sha256),
+            "external_verification_receipt_sha256": (self.external_verification_receipt_sha256),
             "horizon": self.horizon,
             "metric_sha256": self.metric_sha256,
             "rng_schedule_sha256": self.rng_schedule_sha256,
             "runtime_profile_sha256": self.runtime_profile_sha256,
+            "score_evidence_sha256": self.score_evidence_sha256,
             "sealed_protocol_sha256": self.sealed_protocol_sha256,
+            "selection_report_sha256": self.selection_report_sha256,
+            "selection_result_sha256": self.selection_result_sha256,
             "source_evidence_sha256": self.source_evidence_sha256,
         }
 
@@ -298,26 +448,30 @@ class LearningMethodScores:
 
 
 @dataclass(frozen=True, slots=True)
-class PrivilegedDiagnosticScores:
-    """Scores that are recorded only to prove exclusion from superiority tests."""
+class DescriptiveDiagnosticScores:
+    """One fixed descriptive candidate, with its exact protocol exclusion reasons."""
 
-    diagnostic_id: str
+    candidate_id: str
     seeds: tuple[int, ...]
     scores: tuple[float, ...]
+    exclusion_reasons: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        _require_identifier(self.diagnostic_id, "diagnostic_id")
-        seeds = _require_seed_tuple(self.seeds, "diagnostic seeds")
-        scores = _require_score_tuple(self.scores, "diagnostic scores")
+        _require_identifier(self.candidate_id, "candidate_id")
+        seeds = _require_seed_tuple(self.seeds, "descriptive seeds")
+        scores = _require_score_tuple(self.scores, "descriptive scores")
         if len(seeds) != len(scores):
-            raise MatchedStatisticsError("diagnostic seeds and scores must have the same length")
+            raise MatchedStatisticsError("descriptive seeds and scores must have the same length")
+        _require_exclusion_reasons(self.exclusion_reasons, "exclusion_reasons")
 
     def to_payload(self) -> dict[str, object]:
         return {
-            "diagnostic_id": self.diagnostic_id,
+            "analysis_role": "descriptive_only",
+            "candidate_id": self.candidate_id,
+            "exclusion_reasons": list(self.exclusion_reasons),
             "score_count": len(self.scores),
             "scores_sha256": _score_vector_sha256(
-                record_id=self.diagnostic_id,
+                record_id=self.candidate_id,
                 seeds=self.seeds,
                 scores=self.scores,
             ),
@@ -413,10 +567,12 @@ class MatchedComparisonContract:
     methods: tuple[LearningMethodScores, ...]
     primary_comparison: ComparisonSpec
     secondary_comparisons: tuple[ComparisonSpec, ...]
-    privileged_diagnostics: tuple[PrivilegedDiagnosticScores, ...]
+    fixed_descriptive_diagnostics: tuple[DescriptiveDiagnosticScores, ...]
     bootstrap: BootstrapSpec
     permutation: PermutationSpec
     primary_margin: float
+    primary_analysis_implementation_sha256: str
+    secondary_analysis_implementation_sha256: str
     metric_direction: Literal["maximize"] = "maximize"
 
     def __post_init__(self) -> None:
@@ -427,7 +583,8 @@ class MatchedComparisonContract:
             self.secondary_comparisons, "secondary_comparisons"
         )
         diagnostic_objects = _require_exact_tuple(
-            self.privileged_diagnostics, "privileged_diagnostics"
+            self.fixed_descriptive_diagnostics,
+            "fixed_descriptive_diagnostics",
         )
         for index, method in enumerate(method_objects):
             if type(method) is not LearningMethodScores:
@@ -441,14 +598,27 @@ class MatchedComparisonContract:
         secondary = cast(tuple[ComparisonSpec, ...], secondary_objects)
 
         for index, diagnostic in enumerate(diagnostic_objects):
-            if type(diagnostic) is not PrivilegedDiagnosticScores:
-                raise MatchedStatisticsError(f"privileged diagnostic {index} has the wrong type")
-        diagnostics = cast(tuple[PrivilegedDiagnosticScores, ...], diagnostic_objects)
+            if type(diagnostic) is not DescriptiveDiagnosticScores:
+                raise MatchedStatisticsError(f"descriptive diagnostic {index} has the wrong type")
+        diagnostics = cast(tuple[DescriptiveDiagnosticScores, ...], diagnostic_objects)
 
         if type(self.bootstrap) is not BootstrapSpec:
             raise MatchedStatisticsError("bootstrap must be a BootstrapSpec")
         if type(self.permutation) is not PermutationSpec:
             raise MatchedStatisticsError("permutation must be a PermutationSpec")
+        _validated_analysis_implementation_payload()
+        primary_implementation = _require_sha256(
+            self.primary_analysis_implementation_sha256,
+            "primary_analysis_implementation_sha256",
+        )
+        secondary_implementation = _require_sha256(
+            self.secondary_analysis_implementation_sha256,
+            "secondary_analysis_implementation_sha256",
+        )
+        if primary_implementation != PRIMARY_BOOTSTRAP_IMPLEMENTATION_SHA256:
+            raise MatchedStatisticsError("unknown primary analysis implementation")
+        if secondary_implementation != SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SHA256:
+            raise MatchedStatisticsError("unknown secondary analysis implementation")
         margin = _require_finite_float(self.primary_margin, "primary_margin")
         if margin < 0.0:
             raise MatchedStatisticsError("primary_margin must be nonnegative")
@@ -471,12 +641,20 @@ class MatchedComparisonContract:
                 raise MatchedStatisticsError(
                     f"learning method {method.method_id!r} has a different evidence binding"
                 )
+        for diagnostic in diagnostics:
+            if diagnostic.seeds != expected_seeds:
+                raise MatchedStatisticsError(
+                    f"descriptive candidate {diagnostic.candidate_id!r} does not have the "
+                    "exact common seed ordering"
+                )
 
         method_ids = tuple(method.method_id for method in methods)
-        diagnostic_ids = tuple(diagnostic.diagnostic_id for diagnostic in diagnostics)
+        diagnostic_ids = tuple(diagnostic.candidate_id for diagnostic in diagnostics)
         all_ids = (*method_ids, *diagnostic_ids)
         if len(set(all_ids)) != len(all_ids):
-            raise MatchedStatisticsError("learning and diagnostic identifiers must be unique")
+            raise MatchedStatisticsError(
+                "learning and descriptive candidate identifiers must be unique"
+            )
         method_id_set = set(method_ids)
         comparisons = (self.primary_comparison, *secondary)
         hypothesis_ids = tuple(comparison.hypothesis_id for comparison in comparisons)
@@ -514,17 +692,18 @@ class MatchedComparisonContract:
 
     def to_payload(self) -> dict[str, object]:
         return {
+            "analysis_implementations": _validated_analysis_implementation_payload(),
             "bootstrap": self.bootstrap.to_payload(),
             "canonicalization": CANONICALIZATION,
             "digest_algorithm": DIGEST_ALGORITHM,
+            "fixed_descriptive_diagnostics": [
+                diagnostic.to_payload() for diagnostic in self.fixed_descriptive_diagnostics
+            ],
             "methods": [method.to_payload() for method in self.methods],
             "metric_direction": self.metric_direction,
             "permutation": self.permutation.to_payload(),
             "primary_comparison": self.primary_comparison.to_payload(),
             "primary_margin_hex": _float_hex(self.primary_margin),
-            "privileged_diagnostics": [
-                diagnostic.to_payload() for diagnostic in self.privileged_diagnostics
-            ],
             "schema": CONTRACT_SCHEMA,
             "secondary_comparisons": [
                 comparison.to_payload() for comparison in self.secondary_comparisons
@@ -773,25 +952,21 @@ class SecondaryComparisonResult:
 
 
 @dataclass(frozen=True, slots=True)
-class PrivilegedDiagnosticExclusion:
-    diagnostic_id: str
+class DescriptiveDiagnosticExclusion:
+    candidate_id: str
     input_sha256: str
-    exclusion_reason: str = "privileged_diagnostic_not_eligible_for_superiority"
+    exclusion_reasons: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        _require_identifier(self.diagnostic_id, "diagnostic_id")
+        _require_identifier(self.candidate_id, "candidate_id")
         _require_sha256(self.input_sha256, "input_sha256")
-        if (
-            type(self.exclusion_reason) is not str
-            or self.exclusion_reason
-            != "privileged_diagnostic_not_eligible_for_superiority"
-        ):
-            raise MatchedStatisticsError("invalid privileged diagnostic exclusion reason")
+        _require_exclusion_reasons(self.exclusion_reasons, "exclusion_reasons")
 
     def to_payload(self) -> dict[str, object]:
         return {
-            "diagnostic_id": self.diagnostic_id,
-            "exclusion_reason": self.exclusion_reason,
+            "analysis_role": "descriptive_only",
+            "candidate_id": self.candidate_id,
+            "exclusion_reasons": list(self.exclusion_reasons),
             "input_sha256": self.input_sha256,
         }
 
@@ -801,7 +976,7 @@ class MatchedComparisonResult:
     contract: MatchedComparisonContract
     primary: PrimaryComparisonResult
     secondary: tuple[SecondaryComparisonResult, ...]
-    diagnostic_exclusions: tuple[PrivilegedDiagnosticExclusion, ...]
+    fixed_descriptive_exclusions: tuple[DescriptiveDiagnosticExclusion, ...]
 
     def __post_init__(self) -> None:
         if type(self.contract) is not MatchedComparisonContract:
@@ -810,24 +985,23 @@ class MatchedComparisonResult:
             raise MatchedStatisticsError("primary result has the wrong type")
         secondary_objects = _require_exact_tuple(self.secondary, "secondary results")
         exclusion_objects = _require_exact_tuple(
-            self.diagnostic_exclusions, "diagnostic exclusions"
+            self.fixed_descriptive_exclusions,
+            "fixed descriptive exclusions",
         )
         for item in secondary_objects:
             if type(item) is not SecondaryComparisonResult:
                 raise MatchedStatisticsError("secondary result has the wrong type")
         for item in exclusion_objects:
-            if type(item) is not PrivilegedDiagnosticExclusion:
-                raise MatchedStatisticsError("diagnostic exclusion has the wrong type")
+            if type(item) is not DescriptiveDiagnosticExclusion:
+                raise MatchedStatisticsError("fixed descriptive exclusion has the wrong type")
         secondary = cast(tuple[SecondaryComparisonResult, ...], secondary_objects)
-        exclusions = cast(tuple[PrivilegedDiagnosticExclusion, ...], exclusion_objects)
+        exclusions = cast(tuple[DescriptiveDiagnosticExclusion, ...], exclusion_objects)
         if self.primary.comparison != self.contract.primary_comparison:
             raise MatchedStatisticsError("primary comparison does not match the contract")
         primary_intervention = self.contract.method(
             self.contract.primary_comparison.intervention_id
         )
-        primary_comparator = self.contract.method(
-            self.contract.primary_comparison.comparator_id
-        )
+        primary_comparator = self.contract.method(self.contract.primary_comparison.comparator_id)
         expected_primary_differences = paired_differences(
             primary_intervention.scores,
             primary_comparator.scores,
@@ -859,9 +1033,9 @@ class MatchedComparisonResult:
             expected_primary_differences,
             self.contract.bootstrap,
         )
-        if _canonical_json_bytes(
-            self.primary.bootstrap.to_payload()
-        ) != _canonical_json_bytes(expected_bootstrap.to_payload()):
+        if _canonical_json_bytes(self.primary.bootstrap.to_payload()) != _canonical_json_bytes(
+            expected_bootstrap.to_payload()
+        ):
             raise MatchedStatisticsError("bootstrap result does not replay from the contract")
         if tuple(item.comparison for item in secondary) != self.contract.secondary_comparisons:
             raise MatchedStatisticsError("secondary result ordering does not match the contract")
@@ -906,32 +1080,35 @@ class MatchedComparisonResult:
                 expected_differences,
                 self.contract.permutation,
             )
-            if _canonical_json_bytes(
-                item.sign_flip.to_payload()
-            ) != _canonical_json_bytes(expected_sign_flip.to_payload()):
+            if _canonical_json_bytes(item.sign_flip.to_payload()) != _canonical_json_bytes(
+                expected_sign_flip.to_payload()
+            ):
                 raise MatchedStatisticsError("sign-flip result does not replay from the contract")
         expected_holm = holm_adjust(
             tuple(item.comparison.hypothesis_id for item in secondary),
-            tuple(
-                (item.sign_flip.p_numerator, item.sign_flip.p_denominator)
-                for item in secondary
-            ),
+            tuple((item.sign_flip.p_numerator, item.sign_flip.p_denominator) for item in secondary),
             self.contract.permutation.familywise_alpha,
         )
         if tuple(item.holm for item in secondary) != expected_holm:
             raise MatchedStatisticsError("Holm decisions do not match the contract")
-        if tuple(item.diagnostic_id for item in exclusions) != tuple(
-            diagnostic.diagnostic_id for diagnostic in self.contract.privileged_diagnostics
+        if tuple(item.candidate_id for item in exclusions) != tuple(
+            diagnostic.candidate_id for diagnostic in self.contract.fixed_descriptive_diagnostics
         ):
-            raise MatchedStatisticsError("diagnostic exclusions do not match the contract")
+            raise MatchedStatisticsError(
+                "fixed descriptive exclusions do not match the contract order"
+            )
         for exclusion, diagnostic in zip(
             exclusions,
-            self.contract.privileged_diagnostics,
+            self.contract.fixed_descriptive_diagnostics,
             strict=True,
         ):
+            if exclusion.exclusion_reasons != diagnostic.exclusion_reasons:
+                raise MatchedStatisticsError(
+                    "descriptive exclusion reasons do not match the contract"
+                )
             if exclusion.input_sha256 != canonical_payload_sha256(diagnostic.to_payload()):
                 raise MatchedStatisticsError(
-                    "diagnostic exclusion digest does not match the contract"
+                    "descriptive exclusion digest does not match the contract"
                 )
 
     def to_body(self) -> dict[str, object]:
@@ -939,7 +1116,9 @@ class MatchedComparisonResult:
             "classification": "paired_learning_method_comparison",
             "contract": self.contract.to_payload(),
             "contract_sha256": self.contract.payload_sha256,
-            "diagnostic_exclusions": [item.to_payload() for item in self.diagnostic_exclusions],
+            "fixed_descriptive_exclusions": [
+                item.to_payload() for item in self.fixed_descriptive_exclusions
+            ],
             "no_promotion_authority": True,
             "primary": self.primary.to_payload(),
             "primary_superiority_passed": self.primary.superiority_passed,
@@ -1024,9 +1203,7 @@ def paired_percentile_bootstrap_lower_bound(
     )
 
 
-def paired_sign_flip_test(
-    differences: tuple[float, ...], spec: PermutationSpec
-) -> SignFlipResult:
+def paired_sign_flip_test(differences: tuple[float, ...], spec: PermutationSpec) -> SignFlipResult:
     """One-sided paired sign-flip test; exact for n<=20, Monte Carlo otherwise."""
 
     checked = _require_score_tuple(differences, "differences")
@@ -1099,9 +1276,7 @@ def _exact_sign_flip_extreme_count(values: tuple[int, ...], draws: int) -> int:
     return extreme
 
 
-def _monte_carlo_sign_flip_extreme_count(
-    values: tuple[int, ...], draws: int, seed: int
-) -> int:
+def _monte_carlo_sign_flip_extreme_count(values: tuple[int, ...], draws: int, seed: int) -> int:
     n_pairs = len(values)
     rng = np.random.Generator(np.random.PCG64(seed))
     chunk_size = max(1, min(draws, _SIGN_FLIP_CHUNK_ELEMENTS // n_pairs))
@@ -1122,9 +1297,7 @@ def _monte_carlo_sign_flip_extreme_count(
         else:
             for row in negative:
                 subset_sum = sum(
-                    value
-                    for value, is_negative in zip(values, row, strict=True)
-                    if is_negative
+                    value for value, is_negative in zip(values, row, strict=True) if is_negative
                 )
                 extreme += int(subset_sum <= 0)
     return extreme
@@ -1262,17 +1435,18 @@ def analyze_matched_scores(contract: MatchedComparisonContract) -> MatchedCompar
         )
     )
     exclusions = tuple(
-        PrivilegedDiagnosticExclusion(
-            diagnostic_id=diagnostic.diagnostic_id,
+        DescriptiveDiagnosticExclusion(
+            candidate_id=diagnostic.candidate_id,
             input_sha256=canonical_payload_sha256(diagnostic.to_payload()),
+            exclusion_reasons=diagnostic.exclusion_reasons,
         )
-        for diagnostic in contract.privileged_diagnostics
+        for diagnostic in contract.fixed_descriptive_diagnostics
     )
     return MatchedComparisonResult(
         contract=contract,
         primary=primary,
         secondary=secondary,
-        diagnostic_exclusions=exclusions,
+        fixed_descriptive_exclusions=exclusions,
     )
 
 
@@ -1314,6 +1488,28 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
     return result
 
 
+def _validate_canonical_result_shape(value: object) -> None:
+    """Bound parsed JSON complexity without recursively walking untrusted input."""
+
+    node_count = 0
+    pending: list[tuple[object, int]] = [(value, 1)]
+    while pending:
+        node, depth = pending.pop()
+        if depth > _MAX_CANONICAL_RESULT_DEPTH:
+            raise MatchedStatisticsError("result JSON exceeds the maximum nesting depth")
+        node_count += 1
+        if type(node) is dict:
+            mapping = cast(dict[str, object], node)
+            node_count += len(mapping)  # Object member names are JSON string nodes.
+            if node_count > _MAX_CANONICAL_RESULT_NODES:
+                raise MatchedStatisticsError("result JSON contains too many nodes")
+            pending.extend((item, depth + 1) for item in mapping.values())
+        elif type(node) is list:
+            pending.extend((item, depth + 1) for item in cast(list[object], node))
+        if node_count + len(pending) > _MAX_CANONICAL_RESULT_NODES:
+            raise MatchedStatisticsError("result JSON contains too many nodes")
+
+
 def load_canonical_result(
     raw: bytes, contract: MatchedComparisonContract
 ) -> MatchedComparisonResult:
@@ -1321,6 +1517,8 @@ def load_canonical_result(
 
     if type(raw) is not bytes:
         raise MatchedStatisticsError("raw result must be bytes")
+    if len(raw) > _MAX_CANONICAL_RESULT_BYTES:
+        raise MatchedStatisticsError("raw result exceeds the maximum byte length")
     try:
         decoded = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -1334,8 +1532,11 @@ def load_canonical_result(
                 parse_constant=_reject_json_constant,
             ),
         )
-    except (json.JSONDecodeError, TypeError) as exc:
+    except MatchedStatisticsError:
+        raise
+    except (json.JSONDecodeError, TypeError, ValueError, OverflowError, RecursionError) as exc:
         raise MatchedStatisticsError("result is not valid JSON") from exc
+    _validate_canonical_result_shape(parsed_object)
     if type(parsed_object) is not dict:
         raise MatchedStatisticsError("result JSON must be an object")
     parsed = cast(dict[str, object], parsed_object)
@@ -1351,6 +1552,8 @@ __all__ = [
     "COMPARISON_INPUT_SCHEMA",
     "CONTRACT_SCHEMA",
     "ComparisonSpec",
+    "DescriptiveDiagnosticExclusion",
+    "DescriptiveDiagnosticScores",
     "DIFFERENCE_VECTOR_SCHEMA",
     "DIGEST_ALGORITHM",
     "EXACT_SIGN_FLIP_MAX_PAIRS",
@@ -1361,13 +1564,15 @@ __all__ = [
     "MatchedComparisonResult",
     "MatchedStatisticsError",
     "PermutationSpec",
+    "PRIMARY_BOOTSTRAP_IMPLEMENTATION_SCHEMA",
+    "PRIMARY_BOOTSTRAP_IMPLEMENTATION_SHA256",
     "PrimaryComparisonResult",
-    "PrivilegedDiagnosticExclusion",
-    "PrivilegedDiagnosticScores",
     "QUANTILE_METHOD",
     "RESULT_SCHEMA",
     "RNG_ALGORITHM",
     "SCORE_VECTOR_SCHEMA",
+    "SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SCHEMA",
+    "SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SHA256",
     "SecondaryComparisonResult",
     "SignFlipResult",
     "analyze_matched_scores",
@@ -1378,5 +1583,7 @@ __all__ = [
     "paired_differences",
     "paired_percentile_bootstrap_lower_bound",
     "paired_sign_flip_test",
+    "primary_bootstrap_implementation_descriptor",
+    "secondary_sign_flip_holm_implementation_descriptor",
     "validate_result_payload",
 ]

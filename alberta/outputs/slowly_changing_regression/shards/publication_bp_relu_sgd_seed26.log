@@ -1,0 +1,3 @@
+WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+<frozen runpy>:128: RuntimeWarning: 'alberta_framework.benchmarks.slowly_changing_regression' found in sys.modules after import of package 'alberta_framework.benchmarks', but prior to execution of 'alberta_framework.benchmarks.slowly_changing_regression'; this may result in unpredictable behaviour
+2026-07-31 22:32:37,460 alberta_framework.benchmarks.slowly_changing_regression_v2 INFO wrote immutable nonpromoting shard /home/shaw/milady/research/alberta/outputs/slowly_changing_regression/shards/publication_bp_relu_sgd_seed26.json

@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Beat-SOTA screening lane** (`benchmarks/ipmnist_screening.py`, 47 tests):
+  22 mechanism-combination arms on a validated 60-task proxy (an exact
+  bit-prefix of the 200-task protocol; control parity pinned bitwise) —
+  UPGD×IDBD, UPGD×Autostep, UPGD+CBP, AdamW+CBP, UPGD+L2-Init,
+  UPGD+EMA-input-norm, a UPGD-W hyperparameter star, weight clipping
+  (Elsayed et al. RLC 2024, ±κ/√fan_in, 4 configs), per-layer gate
+  normalization, FADE-style meta-learned per-parameter head decay
+  (arXiv 2604.27063, sign conventions derived and unit-pinned), and a
+  SwiftTD-stabilized UPGD×IDBD (overshoot bound + persistent step-size
+  decay).  Includes plan/run/validate-proxy/merge CLI, idempotent shard
+  workers, and autonomous endgame pipelines with full-protocol pool64
+  confirmation and a strict paired BEATS/TIES/BELOW verdict
+  (`outputs/ipmnist_screening/`).  Screening results are permanently
+  nonpromoting.
+- **Label-permuted EMNIST protocol-exact lane**
+  (`benchmarks/upgd_label_emnist.py`, 21 tests): EMNIST balanced 47-class,
+  labels permuted every 2,500 steps, 400 tasks, pinned to the audited
+  upstream commit; first artifact (`outputs/upgd_label_emnist/results.v1.json`,
+  3 seeds) reproduces the published qualitative picture — UPGD-W online
+  accuracy RISES 0.40→0.737 (published plateau ~0.74) while AdamW collapses
+  to 0.20; whole-run-mean vs figure-readoff gaps honestly flagged.
+- **Slowly-Changing Regression v2 sharded protocol** (plan/run-shard/merge/
+  validate with immutable self-issued plans and exact-replay validation;
+  300 shards = 3 methods × 100 seeds).
+- Added `run_ipmnist(noise_mode="pool", noise_pool_steps=N)`, a screening-only
+  fast mode for the UPGD Input-permuted MNIST lane that replaces the dominant
+  per-step cost -- generating a fresh 282,160-element N(0, sigma^2)
+  perturbation every step, ~85-90% of single-core UPGD-W step time -- with
+  random contiguous slices of a per-task regenerated noise pool (OpenAI-ES
+  style shared noise table). Measured single-core UPGD-W throughput rises
+  from 133 steps/s (exact) to 559 steps/s (pool 64) and 951 steps/s
+  (pool 16) at the protocol shape. Per-step noise marginals stay exactly
+  N(0, sigma^2) but values are reused across steps, so `IPMNISTRunResult`
+  now records `noise_mode` and `partial_payload` refuses pool-mode results:
+  they can never enter the v2/v3 artifact lifecycle. The default
+  `noise_mode="step"` inner loop is verified bitwise identical to the
+  pre-change runner on fixed-seed 2x5000-step publication-shape runs for
+  both learners, and existing shards/artifacts are unaffected. Full-protocol
+  200-task pool-validation runs are recorded under
+  `outputs/upgd_ipmnist_runner_opt/`.
+
 - Added the strict, namespaced continual-IA v2 development-only contract and
   `CONTINUAL_IA_V2_RUNBOOK.md`. It freezes treatment `recommendation_p075`,
   exact acceptance probability 0.75, the old gates with seed start 60, and
@@ -76,8 +117,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plus at least two exactly budget-matched baselines, continual-transfer and
   recovery metrics, p50/p95/p99 latency, delayed/dropped observations, memory
   and optional energy measurements, graded safety/near-miss accounting, and
-  required component/plasticity diagnostics. Reports remain explicitly
-  `not-assessed`; constructing one is not a scientific pass.
+  required component/plasticity diagnostics. Its bounded scalar streaming
+  executor rejects prediction/probe/source-state mutation, noncanonical or
+  nondeterministic checkpoint state, configuration drift, deadline and host
+  memory-budget violations, and inconsistent exposure metadata. Safety and
+  metric applicability distinguish unavailable measurements from measured
+  zeros. A strict evaluator-bound artifact now hashes the full evaluator
+  identity (including stream/probe and learner configuration) and metric core,
+  cross-validates their shared protocol/budget/condition semantics, and uses
+  atomic report/checkpoint writes. Reports remain explicitly `not-assessed`;
+  constructing one is not a scientific pass.
+- Added a strict v2 continuing-control evaluator and hardened `PrototypeAgent`
+  adapter. Candidate and baselines receive independent functional environment
+  states; exact observation/action/decision-ID ownership enforces
+  predict-before-outcome ordering while regime identity stays evaluator-only.
+  The reconstructing report pins metric direction, exposure rows, recovery and
+  stability references, then derives lifetime/prequential and per-regime
+  return, post-change adaptation AUC, sustained recovery, final held-out action
+  scores, forgetting, backward/forward transfer, stability, and worst-window
+  return with explicit applicability. Canonical config/source digests and
+  atomic checkpoints fail closed on identity or metric tampering. This is
+  development-only infrastructure; no completed Prototype comparison or
+  scientific claim is attached.
+- Added a strict development-only paired continual-control campaign. Explicit
+  seed wrappers bind each environment and learner configuration; cross-seed
+  invariants require identical protocol, budget, probes, condition roles and
+  normalized identities. Every raw report is retained, unavailable pairs stay
+  unavailable, and direction-normalized candidate-minus-baseline differences
+  receive deterministic stratified paired-bootstrap intervals from a frozen
+  counter-hash RNG. Config/source/report/comparison hashes and atomic I/O make
+  the artifact reconstructing. Campaigns remain `not-assessed`; no threshold,
+  completed Prototype campaign, or scientific claim is supplied.
+- Added the WP4 shallow world-model reference: an action-indexed affine
+  regularized-FTL/ridge learner over grounded next-observation, reward, and
+  continuation targets. It predicts before recursively updating fixed
+  Gram/cross sufficient statistics, solves only the selected action block,
+  validates counts, normal equations, positive-semidefinite statistics and
+  numeric bounds fail-closed, has strict RNG-free checkpoints and exact
+  allocation accounting, and exposes a pure one-step supplied-linear-value
+  action scorer. This is L0 mechanism coverage, not a paper reproduction,
+  calibrated model, MPC result, or control-benefit claim.
 - Added identity, fixed-trace, and online trainable gated state builders under
   one causal fixed-budget contract, including checkpoint parity and a
   development-only partially observable diagnostic.
@@ -97,12 +176,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-audits the effective stored delta after dtype cast and parameter addition,
   applies atomically, and reports the formed candidate and effective-delta
   assessments separately from a parameter change actually being `applied`.
-  No integrated production consumer or realized-benefit result is claimed.
+  The Prototype's opt-in learned-state lane is now a development consumer: it
+  binds probe evidence to the dispatched decision and commits only an accepted
+  effective delta into the advanced recurrent builder state. No realized-
+  benefit result is claimed.
+- Added an isolated continuing categorical actor-critic for the separate
+  paper-specific Delightful Policy Gradient experiment. Ordinary and
+  delightful modes share the actor, differential critic, reward-rate baseline,
+  typed RNG, and action sampler; the actor trace is fixed to zero, and the
+  detached delight coefficient never gates critic/baseline or explicit
+  safety/model/representation routes. Exact on-policy records, atomic failure,
+  JIT/scan/checkpoint parity, gate strata, effective sample size, and logical
+  resource accounting are contract-tested. A strict development runner now
+  compares both modes under paired random-number schedules on contextual
+  heteroskedastic gambling and uninterrupted six-state RiverSwim A/B/A, with a
+  validator that reconstructs every declared trace and derived diagnostic.
+  The seeds/thresholds are nonpromoting, trajectories may diverge after policy
+  divergence, and no policy-quality, safety, compute-saving, or paper-
+  reproduction claim follows.
 - Added a predict-before-update typed learning-signal producer that keeps
   ensemble epistemic disagreement, aleatoric uncertainty, normalized residual,
   learning progress, and sustained change probability separate, with warm-up
   flags, noisy-TV and change diagnostics, bounded counters, and fixed resource
   accounting. Causal ordering is part of the caller contract.
+- Added a fixed-size bootstrap world-model ensemble with distinct initialization,
+  persistent mask RNG/counters, typed warm-up signals, a causal representation
+  gradient, exact resource accounting, and full checkpoint parity. It is
+  integrated into Prototype as a mutually exclusive development lane; its
+  residual-variance proxy is not externally calibrated aleatoric uncertainty,
+  and ensemble dreaming remains disabled.
+- Added `DualReplayMemory`, a fixed-capacity recency-FIFO plus long-term replay
+  substrate with reservoir or configured surprise/coverage/progress retention,
+  explicit aleatoric control, policy/value and representation provenance,
+  fixed-quota stale-aware sampling, exact resource accounting, and strict
+  deterministic checkpoints. Added `ModelReplayRehearsal` to atomically compose
+  the real ensemble update, signal-aware record, fixed-quota sample, and
+  model-member-only rehearsal, with isolated replay RNG/masks/counters and
+  strict composition checkpoints/resources. Prototype exposes it as a mutually
+  exclusive model lane and sends only the commit-gated real gradient to builder
+  learning and joy. Replay never trains the actor, critic, builder, or causal
+  calibrator; no retention or control benefit is claimed.
+- Added a development-only component-retention evaluator with frozen
+  non-learning snapshots; seven separately applicable representation, model,
+  reward/termination, value, and actor channels; mutation checks; bounded
+  record/state budgets; and reconstructing reports/checkpoint resume. It is not
+  a longitudinal or scientific retention result.
 - Added fixed-capacity experiential memory with typed provenance/version
   metadata, query-before-write ordering, similarity/reliability/staleness
   retrieval, deterministic utility/recency eviction, controlled stale- and
@@ -148,8 +266,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   continuation through real world-model, primitive/option control, the IA
   exo-cortex, scan, and accepted dream updates, while optional per-GVF
   continuation reaches Horde without erasing each demon's declared horizon.
-  It does not yet implement WP4's planned explicit action and separate
-  terminated/truncated fields.
+  The authoritative contract now also records the raw observation, exact
+  dispatched primitive action, lifecycle/generation decision token,
+  terminated/truncated flags, final/bootstrap observation, and post-reset
+  decision observation. Runtime-invalid transitions are transactional no-ops;
+  positive-discount truncation bootstraps on the final state while resetting
+  episode-local recurrence and option execution before selecting on the reset
+  state. Prototype checkpoints now use the v3 rehearsal-isolation schema. A v2
+  ensemble checkpoint preserves every learned member, signal statistic, and
+  real bootstrap stream while deterministically initializing only the new
+  replay key/mask/counters; ambiguous v1 lifecycle restoration still requires
+  an explicit provenance trust override.
+- Integrated the common `StateBuilder` protocol into `PrototypeAgent` with
+  identity, fixed-trace, and online-gated modes, exact recurrence/event counts,
+  cached-action semantics, scan parity, and config-bound checkpoints. The
+  online-gated learner now rejects non-finite/overflowing gradients atomically;
+  Prototype now has one ensemble model-loss gradient producer but still lacks
+  the balanced multi-objective representation-gradient set, so this is not a
+  learned-state efficacy claim.
 - Added an opt-in `sample_one_hot` Prototype dream-observation mode for wholly
   one-hot control features. It projects finite model outputs to categorical
   mass, samples on an RNG stream isolated from legacy anchor/action choices,

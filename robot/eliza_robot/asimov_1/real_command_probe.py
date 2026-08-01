@@ -7,6 +7,7 @@ from typing import Any
 
 from eliza_robot.asimov_1.constants import ASIMOV1_FULL_ACTION_DIM
 from eliza_robot.asimov_1.livekit_transport import LiveKitAsimovTransport
+from eliza_robot.bridge.physical_execution import reject_unsupervised_physical_motion
 
 
 def telemetry_summary(frame: Any) -> dict[str, Any]:
@@ -46,12 +47,16 @@ async def probe_real_command_sequence(
 ) -> dict[str, Any]:
     """Run a staged real-hardware command probe.
 
-    The probe always waits for telemetry before sending any command. By default
-    it only sends DAMP. STAND and zero-velocity are opt-in because they may move
-    hardware depending on firmware state and controller configuration.
+    The probe always waits for telemetry before sending any command and only
+    sends DAMP. Legacy STAND and zero-velocity options are retained for API
+    compatibility but are quarantined before the transport connects.
     """
     if allow_zero_velocity and not allow_stand:
         raise ValueError("zero-velocity probe requires --allow-stand before velocity commands")
+    if allow_stand or allow_zero_velocity:
+        reject_unsupervised_physical_motion(
+            "eliza_robot.asimov_1.real_command_probe motion stages"
+        )
     start = time.time()
     await transport.connect()
     command_stages: list[str] = []

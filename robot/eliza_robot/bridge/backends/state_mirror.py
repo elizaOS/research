@@ -25,8 +25,8 @@ The cost: sim is no longer a free-running predictor of where the
 robot will be — it's a reflective mirror of where the robot IS. That's
 exactly what "fully compensated" means in a strict reading.
 
-Usage:
-    real = AinexRemoteBackend(...)
+Simulation composition example:
+    real = NoiseInjectorBackend(MuJocoBackend(twin_env), profile=noise_profile)
     sim = MuJocoBackend(DemoEnv(...))
     dual = DualTargetBackend(real=real, sim=sim)
     mirror = StateMirrorBackend(dual, real=real, sim_env=demo_env)
@@ -34,11 +34,16 @@ Usage:
     # ... agent commands flow through mirror.handle_command
     # ... mirror's background task pulls real state every ~50ms and
     #     writes it into sim_env.data.qpos / mj_forward.
+
+Physical backends must be constructed only by the authenticated supervised
+server. Legacy evidence programs may not compose this wrapper around a direct
+physical transport.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 from dataclasses import dataclass
@@ -102,23 +107,25 @@ class StateMirrorBackend(BridgeBackend):
     def backend_name(self) -> str:
         return f"mirror({self._inner.backend_name})"
 
+    def physical_motion_resources(self) -> tuple[str, ...]:
+        return self._inner.physical_motion_resources()
+
     def capabilities(self) -> JsonDict:
         caps = dict(self._inner.capabilities())
+        # Wrapper construction may happen after the inner backend has moved,
+        # so an inner connect-time pose claim cannot be replayed through this
+        # new object identity. Require a fresh attested pose instead.
+        caps.pop("motion_safety", None)
+        caps["motion_safety_invalidated"] = "wrapper_requires_fresh_pose_attestation"
         caps["state_mirror"] = True
         caps["mirror_period_s"] = self._sync_period
         return caps
 
     async def connect(self) -> None:
         await self._inner.connect()
-        # Park the sim at home so the first mirror sync has a clean target.
-        try:
-            await self._inner.handle_command(CommandEnvelope(
-                request_id="mirror-init", timestamp=utc_now_iso(),
-                command="action.play", payload={"name": "stand"},
-            ))
-            await asyncio.sleep(1.5)
-        except Exception:
-            pass
+        # Do not issue an implicit action.play here. Motion must originate at
+        # the guarded dispatch boundary; the first mirror sample establishes
+        # the simulator state without a hidden startup command.
         self._stop.clear()
         self._mirror_task = asyncio.create_task(self._mirror_loop())
 
@@ -126,10 +133,8 @@ class StateMirrorBackend(BridgeBackend):
         self._stop.set()
         if self._mirror_task and not self._mirror_task.done():
             self._mirror_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._mirror_task
-            except (asyncio.CancelledError, Exception):
-                pass
             self._mirror_task = None
         await self._inner.shutdown()
 
@@ -159,7 +164,7 @@ class StateMirrorBackend(BridgeBackend):
     async def _mirror_loop(self) -> None:
         """The actual compensator: real → read → write into sim_env.qpos."""
         try:
-            import mujoco
+            import mujoco  # type: ignore[import-not-found]
         except ImportError:
             return
         env = self._sim_env

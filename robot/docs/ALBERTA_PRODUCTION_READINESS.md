@@ -95,9 +95,11 @@ requires `manifest.json`, and rejects profile or full-output-dimension
 mismatches before constructing the MuJoCo env.
 Legacy AiNex evidence scripts (`evidence_final_e2e.py`,
 `evidence_state_mirror_e2e.py`, `evidence_text_to_action_calibrated_e2e.py`,
-and `evidence_vlm_evaluation_e2e.py`) now also default to
+and `evidence_vlm_evaluation_e2e.py`) now default to simulation and quarantine
+their direct physical transports. Physical modes fail before connecting until
+they are authenticated unified-bridge clients. They also default to
 `checkpoints/alberta_text_conditioned` and reject checkpoint/profile mismatches
-before constructing the HiWonder MuJoCo/real bridge path. The sim validation
+before constructing the HiWonder MuJoCo path. The sim validation
 gate also defaults to the Alberta checkpoint.
 For robot-env comparison evidence, `scripts/compare_text_conditioned_backends.py`
 trains Alberta and PPO on the same profile/task/seed/budget/domain-randomization
@@ -242,8 +244,9 @@ top-level `"ok": true`.
 - Long ASIMOV-1/full-policy training still belongs on Nebius H200. Use
   `scripts/compare_text_conditioned_backends.py` to train/evaluate Alberta and
   PPO under the same profile/task/step budget, then review `comparison.json`.
-- Real robot E2E evidence still requires hardware/bridge access and should use
-  `scripts/evidence_text_to_action_e2e.py` with a real checkpoint. ASIMOV
+- Real robot E2E evidence still requires hardware/bridge access and a new
+  authenticated command-envelope client; the legacy direct-backend evidence
+  scripts are quarantined and cannot establish it. ASIMOV
   real-agent run reports now archive the production checkpoint validator
   summary, including the Alberta ASIMOV MJCF and asset-manifest provenance
   checks.

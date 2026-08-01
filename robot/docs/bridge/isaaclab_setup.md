@@ -47,7 +47,7 @@ Source: `ros_ws_src/ainex_simulations/ainex_description/urdf/ainex.xacro`
 ## 4) Validate Robot Model
 
 ```bash
-PYTHONPATH=. python -m bridge.isaaclab.validate_model
+PYTHONPATH=. python -m eliza_robot.bridge.isaaclab.validate_model
 ```
 
 Checks:
@@ -61,13 +61,13 @@ Checks:
 In the Isaac-enabled Python environment:
 
 ```bash
-PYTHONPATH=. python -m bridge.isaaclab.convert_urdf_to_usd
+PYTHONPATH=. python -m eliza_robot.bridge.isaaclab.convert_urdf_to_usd
 ```
 
 Or validate only:
 
 ```bash
-PYTHONPATH=. python -m bridge.isaaclab.convert_urdf_to_usd --validate-only
+PYTHONPATH=. python -m eliza_robot.bridge.isaaclab.convert_urdf_to_usd --validate-only
 ```
 
 Output: `bridge/generated/ainex.usd`
@@ -77,14 +77,14 @@ Output: `bridge/generated/ainex.usd`
 Dry-run (no Isaac Sim required):
 
 ```bash
-PYTHONPATH=. python -m bridge.isaaclab.run_sim --dry-run
+PYTHONPATH=. python -m eliza_robot.bridge.isaaclab.run_sim --dry-run
 ```
 
 Full simulation (requires Isaac Sim):
 
 ```bash
-PYTHONPATH=. python -m bridge.isaaclab.run_sim
-PYTHONPATH=. python -m bridge.isaaclab.run_sim --headless
+PYTHONPATH=. python -m eliza_robot.bridge.isaaclab.run_sim
+PYTHONPATH=. python -m eliza_robot.bridge.isaaclab.run_sim --headless
 ```
 
 ## 7) Start Bridge
@@ -93,31 +93,35 @@ PYTHONPATH=. python -m bridge.isaaclab.run_sim --headless
 
 ```bash
 # Isaac backend (default)
-PYTHONPATH=. python -m bridge.launch --target isaac
+PYTHONPATH=. python -m eliza_robot.bridge.launch --target isaac
 
-# Real robot
-PYTHONPATH=. python -m bridge.launch --target real
+# Real robot (both deployment values must already be provisioned)
+: "${ELIZA_ROBOT_BRIDGE_AUTH_TOKEN:?set a random 32-to-4096-character visible-ASCII token}"
+: "${ELIZA_ROBOT_PHYSICAL_RESOURCE_ID:?set the stable inventory identity for this robot}"
+PYTHONPATH=. python -m eliza_robot.bridge.launch --target real
 
 # Gazebo simulation
-PYTHONPATH=. python -m bridge.launch --target sim
+PYTHONPATH=. python -m eliza_robot.bridge.launch --target sim
 
 # Development mock
-PYTHONPATH=. python -m bridge.launch --target mock
+PYTHONPATH=. python -m eliza_robot.bridge.launch --target mock
 
 # List all targets
-PYTHONPATH=. python -m bridge.launch --list-targets
+PYTHONPATH=. python -m eliza_robot.bridge.launch --list-targets
 ```
 
 ### Convenience Scripts
 
 ```bash
-./bridge/scripts/start_rosbridge_isaac.sh   # Isaac backend
-./bridge/scripts/start_rosbridge_real.sh    # Real robot
-./bridge/scripts/start_rosbridge_sim.sh     # Gazebo sim
-./bridge/scripts/start_rosbridge_mock.sh    # Mock backend
+./eliza_robot/bridge/scripts/start_rosbridge_isaac.sh   # Isaac backend
+./eliza_robot/bridge/scripts/start_rosbridge_real.sh    # Real unified endpoint
+./eliza_robot/bridge/scripts/start_rosbridge_sim.sh     # Gazebo sim
+./eliza_robot/bridge/scripts/start_rosbridge_mock.sh    # Mock backend
 ```
 
-All expose ROSBridge-compatible websocket on `ws://<host>:9090`.
+The simulation scripts expose a ROSBridge-compatible websocket. The
+compatibility-named real script requires both physical deployment variables
+and starts only the authenticated, loopback unified endpoint on port 9100.
 
 ### Environment Overrides
 
@@ -129,6 +133,14 @@ All expose ROSBridge-compatible websocket on `ws://<host>:9090`.
 | `AINEX_PUBLISH_HZ` | Telemetry publish rate |
 | `AINEX_MAX_CMD_SEC` | Rate limit (commands/sec) |
 | `AINEX_DEADMAN_SEC` | Deadman timeout (seconds) |
+| `ELIZA_ROBOT_BRIDGE_AUTH_TOKEN` | Bridge bearer secret; physical targets require 32–4096 visible ASCII characters |
+| `ELIZA_ROBOT_PHYSICAL_RESOURCE_ID` | Stable raw inventory identity; required only by the physical bridge host |
+
+The elizaOS plugin uses `ELIZA_AINEX_BRIDGE_AUTH_TOKEN`; configure it with the
+same secret value as `ELIZA_ROBOT_BRIDGE_AUTH_TOKEN`. It does not read the
+physical resource ID. The ID is process-local coordination metadata, not a
+client credential or a cross-process lock. These settings do not establish
+real-hardware validation.
 
 ## 8) Run Tests
 
@@ -149,13 +161,13 @@ PYTHONPATH=. python -m unittest bridge.tests.test_sim_state
 Smoke test against a running endpoint:
 
 ```bash
-PYTHONPATH=. python -m bridge.tools.rosbridge_smoke --uri ws://127.0.0.1:9090
+PYTHONPATH=. python -m eliza_robot.bridge.tools.rosbridge_smoke --uri ws://127.0.0.1:9090
 ```
 
 Parity check between two endpoints:
 
 ```bash
-PYTHONPATH=. python -m bridge.tools.rosbridge_parity \
+PYTHONPATH=. python -m eliza_robot.bridge.tools.rosbridge_parity \
   --left-uri ws://127.0.0.1:9090 \
   --right-uri ws://127.0.0.1:9091
 ```

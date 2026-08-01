@@ -150,29 +150,16 @@ input[type=number]{background:#1a1a30;border:1px solid #3a3a5a;color:#ddd;paddin
     </div>
     <div id="cm" class="msg i" style="display:none"></div>
 
-    <h3>ArUco Navigation Demo</h3>
+    <h3>ArUco Navigation</h3>
     <p style="font-size:11px;color:#888;margin-bottom:6px">
-      Walk robot to each detected object marker using ground-plane geometry.
+      Physical navigation is unavailable in this visualization-only dashboard.
+      Use an authenticated unified bridge client and its motion supervisor.
     </p>
-    <div style="display:flex;gap:4px;flex-wrap:wrap">
-      <button class="btn p" onclick="navStart('red_ball')">Go to Red Ball</button>
-      <button class="btn p" onclick="navStart('blue_cube')">Go to Blue Cube</button>
-      <button class="btn p" onclick="navStart()">All Objects</button>
-      <button class="btn" onclick="navStop()" style="background:#5a2a2a;border-color:#8a3a3a">Stop</button>
-    </div>
-    <div style="margin-top:6px">
-      <label>Robot IP: <input type="text" id="robot-ip" value="192.168.1.218" style="background:#1a1a30;border:1px solid #3a3a5a;color:#ddd;padding:4px 6px;border-radius:3px;width:120px;font-size:12px"></label>
-      <label>Stride (m): <input type="number" id="nav-stride" value="0.015" step="0.001" style="width:60px"></label>
-      <label>Turn step: <input type="number" id="nav-turn" value="8" step="1" style="width:50px"> deg</label>
-      <label>Speed: <input type="number" id="nav-speed" value="2" step="1" min="1" max="4" style="width:40px"></label>
-    </div>
-    <div id="nav-log" style="font-size:10px;color:#8ac;max-height:120px;overflow-y:auto;margin-top:6px;font-family:monospace"></div>
 
     <h3>Floor Markers</h3>
     <div id="fm" style="font-size:11px;color:#999"></div>
   </div>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/roslib@1/build/roslib.min.js"></script>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.164.1/examples/jsm/"}}</script>
 <script type="module">
 import {init as arInit, update as arUpdate, toggle as arToggle} from '/ar_overlay.js';
@@ -350,148 +337,6 @@ async function loadCams(){
   }catch(e){}
 }
 loadCams();
-
-// ---- ArUco Navigation Demo ----
-let _navRunning=false, _ros=null, _walkPub=null, _walkSvc=null;
-function navLog(msg){
-  const el=document.getElementById('nav-log');
-  el.innerHTML+=msg+'<br>';el.scrollTop=el.scrollHeight;
-}
-function rosConnect(){
-  const ip=document.getElementById('robot-ip').value;
-  if(_ros&&_ros.isConnected)return Promise.resolve();
-  return new Promise((res,rej)=>{
-    _ros=new ROSLIB.Ros({url:'ws://'+ip+':8888/ws_proxy'});
-    _ros.on('connection',()=>{
-      navLog('ROSBridge connected');
-      _walkPub=new ROSLIB.Topic({ros:_ros,name:'/app/set_walking_param',messageType:'ainex_interfaces/AppWalkingParam'});
-      _walkSvc=new ROSLIB.Service({ros:_ros,name:'/walking/command',serviceType:'ainex_interfaces/SetWalkingCommand'});
-      res();
-    });
-    _ros.on('error',(e)=>{navLog('ROS error: '+e);rej(e);});
-    setTimeout(()=>rej('timeout'),5000);
-  });
-}
-function walkCmd(cmd){
-  return new Promise((res,rej)=>{
-    if(!_walkSvc){rej('no svc');return;}
-    _walkSvc.callService(new ROSLIB.ServiceRequest({command:cmd}),(r)=>res(r),(e)=>rej(e));
-  });
-}
-function publishWalk(x,y,angle){
-  if(!_walkPub)return;
-  const spd=parseInt(document.getElementById('nav-speed').value)||2;
-  _walkPub.publish(new ROSLIB.Message({speed:spd,height:0.036,x:x,y:y,angle:angle}));
-}
-function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
-function normalizeAngle(a){while(a>Math.PI)a-=2*Math.PI;while(a<-Math.PI)a+=2*Math.PI;return a;}
-
-async function getWorldState(){
-  const r=await fetch('/api/world_state');return r.json();
-}
-
-async function navStart(targetLabel){
-  if(_navRunning){navLog('Already running');return;}
-  _navRunning=true;
-  document.getElementById('nav-log').innerHTML='';
-  const stride=parseFloat(document.getElementById('nav-stride').value)||0.015;
-  const turnStep=parseFloat(document.getElementById('nav-turn').value)||8;
-  const arrivalDist=0.15; // meters
-  const angleTol=0.25; // radians (~14 deg)
-
-  try{
-    await rosConnect();
-    navLog('Fetching world state...');
-    let ws=await getWorldState();
-    if(!ws.robot_position){navLog('ERROR: Robot not visible! Need body marker (ID 0) in USB camera view.');_navRunning=false;return;}
-
-    let targets=ws.objects||[];
-    if(targetLabel) targets=targets.filter(o=>o.label===targetLabel);
-    if(targets.length===0){navLog('ERROR: Target "'+targetLabel+'" not found. Visible: '+(ws.objects||[]).map(o=>o.label).join(', '));_navRunning=false;return;}
-
-    navLog('Robot at ('+ws.robot_position[0].toFixed(2)+', '+ws.robot_position[1].toFixed(2)+')');
-    navLog('Targets: '+targets.map(o=>o.label).join(', '));
-
-    await walkCmd('start');
-    navLog('Walking enabled');
-    await sleep(500);
-
-    // Heartbeat: continuously republish current walk command at 10Hz
-    // The gait controller needs repeated messages to keep walking
-    let curX=0, curY=0, curAngle=0;
-    const hb=setInterval(()=>{
-      if(_navRunning) publishWalk(curX, curY, curAngle);
-    }, 100);
-
-    for(const obj of targets){
-      if(!_navRunning)break;
-      navLog('--- Target: '+obj.label+' ---');
-
-      for(let step=0;step<300&&_navRunning;step++){
-        ws=await getWorldState();
-        if(!ws.robot_position){
-          navLog('Lost robot marker, holding...');
-          curX=0; curY=0; curAngle=0;
-          await sleep(500);
-          continue;
-        }
-
-        const rx=ws.robot_position[0], ry=ws.robot_position[1];
-        const rh=ws.robot_heading||0;
-
-        const cur=(ws.objects||[]).find(o=>o.marker_id===obj.marker_id);
-        const tx=cur?cur.position[0]:obj.position[0];
-        const ty=cur?cur.position[1]:obj.position[1];
-
-        const dx=tx-rx, dy=ty-ry;
-        const dist=Math.sqrt(dx*dx+dy*dy);
-
-        if(dist<arrivalDist){
-          navLog('ARRIVED at '+obj.label+' ('+dist.toFixed(2)+'m)');
-          curX=0; curY=0; curAngle=0;
-          await sleep(1000);
-          break;
-        }
-
-        const targetAngle=Math.atan2(dy, dx);
-        const angleDiff=normalizeAngle(targetAngle - rh);
-
-        // Always walk forward + steer proportionally
-        // angle command is proportional to heading error, clamped to turnStep
-        curAngle = Math.max(-turnStep, Math.min(turnStep, angleDiff * (turnStep / 0.5)));
-        curX = stride;
-        curY = 0;
-
-        if(step%8===0) navLog(
-          'pos=('+rx.toFixed(2)+','+ry.toFixed(2)+
-          ') hdg='+(rh*180/Math.PI).toFixed(0)+
-          ' err='+(angleDiff*180/Math.PI).toFixed(0)+
-          'deg dist='+dist.toFixed(2)+'m'+
-          ' [FWD x='+curX+' a='+curAngle.toFixed(1)+']'
-        );
-
-        await sleep(500);
-      }
-    }
-
-    clearInterval(hb);
-    navLog('=== Done ===');
-    publishWalk(0,0,0);
-    await sleep(300);
-    await walkCmd('stop');
-  }catch(e){
-    navLog('ERROR: '+e);
-  }
-  _navRunning=false;
-}
-
-function navStop(){
-  _navRunning=false;
-  // Publish stop a few times to make sure it takes
-  for(let i=0;i<5;i++) setTimeout(()=>{ if(_walkPub) publishWalk(0,0,0); }, i*100);
-  if(_walkSvc)walkCmd('stop').catch(()=>{});
-  navLog('STOPPED');
-}
 
 async function tog(el){
   const k=el.id.replace('show-','');

@@ -1,7 +1,7 @@
 """Convert AiNex URDF to USD for IsaacLab import.
 
 Usage:
-    python -m bridge.isaaclab.convert_urdf_to_usd [--urdf PATH] [--out PATH]
+    python -m eliza_robot.bridge.isaaclab.convert_urdf_to_usd [--urdf PATH] [--out PATH]
 
 Requires Isaac Sim Python environment with omni.isaac.lab available.
 Falls back to a standalone validation mode when Isaac is not available.

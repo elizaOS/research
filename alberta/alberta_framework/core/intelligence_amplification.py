@@ -207,7 +207,7 @@ def _checked_partner_action(
         raise ValueError("partner_action must have an integer dtype")
     executed = jnp.asarray(raw, dtype=jnp.int32)
     valid = (executed >= 0) & (executed < n_primitive_actions)
-    if not isinstance(executed, jax.core.Tracer) and not bool(valid):
+    if not isinstance(valid, jax.core.Tracer) and not bool(valid):
         raise ValueError(
             f"partner_action must be in [0, {n_primitive_actions})"
         )
@@ -260,6 +260,8 @@ class ExoCortexAgent:
         partner_action: Array | None = None,
         *,
         discount: Array | None = None,
+        decision_observation: Array | None = None,
+        execution_boundary: Array | bool = False,
     ) -> tuple[ExoCortexState, Int[Array, ""], Float[Array, ""]]:
         """Update cortex from partner experience and return recommendation.
 
@@ -311,13 +313,20 @@ class ExoCortexAgent:
                 executing_option=jnp.array(-1, dtype=jnp.int32),
             )
             state = cast(ExoCortexState, state.replace(stomp_state=stomp_state))
+        decision_obs = (
+            partner_next_obs
+            if decision_observation is None
+            else decision_observation
+        )
         result = self._oak.update(
             state,
             partner_reward,
             partner_next_obs,
             routed_discount,
+            decision_observation=decision_obs,
+            execution_boundary=execution_boundary,
         )
-        recommendation = self.recommend(result.state, partner_next_obs)
+        recommendation = self.recommend(result.state, decision_obs)
         return result.state, recommendation, result.td_error
 
 
@@ -597,6 +606,8 @@ class IAAgent:
         partner_action: Array | None = None,
         *,
         discount: Array | None = None,
+        decision_observation: Array | None = None,
+        execution_boundary: Array | bool = False,
     ) -> IAUpdateResult:
         """Process one IA step from partner experience.
 
@@ -634,6 +645,8 @@ class IAAgent:
             next_obs,
             partner_action=partner_action,
             discount=discount,
+            decision_observation=decision_observation,
+            execution_boundary=execution_boundary,
         )
 
         # Augmented observation for the partner
@@ -663,6 +676,8 @@ class IAAgent:
         partner_actions: Array | None = None,
         *,
         discounts: Array | None = None,
+        partner_decision_obs: Array | None = None,
+        execution_boundaries: Array | None = None,
     ) -> IAArrayResult:
         """Run the IA agent over pre-collected partner transition arrays.
 
@@ -682,12 +697,21 @@ class IAAgent:
         """
         use_actions = partner_actions is not None
         use_discounts = discounts is not None
+        use_decision_observations = partner_decision_obs is not None
 
         def step_fn(
             carry: IAState,
             inputs: tuple[Array, ...],
         ) -> tuple[IAState, tuple[Array, ...]]:
-            obs, reward, next_ob, action, transition_discount = inputs
+            (
+                obs,
+                reward,
+                next_ob,
+                decision_ob,
+                action,
+                transition_discount,
+                execution_boundary,
+            ) = inputs
             result = self.update(
                 carry,
                 obs,
@@ -695,6 +719,10 @@ class IAAgent:
                 next_ob,
                 partner_action=action if use_actions else None,
                 discount=transition_discount if use_discounts else None,
+                decision_observation=(
+                    decision_ob if use_decision_observations else None
+                ),
+                execution_boundary=execution_boundary,
             )
             return result.state, (
                 result.predictions,
@@ -715,12 +743,24 @@ class IAAgent:
             if discounts is not None
             else jnp.ones((num_steps,), dtype=jnp.float32)
         )
+        scan_decision_observations = (
+            jnp.asarray(partner_next_obs, dtype=jnp.float32)
+            if partner_decision_obs is None
+            else jnp.asarray(partner_decision_obs, dtype=jnp.float32)
+        )
+        scan_execution_boundaries = (
+            jnp.zeros((num_steps,), dtype=jnp.bool_)
+            if execution_boundaries is None
+            else jnp.asarray(execution_boundaries, dtype=jnp.bool_)
+        )
         xs: tuple[Array, ...] = (
             partner_obs,
             partner_rewards,
             partner_next_obs,
+            scan_decision_observations,
             scan_actions,
             scan_discounts,
+            scan_execution_boundaries,
         )
 
         (

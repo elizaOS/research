@@ -41,6 +41,7 @@ _MAX_RESOURCE_COUNT: Final = 2**63 - 1
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _GIT_COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_GIT_TREE_SHA1 = re.compile(r"[0-9a-f]{40}")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _DOTTED_TARGET = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
 _PATH_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -84,6 +85,7 @@ _KNOWN_HISTORICAL_IMPLEMENTATIONS: Final = frozenset(
         "historical_rtu_ppo",
     }
 )
+_CAPABILITY_DESCRIPTOR_SCHEMA: Final = "alberta.forager_candidate_capability_descriptor.v1"
 
 
 class ForagerMatchedProtocolError(ValueError):
@@ -141,26 +143,27 @@ class SourceBinding:
     """Content-addressed source provenance for one candidate.
 
     ``git_tree`` means the exact candidate is present in ``base_commit`` and
-    ``tree_sha256``.  ``reviewed_snapshot`` means ``base_commit`` is ancestry
-    context only: the exact dirty/untracked source is instead the archive,
-    inventory, and snapshot descriptor named here.  A candidate capability
-    receipt must bind this complete descriptor.
+    the repository's native SHA-1 ``tree_git_sha1``; its snapshot descriptor is
+    null.  ``reviewed_snapshot`` means ``base_commit`` is ancestry context only:
+    the exact dirty/untracked source is instead the archive, inventory, and
+    SHA-256 snapshot descriptor named here.  A candidate capability receipt
+    must bind this complete descriptor.
     """
 
     provenance_kind: Literal["git_tree", "reviewed_snapshot"]
     repository: str
     base_commit: str
-    tree_sha256: str | None
+    tree_git_sha1: str | None
     archive_sha256: str
     inventory_sha256: str
-    snapshot_descriptor_sha256: str
+    snapshot_descriptor_sha256: str | None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "provenance_kind": self.provenance_kind,
             "repository": self.repository,
             "base_commit": self.base_commit,
-            "tree_sha256": self.tree_sha256,
+            "tree_git_sha1": self.tree_git_sha1,
             "archive_sha256": self.archive_sha256,
             "inventory_sha256": self.inventory_sha256,
             "snapshot_descriptor_sha256": self.snapshot_descriptor_sha256,
@@ -279,12 +282,17 @@ class CandidateRuntimeBinding:
     The receipt digest is not a self-attested trust boolean.  A verifier outside
     this reward-agnostic parser must resolve ``qualification_trust_anchor_identity``
     and verify that the receipt binds the candidate source, derived configuration,
-    entrypoint, observation access, and RNG topology.
+    entrypoint, observation access, and RNG topology.  The qualified source
+    descriptor is recomputed locally from source, configuration, entrypoint,
+    observation, RNG, runtime, and role declarations.  It includes the exact
+    :class:`SourceBinding` snapshot descriptor and is the subject the external
+    receipt must contain.
     """
 
     image_sha256: str
     runtime_profile_sha256: str
     task_identity_sha256: str
+    qualified_capability_descriptor_sha256: str
     capability_qualification_receipt_sha256: str
     qualification_trust_anchor_identity: str
 
@@ -293,6 +301,7 @@ class CandidateRuntimeBinding:
             "image_sha256": self.image_sha256,
             "runtime_profile_sha256": self.runtime_profile_sha256,
             "task_identity_sha256": self.task_identity_sha256,
+            "qualified_capability_descriptor_sha256": (self.qualified_capability_descriptor_sha256),
             "capability_qualification_receipt_sha256": (
                 self.capability_qualification_receipt_sha256
             ),
@@ -374,6 +383,36 @@ class MatchedCandidate:
         }
 
 
+def candidate_capability_descriptor_sha256(candidate: MatchedCandidate) -> str:
+    """Return the locally reproducible subject of a candidate qualification receipt."""
+    if type(candidate) is not MatchedCandidate:
+        raise ForagerMatchedProtocolError("candidate must be a MatchedCandidate")
+    binding = candidate.runtime_binding
+    payload: dict[str, Any] = {
+        "agent_rng": candidate.agent_rng.to_dict(),
+        "candidate_id": candidate.candidate_id,
+        "configuration": candidate.configuration.to_dict(),
+        "entrypoint_family": candidate.entrypoint_family,
+        "environment_rng": candidate.environment_rng.to_dict(),
+        "execution_semantics": candidate.execution_semantics.to_dict(),
+        "implementation_kind": candidate.implementation_kind,
+        "observation_access": candidate.observation_access.to_dict(),
+        "pairing": candidate.pairing.to_dict(),
+        "resources": candidate.resources.to_dict(),
+        "runtime_identity": {
+            "image_sha256": binding.image_sha256,
+            "runtime_profile_sha256": binding.runtime_profile_sha256,
+            "task_identity_sha256": binding.task_identity_sha256,
+        },
+        "schema_version": _CAPABILITY_DESCRIPTOR_SCHEMA,
+        "seed_contract": candidate.seed_contract.to_dict(),
+        "selection_group": candidate.selection_group,
+        "source": candidate.source.to_dict(),
+        "stratum": candidate.stratum,
+    }
+    return hashlib.sha256(_canonical_plain_json_bytes(payload)).hexdigest()
+
+
 @dataclass(frozen=True)
 class SelectionSlot:
     """One deterministic winner slot, identified only by group and one-based rank."""
@@ -403,10 +442,18 @@ class SelectionGroup:
 
 @dataclass(frozen=True)
 class SelectionPlan:
-    """Open-tuning selection contract retained in both stages."""
+    """Open-tuning selection contract retained in both stages.
+
+    ``conservative_ci_endpoint`` is the lower endpoint of a two-sided,
+    equal-tail percentile interval.  Its selected quantile is therefore
+    exactly ``(1 - confidence) / 2``; the schema records all three identities
+    explicitly so a consumer cannot reinterpret ``confidence`` as a one-sided
+    lower-bound confidence level.
+    """
 
     metric: str
     metric_implementation_sha256: str
+    candidate_universe_sha256: str
     direction: Literal["maximize"]
     statistic: SelectionStatistic
     statistic_implementation_sha256: str
@@ -417,6 +464,9 @@ class SelectionPlan:
     bootstrap_rng_implementation_sha256: str
     resampling_unit: Literal["candidate_seed_block"]
     quantile_method: Literal["linear"]
+    bootstrap_interval: Literal["two_sided_equal_tail"]
+    conservative_endpoint: Literal["lower"]
+    endpoint_quantile: Literal["(1-confidence)/2"]
     tie_break: Literal["candidate_id_ascending"]
     groups: tuple[SelectionGroup, ...]
 
@@ -433,6 +483,7 @@ class SelectionPlan:
         return {
             "metric": self.metric,
             "metric_implementation_sha256": self.metric_implementation_sha256,
+            "candidate_universe_sha256": self.candidate_universe_sha256,
             "direction": self.direction,
             "statistic": self.statistic,
             "statistic_implementation_sha256": self.statistic_implementation_sha256,
@@ -440,11 +491,12 @@ class SelectionPlan:
             "bootstrap_resamples": self.bootstrap_resamples,
             "bootstrap_seed": self.bootstrap_seed,
             "bootstrap_rng_identity": self.bootstrap_rng_identity,
-            "bootstrap_rng_implementation_sha256": (
-                self.bootstrap_rng_implementation_sha256
-            ),
+            "bootstrap_rng_implementation_sha256": (self.bootstrap_rng_implementation_sha256),
             "resampling_unit": self.resampling_unit,
             "quantile_method": self.quantile_method,
+            "bootstrap_interval": self.bootstrap_interval,
+            "conservative_endpoint": self.conservative_endpoint,
+            "endpoint_quantile": self.endpoint_quantile,
             "tie_break": self.tie_break,
             "groups": [group.to_dict() for group in self.groups],
         }
@@ -544,6 +596,8 @@ class SecondarySignFlipAnalysis:
     rng_algorithm: Literal["PCG64"]
     implementation_sha256: str
     alternative: Literal["greater"]
+    multiplicity_method: Literal["holm"]
+    familywise_alpha: float
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -554,6 +608,8 @@ class SecondarySignFlipAnalysis:
             "rng_algorithm": self.rng_algorithm,
             "implementation_sha256": self.implementation_sha256,
             "alternative": self.alternative,
+            "multiplicity_method": self.multiplicity_method,
+            "familywise_alpha": self.familywise_alpha,
         }
 
 
@@ -666,6 +722,19 @@ class ResolvedHypothesis:
     hypothesis_id: str
     intervention_candidate_id: str
     comparator_candidate_id: str
+    method: AnalysisMethod
+    alternative: Literal["greater"]
+    difference_order: Literal["intervention_minus_comparator"]
+
+    def comparison_spec_payload(self) -> dict[str, str]:
+        """Return the exact explicit-ID payload consumed by statistics ComparisonSpec."""
+        return {
+            "hypothesis_id": self.hypothesis_id,
+            "intervention_id": self.intervention_candidate_id,
+            "comparator_id": self.comparator_candidate_id,
+            "alternative": self.alternative,
+            "difference_order": self.difference_order,
+        }
 
 
 @dataclass(frozen=True)
@@ -766,9 +835,7 @@ class MatchedRuntime:
             "executor_kind": self.executor_kind,
             "image_sha256": self.image_sha256,
             "runtime_profile_sha256": self.runtime_profile_sha256,
-            "executor_qualification_receipt_sha256": (
-                self.executor_qualification_receipt_sha256
-            ),
+            "executor_qualification_receipt_sha256": (self.executor_qualification_receipt_sha256),
             "qualification_trust_anchor_identity": self.qualification_trust_anchor_identity,
             "source_mount_mode": self.source_mount_mode,
             "default_prng": self.default_prng,
@@ -792,6 +859,7 @@ class ForagerMatchedProtocol:
     candidates: tuple[MatchedCandidate, ...]
     selection_plan: SelectionPlan
     selection_outcome: SelectionOutcome
+    analysis_plan: MatchedAnalysisPlan
     evaluation_panel: EvaluationPanel
     primary_hypothesis: MatchedHypothesis
     secondary_hypotheses: tuple[MatchedHypothesis, ...]
@@ -817,6 +885,7 @@ class ForagerMatchedProtocol:
             "candidates": [candidate.to_dict() for candidate in self.candidates],
             "selection_plan": self.selection_plan.to_dict(),
             "selection_outcome": self.selection_outcome.to_dict(),
+            "analysis_plan": self.analysis_plan.to_dict(),
             "evaluation_panel": self.evaluation_panel.to_dict(),
             "primary_hypothesis": self.primary_hypothesis.to_dict(),
             "secondary_hypotheses": [
@@ -1027,6 +1096,12 @@ def _require_nonnegative_float(value: Any, path: str) -> float:
     return value
 
 
+def _require_probability_float(value: Any, path: str) -> float:
+    if type(value) is not float:
+        raise ForagerMatchedProtocolError(f"{path} must be a JSON float")
+    return _require_probability(value, path)
+
+
 def _require_sha256(value: Any, path: str) -> str:
     text = _require_string(value, path, maximum=64)
     if _SHA256.fullmatch(text) is None:
@@ -1219,7 +1294,7 @@ def _parse_source(value: Any, path: str) -> SourceBinding:
             "provenance_kind",
             "repository",
             "base_commit",
-            "tree_sha256",
+            "tree_git_sha1",
             "archive_sha256",
             "inventory_sha256",
             "snapshot_descriptor_sha256",
@@ -1233,29 +1308,36 @@ def _parse_source(value: Any, path: str) -> SourceBinding:
     commit = _require_string(payload["base_commit"], f"{path}.base_commit", maximum=64)
     if _GIT_COMMIT.fullmatch(commit) is None:
         raise ForagerMatchedProtocolError(f"{path}.base_commit must be a full lowercase commit ID")
-    raw_tree = payload["tree_sha256"]
+    raw_tree = payload["tree_git_sha1"]
     tree: str | None
+    raw_snapshot = payload["snapshot_descriptor_sha256"]
+    snapshot: str | None
     if provenance_kind == "git_tree":
-        tree = _require_sha256(raw_tree, f"{path}.tree_sha256")
+        tree = _require_string(raw_tree, f"{path}.tree_git_sha1", maximum=40)
+        if _GIT_TREE_SHA1.fullmatch(tree) is None:
+            raise ForagerMatchedProtocolError(
+                f"{path}.tree_git_sha1 must be a full lowercase Git SHA-1"
+            )
+        if raw_snapshot is not None:
+            raise ForagerMatchedProtocolError(
+                f"{path}.snapshot_descriptor_sha256 must be null for git_tree provenance"
+            )
+        snapshot = None
     else:
         if raw_tree is not None:
             raise ForagerMatchedProtocolError(
-                f"{path}.tree_sha256 must be null for reviewed_snapshot provenance"
+                f"{path}.tree_git_sha1 must be null for reviewed_snapshot provenance"
             )
         tree = None
+        snapshot = _require_sha256(raw_snapshot, f"{path}.snapshot_descriptor_sha256")
     return SourceBinding(
         provenance_kind=cast(Literal["git_tree", "reviewed_snapshot"], provenance_kind),
         repository=_require_repository(payload["repository"], f"{path}.repository"),
         base_commit=commit,
-        tree_sha256=tree,
+        tree_git_sha1=tree,
         archive_sha256=_require_sha256(payload["archive_sha256"], f"{path}.archive_sha256"),
-        inventory_sha256=_require_sha256(
-            payload["inventory_sha256"], f"{path}.inventory_sha256"
-        ),
-        snapshot_descriptor_sha256=_require_sha256(
-            payload["snapshot_descriptor_sha256"],
-            f"{path}.snapshot_descriptor_sha256",
-        ),
+        inventory_sha256=_require_sha256(payload["inventory_sha256"], f"{path}.inventory_sha256"),
+        snapshot_descriptor_sha256=snapshot,
     )
 
 
@@ -1457,6 +1539,7 @@ def _parse_runtime_binding(value: Any, path: str) -> CandidateRuntimeBinding:
             "image_sha256",
             "runtime_profile_sha256",
             "task_identity_sha256",
+            "qualified_capability_descriptor_sha256",
             "capability_qualification_receipt_sha256",
             "qualification_trust_anchor_identity",
         },
@@ -1468,6 +1551,10 @@ def _parse_runtime_binding(value: Any, path: str) -> CandidateRuntimeBinding:
         ),
         task_identity_sha256=_require_sha256(
             payload["task_identity_sha256"], f"{path}.task_identity_sha256"
+        ),
+        qualified_capability_descriptor_sha256=_require_sha256(
+            payload["qualified_capability_descriptor_sha256"],
+            f"{path}.qualified_capability_descriptor_sha256",
         ),
         capability_qualification_receipt_sha256=_require_sha256(
             payload["capability_qualification_receipt_sha256"],
@@ -1599,6 +1686,7 @@ def _parse_selection_plan(value: Any) -> SelectionPlan:
         {
             "metric",
             "metric_implementation_sha256",
+            "candidate_universe_sha256",
             "direction",
             "statistic",
             "statistic_implementation_sha256",
@@ -1609,6 +1697,9 @@ def _parse_selection_plan(value: Any) -> SelectionPlan:
             "bootstrap_rng_implementation_sha256",
             "resampling_unit",
             "quantile_method",
+            "bootstrap_interval",
+            "conservative_endpoint",
+            "endpoint_quantile",
             "tie_break",
             "groups",
         },
@@ -1673,10 +1764,28 @@ def _parse_selection_plan(value: Any) -> SelectionPlan:
     quantile_method = _require_literal(
         payload["quantile_method"], f"{path}.quantile_method", ("linear",)
     )
+    bootstrap_interval = _require_literal(
+        payload["bootstrap_interval"],
+        f"{path}.bootstrap_interval",
+        ("two_sided_equal_tail",),
+    )
+    conservative_endpoint = _require_literal(
+        payload["conservative_endpoint"],
+        f"{path}.conservative_endpoint",
+        ("lower",),
+    )
+    endpoint_quantile = _require_literal(
+        payload["endpoint_quantile"],
+        f"{path}.endpoint_quantile",
+        ("(1-confidence)/2",),
+    )
     return SelectionPlan(
         metric=_require_identifier(payload["metric"], f"{path}.metric"),
         metric_implementation_sha256=_require_sha256(
             payload["metric_implementation_sha256"], f"{path}.metric_implementation_sha256"
+        ),
+        candidate_universe_sha256=_require_sha256(
+            payload["candidate_universe_sha256"], f"{path}.candidate_universe_sha256"
         ),
         direction=cast(Literal["maximize"], direction),
         statistic=cast(SelectionStatistic, statistic_value),
@@ -1704,6 +1813,9 @@ def _parse_selection_plan(value: Any) -> SelectionPlan:
         ),
         resampling_unit=cast(Literal["candidate_seed_block"], resampling_unit),
         quantile_method=cast(Literal["linear"], quantile_method),
+        bootstrap_interval=cast(Literal["two_sided_equal_tail"], bootstrap_interval),
+        conservative_endpoint=cast(Literal["lower"], conservative_endpoint),
+        endpoint_quantile=cast(Literal["(1-confidence)/2"], endpoint_quantile),
         tie_break=cast(Literal["candidate_id_ascending"], tie_break),
         groups=tuple(groups),
     )
@@ -1713,18 +1825,20 @@ def _parse_selection_slot(value: Any, path: str) -> SelectionSlot:
     payload = _require_object(value, path)
     _require_exact_keys(payload, path, {"selection_group", "rank"})
     return SelectionSlot(
-        selection_group=_require_identifier(
-            payload["selection_group"], f"{path}.selection_group"
-        ),
+        selection_group=_require_identifier(payload["selection_group"], f"{path}.selection_group"),
         rank=_require_int(payload["rank"], f"{path}.rank", minimum=1, maximum=_MAX_CANDIDATES),
     )
 
 
-def _parse_selection_slots(value: Any, path: str, *, allow_empty: bool) -> tuple[SelectionSlot, ...]:
+def _parse_selection_slots(
+    value: Any, path: str, *, allow_empty: bool
+) -> tuple[SelectionSlot, ...]:
     items = _require_array(value, path)
     if not allow_empty and not items:
         raise ForagerMatchedProtocolError(f"{path} must not be empty")
-    slots = tuple(_parse_selection_slot(item, f"{path}[{index}]") for index, item in enumerate(items))
+    slots = tuple(
+        _parse_selection_slot(item, f"{path}[{index}]") for index, item in enumerate(items)
+    )
     if len(set(slots)) != len(slots):
         raise ForagerMatchedProtocolError(f"{path} contains duplicate selection slots")
     return slots
@@ -1774,7 +1888,144 @@ def _parse_evaluation_panel(value: Any) -> EvaluationPanel:
     )
 
 
-def _parse_hypothesis(value: Any, path: str) -> MatchedHypothesis:
+def _parse_analysis_plan(value: Any) -> MatchedAnalysisPlan:
+    path = "protocol.analysis_plan"
+    payload = _require_object(value, path)
+    _require_exact_keys(
+        payload,
+        path,
+        {"metric", "metric_implementation_sha256", "metric_direction", "primary", "secondary"},
+    )
+    primary_path = f"{path}.primary"
+    primary = _require_object(payload["primary"], primary_path)
+    _require_exact_keys(
+        primary,
+        primary_path,
+        {
+            "method",
+            "resamples",
+            "seed",
+            "confidence",
+            "primary_margin",
+            "rng_algorithm",
+            "quantile_method",
+            "implementation_sha256",
+            "gate",
+        },
+    )
+    primary_method = _require_literal(
+        primary["method"], primary_path + ".method", ("paired_percentile_bootstrap_lower_bound",)
+    )
+    primary_rng = _require_literal(
+        primary["rng_algorithm"], primary_path + ".rng_algorithm", ("PCG64",)
+    )
+    primary_quantile = _require_literal(
+        primary["quantile_method"], primary_path + ".quantile_method", ("linear",)
+    )
+    primary_gate = _require_literal(
+        primary["gate"],
+        primary_path + ".gate",
+        ("lower_bound_strictly_greater_than_margin",),
+    )
+
+    secondary_path = f"{path}.secondary"
+    secondary = _require_object(payload["secondary"], secondary_path)
+    _require_exact_keys(
+        secondary,
+        secondary_path,
+        {
+            "method",
+            "monte_carlo_resamples",
+            "seed",
+            "exact_max_pairs",
+            "rng_algorithm",
+            "implementation_sha256",
+            "alternative",
+            "multiplicity_method",
+            "familywise_alpha",
+        },
+    )
+    secondary_method = _require_literal(
+        secondary["method"], secondary_path + ".method", ("paired_sign_flip",)
+    )
+    secondary_rng = _require_literal(
+        secondary["rng_algorithm"], secondary_path + ".rng_algorithm", ("PCG64",)
+    )
+    alternative = _require_literal(
+        secondary["alternative"], secondary_path + ".alternative", ("greater",)
+    )
+    multiplicity_method = _require_literal(
+        secondary["multiplicity_method"],
+        secondary_path + ".multiplicity_method",
+        ("holm",),
+    )
+    exact_max = _require_int(
+        secondary["exact_max_pairs"],
+        secondary_path + ".exact_max_pairs",
+        minimum=20,
+        maximum=20,
+    )
+    metric_direction = _require_literal(
+        payload["metric_direction"], f"{path}.metric_direction", ("maximize",)
+    )
+    return MatchedAnalysisPlan(
+        metric=_require_identifier(payload["metric"], f"{path}.metric"),
+        metric_implementation_sha256=_require_sha256(
+            payload["metric_implementation_sha256"], f"{path}.metric_implementation_sha256"
+        ),
+        metric_direction=cast(Literal["maximize"], metric_direction),
+        primary=PrimaryBootstrapAnalysis(
+            method=cast(Literal["paired_percentile_bootstrap_lower_bound"], primary_method),
+            resamples=_require_int(
+                primary["resamples"], primary_path + ".resamples", minimum=1, maximum=10_000_000
+            ),
+            seed=_require_int(
+                primary["seed"], primary_path + ".seed", minimum=0, maximum=_MAX_UINT64
+            ),
+            confidence=_require_probability_float(
+                primary["confidence"], primary_path + ".confidence"
+            ),
+            primary_margin=_require_nonnegative_float(
+                primary["primary_margin"], primary_path + ".primary_margin"
+            ),
+            rng_algorithm=cast(Literal["PCG64"], primary_rng),
+            quantile_method=cast(Literal["linear"], primary_quantile),
+            implementation_sha256=_require_sha256(
+                primary["implementation_sha256"], primary_path + ".implementation_sha256"
+            ),
+            gate=cast(Literal["lower_bound_strictly_greater_than_margin"], primary_gate),
+        ),
+        secondary=SecondarySignFlipAnalysis(
+            method=cast(Literal["paired_sign_flip"], secondary_method),
+            monte_carlo_resamples=_require_int(
+                secondary["monte_carlo_resamples"],
+                secondary_path + ".monte_carlo_resamples",
+                minimum=1,
+                maximum=10_000_000,
+            ),
+            seed=_require_int(
+                secondary["seed"], secondary_path + ".seed", minimum=0, maximum=_MAX_UINT64
+            ),
+            exact_max_pairs=cast(Literal[20], exact_max),
+            rng_algorithm=cast(Literal["PCG64"], secondary_rng),
+            implementation_sha256=_require_sha256(
+                secondary["implementation_sha256"], secondary_path + ".implementation_sha256"
+            ),
+            alternative=cast(Literal["greater"], alternative),
+            multiplicity_method=cast(Literal["holm"], multiplicity_method),
+            familywise_alpha=_require_probability_float(
+                secondary["familywise_alpha"], secondary_path + ".familywise_alpha"
+            ),
+        ),
+    )
+
+
+def _parse_hypothesis(
+    value: Any,
+    path: str,
+    *,
+    expected_method: AnalysisMethod,
+) -> MatchedHypothesis:
     payload = _require_object(value, path)
     _require_exact_keys(
         payload,
@@ -1784,20 +2035,25 @@ def _parse_hypothesis(value: Any, path: str) -> MatchedHypothesis:
             "intervention_slot",
             "comparator_slot",
             "estimand",
-            "direction",
-            "confidence",
+            "method",
+            "alternative",
+            "difference_order",
             "paired",
-            "gate",
         },
     )
     estimand = _require_literal(
         payload["estimand"], f"{path}.estimand", ("paired_mean_difference",)
     )
-    direction = _require_literal(payload["direction"], f"{path}.direction", ("greater",))
+    method = _require_literal(payload["method"], f"{path}.method", (expected_method,))
+    alternative = _require_literal(payload["alternative"], f"{path}.alternative", ("greater",))
+    difference_order = _require_literal(
+        payload["difference_order"],
+        f"{path}.difference_order",
+        ("intervention_minus_comparator",),
+    )
     paired = _require_bool(payload["paired"], f"{path}.paired")
     if paired is not True:
         raise ForagerMatchedProtocolError(f"{path}.paired must be true")
-    gate = _require_literal(payload["gate"], f"{path}.gate", ("paired_ci_lower_gt_zero",))
     return MatchedHypothesis(
         hypothesis_id=_require_identifier(payload["hypothesis_id"], f"{path}.hypothesis_id"),
         intervention_slot=_parse_selection_slot(
@@ -1807,10 +2063,10 @@ def _parse_hypothesis(value: Any, path: str) -> MatchedHypothesis:
             payload["comparator_slot"], f"{path}.comparator_slot"
         ),
         estimand=cast(Literal["paired_mean_difference"], estimand),
-        direction=cast(Literal["greater"], direction),
-        confidence=_require_probability(payload["confidence"], f"{path}.confidence"),
+        method=cast(AnalysisMethod, method),
+        alternative=cast(Literal["greater"], alternative),
+        difference_order=cast(Literal["intervention_minus_comparator"], difference_order),
         paired=True,
-        gate=cast(Literal["paired_ci_lower_gt_zero"], gate),
     )
 
 
@@ -1840,9 +2096,7 @@ def _parse_resolved_selection_slot(value: Any, path: str) -> ResolvedSelectionSl
     payload = _require_object(value, path)
     _require_exact_keys(payload, path, {"selection_group", "rank", "candidate_id"})
     return ResolvedSelectionSlot(
-        selection_group=_require_identifier(
-            payload["selection_group"], f"{path}.selection_group"
-        ),
+        selection_group=_require_identifier(payload["selection_group"], f"{path}.selection_group"),
         rank=_require_int(payload["rank"], f"{path}.rank", minimum=1, maximum=_MAX_CANDIDATES),
         candidate_id=_require_identifier(payload["candidate_id"], f"{path}.candidate_id"),
     )
@@ -1887,9 +2141,7 @@ def _parse_selection_outcome(
         )
     if status != "resolved":
         raise ForagerMatchedProtocolError(f"{path} must be resolved during sealed evaluation")
-    open_digest = _require_sha256(
-        payload["open_protocol_sha256"], f"{path}.open_protocol_sha256"
-    )
+    open_digest = _require_sha256(payload["open_protocol_sha256"], f"{path}.open_protocol_sha256")
     result_digest = _require_sha256(
         payload["selection_result_sha256"], f"{path}.selection_result_sha256"
     )
@@ -2174,12 +2426,20 @@ def _validate_candidate_contracts(
                     f"{path} pairing-eligible candidates must use the common partial observation"
                 )
 
+        if binding.qualified_capability_descriptor_sha256 != candidate_capability_descriptor_sha256(
+            candidate
+        ):
+            raise ForagerMatchedProtocolError(
+                f"{path} capability receipt subject does not match candidate semantics"
+            )
+
 
 def _validate_cross_references(
     *,
     candidates: tuple[MatchedCandidate, ...],
     selection_plan: SelectionPlan,
     selection_outcome: SelectionOutcome,
+    analysis_plan: MatchedAnalysisPlan,
     evaluation_panel: EvaluationPanel,
     primary: MatchedHypothesis,
     secondary: tuple[MatchedHypothesis, ...],
@@ -2188,6 +2448,14 @@ def _validate_cross_references(
     historical: DescriptiveContext,
 ) -> None:
     index = {candidate.candidate_id: candidate for candidate in candidates}
+    if (
+        analysis_plan.metric != selection_plan.metric
+        or analysis_plan.metric_implementation_sha256 != selection_plan.metric_implementation_sha256
+        or analysis_plan.metric_direction != selection_plan.direction
+    ):
+        raise ForagerMatchedProtocolError(
+            "protocol.analysis_plan metric identity must exactly match selection_plan"
+        )
     grouped_candidate_ids: dict[str, list[str]] = {}
     eligible_group_order: list[str] = []
     for candidate in candidates:
@@ -2244,11 +2512,17 @@ def _validate_cross_references(
     groups_by_id = {group.selection_group: group for group in selection_plan.groups}
     alberta_group = groups_by_id[primary_slots[0].selection_group]
     baseline_group = groups_by_id[primary_slots[1].selection_group]
-    if any(index[candidate_id].stratum != "alberta_learning" for candidate_id in alberta_group.candidate_ids):
+    if any(
+        index[candidate_id].stratum != "alberta_learning"
+        for candidate_id in alberta_group.candidate_ids
+    ):
         raise ForagerMatchedProtocolError(
             "protocol.evaluation_panel Alberta primary slot must select an Alberta group"
         )
-    if any(index[candidate_id].stratum != "external_learning" for candidate_id in baseline_group.candidate_ids):
+    if any(
+        index[candidate_id].stratum != "external_learning"
+        for candidate_id in baseline_group.candidate_ids
+    ):
         raise ForagerMatchedProtocolError(
             "protocol.evaluation_panel external primary slot must select an external group"
         )
@@ -2317,6 +2591,14 @@ def _validate_cross_references(
             "protocol.multiplicity_policy hypothesis IDs/order must exactly match "
             "secondary_hypotheses"
         )
+    if (
+        analysis_plan.secondary.multiplicity_method != multiplicity.method
+        or analysis_plan.secondary.familywise_alpha != multiplicity.alpha
+    ):
+        raise ForagerMatchedProtocolError(
+            "protocol.analysis_plan secondary Holm method/alpha must exactly match "
+            "multiplicity_policy"
+        )
 
 
 def parse_forager_matched_protocol(value: Any) -> ForagerMatchedProtocol:
@@ -2336,6 +2618,7 @@ def parse_forager_matched_protocol(value: Any) -> ForagerMatchedProtocol:
         "candidates",
         "selection_plan",
         "selection_outcome",
+        "analysis_plan",
         "evaluation_panel",
         "primary_hypothesis",
         "secondary_hypotheses",
@@ -2390,8 +2673,13 @@ def parse_forager_matched_protocol(value: Any) -> ForagerMatchedProtocol:
         stage=stage_value,
         expected_slots=selection_plan.slots,
     )
+    analysis_plan = _parse_analysis_plan(payload["analysis_plan"])
     evaluation_panel = _parse_evaluation_panel(payload["evaluation_panel"])
-    primary = _parse_hypothesis(payload["primary_hypothesis"], "protocol.primary_hypothesis")
+    primary = _parse_hypothesis(
+        payload["primary_hypothesis"],
+        "protocol.primary_hypothesis",
+        expected_method="paired_percentile_bootstrap_lower_bound",
+    )
     secondary_payload = _require_array(
         payload["secondary_hypotheses"], "protocol.secondary_hypotheses"
     )
@@ -2400,7 +2688,11 @@ def parse_forager_matched_protocol(value: Any) -> ForagerMatchedProtocol:
             "protocol.secondary_hypotheses contains too many hypotheses"
         )
     secondary = tuple(
-        _parse_hypothesis(item, f"protocol.secondary_hypotheses[{index}]")
+        _parse_hypothesis(
+            item,
+            f"protocol.secondary_hypotheses[{index}]",
+            expected_method="paired_sign_flip",
+        )
         for index, item in enumerate(secondary_payload)
     )
     multiplicity = _parse_multiplicity_policy(payload["multiplicity_policy"])
@@ -2421,6 +2713,7 @@ def parse_forager_matched_protocol(value: Any) -> ForagerMatchedProtocol:
         candidates=candidates,
         selection_plan=selection_plan,
         selection_outcome=selection_outcome,
+        analysis_plan=analysis_plan,
         evaluation_panel=evaluation_panel,
         primary=primary,
         secondary=secondary,
@@ -2442,6 +2735,7 @@ def parse_forager_matched_protocol(value: Any) -> ForagerMatchedProtocol:
         candidates=candidates,
         selection_plan=selection_plan,
         selection_outcome=selection_outcome,
+        analysis_plan=analysis_plan,
         evaluation_panel=evaluation_panel,
         primary_hypothesis=primary,
         secondary_hypotheses=secondary,
@@ -2476,8 +2770,7 @@ def parse_forager_matched_selection_result(value: Any) -> ForagerMatchedSelectio
     schema = _require_string(payload["schema_version"], f"{path}.schema_version", maximum=64)
     if schema != FORAGER_MATCHED_SELECTION_RESULT_SCHEMA_VERSION:
         raise ForagerMatchedProtocolError(
-            f"{path}.schema_version must be "
-            f"{FORAGER_MATCHED_SELECTION_RESULT_SCHEMA_VERSION!r}"
+            f"{path}.schema_version must be {FORAGER_MATCHED_SELECTION_RESULT_SCHEMA_VERSION!r}"
         )
     group_values = _require_array(payload["ranked_groups"], f"{path}.ranked_groups")
     if not group_values or len(group_values) > _MAX_CANDIDATES:
@@ -2566,6 +2859,83 @@ def _stage_invariant_protocol_bytes(protocol: ForagerMatchedProtocol) -> bytes:
     return _canonical_plain_json_bytes(payload)
 
 
+def seal_forager_matched_protocol(
+    open_protocol: ForagerMatchedProtocol | Mapping[str, Any] | bytes | str,
+    selection_result: ForagerMatchedSelectionResult | Mapping[str, Any] | bytes | str,
+) -> ForagerMatchedProtocol:
+    """Mechanically resolve an open protocol into its sealed-evaluation form.
+
+    This function is reward-blind and authority-blind.  It does not authenticate
+    the ranking evidence named by ``selection_result``; callers must obtain that
+    result through the separately authenticated selection workflow.  Its only
+    job is to make the stage transition reproducible without hand-editing JSON,
+    while proving that every stage-invariant field remains byte-identical.
+    """
+    open_value = _parse_protocol_instance(open_protocol)
+    if open_value.stage != "open_tuning":
+        raise ForagerMatchedProtocolError("only an open_tuning protocol can be sealed")
+    result = parse_forager_matched_selection_result(selection_result)
+    if result.open_protocol_sha256 != open_value.protocol_sha256:
+        raise ForagerMatchedProtocolError(
+            "selection result is not bound to the canonical open protocol"
+        )
+    if result.selection_plan_sha256 != open_value.selection_plan.plan_sha256:
+        raise ForagerMatchedProtocolError(
+            "selection result is not bound to the canonical selection plan"
+        )
+    if result.tuning_seeds != open_value.tuning_seeds:
+        raise ForagerMatchedProtocolError(
+            "selection result tuning seeds/order do not match the open protocol"
+        )
+    plan_groups = open_value.selection_plan.groups
+    if len(result.ranked_groups) != len(plan_groups):
+        raise ForagerMatchedProtocolError(
+            "selection result groups/order do not match the selection plan"
+        )
+    resolutions: list[dict[str, Any]] = []
+    for plan_group, ranked_group in zip(
+        plan_groups, result.ranked_groups, strict=True
+    ):
+        if ranked_group.selection_group != plan_group.selection_group:
+            raise ForagerMatchedProtocolError(
+                "selection result groups/order do not match the selection plan"
+            )
+        if (
+            len(ranked_group.ranked_candidate_ids) != len(plan_group.candidate_ids)
+            or set(ranked_group.ranked_candidate_ids) != set(plan_group.candidate_ids)
+        ):
+            raise ForagerMatchedProtocolError(
+                f"selection result group {plan_group.selection_group!r} must rank every "
+                "preregistered candidate exactly once"
+            )
+        resolutions.extend(
+            {
+                "selection_group": plan_group.selection_group,
+                "rank": rank,
+                "candidate_id": ranked_group.ranked_candidate_ids[rank - 1],
+            }
+            for rank in range(1, plan_group.advance_count + 1)
+        )
+
+    sealed_payload = open_value.to_dict()
+    sealed_payload["stage"] = "sealed_evaluation"
+    sealed_payload["active_seeds"] = list(open_value.evaluation_seeds)
+    sealed_payload["selection_outcome"] = {
+        "status": "resolved",
+        "open_protocol_sha256": open_value.protocol_sha256,
+        "selection_result_sha256": result.selection_result_sha256,
+        "resolved_slots": resolutions,
+    }
+    sealed = parse_forager_matched_protocol(sealed_payload)
+    validate_sealed_protocol_transition(
+        open_value,
+        sealed,
+        result,
+        result.selection_result_sha256,
+    )
+    return sealed
+
+
 def validate_sealed_protocol_transition(
     open_protocol: ForagerMatchedProtocol | Mapping[str, Any] | bytes | str,
     sealed_protocol: ForagerMatchedProtocol | Mapping[str, Any] | bytes | str,
@@ -2633,10 +3003,9 @@ def validate_sealed_protocol_transition(
         )
     expected_resolutions: list[ResolvedSelectionSlot] = []
     for plan_group, ranked_group in zip(plan_groups, result.ranked_groups, strict=True):
-        if (
-            len(ranked_group.ranked_candidate_ids) != len(plan_group.candidate_ids)
-            or set(ranked_group.ranked_candidate_ids) != set(plan_group.candidate_ids)
-        ):
+        if len(ranked_group.ranked_candidate_ids) != len(plan_group.candidate_ids) or set(
+            ranked_group.ranked_candidate_ids
+        ) != set(plan_group.candidate_ids):
             raise ForagerMatchedProtocolError(
                 f"selection result group {plan_group.selection_group!r} must rank every "
                 "preregistered candidate exactly once"
@@ -2655,7 +3024,9 @@ def validate_sealed_protocol_transition(
         )
 
     slot_index = {item.slot: item.candidate_id for item in expected_resolutions}
-    selected_panel_ids = tuple(slot_index[slot] for slot in sealed_value.evaluation_panel.selection_slots)
+    selected_panel_ids = tuple(
+        slot_index[slot] for slot in sealed_value.evaluation_panel.selection_slots
+    )
     evaluation_ids = (
         selected_panel_ids + sealed_value.evaluation_panel.fixed_descriptive_candidate_ids
     )
@@ -2669,13 +3040,18 @@ def validate_sealed_protocol_transition(
             hypothesis_id=hypothesis.hypothesis_id,
             intervention_candidate_id=slot_index[hypothesis.intervention_slot],
             comparator_candidate_id=slot_index[hypothesis.comparator_slot],
+            method=hypothesis.method,
+            alternative=hypothesis.alternative,
+            difference_order=hypothesis.difference_order,
         )
         for hypothesis in hypotheses
     )
     primary = resolved_hypotheses[0]
     candidate_index = sealed_value.candidate_index
     if candidate_index[primary.intervention_candidate_id].stratum != "alberta_learning":
-        raise ForagerMatchedProtocolError("resolved primary intervention is not an Alberta candidate")
+        raise ForagerMatchedProtocolError(
+            "resolved primary intervention is not an Alberta candidate"
+        )
     if candidate_index[primary.comparator_candidate_id].stratum != "external_learning":
         raise ForagerMatchedProtocolError("resolved primary comparator is not external learning")
     return SealedProtocolValidation(
@@ -2772,6 +3148,7 @@ normalize_matched_protocol = normalize_forager_matched_protocol
 
 __all__ = [
     "FORAGER_MATCHED_PROTOCOL_SCHEMA_VERSION",
+    "FORAGER_MATCHED_SELECTION_RESULT_SCHEMA_VERSION",
     "MATCHED_PROTOCOL_SCHEMA_VERSION",
     "AllowedTransform",
     "AgentRNGContract",
@@ -2784,6 +3161,8 @@ __all__ = [
     "ExecutionSemantics",
     "ForagerMatchedProtocol",
     "ForagerMatchedProtocolError",
+    "ForagerMatchedSelectionResult",
+    "MatchedAnalysisPlan",
     "MatchedCandidate",
     "MatchedHypothesis",
     "MatchedRuntime",
@@ -2791,18 +3170,32 @@ __all__ = [
     "MultiplicityPolicy",
     "ObservationAccess",
     "PairingEligibility",
+    "PrimaryBootstrapAnalysis",
+    "RankedSelectionGroup",
     "ResourceAccounting",
     "SeedContract",
     "SelectionGroup",
+    "SelectionOutcome",
     "SelectionPlan",
+    "SelectionSlot",
+    "SecondarySignFlipAnalysis",
+    "SealedProtocolValidation",
+    "ResolvedHypothesis",
+    "ResolvedSelectionSlot",
     "SourceBinding",
     "canonical_json_bytes",
     "canonical_json_sha256",
+    "canonical_selection_result_bytes",
+    "canonical_selection_result_sha256",
+    "candidate_capability_descriptor_sha256",
     "decode_strict_json",
     "load_forager_matched_protocol",
     "load_matched_protocol",
     "normalize_forager_matched_protocol",
     "normalize_matched_protocol",
     "parse_forager_matched_protocol",
+    "parse_forager_matched_selection_result",
     "parse_matched_protocol",
+    "seal_forager_matched_protocol",
+    "validate_sealed_protocol_transition",
 ]

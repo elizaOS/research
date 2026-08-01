@@ -49,6 +49,7 @@ def _protocol() -> ContinualEvaluationProtocol:
         recovery_window=2,
         worst_window_size=2,
         dropped_observation_score=0.0,
+        operation_latency_deadline_ms=1.0,
     )
 
 
@@ -60,6 +61,7 @@ def _budget() -> MatchedBudget:
         backward_call_limit=9,
         parameter_count_limit=16,
         persistent_state_bytes_limit=4_096,
+        host_high_water_bytes_limit=4_096,
     )
 
 
@@ -97,6 +99,7 @@ def _condition(
                 forward=_latencies(),
                 update=_latencies(),
                 backward=_latencies(),
+                measurement_method="test fixture clock",
             ),
             memory=MemoryHighWaterMarks(
                 host_high_water_bytes=3_072,
@@ -121,10 +124,9 @@ def _condition(
             interventions=1 if candidate_diagnostics else 0,
             near_misses=1 if candidate_diagnostics else 0,
             cumulative_cost=0.2 if candidate_diagnostics else 0.0,
-            cumulative_near_miss_cost=(
-                0.1 if candidate_diagnostics else 0.0
-            ),
+            cumulative_near_miss_cost=(0.1 if candidate_diagnostics else 0.0),
             maximum_step_cost=0.2 if candidate_diagnostics else 0.0,
+            measurement_method="test fixture safety accounting",
         ),
         applicable_components=("toy_component",) if candidate_diagnostics else (),
         component_diagnostics=(
@@ -200,7 +202,7 @@ def test_hand_computed_metrics_and_raw_invariants() -> None:
 
     adaptation = metrics["adaptation_auc"]
     assert isinstance(adaptation, dict)
-    assert adaptation["mean_normalized_auc"] == pytest.approx((0.6 + 0.25 + 0.75) / 3.0)
+    assert adaptation["mean_normalized_auc"] == pytest.approx((0.25 + 0.75) / 2.0)
 
     recovery = metrics["recovery"]
     assert isinstance(recovery, dict)
@@ -226,8 +228,8 @@ def test_hand_computed_metrics_and_raw_invariants() -> None:
     assert backward["mean"] == pytest.approx(-0.225)
     assert forward["per_regime"] == {"A": None, "B": pytest.approx(-0.1)}
     assert forward["mean_over_available"] == pytest.approx(-0.1)
-    assert stability["mean_gap"] == pytest.approx(0.3)
-    assert stability["maximum_gap"] == pytest.approx(0.8)
+    assert stability["mean_gap"] == pytest.approx(0.55)
+    assert stability["maximum_gap"] == pytest.approx(0.7)
     assert worst == {
         "window_size": 2,
         "score": pytest.approx(0.05),
@@ -259,6 +261,9 @@ def test_hand_computed_metrics_and_raw_invariants() -> None:
         "unit": "joule",
         "measurement_method": "test fixture",
     }
+    applicability = metrics["metric_applicability"]
+    assert isinstance(applicability, dict)
+    assert set(applicability) == set(metrics) - {"metric_applicability"}
     assert validate_continual_evaluation_report(report).valid
     assert json.loads(continual_evaluation_report_json(report)) == report
 
@@ -271,6 +276,122 @@ def test_learner_trace_api_has_no_regime_identifier() -> None:
     }
     assert all("regime" not in field.name for field in fields(PredictBeforeUpdateTrace))
     assert "regime_schedule" in {field.name for field in fields(ContinualEvaluationProtocol)}
+
+
+@pytest.mark.unit
+def test_protocol_rejects_false_first_exposure_metadata_and_missing_deadline() -> None:
+    with pytest.raises(ValueError, match="first checkpoint at or after first exposure"):
+        replace(
+            _protocol(),
+            first_exposure_checkpoint={"A": 0, "B": 0},
+        )
+    with pytest.raises(ValueError, match="operation_latency_deadline_ms must be positive"):
+        replace(_protocol(), operation_latency_deadline_ms=0.0)
+    with pytest.raises(ValueError, match="unmeasured safety fields must all be zero"):
+        SafetyMeasurements(
+            checks=1,
+            violations=0,
+            interventions=0,
+            near_misses=0,
+            cumulative_cost=0.0,
+            cumulative_near_miss_cost=0.0,
+            maximum_step_cost=0.0,
+            measurement_method=None,
+        )
+
+
+@pytest.mark.unit
+def test_forward_transfer_is_explicitly_unavailable_without_preexposure_probe() -> None:
+    protocol = replace(
+        _protocol(),
+        regime_schedule=("A", "B", "A", "B", "B", "B", "A", "A", "A"),
+        first_exposure_checkpoint={"A": 0, "B": 0},
+    )
+    candidate = _condition(
+        "candidate",
+        scores=(0.5,) * 9,
+        processed=(True,) * 9,
+        matrix=((0.5, 0.5),) * 3,
+    )
+    report = build_continual_evaluation_report(
+        protocol=protocol,
+        candidate=candidate,
+        baselines=(
+            replace(candidate, name="frozen"),
+            replace(candidate, name="running"),
+        ),
+    )
+    record = _condition_record(report, "candidate")
+    metrics = record["metrics"]
+    assert isinstance(metrics, dict)
+    applicability = metrics["metric_applicability"]
+    forward = metrics["forward_transfer"]
+    assert isinstance(applicability, dict)
+    assert isinstance(forward, dict)
+    forward_applicability = applicability["forward_transfer"]
+    assert forward_applicability == {
+        "applicable": False,
+        "unavailable_reason": "no regime has a pre-exposure held-out probe",
+        "evidence_source": "held_out_non_learning_regime_probes",
+        "available_regimes": [],
+        "unavailable_regimes": {
+            "A": "no pre-exposure checkpoint exists for this regime",
+            "B": "no pre-exposure checkpoint exists for this regime",
+        },
+    }
+    assert forward["mean_over_available"] is None
+    assert forward["available_regime_count"] == 0
+    assert forward["per_regime"] == {"A": None, "B": None}
+    assert validate_continual_evaluation_report(report).valid
+
+
+@pytest.mark.unit
+def test_lower_is_better_direction_applies_to_change_and_probe_metrics() -> None:
+    protocol = replace(
+        _protocol(),
+        higher_is_better=False,
+        recovery_thresholds={"A": 0.2, "B": 0.2},
+        stability_references={"A": 0.2, "B": 0.2},
+        dropped_observation_score=1.0,
+    )
+    candidate = _condition(
+        "loss_candidate",
+        scores=(0.8, 0.4, 0.1, 0.9, 0.3, 0.1, 0.8, 0.2, 0.1),
+        processed=(True,) * 9,
+        matrix=((0.1, 0.6), (0.5, 0.1), (0.2, 0.4)),
+    )
+    report = build_continual_evaluation_report(
+        protocol=protocol,
+        candidate=candidate,
+        baselines=(
+            replace(candidate, name="loss_frozen"),
+            replace(candidate, name="loss_running"),
+        ),
+    )
+    record = _condition_record(report, "loss_candidate")
+    metrics = record["metrics"]
+    assert isinstance(metrics, dict)
+    adaptation = metrics["adaptation_auc"]
+    forgetting = metrics["forgetting"]
+    backward = metrics["backward_transfer"]
+    forward = metrics["forward_transfer"]
+    stability = metrics["stability"]
+    worst = metrics["worst_window"]
+    assert isinstance(adaptation, dict)
+    assert isinstance(forgetting, dict)
+    assert isinstance(backward, dict)
+    assert isinstance(forward, dict)
+    assert isinstance(stability, dict)
+    assert isinstance(worst, dict)
+    assert adaptation["mean_normalized_auc"] == pytest.approx(0.3625)
+    assert forgetting["per_regime"] == pytest.approx({"A": 0.1, "B": 0.3})
+    assert backward["per_regime"] == pytest.approx({"A": -0.1, "B": -0.3})
+    assert forward["per_regime"] == {"A": None, "B": pytest.approx(-0.1)}
+    assert stability["mean_gap"] == pytest.approx(0.65)
+    assert stability["maximum_gap"] == pytest.approx(0.7)
+    assert worst["score"] == pytest.approx(0.6)
+    assert worst["start_step"] == 0
+    assert validate_continual_evaluation_report(report).valid
 
 
 @pytest.mark.unit
@@ -336,6 +457,27 @@ def test_builder_requires_two_unique_exactly_matched_baselines() -> None:
             protocol=_protocol(),
             candidate=candidate,
             baselines=(baseline, mismatched),
+        )
+
+    host_unbounded_budget = replace(
+        _budget(),
+        host_high_water_bytes_limit=2_048,
+    )
+    host_unbounded = _condition(
+        "host_unbounded",
+        scores=(0.5,) * 9,
+        processed=(True,) * 9,
+        matrix=((0.5, 0.5),) * 3,
+        budget=host_unbounded_budget,
+    )
+    with pytest.raises(ValueError, match="host high-water mark exceeds"):
+        build_continual_evaluation_report(
+            protocol=_protocol(),
+            candidate=host_unbounded,
+            baselines=(
+                replace(host_unbounded, name="host_baseline_a"),
+                replace(host_unbounded, name="host_baseline_b"),
+            ),
         )
 
 
@@ -423,6 +565,7 @@ def _run_toy_condition(
                 forward=_measured_latency(forward_latencies),
                 update=_measured_latency(update_latencies),
                 backward=_measured_latency([]),
+                measurement_method="time.perf_counter_ns wall clock",
             ),
             memory=MemoryHighWaterMarks(
                 host_high_water_bytes=host_peak,
@@ -441,6 +584,7 @@ def _run_toy_condition(
             cumulative_cost=0.0,
             cumulative_near_miss_cost=0.0,
             maximum_step_cost=0.0,
+            measurement_method="toy per-observation safety accounting",
         ),
         applicable_components=("toy_scalar_learner",),
         component_diagnostics=component_diagnostics,
@@ -466,6 +610,7 @@ def test_end_to_end_deliberately_forgetting_toy_trace() -> None:
         backward_call_limit=0,
         parameter_count_limit=2,
         persistent_state_bytes_limit=1_000_000,
+        host_high_water_bytes_limit=1_000_000,
     )
     candidate = _run_toy_condition(
         "overwrite_last_target",

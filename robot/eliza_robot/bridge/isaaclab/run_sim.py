@@ -4,7 +4,7 @@ This script creates an IsaacLab environment with the AiNex robot and
 exposes joint-level control that the bridge backends can drive.
 
 Usage (requires Isaac Sim Python environment):
-    python -m bridge.isaaclab.run_sim [--headless] [--num-envs 1]
+    python -m eliza_robot.bridge.isaaclab.run_sim [--headless] [--num-envs 1]
 
 When Isaac Sim is not available, runs in dry-run mode to validate config.
 """
@@ -14,7 +14,10 @@ from __future__ import annotations
 import argparse
 import sys
 
-from eliza_robot.bridge.isaaclab.ainex_cfg import build_ainex_cfg, try_build_isaaclab_articulation_cfg
+from eliza_robot.bridge.isaaclab.ainex_cfg import (
+    build_ainex_cfg,
+    try_build_isaaclab_articulation_cfg,
+)
 from eliza_robot.bridge.isaaclab.joint_map import JOINT_NAMES
 
 

@@ -96,6 +96,68 @@ def _retarget_shard_command(payload: dict[str, Any], path: Path) -> None:
     )
 
 
+def _copy_immutable(source: Path, destination: Path) -> Path:
+    destination.write_bytes(source.read_bytes())
+    destination.chmod(0o444)
+    return destination
+
+
+def _bind_shard_reservation(
+    payload: dict[str, Any],
+    plan_path: Path,
+    shard_path: Path,
+) -> Path:
+    plan_raw = plan_path.read_bytes()
+    method_id = payload["method_id"]
+    seed_id = payload["seed_id"]
+    reservation_path = scr_v2_module._shard_reservation_path(
+        plan_path,
+        plan_raw,
+        method_id,
+        seed_id,
+    )
+    reservation = scr_v2_module._build_shard_reservation(
+        plan_path=plan_path,
+        plan_raw=plan_raw,
+        method_id=method_id,
+        seed_id=seed_id,
+        output=shard_path,
+        prescribed_command=payload["execution"]["command"],
+    )
+    reservation_raw = scr_v2_module._canonical_json_bytes(reservation)
+    reservation_path.parent.mkdir(parents=True, exist_ok=True)
+    reservation_path.write_bytes(reservation_raw)
+    reservation_path.chmod(0o444)
+    payload["reservation_binding"] = {
+        "path": str(reservation_path.absolute()),
+        "byte_size": len(reservation_raw),
+        "sha256": hashlib.sha256(reservation_raw).hexdigest(),
+    }
+    return reservation_path
+
+
+def _copy_bound_bundle(
+    bundle: dict[str, Any],
+    root: Path,
+    prefix: str,
+) -> tuple[Path, tuple[Path, ...]]:
+    bundle_root = root / f"{prefix}-bundle"
+    bundle_root.mkdir()
+    plan_path = _copy_immutable(
+        Path(bundle["plan"]),
+        bundle_root / "plan.json",
+    )
+    shard_paths: list[Path] = []
+    for index, original in enumerate(bundle["shards"]):
+        payload = json.loads(Path(original).read_text())
+        shard_path = bundle_root / f"shard-{index}.json"
+        _retarget_shard_command(payload, shard_path)
+        _bind_shard_reservation(payload, plan_path, shard_path)
+        _write_json(shard_path, payload)
+        shard_paths.append(shard_path)
+    return plan_path, tuple(shard_paths)
+
+
 def _capture_stable_source_manifest() -> dict[str, Any]:
     for _ in range(32):
         try:
@@ -394,13 +456,43 @@ class TestClosedRunSpec:
         assert runtime["python_executable"]["byte_size"] > 0
         assert len(runtime["python_executable"]["sha256"]) == 64
         assert set(runtime["distribution_content"]) == {
+            "absl-py",
+            "aiofiles",
             "chex",
+            "cloudpickle",
+            "etils",
+            "humanize",
             "jax",
             "jaxlib",
+            "ml-dtypes",
+            "msgpack",
             "numpy",
+            "opt-einsum",
+            "orbax-checkpoint",
+            "prometheus-client",
+            "protobuf",
+            "psutil",
+            "pygments",
+            "pyyaml",
+            "scipy",
+            "simplejson",
+            "tensorstore",
+            "toolz",
+            "typing-extensions",
+            "uvloop",
+            "wadler-lindig",
             "jaxtyping",
         }
         assert runtime["distribution_content"]["jax"]["status"] == "content_hashed"
+        assert (
+            runtime["distribution_content_scope"]
+            == "explicit_clean_import_observed_plus_required_dependency_set"
+        )
+        assert runtime["unbound_runtime_scope"] == [
+            "system_shared_libraries_loaded_by_python_or_extension_modules",
+            "device_drivers_and_firmware",
+            "dynamically_loaded_code_outside_distribution_file_manifests",
+        ]
         assert "jax_default_matmul_precision" in runtime
         assert type(runtime["jax_config"]["jax_random_seed_offset"]) is int
         assert "jax_disable_jit" in runtime["jax_config"]
@@ -414,6 +506,23 @@ class TestClosedRunSpec:
         monkeypatch.setattr(scr_v2_module, "_discover_runtime_manifest", broken_discovery)
         with pytest.raises(SCRV2ValidationError, match="runtime discovery failed closed"):
             _build_runtime_manifest()
+
+    def test_transitive_distribution_content_drift_breaks_current_binding(
+        self,
+        tiny_bundle: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        plan = json.loads(Path(tiny_bundle["plan"]).read_text())
+        changed_runtime = copy.deepcopy(plan["runtime_manifest"])
+        changed_runtime["distribution_content"]["ml-dtypes"]["sha256"] = "0" * 64
+        monkeypatch.setattr(
+            scr_v2_module,
+            "_build_runtime_manifest",
+            lambda: copy.deepcopy(changed_runtime),
+        )
+        report = validate_scr_v2_run_plan(tiny_bundle["plan"])
+        assert not report.valid
+        assert "current runtime differs" in report.errors[0]
 
 
 class TestStrictJSON:
@@ -456,6 +565,14 @@ class TestPlanAndShardContracts:
                 50,
                 created_unix=int(time.time()) + 60,
             )
+
+    def test_future_timestamp_policy_allows_only_five_seconds_of_clock_skew(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(scr_v2_module.time, "time", lambda: 1_000.0)
+        assert scr_v2_module._require_not_future_unix(1_005, "timestamp") == 1_005
+        with pytest.raises(SCRV2ValidationError, match="5-second clock-skew tolerance"):
+            scr_v2_module._require_not_future_unix(1_006, "timestamp")
 
     def test_validator_rejects_fabricated_future_plan_timestamp(
         self, tiny_bundle: dict[str, Any], tmp_path: Path
@@ -594,8 +711,10 @@ class TestPlanAndShardContracts:
         output = tmp_path / "swapped.json"
         with pytest.raises(SCRV2ValidationError, match="descriptor-held"):
             scr_v2_module._atomic_write_new(output, b"trusted bytes\n")
-        assert not output.exists()
-        assert not tuple(tmp_path.glob(".*.tmp"))
+        assert output.read_bytes() == b"attacker bytes\n"
+        substituted_temporary_names = tuple(tmp_path.glob(".*.tmp"))
+        assert len(substituted_temporary_names) == 1
+        assert substituted_temporary_names[0].read_bytes() == b"attacker bytes\n"
 
     def test_atomic_publication_rejects_extra_hard_link(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -650,6 +769,28 @@ class TestPlanAndShardContracts:
         with pytest.raises(SCRV2ValidationError, match="output bytes differ"):
             scr_v2_module._atomic_write_new(output, b"trusted bytes\n")
         assert not output.exists()
+
+    def test_atomic_publication_preserves_unknown_target_replaced_after_readback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        output = tmp_path / "post-read-replacement.json"
+        real_read = scr_v2_module._read_regular_bytes
+        replaced = False
+
+        def replace_after_readback(path: Path, *, require_immutable: bool) -> bytes:
+            nonlocal replaced
+            raw = real_read(path, require_immutable=require_immutable)
+            if Path(path) == output and require_immutable and not replaced:
+                output.unlink()
+                output.write_bytes(b"unknown concurrent publication\n")
+                output.chmod(0o444)
+                replaced = True
+            return raw
+
+        monkeypatch.setattr(scr_v2_module, "_read_regular_bytes", replace_after_readback)
+        with pytest.raises(SCRV2ValidationError, match="changed after final readback"):
+            scr_v2_module._atomic_write_new(output, b"trusted bytes\n")
+        assert output.read_bytes() == b"unknown concurrent publication\n"
 
     def test_atomic_publication_rejects_renamed_ancestor(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -818,28 +959,87 @@ class TestPlanAndShardContracts:
         path = tmp_path / "late-plan.json"
         path.write_bytes(Path(tiny_bundle["plan"]).read_bytes())
         path.chmod(0o444)
-        real_check = scr_v2_module._require_current_plan_bindings
+        real_reread = scr_v2_module._require_exact_reread
         replaced = False
 
-        def replace_after_binding(plan: dict[str, Any], context: str) -> None:
+        def replace_before_final_reread(
+            reread_path: Path,
+            expected: bytes,
+            context: str,
+        ) -> None:
             nonlocal replaced
-            real_check(plan, context)
-            if not replaced:
-                changed = copy.deepcopy(plan)
+            if context == "run plan" and not replaced:
+                changed = json.loads(expected)
                 changed["created_unix"] += 1
                 path.chmod(0o644)
                 path.write_bytes(scr_v2_module._canonical_json_bytes(changed))
                 path.chmod(0o444)
                 replaced = True
+            real_reread(reread_path, expected, context)
 
         monkeypatch.setattr(
             scr_v2_module,
-            "_require_current_plan_bindings",
-            replace_after_binding,
+            "_require_exact_reread",
+            replace_before_final_reread,
         )
         report = validate_scr_v2_run_plan(path)
         assert not report.valid
         assert "run plan bytes changed" in report.errors[0]
+
+    def test_plan_validation_rechecks_current_source_after_final_reread(
+        self,
+        tiny_bundle: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        baseline = json.loads(Path(tiny_bundle["plan"]).read_text())["source_manifest"]
+        final_reread_completed = False
+        real_reread = scr_v2_module._require_exact_reread
+
+        def tracking_reread(path: Path, expected: bytes, context: str) -> None:
+            nonlocal final_reread_completed
+            real_reread(path, expected, context)
+            if context == "run plan":
+                final_reread_completed = True
+
+        def source_after_reread() -> dict[str, Any]:
+            manifest = copy.deepcopy(baseline)
+            if final_reread_completed:
+                manifest["files"][0]["sha256"] = "0" * 64
+            return manifest
+
+        monkeypatch.setattr(scr_v2_module, "_require_exact_reread", tracking_reread)
+        monkeypatch.setattr(scr_v2_module, "_build_source_manifest", source_after_reread)
+        report = validate_scr_v2_run_plan(tiny_bundle["plan"])
+        assert not report.valid
+        assert "current source bytes differ" in report.errors[0]
+
+    @pytest.mark.parametrize("validator_kind", ["plan", "shard", "artifact"])
+    def test_public_validators_wrap_unexpected_exceptions(
+        self,
+        validator_kind: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def explode(*args: object, **kwargs: object) -> Any:
+            raise RuntimeError("injected unexpected validator failure")
+
+        if validator_kind == "artifact":
+            monkeypatch.setattr(scr_v2_module, "_read_strict_json", explode)
+            report = validate_scr_v2_artifact(Path("unused-artifact.json"))
+        else:
+            monkeypatch.setattr(scr_v2_module, "_read_validated_plan", explode)
+            if validator_kind == "plan":
+                report = validate_scr_v2_run_plan(Path("unused-plan.json"))
+            else:
+                report = validate_scr_v2_shard(
+                    Path("unused-shard.json"),
+                    Path("unused-plan.json"),
+                )
+        assert not report.valid
+        assert (
+            report.errors
+            == ("unexpected validation failure (RuntimeError): "
+                "injected unexpected validator failure",)
+        )
 
     def test_plan_current_source_binding_fails_closed_after_digest_tamper(
         self, tiny_bundle: dict[str, Any], tmp_path: Path
@@ -1000,9 +1200,14 @@ class TestPlanAndShardContracts:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        plan_path = _copy_immutable(
+            Path(tiny_bundle["plan"]),
+            tmp_path / "late-replaced-plan.json",
+        )
         payload = json.loads(Path(tiny_bundle["shards"][0]).read_text())
         path = tmp_path / "late-replaced-shard.json"
         _retarget_shard_command(payload, path)
+        _bind_shard_reservation(payload, plan_path, path)
         _write_json(path, payload)
 
         def replace_after_replay(*args: object, **kwargs: object) -> None:
@@ -1017,7 +1222,7 @@ class TestPlanAndShardContracts:
             "_validate_replayed_measurements",
             replace_after_replay,
         )
-        report = validate_scr_v2_shard(path, tiny_bundle["plan"])
+        report = validate_scr_v2_shard(path, plan_path)
         assert not report.valid
         assert "validated shard bytes changed" in report.errors[0]
 
@@ -1126,6 +1331,9 @@ class TestPlanAndShardContracts:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        plan_path = tmp_path / "failed-worker-plan.json"
+        plan_path.write_bytes(Path(tiny_bundle["plan"]).read_bytes())
+        plan_path.chmod(0o444)
         output = tmp_path / "failed-worker.json"
 
         def fail_worker(*args: object, **kwargs: object) -> jax.Array:
@@ -1134,12 +1342,18 @@ class TestPlanAndShardContracts:
         monkeypatch.setattr(scr_v2_module, "run_scr_v2_seed", fail_worker)
         with pytest.raises(RuntimeError, match="seed consumption"):
             run_scr_v2_shard(
-                tiny_bundle["plan"],
+                plan_path,
                 PUBLICATION_BP_METHOD,
                 0,
                 output,
             )
-        reservation = Path(f"{output}.reservation")
+        plan_raw = plan_path.read_bytes()
+        reservation = scr_v2_module._shard_reservation_path(
+            plan_path,
+            plan_raw,
+            PUBLICATION_BP_METHOD,
+            0,
+        )
         assert not output.exists()
         assert reservation.is_file()
         assert stat.S_IMODE(reservation.stat().st_mode) == 0o444
@@ -1156,26 +1370,145 @@ class TestPlanAndShardContracts:
             return jnp.zeros((4,), dtype=jnp.float32)
 
         monkeypatch.setattr(scr_v2_module, "run_scr_v2_seed", must_not_rerun)
+        alternate_output = tmp_path / "alternate-output-must-not-run.json"
         with pytest.raises(FileExistsError, match="overwrite"):
             run_scr_v2_shard(
-                tiny_bundle["plan"],
+                plan_path,
                 PUBLICATION_BP_METHOD,
                 0,
-                output,
+                alternate_output,
             )
         assert not executed
+        assert not alternate_output.exists()
+
+    def test_distinct_plan_digests_have_distinct_reservation_namespaces(
+        self,
+        tiny_bundle: dict[str, Any],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        del tiny_bundle
+        first_plan = write_scr_v2_run_plan(
+            tmp_path / "first-plan.json",
+            TINY,
+            PARAMS,
+            (PUBLICATION_BP_METHOD,),
+            (0,),
+            50,
+            created_unix=101,
+        )
+        second_plan = write_scr_v2_run_plan(
+            tmp_path / "second-plan.json",
+            TINY,
+            PARAMS,
+            (PUBLICATION_BP_METHOD,),
+            (0,),
+            50,
+            created_unix=102,
+        )
+        monkeypatch.setattr(
+            scr_v2_module,
+            "run_scr_v2_seed",
+            lambda *args, **kwargs: jnp.zeros((4,), dtype=jnp.float32),
+        )
+        first_output = run_scr_v2_shard(
+            first_plan,
+            PUBLICATION_BP_METHOD,
+            0,
+            tmp_path / "first-output.json",
+        )
+        second_output = run_scr_v2_shard(
+            second_plan,
+            PUBLICATION_BP_METHOD,
+            0,
+            tmp_path / "second-output.json",
+        )
+        first_reservation = scr_v2_module._shard_reservation_path(
+            first_plan,
+            first_plan.read_bytes(),
+            PUBLICATION_BP_METHOD,
+            0,
+        )
+        second_reservation = scr_v2_module._shard_reservation_path(
+            second_plan,
+            second_plan.read_bytes(),
+            PUBLICATION_BP_METHOD,
+            0,
+        )
+        assert first_output.is_file() and second_output.is_file()
+        assert first_reservation != second_reservation
+        assert first_reservation.is_file() and second_reservation.is_file()
 
     def test_successful_shards_retain_bound_reservations(
         self, tiny_bundle: dict[str, Any]
     ) -> None:
+        plan_path = Path(tiny_bundle["plan"])
+        plan_raw = plan_path.read_bytes()
         for shard_path in tiny_bundle["shards"]:
             shard = json.loads(Path(shard_path).read_text())
-            reservation_path = Path(f"{shard_path}.reservation")
+            reservation_path = scr_v2_module._shard_reservation_path(
+                plan_path,
+                plan_raw,
+                shard["method_id"],
+                shard["seed_id"],
+            )
             reservation = json.loads(reservation_path.read_text())
             assert reservation["method_id"] == shard["method_id"]
             assert reservation["seed_id"] == shard["seed_id"]
             assert reservation["target_locator"] == str(Path(shard_path).absolute())
             assert reservation["prescribed_command"] == shard["execution"]["command"]
+            assert shard["reservation_binding"] == {
+                "path": str(reservation_path.absolute()),
+                "byte_size": len(reservation_path.read_bytes()),
+                "sha256": hashlib.sha256(reservation_path.read_bytes()).hexdigest(),
+            }
+
+    def test_public_shard_validation_requires_the_exact_bound_reservation(
+        self,
+        tiny_bundle: dict[str, Any],
+        tmp_path: Path,
+    ) -> None:
+        plan_path, shard_paths = _copy_bound_bundle(
+            tiny_bundle,
+            tmp_path,
+            "missing-reservation-validation",
+        )
+        shard = json.loads(shard_paths[0].read_text())
+        reservation_path = Path(shard["reservation_binding"]["path"])
+        reservation_path.unlink()
+        report = validate_scr_v2_shard(shard_paths[0], plan_path)
+        assert not report.valid
+        assert "No such file or directory" in report.errors[0]
+
+    def test_shard_validation_rechecks_current_source_after_reservation_reread(
+        self,
+        tiny_bundle: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        baseline = json.loads(Path(tiny_bundle["plan"]).read_text())["source_manifest"]
+        reservation_reread_completed = False
+        real_reread = scr_v2_module._require_exact_reread
+
+        def tracking_reread(path: Path, expected: bytes, context: str) -> None:
+            nonlocal reservation_reread_completed
+            real_reread(path, expected, context)
+            if context == "validated shard reservation":
+                reservation_reread_completed = True
+
+        def source_after_reread() -> dict[str, Any]:
+            manifest = copy.deepcopy(baseline)
+            if reservation_reread_completed:
+                manifest["files"][0]["sha256"] = "0" * 64
+            return manifest
+
+        monkeypatch.setattr(scr_v2_module, "_require_exact_reread", tracking_reread)
+        monkeypatch.setattr(scr_v2_module, "_build_source_manifest", source_after_reread)
+        report = validate_scr_v2_shard(
+            tiny_bundle["shards"][0],
+            tiny_bundle["plan"],
+        )
+        assert not report.valid
+        assert "final shard validation after final rereads" in report.errors[0]
 
     def test_late_external_plan_replacement_blocks_shard_publication(
         self,
@@ -1206,7 +1539,13 @@ class TestPlanAndShardContracts:
                 output,
             )
         assert not output.exists()
-        assert Path(f"{output}.reservation").is_file()
+        reservation_path = scr_v2_module._shard_reservation_path(
+            plan_path,
+            original,
+            PUBLICATION_BP_METHOD,
+            0,
+        )
+        assert reservation_path.is_file()
 
     def test_reservation_replacement_during_worker_blocks_shard_publication(
         self,
@@ -1214,8 +1553,17 @@ class TestPlanAndShardContracts:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        plan_path = _copy_immutable(
+            Path(tiny_bundle["plan"]),
+            tmp_path / "reservation-race-plan.json",
+        )
         output = tmp_path / "reservation-race.json"
-        reservation_path = Path(f"{output}.reservation")
+        reservation_path = scr_v2_module._shard_reservation_path(
+            plan_path,
+            plan_path.read_bytes(),
+            PUBLICATION_BP_METHOD,
+            0,
+        )
 
         def replacing_worker(*args: object, **kwargs: object) -> jax.Array:
             reservation = json.loads(reservation_path.read_text())
@@ -1233,7 +1581,7 @@ class TestPlanAndShardContracts:
             match="persistent shard reservation bytes changed",
         ):
             run_scr_v2_shard(
-                tiny_bundle["plan"],
+                plan_path,
                 PUBLICATION_BP_METHOD,
                 0,
                 output,
@@ -1246,6 +1594,10 @@ class TestPlanAndShardContracts:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        plan_path = _copy_immutable(
+            Path(tiny_bundle["plan"]),
+            tmp_path / "source-drift-plan.json",
+        )
         baseline = json.loads(Path(tiny_bundle["plan"]).read_text())["source_manifest"]
         calls = 0
 
@@ -1261,7 +1613,7 @@ class TestPlanAndShardContracts:
         output = tmp_path / "must-not-exist.json"
         with pytest.raises(SCRV2ValidationError, match="while the shard was executing"):
             run_scr_v2_shard(
-                tiny_bundle["plan"],
+                plan_path,
                 PUBLICATION_BP_METHOD,
                 0,
                 output,
@@ -1274,27 +1626,37 @@ class TestPlanAndShardContracts:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        plan_path = _copy_immutable(
+            Path(tiny_bundle["plan"]),
+            tmp_path / "late-source-drift-plan.json",
+        )
         baseline = json.loads(Path(tiny_bundle["plan"]).read_text())["source_manifest"]
-        calls = 0
+        reservation_reread_completed = False
+        real_reread = scr_v2_module._require_exact_reread
+
+        def tracking_reread(path: Path, expected: bytes, context: str) -> None:
+            nonlocal reservation_reread_completed
+            real_reread(path, expected, context)
+            if context == "persistent shard reservation":
+                reservation_reread_completed = True
 
         def late_drift() -> dict[str, Any]:
-            nonlocal calls
-            calls += 1
             manifest = copy.deepcopy(baseline)
-            if calls >= 3:
+            if reservation_reread_completed:
                 manifest["files"][0]["sha256"] = "0" * 64
             return manifest
 
+        monkeypatch.setattr(scr_v2_module, "_require_exact_reread", tracking_reread)
         monkeypatch.setattr(scr_v2_module, "_build_source_manifest", late_drift)
         output = tmp_path / "late-drift-must-not-exist.json"
         with pytest.raises(SCRV2ValidationError, match="final shard publication"):
             run_scr_v2_shard(
-                tiny_bundle["plan"],
+                plan_path,
                 PUBLICATION_BP_METHOD,
                 0,
                 output,
             )
-        assert calls >= 3
+        assert reservation_reread_completed
         assert not output.exists()
 
     def test_v1_shard_is_rejected(self, tiny_bundle: dict[str, Any], tmp_path: Path) -> None:
@@ -1585,20 +1947,50 @@ class TestArtifactContract:
     def test_merge_exact_replay_rejects_fabricated_finite_curve(
         self, tiny_bundle: dict[str, Any]
     ) -> None:
-        payload = json.loads(Path(tiny_bundle["shards"][0]).read_text())
         root = Path(tiny_bundle["root"])
-        tampered = root / "fabricated-finite-shard.json"
-        payload["measurements"]["bin_mean_squared_error"] = [0.0] * 4
-        canonical = payload["execution"]["command"]["canonical_semantic_argv"]
-        canonical[-1] = str(tampered.absolute())
-        payload["execution"]["command"]["canonical_semantic_argv_sha256"] = (
-            scr_v2_module._sha256_json(canonical)
+        plan_path, copied_shards = _copy_bound_bundle(
+            tiny_bundle,
+            root,
+            "fabricated-finite",
         )
+        tampered = copied_shards[0]
+        payload = json.loads(tampered.read_text())
+        payload["measurements"]["bin_mean_squared_error"] = [0.0] * 4
+        tampered.chmod(0o644)
         _write_json(tampered, payload)
-        shards = (tampered, *tiny_bundle["shards"][1:])
         output = root / "fabricated-must-not-merge.json"
         with pytest.raises(SCRV2ValidationError, match="deterministic replay"):
-            merge_scr_v2_shards(tiny_bundle["plan"], shards, output)
+            merge_scr_v2_shards(plan_path, copied_shards, output)
+        assert not output.exists()
+
+    def test_merge_requires_every_shards_bound_reservation_before_replay(
+        self,
+        tiny_bundle: dict[str, Any],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        plan_path, shard_paths = _copy_bound_bundle(
+            tiny_bundle,
+            tmp_path,
+            "merge-missing-reservation",
+        )
+        first_shard = json.loads(shard_paths[0].read_text())
+        Path(first_shard["reservation_binding"]["path"]).unlink()
+        replay_started = False
+
+        def must_not_replay(*args: object, **kwargs: object) -> None:
+            nonlocal replay_started
+            replay_started = True
+
+        monkeypatch.setattr(
+            scr_v2_module,
+            "_validate_replayed_measurements",
+            must_not_replay,
+        )
+        output = tmp_path / "missing-reservation-must-not-merge.json"
+        with pytest.raises(OSError):
+            merge_scr_v2_shards(plan_path, shard_paths, output)
+        assert not replay_started
         assert not output.exists()
 
     def test_merge_final_reread_detects_shard_replacement_after_all_replays(
@@ -1607,13 +1999,11 @@ class TestArtifactContract:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        copied_shards: list[Path] = []
-        for index, original in enumerate(tiny_bundle["shards"]):
-            payload = json.loads(Path(original).read_text())
-            copied = tmp_path / f"copied-{index}.json"
-            _retarget_shard_command(payload, copied)
-            _write_json(copied, payload)
-            copied_shards.append(copied)
+        plan_path, copied_shards = _copy_bound_bundle(
+            tiny_bundle,
+            tmp_path,
+            "copied",
+        )
         replay_calls = 0
 
         def mutate_after_last_replay(*args: object, **kwargs: object) -> None:
@@ -1634,11 +2024,7 @@ class TestArtifactContract:
         )
         output = tmp_path / "late-shard-must-not-merge.json"
         with pytest.raises(SCRV2ValidationError, match="merge input shard.*bytes changed"):
-            merge_scr_v2_shards(
-                tiny_bundle["plan"],
-                tuple(copied_shards),
-                output,
-            )
+            merge_scr_v2_shards(plan_path, copied_shards, output)
         assert replay_calls == len(copied_shards)
         assert not output.exists()
 
@@ -1648,17 +2034,12 @@ class TestArtifactContract:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        plan_path = tmp_path / "merge-plan.json"
-        original_plan = Path(tiny_bundle["plan"]).read_bytes()
-        plan_path.write_bytes(original_plan)
-        plan_path.chmod(0o444)
-        copied_shards: list[Path] = []
-        for index, original in enumerate(tiny_bundle["shards"]):
-            payload = json.loads(Path(original).read_text())
-            copied = tmp_path / f"plan-race-shard-{index}.json"
-            _retarget_shard_command(payload, copied)
-            _write_json(copied, payload)
-            copied_shards.append(copied)
+        plan_path, copied_shards = _copy_bound_bundle(
+            tiny_bundle,
+            tmp_path,
+            "plan-race",
+        )
+        original_plan = plan_path.read_bytes()
         replay_calls = 0
 
         def mutate_plan_after_last_replay(*args: object, **kwargs: object) -> None:
@@ -1686,21 +2067,31 @@ class TestArtifactContract:
         self, tiny_bundle: dict[str, Any], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         baseline = json.loads(Path(tiny_bundle["plan"]).read_text())["source_manifest"]
-        calls = 0
+        reservation_rereads = 0
+        all_final_rereads_completed = False
+        real_reread = scr_v2_module._require_exact_reread
+
+        def tracking_reread(path: Path, expected: bytes, context: str) -> None:
+            nonlocal reservation_rereads, all_final_rereads_completed
+            real_reread(path, expected, context)
+            if context.startswith("merge input shard reservation"):
+                reservation_rereads += 1
+                all_final_rereads_completed = reservation_rereads == len(
+                    tiny_bundle["shards"]
+                )
 
         def late_drift() -> dict[str, Any]:
-            nonlocal calls
-            calls += 1
             manifest = copy.deepcopy(baseline)
-            if calls >= 3:
+            if all_final_rereads_completed:
                 manifest["files"][0]["sha256"] = "0" * 64
             return manifest
 
+        monkeypatch.setattr(scr_v2_module, "_require_exact_reread", tracking_reread)
         monkeypatch.setattr(scr_v2_module, "_build_source_manifest", late_drift)
         output = Path(tiny_bundle["root"]) / "late-merge-must-not-exist.json"
         with pytest.raises(SCRV2ValidationError, match="final artifact publication"):
             merge_scr_v2_shards(tiny_bundle["plan"], tiny_bundle["shards"], output)
-        assert calls >= 3
+        assert all_final_rereads_completed
         assert not output.exists()
 
     def test_late_source_and_runtime_drift_fail_final_artifact_validation(
@@ -1710,16 +2101,26 @@ class TestArtifactContract:
     ) -> None:
         plan = json.loads(Path(tiny_bundle["plan"]).read_text())
         baseline_source = plan["source_manifest"]
-        source_calls = 0
+        reservation_rereads = 0
+        all_final_rereads_completed = False
+        real_reread = scr_v2_module._require_exact_reread
+
+        def tracking_reread(path: Path, expected: bytes, context: str) -> None:
+            nonlocal reservation_rereads, all_final_rereads_completed
+            real_reread(path, expected, context)
+            if context.startswith("artifact input shard reservation"):
+                reservation_rereads += 1
+                all_final_rereads_completed = reservation_rereads >= len(
+                    tiny_bundle["shards"]
+                )
 
         def late_source_drift() -> dict[str, Any]:
-            nonlocal source_calls
-            source_calls += 1
             manifest = copy.deepcopy(baseline_source)
-            if source_calls >= 3:
+            if all_final_rereads_completed:
                 manifest["files"][0]["sha256"] = "0" * 64
             return manifest
 
+        monkeypatch.setattr(scr_v2_module, "_require_exact_reread", tracking_reread)
         monkeypatch.setattr(scr_v2_module, "_build_source_manifest", late_source_drift)
         source_report = validate_scr_v2_artifact(tiny_bundle["artifact"])
         assert not source_report.valid
@@ -1731,13 +2132,10 @@ class TestArtifactContract:
             lambda: copy.deepcopy(baseline_source),
         )
         baseline_runtime = plan["runtime_manifest"]
-        runtime_calls = 0
 
         def late_runtime_drift() -> dict[str, Any]:
-            nonlocal runtime_calls
-            runtime_calls += 1
             runtime = copy.deepcopy(baseline_runtime)
-            if runtime_calls >= 3:
+            if all_final_rereads_completed:
                 runtime["python"] = "0.0.0-drift"
             return runtime
 
@@ -1754,16 +2152,11 @@ class TestArtifactContract:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        plan_path = tmp_path / "external-plan.json"
-        plan_path.write_bytes(Path(tiny_bundle["plan"]).read_bytes())
-        plan_path.chmod(0o444)
-        shard_paths: list[Path] = []
-        for index, original in enumerate(tiny_bundle["shards"]):
-            payload = json.loads(Path(original).read_text())
-            shard_path = tmp_path / f"artifact-race-shard-{index}.json"
-            _retarget_shard_command(payload, shard_path)
-            _write_json(shard_path, payload)
-            shard_paths.append(shard_path)
+        plan_path, shard_paths = _copy_bound_bundle(
+            tiny_bundle,
+            tmp_path,
+            "artifact-race",
+        )
         artifact_path = merge_scr_v2_shards(
             plan_path,
             tuple(shard_paths),
@@ -1808,8 +2201,76 @@ class TestArtifactContract:
         }[replacement_target]
         assert expected in report.errors[0]
 
+    def test_artifact_final_reread_detects_reservation_replacement_after_replay(
+        self,
+        tiny_bundle: dict[str, Any],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        plan_path, shard_paths = _copy_bound_bundle(
+            tiny_bundle,
+            tmp_path,
+            "artifact-reservation-race",
+        )
+        artifact_path = merge_scr_v2_shards(
+            plan_path,
+            shard_paths,
+            tmp_path / "artifact-reservation-race.json",
+            created_unix=30,
+        )
+        first_shard = json.loads(shard_paths[0].read_text())
+        reservation_path = Path(first_shard["reservation_binding"]["path"])
+        replay_calls = 0
+
+        def replace_after_last_replay(*args: object, **kwargs: object) -> None:
+            nonlocal replay_calls
+            replay_calls += 1
+            if replay_calls == len(shard_paths):
+                reservation = json.loads(reservation_path.read_text())
+                reservation["state"] = "concurrently_replaced_marker"
+                reservation_path.chmod(0o644)
+                reservation_path.write_bytes(
+                    scr_v2_module._canonical_json_bytes(reservation)
+                )
+                reservation_path.chmod(0o444)
+
+        monkeypatch.setattr(
+            scr_v2_module,
+            "_validate_replayed_measurements",
+            replace_after_last_replay,
+        )
+        report = validate_scr_v2_artifact(artifact_path)
+        assert not report.valid
+        assert replay_calls == len(shard_paths)
+        assert "artifact input shard reservation" in report.errors[0]
+
 
 class TestCLIContracts:
+    def test_cli_wraps_unexpected_failures_as_closed_protocol_errors(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def explode(*args: object, **kwargs: object) -> Path:
+            raise RuntimeError("injected CLI failure")
+
+        monkeypatch.setattr(scr_v2_module, "run_scr_v2_shard", explode)
+        with pytest.raises(
+            SCRV2ValidationError,
+            match=r"SCR v2 command failed closed \(RuntimeError\): injected CLI failure",
+        ):
+            scr_v2_module.main(
+                (
+                    "run-shard",
+                    "--plan",
+                    str(tmp_path / "plan.json"),
+                    "--method",
+                    PUBLICATION_BP_METHOD,
+                    "--seed-id",
+                    "0",
+                    "--output",
+                    str(tmp_path / "shard.json"),
+                )
+            )
+
     def test_plan_and_shard_cli_label_raw_argv_as_self_reported(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

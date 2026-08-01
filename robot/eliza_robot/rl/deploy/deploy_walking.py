@@ -45,12 +45,16 @@ from eliza_robot.bridge.isaaclab.joint_map import (
     radians_to_pulse,
 )
 from eliza_robot.rl import checkpoint_path
+from eliza_robot.rl.deploy.preflight_check import (
+    bridge_connect_options,
+    policy_tick_joint_payload,
+    redacted_bridge_url,
+)
 from eliza_robot.rl.skills.brax_walk_skill import (
     DEFAULT_WALK_CHECKPOINT_NAME,
     BraxWalkSkill,
 )
 from eliza_robot.sim.mujoco.ainex_constants import LEG_JOINT_NAMES
-
 
 # Safety limits
 MAX_JOINT_DELTA = 0.1       # rad — max single-step change (at 50Hz = 5 rad/s)
@@ -152,11 +156,17 @@ class DeployWalking:
         safe_targets = self.safety_clamp(targets, ramp_factor)
         return self.joint_targets_to_servo_commands(safe_targets)
 
-    async def run_with_bridge(self, bridge_url: str) -> None:
+    async def run_with_bridge(
+        self,
+        bridge_url: str,
+        *,
+        physical: bool = True,
+    ) -> None:
         import websockets
 
-        print(f"Connecting to bridge at {bridge_url}...")
-        async with websockets.connect(bridge_url) as ws:
+        connect_options = bridge_connect_options(bridge_url, physical=physical)
+        print(f"Connecting to bridge at {redacted_bridge_url(bridge_url)}...")
+        async with websockets.connect(bridge_url, **connect_options) as ws:
             print("Connected to bridge.")
 
             bridge_hz = min(self.hz, 30.0)
@@ -181,14 +191,7 @@ class DeployWalking:
                 print("\nInterrupted by user.")
             finally:
                 print("Stopping policy mode...")
-                await self._send_standing_pose(ws)
-                await asyncio.sleep(0.5)
-                await self._send_command(ws, "policy.stop", {})
-                try:
-                    await self._recv_response(ws)
-                except Exception:  # noqa: BLE001 — best-effort shutdown
-                    pass
-                print("Policy stopped.")
+                await self._stop_policy(ws, physical=physical)
 
     async def _control_loop(self, ws) -> None:
         start_time = time.monotonic()
@@ -215,15 +218,19 @@ class DeployWalking:
             servo_cmds = self.policy_step(ramp)
 
             if not self.dry_run:
-                action_payload = {
-                    "joint_positions": {
+                action_payload = policy_tick_joint_payload(
+                    {
                         LEG_JOINT_NAMES[i]: float(self._last_targets[i])
                         for i in range(self.skill.action_dim)
                     },
-                    "duration": int(self.dt * 1000),
-                }
+                    duration_sec=self.dt,
+                )
                 await self._send_command(ws, "policy.tick", action_payload)
-                await self._recv_response(ws)
+                response = await self._recv_response(ws)
+                if response.get("ok") is not True:
+                    raise RuntimeError(
+                        f"policy.tick rejected: {response.get('message', 'unknown error')}"
+                    )
                 await self._process_events(ws)
 
             if t0 - last_status_time >= 2.0:
@@ -235,20 +242,23 @@ class DeployWalking:
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
 
-    async def _send_standing_pose(self, ws) -> None:
-        default = self.skill.default_pose
-        action_payload = {
-            "joint_positions": {
-                LEG_JOINT_NAMES[i]: float(default[i])
-                for i in range(self.skill.action_dim)
-            },
-            "duration": 500,
-        }
-        await self._send_command(ws, "policy.tick", action_payload)
+    async def _stop_policy(self, ws, *, physical: bool) -> bool:
+        """Request the bridge safety fence without issuing another motion command."""
         try:
-            await self._recv_response(ws)
-        except Exception:  # noqa: BLE001 — best-effort
-            pass
+            await self._send_command(ws, "policy.stop", {})
+            response = await self._recv_response(ws)
+        except Exception as exc:  # noqa: BLE001 — preserve the triggering failure
+            detail = type(exc).__name__ if physical else str(exc)
+            print(f"WARNING: policy.stop could not be confirmed: {detail}")
+            return False
+
+        rendered = json.dumps(response, sort_keys=True, separators=(",", ":"))
+        if response.get("ok") is True:
+            print(f"policy.stop acknowledged: {rendered}")
+            return True
+
+        print(f"WARNING: policy.stop was not acknowledged: {rendered}")
+        return False
 
     async def _send_command(self, ws, command: str, payload: dict) -> None:
         msg = {
@@ -274,7 +284,7 @@ class DeployWalking:
                 if "data" in data:
                     self._update_telemetry(data["data"])
                 return data
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 break
         return {"ok": False, "message": "timeout"}
 
@@ -285,7 +295,7 @@ class DeployWalking:
                 data = json.loads(raw)
                 if data.get("event") == "telemetry.basic":
                     self._update_telemetry(data.get("data", {}))
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return
         except Exception as exc:  # noqa: BLE001 — log and continue
             print(f"  WARNING: event processing error: {exc}")
@@ -402,6 +412,11 @@ def main() -> None:
         "--profile", default="hiwonder-ainex",
         help="Robot profile id (resolves leg DoF, joint names, safety envelope)",
     )
+    parser.add_argument(
+        "--simulation",
+        action="store_true",
+        help="Connect to a nonphysical bridge without sending the hardware bearer token",
+    )
 
     args = parser.parse_args()
 
@@ -436,7 +451,7 @@ def main() -> None:
         print("DEPLOYING WALKING POLICY TO REAL ROBOT")
         print(f"{'='*60}")
         print(f"  Checkpoint: {args.checkpoint or '(default checkpoint dir)'}")
-        print(f"  Bridge:     {args.bridge}")
+        print(f"  Bridge:     {redacted_bridge_url(args.bridge)}")
         print(f"  Frequency:  {args.hz} Hz")
         print(f"  Duration:   {args.duration}s")
         print(f"  Ramp:       {args.ramp_seconds}s")
@@ -446,7 +461,12 @@ def main() -> None:
         print(f"{'='*60}")
         print()
 
-        asyncio.run(deployer.run_with_bridge(args.bridge))
+        asyncio.run(
+            deployer.run_with_bridge(
+                args.bridge,
+                physical=not args.simulation,
+            )
+        )
 
 
 if __name__ == "__main__":

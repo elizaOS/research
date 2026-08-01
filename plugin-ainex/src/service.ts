@@ -8,7 +8,7 @@ import {
   Service,
   type ServiceTypeName,
 } from "@elizaos/core";
-import { AinexBridgeClient } from "./bridge-client";
+import { AinexBridgeClient, redactedBridgeUrl } from "./bridge-client";
 import { loadProfileFromBridge } from "./profile-schema";
 import type { EventEnvelope, JsonDict, RobotProfileDescriptor } from "./types";
 
@@ -192,6 +192,7 @@ export class AinexService extends Service {
 
   private async _tryConnect(): Promise<void> {
     const configuredUrl = this._readSetting("ELIZA_AINEX_BRIDGE_URL");
+    const authToken = this._readSetting("ELIZA_AINEX_BRIDGE_AUTH_TOKEN");
     // Only dial when a bridge URL is explicitly configured. Auto-connecting to a
     // hardcoded `ws://localhost:9100` default when no robot is configured starts
     // an endless background reconnect loop; under Bun (where the `ws` import is
@@ -204,12 +205,16 @@ export class AinexService extends Service {
       return;
     }
     const url = configuredUrl;
-    const client = new AinexBridgeClient({ url });
+    const client = new AinexBridgeClient({
+      url,
+      ...(authToken === null ? {} : { authToken }),
+    });
+    const safeUrl = redactedBridgeUrl(url);
     this._registerEventHandlers(client);
     try {
       await client.connect();
       this.bridge = client;
-      logger.info(`[AinexService] connected to bridge ${url}`);
+      logger.info(`[AinexService] connected to bridge ${safeUrl}`);
       this.profile = await loadProfileFromBridge(client);
     } catch (err) {
       // The bridge may not be up at agent start (e.g. user hasn't launched
@@ -217,7 +222,7 @@ export class AinexService extends Service {
       // service; the autoReconnect path in the client will recover, but
       // until then providers return "not connected" and actions error loudly.
       logger.warn(
-        `[AinexService] bridge unreachable at ${url}: ${(err as Error).message}`,
+        `[AinexService] bridge unreachable at ${safeUrl}: ${(err as Error).message}`,
       );
       this.bridge = client;
     }

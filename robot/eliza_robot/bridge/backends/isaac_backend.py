@@ -11,7 +11,12 @@ from __future__ import annotations
 from eliza_robot.bridge.backends.base import BridgeBackend
 from eliza_robot.bridge.isaaclab.joint_map import JOINT_BY_SERVO_ID, pulse_to_radians
 from eliza_robot.bridge.isaaclab.sim_state import SimRobotState
-from eliza_robot.bridge.protocol import CommandEnvelope, EventEnvelope, ResponseEnvelope, utc_now_iso
+from eliza_robot.bridge.protocol import (
+    CommandEnvelope,
+    EventEnvelope,
+    ResponseEnvelope,
+    utc_now_iso,
+)
 from eliza_robot.bridge.types import JsonDict
 
 
@@ -40,6 +45,7 @@ class IsaacBackend(BridgeBackend):
             "servo_set": True,
             "camera_stream_passthrough": True,
             "runtime": "isaaclab",
+            "motion_safety": {"walk_stop": True},
         }
 
     async def handle_command(self, cmd: CommandEnvelope) -> ResponseEnvelope:
@@ -110,7 +116,6 @@ class IsaacBackend(BridgeBackend):
             return
 
         if cmd.command == "servo.set":
-            duration = float(cmd.payload.get("duration", 0.3))
             positions_value = cmd.payload.get("positions")
             if not isinstance(positions_value, list):
                 raise ValueError("servo.set payload.positions must be a list")

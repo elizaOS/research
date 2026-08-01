@@ -140,23 +140,22 @@ Re-plug `/dev/video4` and re-run for a side-view recording.
 
 ### Reproduce
 
-```bash
-PYTHONPATH=packages/research/robot python packages/research/robot/scripts/evidence_real_robot_sweep.py \
-  --host 192.168.1.218 --port 9090 --include-locomotion --obsbot-device 4
-```
-
-Drop `--include-locomotion` to skip walks/turns (safe default for first
-contact). Pass `--obsbot-device -1` to record only the onboard camera.
+This section describes a historical run. The direct-transport reproduction
+command is now quarantined and fails before connecting. Reproduction requires a
+new authenticated unified-bridge client; do not use the historical script to
+command hardware. The archived files above are not current safety evidence.
 
 ---
 
 To verify against a different AiNex / topology:
 
 1. Power the AiNex Pi, launch `roslaunch ainex_bringup robot.launch`.
-2. From the dev box: `python -m eliza_robot.bridge.launch --target real --envelope`.
-3. Re-run the smoke check: `python packages/research/robot/scripts/check_real_robot.py
-   --url ws://<robot-ip>:9100 --save-frame /tmp/robot_first_frame.png`.
-4. Re-run the action sweep against the same URL (use `--out` to a fresh dir).
+2. Export a random `ELIZA_ROBOT_BRIDGE_AUTH_TOKEN` of at least 32 characters,
+   then run `python -m eliza_robot.bridge.launch --target real --envelope`.
+3. Re-run the read-only smoke check against the loopback endpoint:
+   `python packages/research/robot/scripts/check_real_robot.py --url
+   ws://127.0.0.1:9100 --save-frame /tmp/robot_first_frame.png`.
+4. Use an authenticated supervised client; the legacy action sweep is quarantined.
 5. Re-run the live-camera evidence pointed at `--device 4` for the Obsbot.
 
 Everything the agent → bridge contract relies on is verified in sim. The

@@ -88,6 +88,11 @@
         "type": "string",
         "description": "Websocket URL for the AiNex bridge server (default: ws://localhost:9100)"
       },
+      "ELIZA_AINEX_BRIDGE_AUTH_TOKEN": {
+        "type": "string",
+        "description": "Bearer secret for an authenticated wss:// or loopback ws:// bridge upgrade",
+        "sensitive": true
+      },
       "ELIZA_AINEX_PROFILE": {
         "type": "string",
         "description": "Robot profile descriptor name (default: hiwonder-ainex)"

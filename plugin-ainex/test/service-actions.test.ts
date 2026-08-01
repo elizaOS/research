@@ -33,9 +33,11 @@ async function buildBridgeServer() {
   const sockets: WsWebSocket[] = [];
   const received: Array<{ command: string; payload: Record<string, unknown> }> =
     [];
+  const authorizationHeaders: Array<string | undefined> = [];
 
-  wss.on("connection", (socket) => {
+  wss.on("connection", (socket, request) => {
     sockets.push(socket);
+    authorizationHeaders.push(request.headers.authorization);
     socket.send(
       JSON.stringify({
         type: "event",
@@ -66,6 +68,7 @@ async function buildBridgeServer() {
   return {
     url,
     received,
+    authorizationHeaders,
     emit(event: string, data: Record<string, unknown>) {
       const frame = JSON.stringify({
         type: "event",
@@ -86,6 +89,7 @@ async function buildBridgeServer() {
 }
 
 describe("plugin-ainex integration", () => {
+  const bridgeAuthToken = "plugin-bridge-token-that-is-at-least-32-chars";
   let server: Awaited<ReturnType<typeof buildBridgeServer>>;
   let runtime: IAgentRuntime;
 
@@ -95,6 +99,9 @@ describe("plugin-ainex integration", () => {
     (
       runtime as unknown as { __state: TestRuntimeState }
     ).__state.settings.ELIZA_AINEX_BRIDGE_URL = server.url;
+    (
+      runtime as unknown as { __state: TestRuntimeState }
+    ).__state.settings.ELIZA_AINEX_BRIDGE_AUTH_TOKEN = bridgeAuthToken;
     const service = await AinexService.start(runtime);
     (runtime as unknown as { __state: TestRuntimeState }).__state.service =
       service;
@@ -126,6 +133,10 @@ describe("plugin-ainex integration", () => {
     expect(walkSet).toBeDefined();
     expect(walkSet?.payload.x).toBeGreaterThan(0);
     expect(walkStart).toBeDefined();
+  });
+
+  it("passes the configured bridge token in the websocket upgrade", () => {
+    expect(server.authorizationHeaders).toEqual([`Bearer ${bridgeAuthToken}`]);
   });
 
   it("AINEX_STOP sends walk.command:stop with preempt", async () => {

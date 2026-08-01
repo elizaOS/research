@@ -1022,6 +1022,8 @@ class STOMPAgent:
         next_observation: Array,
         discount: Array | None = None,
         *,
+        decision_observation: Array | None = None,
+        execution_boundary: Array | bool = False,
         enable_planning: bool = True,
     ) -> STOMPUpdateResult:
         """Process one real-time transition update.
@@ -1040,6 +1042,20 @@ class STOMPAgent:
            models only plan from real observation anchors.
         5. Returns diagnostics for logging.
 
+        ``next_observation`` is the bootstrap observation used by every
+        learning target. ``decision_observation`` is the state from which the
+        next action is selected; it defaults to ``next_observation`` for
+        continuing callers. This distinction matters for autoreset wrappers,
+        which return a final observation for bootstrapping and a reset
+        observation for the next decision.
+
+        ``execution_boundary`` interrupts an active option lifecycle after
+        this transition without changing its Bellman discount. It is intended
+        for censored episode truncations: the observed transition updates the
+        intra-option policy and the base option value, then option traces are
+        cleared, but the partial execution is not recorded as a completed
+        option-model outcome.
+
         ``discount`` is the effective continuation multiplier for this
         transition.  Explicit callers should always supply it.  ``None`` is a
         compatibility mode: primitive and intra-option bootstraps use one,
@@ -1048,9 +1064,17 @@ class STOMPAgent:
         """
         cfg = self._config
         spec = self._spec_arrays
-        obs = jnp.asarray(next_observation, dtype=jnp.float32).reshape(
+        bootstrap_obs = jnp.asarray(next_observation, dtype=jnp.float32).reshape(
             (cfg.observation_dim,)
         )
+        decision_obs = (
+            bootstrap_obs
+            if decision_observation is None
+            else jnp.asarray(decision_observation, dtype=jnp.float32).reshape(
+                (cfg.observation_dim,)
+            )
+        )
+        boundary = jnp.asarray(execution_boundary, dtype=jnp.bool_).reshape(())
         reward = jnp.asarray(env_reward, dtype=jnp.float32)
         if discount is None:
             primitive_discount = jnp.array(1.0, dtype=jnp.float32)
@@ -1081,7 +1105,7 @@ class STOMPAgent:
         option_idx = jnp.maximum(state.executing_option, jnp.array(0, dtype=jnp.int32))
 
         # Compute pseudo-reward for the currently-executing (or notional) option
-        pseudo_r = compute_pseudo_reward(spec, option_idx, obs)
+        pseudo_r = compute_pseudo_reward(spec, option_idx, bootstrap_obs)
         target_epsilon = (
             cfg.epsilon_option
             if cfg.option_target_epsilon is None
@@ -1098,10 +1122,11 @@ class STOMPAgent:
 
         # Option termination check
         new_option_steps = state.option_steps + 1
-        option_terminates = (
-            check_option_terminated(spec, option_idx, obs, new_option_steps)
+        option_completes = (
+            check_option_terminated(spec, option_idx, bootstrap_obs, new_option_steps)
             | environmental_termination
         )
+        option_lifecycle_ends = option_completes | boundary
 
         # --- Intra-option policy update (only active when executing) ---
         # Gated on is_executing: idle steps must not pollute option 0 (the
@@ -1113,8 +1138,8 @@ class STOMPAgent:
                 state.base_last_obs,
                 state.option_last_intra_action,
                 pseudo_r,
-                obs,
-                option_terminates,
+                bootstrap_obs,
+                option_completes,
                 intra_option_discount,
                 step_size=cfg.option_step_size,
                 avg_reward_step_size=cfg.option_avg_reward_step_size,
@@ -1128,6 +1153,24 @@ class STOMPAgent:
 
         new_option_policies, option_td = jax.lax.cond(
             is_executing, do_intra_update, skip_intra_update, None
+        )
+        # A censored boundary retains the positive bootstrap above, so the
+        # boundary sample contributes to both the weight and trace update.
+        # Clear the stored trace only afterwards to prevent eligibility from
+        # leaking into the reset episode or a newly selected option execution.
+        clear_option_trace = is_executing & option_lifecycle_ends
+        active_traces = new_option_policies.traces[option_idx]
+        new_option_policies = cast(
+            IntraOptionPoliciesState,
+            new_option_policies.replace(
+                traces=new_option_policies.traces.at[option_idx].set(
+                    jnp.where(
+                        clear_option_trace,
+                        jnp.zeros_like(active_traces),
+                        active_traces,
+                    )
+                )
+            ),
         )
 
         # Accumulate option trajectory stats. Pseudo-reward feeds only the
@@ -1150,7 +1193,10 @@ class STOMPAgent:
         new_option_discount = state.option_discount * option_step_discount
 
         # --- Option model update (only on termination while executing) ---
-        should_update_model = is_executing & option_terminates
+        # A pure execution boundary is a censored option trajectory, not an
+        # observed option-model completion. If the subtask also completes
+        # naturally (or the environment terminates), preserve completion.
+        should_update_model = is_executing & option_completes
 
         def do_update_model(_: None) -> OptionModelsState:
             return _update_option_model(
@@ -1162,7 +1208,7 @@ class STOMPAgent:
                 jnp.asarray(new_option_steps, dtype=jnp.float32),
                 new_option_baseline_mass,
                 new_option_discount,
-                obs,
+                bootstrap_obs,
                 model_decay=cfg.option_model_decay,
                 model_step_size=cfg.option_model_step_size,
             )
@@ -1180,7 +1226,7 @@ class STOMPAgent:
         # termination.  Pseudo-reward never enters here — option values must
         # stay in task-reward units to support reward-maximizing planning.
         base_reward = jnp.where(
-            is_executing & option_terminates,
+            is_executing & option_lifecycle_ends,
             new_option_env_cumreward,
             reward,
         )
@@ -1189,17 +1235,17 @@ class STOMPAgent:
         # At unit discounts this mass equals raw duration T_o. Primitive
         # transitions use mass=1 and the supplied one-step discount.
         base_baseline_mass = jnp.where(
-            is_executing & option_terminates,
+            is_executing & option_lifecycle_ends,
             new_option_baseline_mass,
             jnp.array(1.0, dtype=jnp.float32),
         )
         base_discount = jnp.where(
-            is_executing & option_terminates,
+            is_executing & option_lifecycle_ends,
             new_option_discount,
             primitive_discount,
         )
         # Only update base Q on: (a) primitive steps, or (b) option termination
-        should_update_base = (~is_executing) | (is_executing & option_terminates)
+        should_update_base = (~is_executing) | (is_executing & option_lifecycle_ends)
         n_total = cfg.n_total_actions
         beta = jnp.asarray(cfg.base_avg_reward_step_size, dtype=jnp.float32)
         # The base extended action was selected at the option's start state.
@@ -1209,13 +1255,15 @@ class STOMPAgent:
         # start observation. Primitive actions still update from their most
         # recent observation.
         base_update_obs = jnp.where(
-            is_executing & option_terminates,
+            is_executing & option_lifecycle_ends,
             state.option_start_obs,
             state.base_last_obs,
         )
 
         def do_base_update(_: None) -> tuple[MultiHeadMLPState, Array, Array]:
-            next_q_vals = self._base_learner.predict(state.base_learner_state, obs)
+            next_q_vals = self._base_learner.predict(
+                state.base_learner_state, bootstrap_obs
+            )
             max_next_q = base_discount * jnp.max(next_q_vals)
             td_target = (
                 base_reward
@@ -1245,7 +1293,9 @@ class STOMPAgent:
             prev_q = self._base_learner.predict(
                 state.base_learner_state, state.base_last_obs
             )
-            next_q = self._base_learner.predict(state.base_learner_state, obs)
+            next_q = self._base_learner.predict(
+                state.base_learner_state, bootstrap_obs
+            )
             td = primitive_discount * jnp.max(next_q) - prev_q[state.base_last_action]
             return state.base_learner_state, state.base_average_reward, td
 
@@ -1264,7 +1314,7 @@ class STOMPAgent:
             ) = self._apply_option_model_planning(
                 new_base_learner_state,
                 new_option_models,
-                obs,
+                bootstrap_obs,
                 new_avg_r,
                 state.step_count,
             )
@@ -1278,11 +1328,13 @@ class STOMPAgent:
         key = state.rng_key
         key, ext_key, intra_key = jr.split(key, 3)
 
-        ext_q_vals = self._base_learner.predict(new_base_learner_state, obs)
+        ext_q_vals = self._base_learner.predict(new_base_learner_state, decision_obs)
         extended_action, _ = _select_action_epsilon_greedy_from_q(
             ext_q_vals, ext_key, cfg.epsilon_base, cfg.n_total_actions
         )
-        next_select_extended = (~is_executing) | (is_executing & option_terminates)
+        next_select_extended = (~is_executing) | (
+            is_executing & option_lifecycle_ends
+        )
         selected_option = jnp.clip(
             extended_action - cfg.n_primitive_actions,
             0,
@@ -1292,13 +1344,13 @@ class STOMPAgent:
         # starts a new option, sample from that selected option's policy
         # rather than from the idle clamped index (option 0).
         intra_policy_idx = jnp.where(
-            is_executing & (~option_terminates),
+            is_executing & (~option_lifecycle_ends),
             option_idx,
             selected_option,
         )
         intra_action, _ = _select_action_epsilon_greedy(
             new_option_policies.q_weights[intra_policy_idx],
-            obs,
+            decision_obs,
             intra_key,
             cfg.epsilon_option,
             cfg.n_primitive_actions,
@@ -1308,7 +1360,7 @@ class STOMPAgent:
         # If primitive extended action: use extended_action directly.
         # If option extended action: use intra-option policy action.
         new_executing_option = jnp.where(
-            is_executing & (~option_terminates),
+            is_executing & (~option_lifecycle_ends),
             option_idx,
             jnp.where(
                 next_select_extended
@@ -1324,7 +1376,7 @@ class STOMPAgent:
 
         # Primitive action sent to environment
         primitive_action = jnp.where(
-            is_starting_option | (is_executing & (~option_terminates)),
+            is_starting_option | (is_executing & (~option_lifecycle_ends)),
             intra_action,
             extended_action,
         )
@@ -1334,29 +1386,31 @@ class STOMPAgent:
         )
 
         # Reset option tracking on termination or new option start
-        new_option_start_obs = jnp.where(is_starting_option, obs, state.option_start_obs)
+        new_option_start_obs = jnp.where(
+            is_starting_option, decision_obs, state.option_start_obs
+        )
         new_option_cumreward = jnp.where(
-            (is_executing & option_terminates) | is_starting_option,
+            (is_executing & option_lifecycle_ends) | is_starting_option,
             jnp.array(0.0, dtype=jnp.float32),
             new_option_cumreward,
         )
         new_option_env_cumreward = jnp.where(
-            (is_executing & option_terminates) | is_starting_option,
+            (is_executing & option_lifecycle_ends) | is_starting_option,
             jnp.array(0.0, dtype=jnp.float32),
             new_option_env_cumreward,
         )
         new_option_baseline_mass = jnp.where(
-            (is_executing & option_terminates) | is_starting_option,
+            (is_executing & option_lifecycle_ends) | is_starting_option,
             jnp.array(0.0, dtype=jnp.float32),
             new_option_baseline_mass,
         )
         new_option_discount = jnp.where(
-            (is_executing & option_terminates) | is_starting_option,
+            (is_executing & option_lifecycle_ends) | is_starting_option,
             jnp.array(1.0, dtype=jnp.float32),
             new_option_discount,
         )
         new_option_steps = jnp.where(
-            (is_executing & option_terminates) | is_starting_option,
+            (is_executing & option_lifecycle_ends) | is_starting_option,
             jnp.array(0, dtype=jnp.int32),
             new_option_steps,
         )
@@ -1364,7 +1418,7 @@ class STOMPAgent:
         new_state = STOMPState(
             base_learner_state=new_base_learner_state,
             base_average_reward=new_avg_r,
-            base_last_obs=obs,
+            base_last_obs=decision_obs,
             base_last_action=jnp.where(
                 next_select_extended, extended_action, state.base_last_action
             ),
@@ -1375,7 +1429,7 @@ class STOMPAgent:
             executing_option=new_executing_option,
             option_start_obs=new_option_start_obs,
             option_last_intra_action=jnp.where(
-                is_starting_option | (is_executing & (~option_terminates)),
+                is_starting_option | (is_executing & (~option_lifecycle_ends)),
                 intra_action,
                 state.option_last_intra_action,
             ),
@@ -1392,7 +1446,7 @@ class STOMPAgent:
             average_reward=new_avg_r,
             primitive_action=primitive_action,
             executing_option=new_executing_option,
-            option_terminated=is_executing & option_terminates,
+            option_terminated=is_executing & option_lifecycle_ends,
             pseudo_reward=jnp.where(is_executing, pseudo_r, jnp.array(0.0, dtype=jnp.float32)),
             option_importance_ratio=option_importance_ratio,
             planning_backups=planning_backups,
@@ -1405,23 +1459,36 @@ class STOMPAgent:
         env_rewards: Array,
         next_observations: Array,
         discounts: Array | None = None,
+        *,
+        decision_observations: Array | None = None,
+        execution_boundaries: Array | None = None,
     ) -> STOMPArrayResult:
         """Run STOMP over transition arrays via scan.
 
         Supplying ``discounts`` selects the explicit transition contract.
         Omitting it preserves the historical ``option_gamma`` behavior.
+        ``decision_observations`` and ``execution_boundaries`` provide the
+        batched autoreset-boundary split accepted by :meth:`update`.
         """
 
         def step_fn(
             carry: STOMPState,
-            inputs: tuple[Array, Array, Array],
+            inputs: tuple[Array, Array, Array, Array, Array],
         ) -> tuple[STOMPState, tuple[Array, ...]]:
-            reward, next_obs, transition_discount = inputs
+            (
+                reward,
+                next_obs,
+                transition_discount,
+                decision_obs,
+                execution_boundary,
+            ) = inputs
             result = self.update(
                 carry,
                 reward,
                 next_obs,
                 transition_discount if discounts is not None else None,
+                decision_observation=decision_obs,
+                execution_boundary=execution_boundary,
             )
             return result.state, (
                 result.td_error,
@@ -1439,6 +1506,16 @@ class STOMPAgent:
             scan_discounts = jnp.ones_like(env_rewards, dtype=jnp.float32)
         else:
             scan_discounts = jnp.asarray(discounts, dtype=jnp.float32)
+        scan_decision_observations = (
+            next_observations
+            if decision_observations is None
+            else jnp.asarray(decision_observations, dtype=jnp.float32)
+        )
+        scan_execution_boundaries = (
+            jnp.zeros_like(env_rewards, dtype=jnp.bool_)
+            if execution_boundaries is None
+            else jnp.asarray(execution_boundaries, dtype=jnp.bool_)
+        )
 
         final_state, (
             td_errors,
@@ -1453,7 +1530,13 @@ class STOMPAgent:
         ) = jax.lax.scan(
             step_fn,
             state,
-            (env_rewards, next_observations, scan_discounts),
+            (
+                env_rewards,
+                next_observations,
+                scan_discounts,
+                scan_decision_observations,
+                scan_execution_boundaries,
+            ),
         )
         return STOMPArrayResult(
             state=final_state,

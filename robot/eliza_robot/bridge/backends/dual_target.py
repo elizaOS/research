@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
 
 import numpy as np
 
@@ -56,6 +55,12 @@ class DualTargetBackend(BridgeBackend):
     @property
     def backend_name(self) -> str:
         return "dual_target"
+
+    def physical_motion_resources(self) -> tuple[str, ...]:
+        return (
+            self._real.physical_motion_resources()
+            + self._sim.physical_motion_resources()
+        )
 
     def capabilities(self) -> JsonDict:
         real_caps = self._real.capabilities()
@@ -121,7 +126,7 @@ class DualTargetBackend(BridgeBackend):
             sim_response = await asyncio.wait_for(sim_task, timeout=2.0)
             sim_ok = sim_response.ok
             sim_msg = sim_response.message
-        except asyncio.TimeoutError:
+        except TimeoutError:
             sim_task.cancel()
             sim_ok = False
             sim_msg = "sim timeout"

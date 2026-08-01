@@ -19,6 +19,40 @@ SCHEDULE_SHA = "4" * 64
 TRUST_ANCHOR = "alberta_protocol_qualification_anchor_v1"
 
 
+def _capability_descriptor_sha256(candidate: dict[str, Any]) -> str:
+    runtime = candidate["runtime_binding"]
+    payload = {
+        "agent_rng": candidate["agent_rng"],
+        "candidate_id": candidate["candidate_id"],
+        "configuration": candidate["configuration"],
+        "entrypoint_family": candidate["entrypoint_family"],
+        "environment_rng": candidate["environment_rng"],
+        "execution_semantics": candidate["execution_semantics"],
+        "implementation_kind": candidate["implementation_kind"],
+        "observation_access": candidate["observation_access"],
+        "pairing": candidate["pairing"],
+        "resources": candidate["resources"],
+        "runtime_identity": {
+            "image_sha256": runtime["image_sha256"],
+            "runtime_profile_sha256": runtime["runtime_profile_sha256"],
+            "task_identity_sha256": runtime["task_identity_sha256"],
+        },
+        "schema_version": "alberta.forager_candidate_capability_descriptor.v1",
+        "seed_contract": candidate["seed_contract"],
+        "selection_group": candidate["selection_group"],
+        "source": candidate["source"],
+        "stratum": candidate["stratum"],
+    }
+    raw = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
 def _candidate(
     candidate_id: str,
     *,
@@ -38,7 +72,7 @@ def _candidate(
     rollout_steps: int | None = None,
 ) -> dict[str, Any]:
     num_rollouts = HORIZON // rollout_steps if rollout_steps is not None else None
-    return {
+    candidate: dict[str, Any] = {
         "candidate_id": candidate_id,
         "selection_group": selection_group,
         "stratum": stratum,
@@ -50,10 +84,10 @@ def _candidate(
             ),
             "repository": "https://github.com/example/forager-agent",
             "base_commit": "a" * 40,
-            "tree_sha256": None if stratum == "alberta_learning" else "5" * 64,
+            "tree_git_sha1": None if stratum == "alberta_learning" else "5" * 40,
             "archive_sha256": "6" * 64,
             "inventory_sha256": "a" * 64,
-            "snapshot_descriptor_sha256": "b" * 64,
+            "snapshot_descriptor_sha256": "b" * 64 if stratum == "alberta_learning" else None,
         },
         "configuration": {
             "original_path": f"configs/{candidate_id}.json",
@@ -94,6 +128,7 @@ def _candidate(
             "image_sha256": IMAGE_SHA,
             "runtime_profile_sha256": PROFILE_SHA,
             "task_identity_sha256": TASK_SHA,
+            "qualified_capability_descriptor_sha256": "0" * 64,
             "capability_qualification_receipt_sha256": hashlib.sha256(
                 f"capability:{candidate_id}".encode()
             ).hexdigest(),
@@ -111,6 +146,10 @@ def _candidate(
             "exclusion_reasons": exclusion_reasons,
         },
     }
+    candidate["runtime_binding"]["qualified_capability_descriptor_sha256"] = (
+        _capability_descriptor_sha256(candidate)
+    )
+    return candidate
 
 
 def _slot(selection_group: str, rank: int = 1) -> dict[str, Any]:
@@ -169,6 +208,37 @@ def _sealed_payload(
         ],
     }
     return sealed, result
+
+
+def test_seal_protocol_builds_the_exact_validated_transition() -> None:
+    open_payload = _payload()
+    open_protocol = matched.parse_forager_matched_protocol(open_payload)
+    result_payload = _selection_result_payload(open_protocol)
+
+    sealed = matched.seal_forager_matched_protocol(open_protocol, result_payload)
+    expected_payload, _ = _sealed_payload(open_payload, result_payload)
+
+    assert sealed.to_dict() == expected_payload
+    validation = matched.validate_sealed_protocol_transition(
+        open_protocol,
+        sealed,
+        result_payload,
+    )
+    assert validation.open_protocol_sha256 == open_protocol.protocol_sha256
+    assert sealed.active_seeds == open_protocol.evaluation_seeds
+
+
+def test_seal_protocol_rejects_unbound_or_incomplete_selection() -> None:
+    open_protocol = matched.parse_forager_matched_protocol(_payload())
+    result_payload = _selection_result_payload(open_protocol)
+    result_payload["open_protocol_sha256"] = "f" * 64
+    with pytest.raises(matched.ForagerMatchedProtocolError, match="canonical open protocol"):
+        matched.seal_forager_matched_protocol(open_protocol, result_payload)
+
+    result_payload = _selection_result_payload(open_protocol)
+    result_payload["ranked_groups"][0]["ranked_candidate_ids"][0] = "external_dqn"
+    with pytest.raises(matched.ForagerMatchedProtocolError, match="rank every"):
+        matched.seal_forager_matched_protocol(open_protocol, result_payload)
 
 
 def _payload(*, stage: str = "open_tuning") -> dict[str, Any]:
@@ -267,6 +337,7 @@ def _payload(*, stage: str = "open_tuning") -> dict[str, Any]:
         "selection_plan": {
             "metric": "fov_last_10pct_ema_auc",
             "metric_implementation_sha256": "c" * 64,
+            "candidate_universe_sha256": "b" * 64,
             "direction": "maximize",
             "statistic": "conservative_ci_endpoint",
             "statistic_implementation_sha256": "d" * 64,
@@ -277,6 +348,9 @@ def _payload(*, stage: str = "open_tuning") -> dict[str, Any]:
             "bootstrap_rng_implementation_sha256": "e" * 64,
             "resampling_unit": "candidate_seed_block",
             "quantile_method": "linear",
+            "bootstrap_interval": "two_sided_equal_tail",
+            "conservative_endpoint": "lower",
+            "endpoint_quantile": "(1-confidence)/2",
             "tie_break": "candidate_id_ascending",
             "groups": [
                 {
@@ -302,6 +376,33 @@ def _payload(*, stage: str = "open_tuning") -> dict[str, Any]:
             "selection_result_sha256": None,
             "resolved_slots": [],
         },
+        "analysis_plan": {
+            "metric": "fov_last_10pct_ema_auc",
+            "metric_implementation_sha256": "c" * 64,
+            "metric_direction": "maximize",
+            "primary": {
+                "method": "paired_percentile_bootstrap_lower_bound",
+                "resamples": 10_000,
+                "seed": 2_400_000,
+                "confidence": 0.95,
+                "primary_margin": 0.0,
+                "rng_algorithm": "PCG64",
+                "quantile_method": "linear",
+                "implementation_sha256": "f" * 64,
+                "gate": "lower_bound_strictly_greater_than_margin",
+            },
+            "secondary": {
+                "method": "paired_sign_flip",
+                "monte_carlo_resamples": 100_000,
+                "seed": 2_400_001,
+                "exact_max_pairs": 20,
+                "rng_algorithm": "PCG64",
+                "implementation_sha256": "0" * 64,
+                "alternative": "greater",
+                "multiplicity_method": "holm",
+                "familywise_alpha": 0.05,
+            },
+        },
         "evaluation_panel": {
             "selection_slots": [
                 _slot("alberta"),
@@ -319,10 +420,10 @@ def _payload(*, stage: str = "open_tuning") -> dict[str, Any]:
             "intervention_slot": _slot("alberta"),
             "comparator_slot": _slot("external"),
             "estimand": "paired_mean_difference",
-            "direction": "greater",
-            "confidence": 0.95,
+            "method": "paired_percentile_bootstrap_lower_bound",
+            "alternative": "greater",
+            "difference_order": "intervention_minus_comparator",
             "paired": True,
-            "gate": "paired_ci_lower_gt_zero",
         },
         "secondary_hypotheses": [
             {
@@ -330,10 +431,10 @@ def _payload(*, stage: str = "open_tuning") -> dict[str, Any]:
                 "intervention_slot": _slot("recurrent"),
                 "comparator_slot": _slot("external"),
                 "estimand": "paired_mean_difference",
-                "direction": "greater",
-                "confidence": 0.95,
+                "method": "paired_sign_flip",
+                "alternative": "greater",
+                "difference_order": "intervention_minus_comparator",
                 "paired": True,
-                "gate": "paired_ci_lower_gt_zero",
             }
         ],
         "multiplicity_policy": {
@@ -405,6 +506,10 @@ def test_parse_normalizes_freezes_and_hashes_protocol() -> None:
     with pytest.raises(TypeError):
         protocol.candidate_index["new"] = protocol.candidates[0]  # type: ignore[index]
 
+    invalid = replace(protocol, horizon=0)
+    with pytest.raises(matched.ForagerMatchedProtocolError, match="horizon"):
+        matched.canonical_json_bytes(invalid)
+
 
 def test_normalized_protocol_round_trips_and_preserves_order() -> None:
     payload = _payload()
@@ -450,6 +555,54 @@ def test_open_plan_uses_pending_outcome_and_stage_invariant_slots() -> None:
     ]
 
 
+def test_analysis_plan_exactly_freezes_statistics_v2_methods() -> None:
+    protocol = matched.parse_forager_matched_protocol(_payload())
+
+    primary = protocol.analysis_plan.primary
+    secondary = protocol.analysis_plan.secondary
+    assert primary.method == "paired_percentile_bootstrap_lower_bound"
+    assert primary.rng_algorithm == "PCG64"
+    assert primary.quantile_method == "linear"
+    assert primary.gate == "lower_bound_strictly_greater_than_margin"
+    assert primary.primary_margin == 0.0
+    assert secondary.method == "paired_sign_flip"
+    assert secondary.exact_max_pairs == 20
+    assert secondary.rng_algorithm == "PCG64"
+    assert secondary.multiplicity_method == "holm"
+    assert secondary.familywise_alpha == protocol.multiplicity_policy.alpha
+    assert protocol.primary_hypothesis.method == primary.method
+    assert all(
+        hypothesis.method == secondary.method for hypothesis in protocol.secondary_hypotheses
+    )
+
+    selection = protocol.selection_plan
+    assert selection.bootstrap_interval == "two_sided_equal_tail"
+    assert selection.conservative_endpoint == "lower"
+    assert selection.endpoint_quantile == "(1-confidence)/2"
+
+    for path, value in (
+        (("primary", "rng_algorithm"), "MT19937"),
+        (("primary", "quantile_method"), "nearest"),
+        (("primary", "primary_margin"), -0.0 - 0.1),
+        (("secondary", "exact_max_pairs"), 21),
+        (("secondary", "multiplicity_method"), "bonferroni"),
+    ):
+        payload = _payload()
+        payload["analysis_plan"][path[0]][path[1]] = value
+        with pytest.raises(matched.ForagerMatchedProtocolError):
+            matched.parse_forager_matched_protocol(payload)
+
+    for field, value in (
+        ("bootstrap_interval", "one_sided"),
+        ("conservative_endpoint", "upper"),
+        ("endpoint_quantile", "1-confidence"),
+    ):
+        payload = _payload()
+        payload["selection_plan"][field] = value
+        with pytest.raises(matched.ForagerMatchedProtocolError):
+            matched.parse_forager_matched_protocol(payload)
+
+
 def test_sealed_transition_replays_canonical_result_and_exact_resolution() -> None:
     open_payload = _payload()
     open_protocol = matched.parse_forager_matched_protocol(open_payload)
@@ -481,18 +634,21 @@ def test_sealed_transition_rejects_every_nonstage_mutation(mutation: str) -> Non
     sealed_payload, result_payload = _sealed_payload(open_payload)
     if mutation == "metric":
         sealed_payload["selection_plan"]["metric"] = "posthoc_metric"
+        sealed_payload["analysis_plan"]["metric"] = "posthoc_metric"
     elif mutation == "configuration":
-        configuration = _candidate_by_id(sealed_payload, "external_dqn")["configuration"]
+        candidate = _candidate_by_id(sealed_payload, "external_dqn")
+        configuration = candidate["configuration"]
         configuration["original_sha256"] = "f" * 64
         configuration["derived_sha256"] = "f" * 64
+        candidate["runtime_binding"]["qualified_capability_descriptor_sha256"] = (
+            _capability_descriptor_sha256(candidate)
+        )
     else:
         sealed_payload["evaluation_seeds"] = [2_000_000_000, 2_000_000_001]
         sealed_payload["active_seeds"] = list(sealed_payload["evaluation_seeds"])
 
     with pytest.raises(matched.ForagerMatchedProtocolError, match="changed a field"):
-        matched.validate_sealed_protocol_transition(
-            open_payload, sealed_payload, result_payload
-        )
+        matched.validate_sealed_protocol_transition(open_payload, sealed_payload, result_payload)
 
 
 def test_transition_rejects_open_and_selection_result_digest_tampering() -> None:
@@ -551,9 +707,29 @@ def test_selection_result_can_resolve_a_nontrivial_group_winner() -> None:
 
     sealed_payload["selection_outcome"]["resolved_slots"][1]["candidate_id"] = "external_dqn"
     with pytest.raises(matched.ForagerMatchedProtocolError, match="do not match"):
-        matched.validate_sealed_protocol_transition(
-            open_payload, sealed_payload, result_payload
-        )
+        matched.validate_sealed_protocol_transition(open_payload, sealed_payload, result_payload)
+
+
+def test_selection_result_canonicalization_revalidates_dataclass_and_full_rankings() -> None:
+    open_payload = _payload()
+    open_protocol = matched.parse_forager_matched_protocol(open_payload)
+    result_payload = _selection_result_payload(open_protocol)
+    result = matched.parse_forager_matched_selection_result(result_payload)
+    assert result.selection_result_sha256 == matched.canonical_selection_result_sha256(
+        result_payload
+    )
+
+    invalid = replace(result, tuning_seeds=(2_300_001, 2_300_001))
+    with pytest.raises(matched.ForagerMatchedProtocolError, match="duplicate seeds"):
+        matched.canonical_selection_result_bytes(invalid)
+
+    sealed_payload, _ = _sealed_payload(open_payload, result_payload)
+    result_payload["ranked_groups"][1]["ranked_candidate_ids"] = ["search_oracle"]
+    sealed_payload["selection_outcome"]["selection_result_sha256"] = (
+        matched.canonical_selection_result_sha256(result_payload)
+    )
+    with pytest.raises(matched.ForagerMatchedProtocolError, match="rank every"):
+        matched.validate_sealed_protocol_transition(open_payload, sealed_payload, result_payload)
 
 
 @pytest.mark.parametrize(
@@ -690,9 +866,13 @@ def test_historical_orientation_may_retain_noncurrent_runtime_bindings() -> None
         "image_sha256": "a" * 64,
         "runtime_profile_sha256": "b" * 64,
         "task_identity_sha256": "c" * 64,
+        "qualified_capability_descriptor_sha256": "0" * 64,
         "capability_qualification_receipt_sha256": "d" * 64,
         "qualification_trust_anchor_identity": "historical_archive_anchor_v1",
     }
+    historical["runtime_binding"]["qualified_capability_descriptor_sha256"] = (
+        _capability_descriptor_sha256(historical)
+    )
 
     protocol = matched.parse_forager_matched_protocol(payload)
 
@@ -716,6 +896,12 @@ def test_pairable_candidates_require_dedicated_common_environment_rng() -> None:
     candidate = _candidate_by_id(payload, "external_dqn")
     candidate["agent_rng"]["environment_key_shared"] = True
     with pytest.raises(matched.ForagerMatchedProtocolError, match="declaration disagree"):
+        matched.parse_forager_matched_protocol(payload)
+
+    payload = _payload()
+    candidate = _candidate_by_id(payload, "external_dqn")
+    candidate["agent_rng"]["identity"] = "renamed_rng_claim"
+    with pytest.raises(matched.ForagerMatchedProtocolError, match="isolated agent RNG"):
         matched.parse_forager_matched_protocol(payload)
 
 
@@ -754,6 +940,15 @@ def test_exact_upstream_ppo_shared_rng_is_descriptive_and_ineligible() -> None:
     )
     payload["evaluation_panel"]["selection_slots"].append(_slot("exact_orientation"))
     payload["evaluation_panel"]["fixed_descriptive_candidate_ids"].remove("exact_ppo")
+    with pytest.raises(matched.ForagerMatchedProtocolError, match="candidate semantics"):
+        matched.parse_forager_matched_protocol(payload)
+
+    ppo["runtime_binding"]["qualified_capability_descriptor_sha256"] = (
+        _capability_descriptor_sha256(ppo)
+    )
+    ppo["runtime_binding"]["capability_qualification_receipt_sha256"] = hashlib.sha256(
+        b"capability:exact_ppo:isolated_rng"
+    ).hexdigest()
     protocol = matched.parse_forager_matched_protocol(payload)
     assert protocol.candidate_index["exact_ppo"].pairing.eligible is True
 
@@ -869,6 +1064,12 @@ def test_secondary_order_must_exactly_match_holm_family() -> None:
     with pytest.raises(matched.ForagerMatchedProtocolError, match="IDs must be unique"):
         matched.parse_forager_matched_protocol(payload)
 
+    payload = _payload()
+    payload["secondary_hypotheses"][0]["intervention_slot"] = _slot("external")
+    payload["secondary_hypotheses"][0]["comparator_slot"] = _slot("alberta")
+    with pytest.raises(matched.ForagerMatchedProtocolError, match="reverses"):
+        matched.parse_forager_matched_protocol(payload)
+
 
 def test_selection_groups_must_exist_and_cannot_over_advance() -> None:
     payload = _payload()
@@ -923,7 +1124,7 @@ def test_source_provenance_requires_https_full_commit_and_lowercase_digests() ->
 
     payload = _payload()
     source = _candidate_by_id(payload, "external_dqn")["source"]
-    source["tree_sha256"] = "A" * 64
+    source["tree_git_sha1"] = "A" * 40
     with pytest.raises(matched.ForagerMatchedProtocolError, match="lowercase"):
         matched.parse_forager_matched_protocol(payload)
 
@@ -937,6 +1138,107 @@ def test_source_provenance_requires_https_full_commit_and_lowercase_digests() ->
         source["repository"] = malformed_url
         with pytest.raises(matched.ForagerMatchedProtocolError, match="HTTPS"):
             matched.parse_forager_matched_protocol(payload)
+
+
+def test_reviewed_snapshot_provenance_does_not_claim_base_commit_tree() -> None:
+    protocol = matched.parse_forager_matched_protocol(_payload())
+    source = protocol.candidate_index["alberta_causal"].source
+    assert source.provenance_kind == "reviewed_snapshot"
+    assert source.tree_git_sha1 is None
+    assert source.base_commit == "a" * 40
+    assert len(source.archive_sha256) == 64
+    assert len(source.inventory_sha256) == 64
+    assert source.snapshot_descriptor_sha256 is not None
+    assert len(source.snapshot_descriptor_sha256) == 64
+
+    payload = _payload()
+    _candidate_by_id(payload, "alberta_causal")["source"]["tree_git_sha1"] = "5" * 40
+    with pytest.raises(matched.ForagerMatchedProtocolError, match="must be null"):
+        matched.parse_forager_matched_protocol(payload)
+
+    payload = _payload()
+    _candidate_by_id(payload, "external_dqn")["source"]["tree_git_sha1"] = None
+    with pytest.raises(matched.ForagerMatchedProtocolError, match="tree_git_sha1"):
+        matched.parse_forager_matched_protocol(payload)
+
+    payload = _payload()
+    _candidate_by_id(payload, "external_dqn")["source"]["snapshot_descriptor_sha256"] = (
+        "b" * 64
+    )
+    with pytest.raises(matched.ForagerMatchedProtocolError, match="must be null"):
+        matched.parse_forager_matched_protocol(payload)
+
+    payload = _payload()
+    _candidate_by_id(payload, "alberta_causal")["source"]["snapshot_descriptor_sha256"] = None
+    with pytest.raises(
+        matched.ForagerMatchedProtocolError, match="snapshot_descriptor_sha256"
+    ):
+        matched.parse_forager_matched_protocol(payload)
+
+
+def test_qualification_receipts_and_trust_anchor_are_mandatory_bindings() -> None:
+    payload = _payload()
+    del payload["runtime"]["executor_qualification_receipt_sha256"]
+    with pytest.raises(matched.ForagerMatchedProtocolError, match="missing required"):
+        matched.parse_forager_matched_protocol(payload)
+
+    payload = _payload()
+    binding = _candidate_by_id(payload, "external_dqn")["runtime_binding"]
+    binding["qualification_trust_anchor_identity"] = "different_anchor"
+    with pytest.raises(matched.ForagerMatchedProtocolError, match="trust anchor"):
+        matched.parse_forager_matched_protocol(payload)
+
+    payload = _payload()
+    binding = _candidate_by_id(payload, "alberta_causal")["runtime_binding"]
+    binding["qualified_capability_descriptor_sha256"] = "f" * 64
+    with pytest.raises(matched.ForagerMatchedProtocolError, match="candidate semantics"):
+        matched.parse_forager_matched_protocol(payload)
+
+    protocol = matched.parse_forager_matched_protocol(_payload())
+    candidate = protocol.candidate_index["alberta_causal"]
+    assert (
+        candidate.runtime_binding.qualified_capability_descriptor_sha256
+        == matched.candidate_capability_descriptor_sha256(candidate)
+    )
+
+
+def test_known_privileged_and_historical_implementations_cannot_be_relabelled() -> None:
+    payload = _payload()
+    oracle = _candidate_by_id(payload, "search_oracle")
+    oracle["stratum"] = "external_learning"
+    oracle["selection_group"] = "external"
+    oracle["observation_access"] = {
+        "access_mode": "partial_observation",
+        "observation_type": "color",
+        "aperture_size": 9,
+        "privileged_fields": [],
+    }
+    oracle["pairing"] = {"analysis_role": "inferential", "eligible": True, "exclusion_reasons": []}
+    payload["privileged_context"]["candidate_ids"] = []
+    payload["selection_plan"]["groups"][1]["candidate_ids"].append("search_oracle")
+    payload["evaluation_panel"]["fixed_descriptive_candidate_ids"].remove("search_oracle")
+    with pytest.raises(matched.ForagerMatchedProtocolError, match="known privileged"):
+        matched.parse_forager_matched_protocol(payload)
+
+    payload = _payload()
+    historical = _candidate_by_id(payload, "paper_dqn")
+    historical["stratum"] = "external_learning"
+    historical["selection_group"] = "external"
+    historical["observation_access"] = {
+        "access_mode": "partial_observation",
+        "observation_type": "color",
+        "aperture_size": 9,
+        "privileged_fields": [],
+    }
+    historical["pairing"] = {
+        "analysis_role": "inferential",
+        "eligible": True,
+        "exclusion_reasons": [],
+    }
+    payload["historical_orientation"]["candidate_ids"] = []
+    payload["selection_plan"]["groups"][1]["candidate_ids"].append("paper_dqn")
+    with pytest.raises(matched.ForagerMatchedProtocolError, match="known historical"):
+        matched.parse_forager_matched_protocol(payload)
 
 
 def test_configuration_transforms_are_typed_unique_and_hash_explaining() -> None:
@@ -956,6 +1258,10 @@ def test_configuration_transforms_are_typed_unique_and_hash_explaining() -> None
     config = _candidate_by_id(payload, "external_dqn")["configuration"]
     config["derived_sha256"] = "a" * 64
     config["allowed_transforms"] = [transform]
+    candidate = _candidate_by_id(payload, "external_dqn")
+    candidate["runtime_binding"]["qualified_capability_descriptor_sha256"] = (
+        _capability_descriptor_sha256(candidate)
+    )
     parsed = matched.parse_forager_matched_protocol(payload)
     assert parsed.candidate_index["external_dqn"].configuration.allowed_transforms[0].value == (
         HORIZON
@@ -1020,6 +1326,11 @@ def test_direct_values_and_canonicalization_are_validated_fail_closed() -> None:
     payload = _payload()
     payload["selection_plan"]["confidence"] = float("nan")
     with pytest.raises(matched.ForagerMatchedProtocolError, match="non-finite"):
+        matched.parse_forager_matched_protocol(payload)
+
+    payload = _payload()
+    payload["selection_plan"]["confidence"] = 10**400
+    with pytest.raises(matched.ForagerMatchedProtocolError, match="finite number"):
         matched.parse_forager_matched_protocol(payload)
 
     payload = _payload()

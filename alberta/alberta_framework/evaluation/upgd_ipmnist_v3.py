@@ -40,7 +40,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     partial_parser.add_argument("--data-archive", type=Path, default=None)
     artifact_parser = subparsers.add_parser("artifact")
     artifact_parser.add_argument("path", type=Path)
-    artifact_parser.add_argument("--plan", type=Path, default=None)
+    artifact_parser.add_argument("--plan", type=Path, required=True)
     artifact_parser.add_argument("--partials", type=Path, nargs="+", default=None)
     artifact_parser.add_argument("--data-home", type=Path, default=None)
     artifact_parser.add_argument("--data-archive", type=Path, default=None)

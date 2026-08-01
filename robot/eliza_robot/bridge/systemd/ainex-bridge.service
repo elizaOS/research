@@ -9,8 +9,12 @@ RestartSec=2
 User=ubuntu
 WorkingDirectory=/home/ubuntu/ainex-robot-code
 Environment=PYTHONPATH=/home/ubuntu/ainex-robot-code
-ExecStart=/usr/bin/python3 -m bridge.server --backend ros_real --host 0.0.0.0 --port 9100 --queue-size 256 --max-commands-per-sec 30 --deadman-timeout-sec 1.0
+# Required file. Keep it mode 0600 and define both server-side variables:
+# ELIZA_ROBOT_BRIDGE_AUTH_TOKEN and ELIZA_ROBOT_PHYSICAL_RESOURCE_ID.
+EnvironmentFile=/etc/elizaos/ainex-bridge.env
+ExecStartPre=/usr/bin/bash -ec 'test "$${#ELIZA_ROBOT_BRIDGE_AUTH_TOKEN}" -ge 32'
+ExecStartPre=/usr/bin/bash -ec 'test -n "$${ELIZA_ROBOT_PHYSICAL_RESOURCE_ID}"'
+ExecStart=/usr/bin/python3 -m eliza_robot.bridge.server --backend ros_real --host 127.0.0.1 --port 9100 --queue-size 256 --max-commands-per-sec 30 --deadman-timeout-sec 1.0
 
 [Install]
 WantedBy=multi-user.target
-

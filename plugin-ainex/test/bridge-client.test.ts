@@ -1,12 +1,14 @@
 import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WebSocketServer, type WebSocket as WsWebSocket } from "ws";
-import { AinexBridgeClient } from "../src/bridge-client";
+import { AinexBridgeClient, redactedBridgeUrl } from "../src/bridge-client";
 
 interface BridgeServerHarness {
   url: string;
   close: () => Promise<void>;
   emitEvent: (event: string, data: Record<string, unknown>) => void;
+  /** Authorization headers observed during websocket upgrades. */
+  authorizationHeaders: Array<string | undefined>;
   /** Set the handler used to reply to incoming CommandEnvelopes. */
   onCommand: (
     fn: (
@@ -34,6 +36,7 @@ async function startBridgeServer(): Promise<BridgeServerHarness> {
   const url = `ws://127.0.0.1:${port}`;
   const sockets: WsWebSocket[] = [];
   const received: BridgeServerHarness["received"] = [];
+  const authorizationHeaders: Array<string | undefined> = [];
 
   let handler: BridgeServerHarness extends {
     onCommand: (fn: infer H) => unknown;
@@ -41,8 +44,9 @@ async function startBridgeServer(): Promise<BridgeServerHarness> {
     ? H
     : never = (() => ({ ok: true, message: "ok", data: {} })) as never;
 
-  wss.on("connection", (socket) => {
+  wss.on("connection", (socket, request) => {
     sockets.push(socket);
+    authorizationHeaders.push(request.headers.authorization);
     socket.send(
       JSON.stringify({
         type: "event",
@@ -82,6 +86,7 @@ async function startBridgeServer(): Promise<BridgeServerHarness> {
   return {
     url,
     received,
+    authorizationHeaders,
     onCommand(fn) {
       handler = fn as typeof handler;
     },
@@ -142,6 +147,114 @@ describe("AinexBridgeClient", () => {
     expect(harness.received[0]?.payload.x).toBe(0.04);
 
     await client.disconnect();
+  });
+
+  it("sends a configured bridge token only in the Authorization header", async () => {
+    const token = "bridge-test-token-that-is-at-least-32-chars";
+    const client = new AinexBridgeClient({
+      url: harness.url,
+      authToken: token,
+    });
+
+    await client.connect();
+
+    expect(harness.authorizationHeaders).toEqual([`Bearer ${token}`]);
+    expect(client.url).not.toContain(token);
+    await client.disconnect();
+  });
+
+  it("omits Authorization when no bridge token is configured", async () => {
+    const client = new AinexBridgeClient({ url: harness.url });
+
+    await client.connect();
+
+    expect(harness.authorizationHeaders).toEqual([undefined]);
+    await client.disconnect();
+  });
+
+  it("rejects auth tokens that cannot be represented as one safe header value", () => {
+    expect(
+      () =>
+        new AinexBridgeClient({
+          url: harness.url,
+          authToken: "safe-prefix\r\nX-Injected: true",
+        }),
+    ).toThrow(/visible ASCII/);
+  });
+
+  it("enforces the physical bridge bearer length contract", () => {
+    expect(
+      () =>
+        new AinexBridgeClient({
+          url: harness.url,
+          authToken: "too-short",
+        }),
+    ).toThrow(/32\.\.4096 visible ASCII/);
+    expect(
+      () =>
+        new AinexBridgeClient({
+          url: harness.url,
+          authToken: "x".repeat(4097),
+        }),
+    ).toThrow(/32\.\.4096 visible ASCII/);
+  });
+
+  it("rejects bearer auth over a non-loopback plaintext websocket", () => {
+    expect(
+      () =>
+        new AinexBridgeClient({
+          url: "ws://192.0.2.10:9100",
+          authToken: "bridge-test-token-that-is-at-least-32-chars",
+        }),
+    ).toThrow(/wss:\/\/ or a loopback ws:\/\//);
+  });
+
+  it("accepts bearer auth over wss and loopback IPv4 or IPv6", () => {
+    const token = "bridge-test-token-that-is-at-least-32-chars";
+    expect(
+      new AinexBridgeClient({
+        url: "wss://bridge.example.test",
+        authToken: token,
+      }),
+    ).toBeDefined();
+    expect(
+      new AinexBridgeClient({ url: "ws://127.1.2.3:9100", authToken: token }),
+    ).toBeDefined();
+    expect(
+      new AinexBridgeClient({ url: "ws://[::1]:9100", authToken: token }),
+    ).toBeDefined();
+  });
+
+  it("rejects credentials embedded in websocket URL userinfo", () => {
+    expect(
+      () => new AinexBridgeClient({ url: "ws://user:secret@127.0.0.1:9100" }),
+    ).toThrow(/must not be placed in URL userinfo/);
+  });
+
+  it("rejects query, fragment, and nonroot path channels for bearer auth", () => {
+    const token = "bridge-test-token-that-is-at-least-32-chars";
+    for (const url of [
+      "ws://127.0.0.1:9100/?token=LEAKME_7f91",
+      "ws://127.0.0.1:9100/#LEAKME_7f91",
+      "ws://127.0.0.1:9100/LEAKME_7f91",
+    ]) {
+      expect(() => new AinexBridgeClient({ url, authToken: token })).toThrow(
+        /query or fragment|root path/,
+      );
+    }
+  });
+
+  it("redacts URL credentials and components from diagnostics", async () => {
+    const unsafe =
+      "ws://operator:LEAKME_7f91@127.0.0.1:9100/LEAKME_7f91?token=LEAKME_7f91#LEAKME_7f91";
+    expect(redactedBridgeUrl(unsafe)).toBe("ws://127.0.0.1:9100");
+
+    const client = new AinexBridgeClient({
+      url: "ws://127.0.0.1:9100/LEAKME_7f91?token=LEAKME_7f91",
+    });
+    await expect(client.send("profile.describe")).rejects.not.toThrow(
+      /LEAKME_7f91/,
+    );
   });
 
   it("dispatches event envelopes to per-event handlers", async () => {

@@ -1,36 +1,33 @@
 #!/usr/bin/env python3
-"""End-to-end verification client for AiNex bridge.
+"""Simulation-only end-to-end verification client for the compatibility bridge.
 
-Works against both:
-- Native ROSBridge (rosbridge_suite on the real robot)
-- Our custom AiNex bridge server (mock/isaac/ros backends)
+This tool exercises only loopback `mock`, `isaac`, or `ros_sim` endpoints.
+Native ROSBridge and non-loopback targets are rejected before any motion. Real
+hardware must use the authenticated unified command-envelope endpoint.
 
 Verifies camera, arm servo movement, head control, walking, and telemetry.
 
 Usage:
-    # Against real robot (native ROSBridge):
-    python3 bridge/scripts/verify_e2e.py --url ws://192.168.1.218:9090
-
-    # With camera check:
-    python3 bridge/scripts/verify_e2e.py --url ws://192.168.1.218:9090 --verify-camera
-
     # Against our bridge (mock backend):
-    python3 bridge/scripts/verify_e2e.py --url ws://localhost:9091
+    python3 eliza_robot/bridge/scripts/verify_e2e.py --url ws://localhost:9091
 
     # Against our bridge (isaac backend):
-    python3 bridge/scripts/verify_e2e.py --url ws://localhost:9090
+    python3 eliza_robot/bridge/scripts/verify_e2e.py --url ws://localhost:9090
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import sys
 import time
 import urllib.request
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
+
+from eliza_robot.bridge.physical_execution import reject_unsupervised_physical_motion
 
 try:
     from websockets.asyncio.client import connect
@@ -96,7 +93,7 @@ async def _recv_until_op(ws: object, op: str, timeout: float = 5.0) -> dict | No
             msg = await _recv(ws, timeout=max(0.1, remaining))
             if msg.get("op") == op:
                 return msg
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             return None
     return None
 
@@ -110,7 +107,7 @@ async def _drain(ws: object, duration: float = 0.5) -> list[dict]:
             remaining = deadline - time.monotonic()
             raw = await asyncio.wait_for(ws.recv(), timeout=max(0.05, remaining))
             msgs.append(json.loads(raw))
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             break
     return msgs
 
@@ -123,6 +120,16 @@ def _extract_host(url: str) -> str:
 async def run_verification(session: VerifySession) -> bool:
     print(f"\nConnecting to {session.url} ...")
     robot_host = _extract_host(session.url)
+    try:
+        is_loopback = robot_host.lower() == "localhost" or ipaddress.ip_address(
+            robot_host
+        ).is_loopback
+    except ValueError:
+        is_loopback = False
+    if not is_loopback:
+        reject_unsupervised_physical_motion(
+            "eliza_robot/bridge/scripts/verify_e2e.py non-loopback target"
+        )
     request_counter = 0
 
     def next_id() -> str:
@@ -148,6 +155,10 @@ async def run_verification(session: VerifySession) -> bool:
 
             if hello:
                 session.is_native_rosbridge = False
+                if backend not in {"mock", "isaac", "ros_sim"}:
+                    reject_unsupervised_physical_motion(
+                        "eliza_robot/bridge/scripts/verify_e2e.py physical backend"
+                    )
                 caps = hello.get("capabilities", {})
                 safety = hello.get("safety", {})
                 camera_url = hello.get("camera_url", "")
@@ -163,9 +174,9 @@ async def run_verification(session: VerifySession) -> bool:
                     f"rate_limit={safety.get('max_commands_per_sec')}/s deadman={safety.get('deadman_timeout_sec')}s",
                 )
             else:
-                session.is_native_rosbridge = True
-                camera_url = ""
-                session.record("server_type", True, "Native ROSBridge (rosbridge_suite)")
+                reject_unsupervised_physical_motion(
+                    "eliza_robot/bridge/scripts/verify_e2e.py native ROSBridge"
+                )
 
             # ── Camera ──
             print("\n== Camera ==")
@@ -187,7 +198,11 @@ async def run_verification(session: VerifySession) -> bool:
                             session.record("camera_stream", True, f"snapshot: {len(chunk)} bytes from {snapshot_url}")
                             stream_ok = True
                         else:
-                            session.record("camera_stream", False, f"snapshot empty (camera may not be publishing)")
+                            session.record(
+                                "camera_stream",
+                                False,
+                                "snapshot empty (camera may not be publishing)",
+                            )
                             stream_ok = True  # web_video_server is alive, just no frames
                 except Exception:
                     pass

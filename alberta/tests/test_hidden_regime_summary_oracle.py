@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import dataclasses
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 import alberta_framework.evaluation.hidden_regime_signaling_development as development_module
+import alberta_framework.evaluation.hidden_regime_summary_oracle as summary_oracle
 from alberta_framework.core.slot_signaling_agent import SlotSignalingConfig
 from alberta_framework.evaluation.hidden_regime_signaling_development import (
     SELECTIVE_FULL,
@@ -101,6 +104,52 @@ def _validate(run: HiddenRegimeRunResult, *, summary: object, resource: object):
         summary,
         resource,
     )
+
+
+def _d_short_trace() -> SimpleNamespace:
+    rows = 4
+    fields: dict[str, object] = {
+        "segment_index": np.asarray([0, 1, 1, 2], dtype=np.int32),
+        "regime_id": np.asarray([0, 4, 4, 0], dtype=np.int32),
+    }
+    for role in ("helper", "beneficiary"):
+        status = np.tile(np.asarray([1, 2, 2, 2], dtype=np.int32), (rows, 1))
+        generation = np.tile(np.asarray([0, 1, 2, 3], dtype=np.int32), (rows, 1))
+        fields.update(
+            {
+                f"{role}_committed_slot": np.full(rows, -1, dtype=np.int32),
+                f"{role}_retired_slot": np.full(rows, -1, dtype=np.int32),
+                f"{role}_status_pre": status.copy(),
+                f"{role}_status_post": status.copy(),
+                f"{role}_generation_pre": generation.copy(),
+                f"{role}_generation_post": generation.copy(),
+                f"{role}_next_generation_pre": np.full(rows, 4, dtype=np.int32),
+                f"{role}_next_generation_post": np.full(rows, 4, dtype=np.int32),
+            }
+        )
+    return SimpleNamespace(**fields)
+
+
+def test_d_short_oracle_rejects_events_and_restored_midsegment_generation() -> None:
+    trace = _d_short_trace()
+    assert summary_oracle._d_short_non_displacement(trace) == (True, True)
+
+    committed = _d_short_trace()
+    committed.helper_committed_slot[1] = 1
+    assert summary_oracle._d_short_non_displacement(committed) == (True, False)
+
+    retired = _d_short_trace()
+    retired.beneficiary_retired_slot[2] = 2
+    assert summary_oracle._d_short_non_displacement(retired) == (True, False)
+
+    restored = _d_short_trace()
+    restored.helper_generation_post[1, 2] = 4
+    restored.helper_generation_pre[2, 2] = 4
+    assert np.array_equal(
+        restored.helper_generation_pre[1],
+        restored.helper_generation_post[2],
+    )
+    assert summary_oracle._d_short_non_displacement(restored) == (True, False)
 
 
 def test_complete_summary_and_resource_reconstruct_exactly(

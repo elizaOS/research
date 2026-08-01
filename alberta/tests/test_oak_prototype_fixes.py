@@ -26,7 +26,6 @@ from alberta_framework.core.prototype_agent import (
     GRUPerceptionConfig,
     PrototypeAgent,
     PrototypeAgentConfig,
-    _gru_step,
 )
 
 OBS_DIM = 4
@@ -277,12 +276,13 @@ def _gru_proto_cfg() -> PrototypeAgentConfig:
 def test_act_works_with_gru_perception() -> None:
     agent = PrototypeAgent(_gru_proto_cfg())
     state = agent.start(agent.init(jr.key(0)), jnp.zeros(GRU_OBS_DIM))
-    action = agent.act(state, jnp.ones(GRU_OBS_DIM))
+    action = agent.act(state, state.current_raw_observation)
     assert action.shape == ()
+    assert int(action) == int(state.current_action)
     assert 0 <= int(action) < agent.config.oak.n_primitive_actions
 
 
-def test_act_with_gru_matches_augmented_greedy() -> None:
+def test_greedy_action_with_gru_is_pure_and_act_returns_cached_dispatch() -> None:
     agent = PrototypeAgent(_gru_proto_cfg())
     state = agent.start(agent.init(jr.key(0)), jnp.zeros(GRU_OBS_DIM))
     # Advance a few real steps so the GRU hidden state is non-trivial
@@ -290,17 +290,21 @@ def test_act_with_gru_matches_augmented_greedy() -> None:
         obs = jr.normal(jr.key(i + 1), (GRU_OBS_DIM,))
         state = agent.update(state, jnp.array(0.0), obs).state
     query = jr.normal(jr.key(9), (GRU_OBS_DIM,))
-    # act() must use the same augmentation update() would apply
-    _, aug_obs = _gru_step(state.gru_state, query)
+    # Counterfactual encoding pairs the query with current memory and never
+    # advances recurrence; act() remains the cached dispatched command.
+    aug_obs = jnp.concatenate([query, state.gru_state.hidden])
     q = agent.oak_agent.base_q_values(state.oak_state, aug_obs)
     n_prim = agent.config.oak.n_primitive_actions
     expected = int(jnp.argmax(q[:n_prim]))
-    assert int(agent.act(state, query)) == expected
+    assert int(agent.greedy_action(state, query)) == expected
+    assert int(agent.act(state, state.current_raw_observation)) == int(
+        state.current_action
+    )
 
 
 def test_act_without_gru_unchanged() -> None:
     agent = PrototypeAgent(PrototypeAgentConfig(oak=_oak_cfg()))
     state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
-    action = agent.act(state, jnp.ones(OBS_DIM))
+    action = agent.act(state, state.current_raw_observation)
     assert action.shape == ()
     assert 0 <= int(action) < agent.config.oak.n_primitive_actions

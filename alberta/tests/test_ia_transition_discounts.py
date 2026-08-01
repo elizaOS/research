@@ -15,6 +15,7 @@ from alberta_framework.core.intelligence_amplification import (
     IAAgent,
     IAConfig,
     IAState,
+    _checked_partner_action,
 )
 from alberta_framework.core.oak import OaKConfig
 from alberta_framework.core.options import STOMPConfig, SubtaskSpec
@@ -234,6 +235,19 @@ def test_ia_invalid_traced_action_fails_closed_with_nonfinite_td_error() -> None
     )
 
 
+def test_checked_partner_action_accepts_closed_over_action_under_cond() -> None:
+    """The range predicate can be traced even when its source array is concrete."""
+    action = jnp.array(EXECUTED_ACTION, dtype=jnp.int32)
+
+    def branch(_: None) -> tuple[jax.Array, jax.Array]:
+        return _checked_partner_action(action, n_primitive_actions=2)
+
+    executed, valid = jax.lax.cond(jnp.array(True), branch, branch, operand=None)
+
+    assert int(executed) == EXECUTED_ACTION
+    assert bool(valid)
+
+
 @pytest.mark.parametrize(("discount", "expected_discount"), [(0.0, 0.0), (0.4, 0.4)])
 def test_prototype_explicit_transition_routes_discount_to_ia(
     discount: float,
@@ -249,14 +263,21 @@ def test_prototype_explicit_transition_routes_discount_to_ia(
     state = state.replace(
         oak_state=state.oak_state.replace(stomp_state=main_stomp),
         ia_state=_prepare_ia_state(state.ia_state),
+        current_action=jnp.array(EXECUTED_ACTION, dtype=jnp.int32),
     )
 
     result = agent.update_transition(
         state,
         PrototypeTransition(
+            observation=state.current_raw_observation,
+            action=state.current_action,
+            decision_id=state.current_decision_id,
             reward=REWARD,
-            next_observation=OBS,
             discount=jnp.array(discount, dtype=jnp.float32),
+            terminated=jnp.array(discount == 0.0),
+            truncated=jnp.array(False),
+            next_observation=OBS,
+            next_decision_observation=OBS,
         ),
     )
 
@@ -353,4 +374,55 @@ def test_discounted_scan_matches_loop_and_jit() -> None:
         _materialize_typed_keys(scan_result),
         rtol=1e-6,
         atol=1e-6,
+    )
+
+
+def test_ia_boundary_learns_bootstrap_observation_and_arms_reset_observation() -> None:
+    agent = IAAgent(_ia_config())
+    state = _prepare_ia_state(agent.start(agent.init(jr.key(5)), OBS))
+    bootstrap = jnp.asarray([0.25, 0.75], dtype=jnp.float32)
+    reset = jnp.asarray([-0.5, 0.2], dtype=jnp.float32)
+
+    result = agent.update(
+        state,
+        OBS,
+        REWARD,
+        bootstrap,
+        partner_action=jnp.asarray(EXECUTED_ACTION, dtype=jnp.int32),
+        discount=jnp.asarray(0.8, dtype=jnp.float32),
+        decision_observation=reset,
+        execution_boundary=jnp.asarray(True),
+    )
+
+    chex.assert_trees_all_close(
+        result.state.cortex_state.stomp_state.base_last_obs,
+        reset,
+    )
+    # Cerebellum supervision remains the final/bootstrap observation rather
+    # than the post-reset state used for the next recommendation.
+    expected_cerebellum, _, _ = agent._cerebellum.update(
+        state.cerebellum_state,
+        OBS,
+        bootstrap,
+    )
+    chex.assert_trees_all_close(
+        result.state.cerebellum_state,
+        expected_cerebellum,
+    )
+
+    scanned = agent.scan(
+        state,
+        OBS[None, :],
+        REWARD[None],
+        bootstrap[None, :],
+        partner_actions=jnp.asarray([EXECUTED_ACTION], dtype=jnp.int32),
+        discounts=jnp.asarray([0.8], dtype=jnp.float32),
+        partner_decision_obs=reset[None, :],
+        execution_boundaries=jnp.asarray([True]),
+    )
+    chex.assert_trees_all_close(
+        _materialize_typed_keys(scanned.state),
+        _materialize_typed_keys(result.state),
+        rtol=1.0e-6,
+        atol=1.0e-6,
     )

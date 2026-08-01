@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import math
 import threading
 from dataclasses import dataclass, field
@@ -36,7 +37,11 @@ from typing import Any
 
 import numpy as np
 
-from eliza_robot.bridge.backends.base import BridgeBackend
+from eliza_robot.bridge.backends.base import (
+    BridgeBackend,
+    _physical_motion_authority_error,
+    canonical_physical_resource_id,
+)
 from eliza_robot.bridge.protocol import (
     CommandEnvelope,
     EventEnvelope,
@@ -71,10 +76,26 @@ class AinexRemoteBackend(BridgeBackend):
         host: str = "192.168.1.218",
         port: int = 9090,
         connect_timeout: float = 5.0,
+        *,
+        physical_resource_id: str,
     ) -> None:
+        physical_resource = canonical_physical_resource_id(physical_resource_id)
+        if not isinstance(host, str) or not host:
+            raise ValueError("host must be a non-empty string")
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65_535:
+            raise ValueError("port must be an integer in 1..65535")
+        if (
+            isinstance(connect_timeout, bool)
+            or not isinstance(connect_timeout, int | float)
+            or not math.isfinite(float(connect_timeout))
+            or connect_timeout < 0.1
+            or connect_timeout > 60.0
+        ):
+            raise ValueError("connect_timeout must be finite and in 0.1..60 seconds")
         self._host = host
         self._port = port
         self._connect_timeout = connect_timeout
+        self._physical_resources = (physical_resource,)
         self._state = _RemoteState()
         self._lock = threading.Lock()
         # roslibpy Ros + Topic/Service handles populated in connect()
@@ -95,6 +116,9 @@ class AinexRemoteBackend(BridgeBackend):
     def backend_name(self) -> str:
         return "ainex_remote"
 
+    def physical_motion_resources(self) -> tuple[str, ...]:
+        return self._physical_resources
+
     def capabilities(self) -> JsonDict:
         return {
             "walk_set": True,
@@ -106,10 +130,13 @@ class AinexRemoteBackend(BridgeBackend):
             "camera_stream_passthrough": True,
             "remote_rosbridge": True,
             "host": f"{self._host}:{self._port}",
+            # The walking service exposes an explicit stop command. No claim
+            # is made for cancelling servo/head/action motion.
+            "motion_safety": {"walk_stop": True},
         }
 
     async def connect(self) -> None:
-        import roslibpy
+        import roslibpy  # type: ignore[import-not-found]
 
         self._ros = roslibpy.Ros(host=self._host, port=self._port)
         self._ros.run(timeout=self._connect_timeout)
@@ -182,10 +209,8 @@ class AinexRemoteBackend(BridgeBackend):
                 self._servo_pub,
             ):
                 if t is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         t.unadvertise()
-                    except Exception:
-                        pass
             for s in (
                 self._sub_walking,
                 self._sub_battery,
@@ -193,10 +218,8 @@ class AinexRemoteBackend(BridgeBackend):
                 self._sub_camera,
             ):
                 if s is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         s.unsubscribe()
-                    except Exception:
-                        pass
             self._ros.terminate()
         finally:
             self._ros = None
@@ -244,6 +267,13 @@ class AinexRemoteBackend(BridgeBackend):
     # Command dispatch
     # ------------------------------------------------------------------
     async def handle_command(self, cmd: CommandEnvelope) -> ResponseEnvelope:
+        authority_error = _physical_motion_authority_error(
+            self.backend_name,
+            self._physical_resources[0],
+            cmd,
+        )
+        if authority_error is not None:
+            return authority_error
         if self._ros is None or not self._ros.is_connected:
             return ResponseEnvelope(
                 request_id=cmd.request_id,
@@ -254,7 +284,7 @@ class AinexRemoteBackend(BridgeBackend):
                 data={},
             )
         try:
-            self._dispatch(cmd)
+            await asyncio.to_thread(self._dispatch, cmd)
             with self._lock:
                 snap = {
                     "is_walking": self._state.is_walking,
@@ -279,7 +309,7 @@ class AinexRemoteBackend(BridgeBackend):
             )
 
     def _dispatch(self, cmd: CommandEnvelope) -> None:
-        import roslibpy
+        import roslibpy  # type: ignore[import-not-found]
 
         if cmd.command == "walk.set":
             speed = int(cmd.payload.get("speed", 2))
@@ -305,7 +335,17 @@ class AinexRemoteBackend(BridgeBackend):
             if not isinstance(action, str):
                 raise ValueError("walk.command payload.action must be a string")
             request = roslibpy.ServiceRequest({"command": action})
-            self._walking_cmd_srv.call(request, callback=None, errback=None, timeout=2.0)
+            response = self._walking_cmd_srv.call(
+                request,
+                callback=None,
+                errback=None,
+                timeout=2.0,
+            )
+            if not isinstance(response, dict) or response.get("result") is not True:
+                raise RuntimeError(
+                    "walking command service did not return exact result=true "
+                    f"acknowledgement: {response!r}"
+                )
             return
 
         if cmd.command == "action.play":
@@ -378,7 +418,7 @@ class AinexRemoteBackend(BridgeBackend):
         """
         if self._ros is None or not self._ros.is_connected:
             return {}
-        import roslibpy
+        import roslibpy  # type: ignore[import-not-found]
 
         from eliza_robot.bridge.isaaclab.joint_map import (
             pulse_to_radians,
@@ -412,7 +452,7 @@ class AinexRemoteBackend(BridgeBackend):
         )
         try:
             return await asyncio.wait_for(fut, timeout=4.0)
-        except (asyncio.TimeoutError, Exception):
+        except Exception:
             return {}
 
     def snapshot_camera(self, _camera: str = "head") -> np.ndarray | None:

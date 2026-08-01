@@ -14,6 +14,9 @@ previously failed to track.
 SAFETY: each leg probe is ±0.03 rad (~1.7°). One joint at a time.
 Robot returns to `stand` between groups. If a single probe takes the
 robot off-balance, the subsequent stand should recover it.
+
+QUARANTINE: this legacy direct-transport motion path now fails before
+connecting. It must be rewritten as an authenticated unified-bridge client.
 """
 
 from __future__ import annotations
@@ -26,10 +29,12 @@ from dataclasses import asdict
 from pathlib import Path
 
 from eliza_robot.bridge.backends.ainex_remote import AinexRemoteBackend
+from eliza_robot.bridge.physical_execution import reject_unsupervised_physical_motion
 from eliza_robot.sim2real.sysid_full import run_full_sysid
 
 
 async def main_async(args) -> int:
+    reject_unsupervised_physical_motion("scripts/evidence_full_sysid.py")
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 

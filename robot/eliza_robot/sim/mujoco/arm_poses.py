@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from bridge.isaaclab.ainex_cfg import STAND_JOINT_POSITIONS
+from eliza_robot.bridge.isaaclab.ainex_cfg import STAND_JOINT_POSITIONS
 
 
 @dataclass(frozen=True)

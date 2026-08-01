@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib
+import importlib.machinery
 import importlib.metadata
 import importlib.util
 import json
@@ -28,11 +29,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Final, cast
+from typing import Any, Final, Literal, cast
 
 import numpy as np
 
 PARITY_RESULT_SCHEMA_VERSION: Final = "alberta.forager_fixed_action_rng_parity.v1"
+COLLECTOR_RESULT_SCHEMA_VERSION: Final = "alberta.forager_fixed_action_rng_parity_collector.v1"
 TRACE_SCHEMA_VERSION: Final = "alberta.forager_fixed_action_environment_trace.v1"
 ACTION_SEQUENCE_SCHEMA_VERSION: Final = "alberta.forager_fixed_action_sequence.v1"
 TASK_SCHEMA_VERSION: Final = "alberta.forager_fov_task_identity.v1"
@@ -65,8 +67,10 @@ REQUIRED_DEPENDENCY_LOCK_SHA256: Final = (
 )
 REQUIRED_SOURCE_ROOT: Final = Path("/opt/continual-foragax-agents")
 REQUIRED_SOURCE_SRC_ROOT: Final = REQUIRED_SOURCE_ROOT / "src"
+REQUIRED_SOURCE_DIRECTORY_MODES: Final = frozenset({0o555, 0o755})
 REQUIRED_WRAPPER_PATH: Final = REQUIRED_SOURCE_SRC_ROOT / "environments/Foragax.py"
 REQUIRED_WRAPPER_SHA256: Final = "91c4e34ee3d477f52bedafb5526785ea138ae2b187df0f1d720a805927ab67dc"
+REQUIRED_SOURCE_TREE_HASH_SCHEME: Final = "canonical-entry-json+mode+size+bytes-v1"
 
 REQUIRED_FORAGAX_DISTRIBUTION: Final = "continual-foragax"
 REQUIRED_FORAGAX_VERSION: Final = "0.55.0"
@@ -79,6 +83,8 @@ REQUIRED_FORAGAX_INSTALL_TREE_SHA256: Final = (
 REQUIRED_FORAGAX_INSTALL_TREE_HASH_SCHEME: Final = "relative-path+size+bytes-v1"
 
 REQUIRED_PYTHON_VERSION: Final = "3.12.3"
+REQUIRED_RUNTIME_ROOT: Final = Path("/opt/alberta-runtime")
+REQUIRED_RUNTIME_SITE_PACKAGES: Final = REQUIRED_RUNTIME_ROOT / "lib/python3.12/site-packages"
 REQUIRED_PYTHON_EXECUTABLE: Final = Path("/opt/alberta-runtime/bin/python")
 REQUIRED_PYTHON_EXECUTABLE_SHA256: Final = (
     "1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118"
@@ -96,6 +102,10 @@ MAX_JSON_BYTES: Final = 4 * 1024 * 1024
 MAX_JSON_NODES: Final = 100_000
 MAX_JSON_DEPTH: Final = 64
 MAX_SOURCE_BYTES: Final = 8 * 1024 * 1024
+MAX_TREE_FILE_BYTES: Final = 16 * 1024 * 1024
+MAX_TREE_FILES: Final = 100_000
+MAX_TREE_ENTRIES: Final = 150_000
+MAX_TREE_BYTES: Final = 512 * 1024 * 1024
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _KEY_WORD_MAX: Final = 2**32 - 1
@@ -385,6 +395,43 @@ class ParityProbeResult:
             "matched_trace": self.matched_trace.to_dict(),
             "wrapper_trace_sha256": self.wrapper_trace_sha256,
             "direct_trace_sha256": self.direct_trace_sha256,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = self.unsigned_dict()
+        payload["payload_sha256"] = self.payload_sha256
+        return payload
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_dict())
+
+
+CollectorKind = Literal["wrapper", "direct"]
+
+
+@dataclass(frozen=True)
+class ParityCollectorResult:
+    """One hash-only trace produced by exactly one isolated live collector."""
+
+    collector: CollectorKind
+    runtime: VerifiedRuntimeIdentity
+    config: FixedActionProbeConfig
+    trace: EnvironmentTraceDigest
+    payload_sha256: str
+
+    def unsigned_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": COLLECTOR_RESULT_SCHEMA_VERSION,
+            "classification": "open_fixed_action_environment_parity_collector",
+            "collector": self.collector,
+            "evidence_boundary": CONTENT_IDENTITY_BOUNDARY,
+            "promotion_authorized": False,
+            "runtime": self.runtime.to_dict(),
+            "task": task_descriptor(),
+            "rng_contract": rng_contract_descriptor(),
+            "probe": self.config.to_dict(),
+            "trace": self.trace.to_dict(),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -870,82 +917,474 @@ def compare_fixed_action_traces(
     return replace(draft, payload_sha256=_canonical_sha256(draft.unsigned_dict()))
 
 
-def _file_sha256(path: Path) -> str:
+@dataclass(frozen=True)
+class _VerifiedTreeFile:
+    relative_path: str
+    mode: int
+    size: int
+    sha256: str
+    contents: bytes | None
+
+
+def _stat_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _open_flags(*, directory: bool) -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    close_on_exec = getattr(os, "O_CLOEXEC", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0) if directory else 0
+    if no_follow == 0 or (directory and directory_flag == 0):
+        raise ForagerRngParityError("the runtime lacks required no-follow file APIs")
+    return os.O_RDONLY | no_follow | close_on_exec | directory_flag
+
+
+def _require_stable_metadata(
+    expected: os.stat_result,
+    observed: os.stat_result,
+    *,
+    label: str,
+) -> None:
+    if _stat_identity(expected) != _stat_identity(observed):
+        raise ForagerRngParityError(f"{label} changed during verified access")
+
+
+def _read_verified_regular_fd(
+    descriptor: int,
+    initial: os.stat_result,
+    *,
+    label: str,
+    maximum_bytes: int,
+    require_read_only: bool,
+    capture_contents: bool,
+) -> tuple[str, bytes | None]:
+    opened = os.fstat(descriptor)
+    _require_stable_metadata(initial, opened, label=label)
+    if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+        raise ForagerRngParityError(f"{label} must be a single-link regular file")
+    if opened.st_size < 0 or opened.st_size > maximum_bytes:
+        raise ForagerRngParityError(f"{label} exceeds its verified byte limit")
+    if require_read_only and not bool(os.fstatvfs(descriptor).f_flag & os.ST_RDONLY):
+        raise ForagerRngParityError(f"{label} is not on a read-only mount")
     digest = hashlib.sha256()
-    with path.open("rb") as source:
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+    captured = bytearray() if capture_contents else None
+    remaining = opened.st_size
+    while remaining:
+        block = os.read(descriptor, min(1024 * 1024, remaining))
+        if not block:
+            raise ForagerRngParityError(f"{label} was truncated during verified access")
+        digest.update(block)
+        if captured is not None:
+            captured.extend(block)
+        remaining -= len(block)
+    if os.read(descriptor, 1):
+        raise ForagerRngParityError(f"{label} grew during verified access")
+    _require_stable_metadata(opened, os.fstat(descriptor), label=label)
+    return digest.hexdigest(), None if captured is None else bytes(captured)
 
 
-def _verify_exact_read_only_file(path: Path, expected_sha256: str, *, label: str) -> bytes:
+def _read_verified_file(
+    path: Path,
+    *,
+    label: str,
+    maximum_bytes: int = MAX_SOURCE_BYTES,
+    require_read_only: bool = True,
+) -> tuple[str, bytes]:
+    if not path.is_absolute():
+        raise ForagerRngParityError(f"{label} path must be absolute")
     try:
-        metadata = path.lstat()
-    except OSError as exc:
-        raise ForagerRngParityError(f"could not stat {label}: {exc}") from exc
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-        raise ForagerRngParityError(f"{label} must be a regular non-symlink file")
-    if metadata.st_size > MAX_SOURCE_BYTES:
-        raise ForagerRngParityError(f"{label} exceeds the source-size limit")
-    try:
-        if not bool(os.statvfs(path).f_flag & os.ST_RDONLY):
-            raise ForagerRngParityError(f"{label} is not on a read-only mount")
-        contents = path.read_bytes()
+        if path.resolve(strict=True) != path:
+            raise ForagerRngParityError(f"{label} path contains a symbolic link")
+        initial = path.lstat()
+        descriptor = os.open(path, _open_flags(directory=False))
     except ForagerRngParityError:
         raise
     except OSError as exc:
+        raise ForagerRngParityError(f"could not open {label}: {exc}") from exc
+    try:
+        digest, contents = _read_verified_regular_fd(
+            descriptor,
+            initial,
+            label=label,
+            maximum_bytes=maximum_bytes,
+            require_read_only=require_read_only,
+            capture_contents=True,
+        )
+    except OSError as exc:
         raise ForagerRngParityError(f"could not read {label}: {exc}") from exc
-    if len(contents) != metadata.st_size:
-        raise ForagerRngParityError(f"{label} changed while it was read")
-    if hashlib.sha256(contents).hexdigest() != expected_sha256:
+    finally:
+        os.close(descriptor)
+    if contents is None:  # pragma: no cover - capture_contents is fixed true above
+        raise ForagerRngParityError(f"{label} contents were not captured")
+    return digest, contents
+
+
+def _verified_tree_entries(
+    root: Path,
+    *,
+    label: str,
+    require_read_only: bool,
+    capture_contents: bool,
+    directory_modes: set[int],
+    file_modes: set[int],
+) -> tuple[tuple[tuple[str, int], ...], tuple[_VerifiedTreeFile, ...]]:
+    if not root.is_absolute():
+        raise ForagerRngParityError(f"{label} root must be absolute")
+    try:
+        if root.resolve(strict=True) != root:
+            raise ForagerRngParityError(f"{label} root contains a symbolic link")
+        root_initial = root.lstat()
+        root_fd = os.open(root, _open_flags(directory=True))
+    except ForagerRngParityError:
+        raise
+    except OSError as exc:
+        raise ForagerRngParityError(f"could not open {label} root: {exc}") from exc
+
+    directories: list[tuple[str, int]] = []
+    files: list[_VerifiedTreeFile] = []
+    total_bytes = 0
+    total_entries = 0
+
+    def visit(directory_fd: int, prefix: str, initial: os.stat_result) -> None:
+        nonlocal total_bytes, total_entries
+        opened = os.fstat(directory_fd)
+        _require_stable_metadata(initial, opened, label=label if not prefix else prefix)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise ForagerRngParityError(f"{label} contains a non-directory traversal root")
+        if require_read_only and not bool(os.fstatvfs(directory_fd).f_flag & os.ST_RDONLY):
+            raise ForagerRngParityError(f"{label} directory {prefix or '.'} is writable")
+        try:
+            names = sorted(os.listdir(directory_fd))
+        except OSError as exc:
+            raise ForagerRngParityError(f"could not enumerate {label}: {exc}") from exc
+        if len(names) != len(set(names)):
+            raise ForagerRngParityError(f"{label} repeats a directory entry")
+        for name in names:
+            try:
+                name.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ForagerRngParityError(f"{label} contains a non-UTF-8 path") from exc
+            relative = name if not prefix else f"{prefix}/{name}"
+            try:
+                before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise ForagerRngParityError(
+                    f"could not stat {label} entry {relative}: {exc}"
+                ) from exc
+            total_entries += 1
+            if total_entries > MAX_TREE_ENTRIES:
+                raise ForagerRngParityError(f"{label} exceeds the entry-count limit")
+            mode = stat.S_IMODE(before.st_mode)
+            if stat.S_ISLNK(before.st_mode):
+                raise ForagerRngParityError(f"{label} contains a symbolic link: {relative}")
+            if stat.S_ISDIR(before.st_mode):
+                if mode not in directory_modes:
+                    raise ForagerRngParityError(f"{label} directory mode differs at {relative}")
+                directories.append((relative, mode))
+                try:
+                    child_fd = os.open(
+                        name,
+                        _open_flags(directory=True),
+                        dir_fd=directory_fd,
+                    )
+                except OSError as exc:
+                    raise ForagerRngParityError(
+                        f"could not open {label} directory {relative}: {exc}"
+                    ) from exc
+                try:
+                    visit(child_fd, relative, before)
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(before.st_mode):
+                if mode not in file_modes:
+                    raise ForagerRngParityError(f"{label} file mode differs at {relative}")
+                if len(files) >= MAX_TREE_FILES:
+                    raise ForagerRngParityError(f"{label} exceeds the file-count limit")
+                try:
+                    file_fd = os.open(
+                        name,
+                        _open_flags(directory=False),
+                        dir_fd=directory_fd,
+                    )
+                except OSError as exc:
+                    raise ForagerRngParityError(
+                        f"could not open {label} file {relative}: {exc}"
+                    ) from exc
+                try:
+                    digest, contents = _read_verified_regular_fd(
+                        file_fd,
+                        before,
+                        label=f"{label} file {relative}",
+                        maximum_bytes=MAX_TREE_FILE_BYTES,
+                        require_read_only=require_read_only,
+                        capture_contents=capture_contents,
+                    )
+                finally:
+                    os.close(file_fd)
+                total_bytes += before.st_size
+                if total_bytes > MAX_TREE_BYTES:
+                    raise ForagerRngParityError(f"{label} exceeds the aggregate byte limit")
+                files.append(
+                    _VerifiedTreeFile(
+                        relative_path=relative,
+                        mode=mode,
+                        size=before.st_size,
+                        sha256=digest,
+                        contents=contents,
+                    )
+                )
+            else:
+                raise ForagerRngParityError(f"{label} contains a special entry: {relative}")
+            try:
+                after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise ForagerRngParityError(
+                    f"could not restat {label} entry {relative}: {exc}"
+                ) from exc
+            _require_stable_metadata(before, after, label=f"{label} entry {relative}")
+        _require_stable_metadata(opened, os.fstat(directory_fd), label=label)
+
+    try:
+        root_mode = stat.S_IMODE(root_initial.st_mode)
+        if root_mode not in directory_modes:
+            raise ForagerRngParityError(f"{label} root mode differs from the lock")
+        visit(root_fd, "", root_initial)
+    except OSError as exc:
+        raise ForagerRngParityError(f"could not verify {label}: {exc}") from exc
+    finally:
+        os.close(root_fd)
+    if not files:
+        raise ForagerRngParityError(f"{label} tree is empty")
+    return tuple(directories), tuple(files)
+
+
+def _source_tree_inventory_sha256() -> str:
+    directories, files = _verified_tree_entries(
+        REQUIRED_SOURCE_ROOT,
+        label="upstream source",
+        require_read_only=True,
+        capture_contents=False,
+        directory_modes=set(REQUIRED_SOURCE_DIRECTORY_MODES),
+        file_modes={0o444, 0o555},
+    )
+    entries: list[dict[str, Any]] = [
+        {"mode": 0o775, "path": path, "type": "directory"} for path, _mode in directories
+    ]
+    entries.extend(
+        {
+            "mode": 0o775 if item.mode & 0o111 else 0o664,
+            "path": item.relative_path,
+            "sha256": item.sha256,
+            "size": item.size,
+            "type": "file",
+        }
+        for item in files
+    )
+    entries.sort(
+        key=lambda item: (
+            cast(str, item["path"]) + ("/" if item["type"] == "directory" else "")
+        ).encode("utf-8")
+    )
+    return _canonical_sha256(
+        {
+            "entries": entries,
+            "hash_scheme": REQUIRED_SOURCE_TREE_HASH_SCHEME,
+        }
+    )
+
+
+def _verify_exact_read_only_file(path: Path, expected_sha256: str, *, label: str) -> bytes:
+    _require_sha256(expected_sha256, f"{label} expected SHA-256")
+    actual_sha256, contents = _read_verified_file(path, label=label)
+    if actual_sha256 != expected_sha256:
         raise ForagerRngParityError(f"{label} SHA-256 differs from the qualified lock")
     return contents
 
 
 def _foragax_install_tree_sha256() -> str:
+    expected_root = REQUIRED_RUNTIME_SITE_PACKAGES / "foragax"
     spec = importlib.util.find_spec("foragax")
-    locations = spec.submodule_search_locations if spec is not None else None
-    if not locations:
-        raise ForagerRngParityError("the qualified foragax package is not importable")
-    files: list[tuple[str, Path]] = []
-    for raw_root in locations:
-        root = Path(raw_root).resolve()
-        if not root.is_dir():
-            continue
-        files.extend(
-            (f"foragax/{path.relative_to(root).as_posix()}", path)
-            for path in root.rglob("*")
-            if path.is_file()
-            and "__pycache__" not in path.parts
-            and path.suffix not in {".pyc", ".pyo"}
-        )
-    if not files:
-        raise ForagerRngParityError("the qualified foragax package tree is empty")
+    locations = tuple(spec.submodule_search_locations or ()) if spec is not None else ()
+    if (
+        spec is None
+        or len(locations) != 1
+        or Path(locations[0]).resolve() != expected_root
+        or spec.origin is None
+        or Path(spec.origin).resolve() != expected_root / "__init__.py"
+        or not isinstance(spec.loader, importlib.machinery.SourceFileLoader)
+    ):
+        raise ForagerRngParityError("the qualified foragax package origin/loader differs")
+    _directories, files = _verified_tree_entries(
+        expected_root,
+        label="qualified foragax package",
+        require_read_only=True,
+        capture_contents=True,
+        directory_modes={0o555},
+        file_modes={0o444, 0o555},
+    )
     digest = hashlib.sha256()
-    for relative, path in sorted(files):
-        encoded_path = relative.encode("utf-8")
-        contents = path.read_bytes()
-        digest.update(len(encoded_path).to_bytes(4, "big"))
-        digest.update(encoded_path)
-        digest.update(len(contents).to_bytes(8, "big"))
-        digest.update(contents)
+    for item in sorted(files, key=lambda candidate: candidate.relative_path):
+        path = Path(item.relative_path)
+        if "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
+            raise ForagerRngParityError("the qualified foragax package contains bytecode cache")
+        if item.contents is None:  # pragma: no cover - capture_contents is fixed true
+            raise ForagerRngParityError("foragax package content capture failed")
+        relative = f"foragax/{item.relative_path}".encode()
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(len(item.contents).to_bytes(8, "big"))
+        digest.update(item.contents)
     return digest.hexdigest()
 
 
 def _read_probe_module_identity() -> str:
-    path = Path(__file__)
+    digest, _contents = _read_verified_file(Path(__file__), label="probe module source")
+    return digest
+
+
+def _path_is_under(path: Path, root: Path) -> bool:
     try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_isolated_runtime() -> None:
+    required_flags = {
+        "dont_write_bytecode": 1,
+        "ignore_environment": 1,
+        "isolated": 1,
+        "no_user_site": 1,
+        "safe_path": True,
+    }
+    mismatched_flags = [
+        name for name, expected in required_flags.items() if getattr(sys.flags, name) != expected
+    ]
+    if mismatched_flags:
+        raise ForagerRngParityError(
+            "probe requires Python -I -B isolated safe mode: " + ", ".join(mismatched_flags)
+        )
+    allowed_environment = {
+        "PYTHONHASHSEED": {None, "0"},
+        "PYTHONHOME": {None, ""},
+        "PYTHONNOUSERSITE": {None, "1"},
+        "PYTHONPATH": {None, ""},
+        "PYTHONDONTWRITEBYTECODE": {None, "1"},
+        "PYTHONUTF8": {None, "1"},
+    }
+    drifted_environment = [
+        name for name, allowed in allowed_environment.items() if os.environ.get(name) not in allowed
+    ]
+    forbidden_environment = [
+        name
+        for name in (
+            "LD_LIBRARY_PATH",
+            "LD_PRELOAD",
+            "PYTHONBREAKPOINT",
+            "PYTHONINSPECT",
+            "PYTHONSTARTUP",
+            "PYTHONUSERBASE",
+        )
+        if os.environ.get(name)
+    ]
+    if drifted_environment or forbidden_environment:
+        raise ForagerRngParityError(
+            "probe import environment is not sanitized: "
+            + ", ".join(sorted((*drifted_environment, *forbidden_environment)))
+        )
+
+    allowed_roots = (REQUIRED_RUNTIME_ROOT, Path("/usr/lib"))
+    for index, raw_path in enumerate(sys.path):
+        path = Path(raw_path)
+        if not raw_path or not path.is_absolute():
+            raise ForagerRngParityError(f"sys.path[{index}] is not an absolute trusted path")
+        try:
+            resolved = path.resolve(strict=path.exists())
+        except OSError as exc:
+            raise ForagerRngParityError(f"could not resolve sys.path[{index}]: {exc}") from exc
+        if resolved != path or not any(_path_is_under(path, root) for root in allowed_roots):
+            raise ForagerRngParityError(f"sys.path[{index}] escapes trusted runtime roots")
+        existing = path if path.exists() else path.parent
+        try:
+            if not bool(os.statvfs(existing).f_flag & os.ST_RDONLY):
+                raise ForagerRngParityError(f"sys.path[{index}] is on a writable mount")
+        except OSError as exc:
+            raise ForagerRngParityError(f"could not inspect sys.path[{index}]: {exc}") from exc
+
+    cwd = Path.cwd()
+    try:
+        if (
+            cwd.resolve(strict=True) != cwd
+            or not _path_is_under(cwd, REQUIRED_SOURCE_ROOT)
+            or not bool(os.statvfs(cwd).f_flag & os.ST_RDONLY)
+        ):
+            raise ForagerRngParityError("probe working directory is not the immutable source root")
+    except OSError as exc:
+        raise ForagerRngParityError(f"could not inspect probe working directory: {exc}") from exc
+
+    shadow_prefixes = ("environments", "foragax", "utils")
+    shadowed = sorted(
+        name
+        for name in sys.modules
+        if any(name == prefix or name.startswith(prefix + ".") for prefix in shadow_prefixes)
+    )
+    if shadowed:
+        raise ForagerRngParityError(
+            "trusted wrapper/package modules were preloaded before verification: "
+            + ", ".join(shadowed)
+        )
+
+
+def _require_trusted_module_origin(module: Any, root: Path, *, label: str) -> Path:
+    raw_path = getattr(module, "__file__", None)
+    spec = getattr(module, "__spec__", None)
+    loader = getattr(spec, "loader", None)
+    if type(raw_path) is not str or not isinstance(
+        loader,
+        (importlib.machinery.SourceFileLoader, importlib.machinery.ExtensionFileLoader),
+    ):
+        raise ForagerRngParityError(f"{label} module loader/origin is not trusted")
+    path = Path(raw_path)
+    try:
+        resolved = path.resolve(strict=True)
         metadata = path.lstat()
         read_only = bool(os.statvfs(path).f_flag & os.ST_RDONLY)
     except OSError as exc:
-        raise ForagerRngParityError(f"could not inspect probe module source: {exc}") from exc
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-        raise ForagerRngParityError("probe module source must be a regular non-symlink file")
-    if not read_only:
-        raise ForagerRngParityError("probe module source is not on a read-only mount")
-    if metadata.st_size > MAX_SOURCE_BYTES:
-        raise ForagerRngParityError("probe module source exceeds the size limit")
-    return _file_sha256(path)
+        raise ForagerRngParityError(f"could not inspect {label} module origin: {exc}") from exc
+    if (
+        not path.is_absolute()
+        or resolved != path
+        or not _path_is_under(path, root)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or not read_only
+    ):
+        raise ForagerRngParityError(f"{label} module origin escapes its immutable root")
+    return path
+
+
+def _require_loaded_modules_under(prefix: str, root: Path) -> None:
+    matched = False
+    for name, module in tuple(sys.modules.items()):
+        if name != prefix and not name.startswith(prefix + "."):
+            continue
+        if module is None:
+            raise ForagerRngParityError(f"trusted module {name} has a null loader result")
+        _require_trusted_module_origin(module, root, label=name)
+        matched = True
+    if not matched:
+        raise ForagerRngParityError(f"trusted module prefix {prefix!r} was not loaded")
 
 
 def collect_verified_runtime_identity() -> VerifiedRuntimeIdentity:
@@ -955,6 +1394,7 @@ def collect_verified_runtime_identity() -> VerifiedRuntimeIdentity:
     process cannot authenticate its own image, which is why the returned
     result explicitly retains :data:`CONTENT_IDENTITY_BOUNDARY`.
     """
+    _validate_isolated_runtime()
     attestation_bytes = _verify_exact_read_only_file(
         REQUIRED_BUILD_ATTESTATION_PATH,
         REQUIRED_BUILD_ATTESTATION_SHA256,
@@ -965,11 +1405,11 @@ def collect_verified_runtime_identity() -> VerifiedRuntimeIdentity:
         REQUIRED_WRAPPER_SHA256,
         label="upstream Foragax wrapper source",
     )
-    try:
-        if not bool(os.statvfs(REQUIRED_SOURCE_ROOT).f_flag & os.ST_RDONLY):
-            raise ForagerRngParityError("upstream source root is not read-only")
-    except OSError as exc:
-        raise ForagerRngParityError(f"could not inspect upstream source root: {exc}") from exc
+    source_inventory_sha256 = _source_tree_inventory_sha256()
+    if source_inventory_sha256 != REQUIRED_SOURCE_ARCHIVE_INVENTORY_SHA256:
+        raise ForagerRngParityError(
+            "runtime upstream source tree differs from the pinned archive inventory"
+        )
 
     attestation = _require_object(
         decode_strict_json(attestation_bytes),
@@ -1016,7 +1456,19 @@ def collect_verified_runtime_identity() -> VerifiedRuntimeIdentity:
     if python_version != REQUIRED_PYTHON_VERSION:
         raise ForagerRngParityError("Python version differs from the qualified lock")
 
+    _require_trusted_module_origin(np, REQUIRED_RUNTIME_SITE_PACKAGES / "numpy", label="NumPy")
     jax, _, jr = _jax_modules()
+    jaxlib = importlib.import_module("jaxlib")
+    _require_trusted_module_origin(
+        jax,
+        REQUIRED_RUNTIME_SITE_PACKAGES / "jax",
+        label="JAX",
+    )
+    _require_trusted_module_origin(
+        jaxlib,
+        REQUIRED_RUNTIME_SITE_PACKAGES / "jaxlib",
+        label="jaxlib",
+    )
     backend = str(jax.default_backend())
     devices = tuple(jax.devices())
     if (
@@ -1083,18 +1535,37 @@ def _task_kwargs() -> dict[str, Any]:
 
 def _load_exact_wrapper_class() -> Any:
     source_text = REQUIRED_SOURCE_SRC_ROOT.as_posix()
-    if source_text not in sys.path:
-        sys.path.insert(0, source_text)
+    if source_text in sys.path:
+        raise ForagerRngParityError("trusted source path was injected before wrapper loading")
+    shadowed = sorted(
+        name
+        for name in sys.modules
+        if name in {"environments", "utils"}
+        or name.startswith("environments.")
+        or name.startswith("utils.")
+    )
+    if shadowed:
+        raise ForagerRngParityError(
+            "upstream wrapper dependencies were preloaded: " + ", ".join(shadowed)
+        )
+    sys.path.insert(0, source_text)
     try:
         module = importlib.import_module("environments.Foragax")
     except ImportError as exc:
         raise ForagerRngParityError("could not import the exact upstream wrapper") from exc
-    raw_module_path = getattr(module, "__file__", None)
-    if type(raw_module_path) is not str:
-        raise ForagerRngParityError("upstream wrapper module has no source path")
-    module_path = Path(raw_module_path).resolve()
+    module_path = _require_trusted_module_origin(
+        module,
+        REQUIRED_SOURCE_SRC_ROOT / "environments",
+        label="upstream Foragax wrapper",
+    )
     if module_path != REQUIRED_WRAPPER_PATH:
         raise ForagerRngParityError("upstream wrapper import resolved outside the locked source")
+    _require_loaded_modules_under("environments", REQUIRED_SOURCE_SRC_ROOT / "environments")
+    _require_loaded_modules_under("utils", REQUIRED_SOURCE_SRC_ROOT / "utils")
+    _require_loaded_modules_under(
+        "foragax",
+        REQUIRED_RUNTIME_SITE_PACKAGES / "foragax",
+    )
     wrapper_class = getattr(module, "Foragax", None)
     if not isinstance(wrapper_class, type):
         raise ForagerRngParityError("upstream wrapper class is missing")
@@ -1102,6 +1573,28 @@ def _load_exact_wrapper_class() -> Any:
     if init_code is None or Path(str(init_code.co_filename)).resolve() != REQUIRED_WRAPPER_PATH:
         raise ForagerRngParityError("upstream wrapper class was not defined by the locked source")
     return wrapper_class
+
+
+def _load_exact_foragax_make() -> Any:
+    try:
+        registry = importlib.import_module("foragax.registry")
+    except ImportError as exc:
+        raise ForagerRngParityError("could not import the exact Foragax registry") from exc
+    registry_path = _require_trusted_module_origin(
+        registry,
+        REQUIRED_RUNTIME_SITE_PACKAGES / "foragax",
+        label="Foragax registry",
+    )
+    if registry_path != REQUIRED_RUNTIME_SITE_PACKAGES / "foragax/registry.py":
+        raise ForagerRngParityError("Foragax registry resolved outside the locked package")
+    _require_loaded_modules_under(
+        "foragax",
+        REQUIRED_RUNTIME_SITE_PACKAGES / "foragax",
+    )
+    make = getattr(registry, "make", None)
+    if not callable(make):
+        raise ForagerRngParityError("Foragax registry.make is missing")
+    return make
 
 
 def _frame_from_split(input_key: Any) -> tuple[Any, Any, KeyFrame]:
@@ -1181,8 +1674,7 @@ def _run_wrapper_trace(config: FixedActionProbeConfig) -> RawEnvironmentTrace:
 def _run_direct_trace(config: FixedActionProbeConfig) -> RawEnvironmentTrace:
     jax, jnp, jr = _jax_modules()
     try:
-        from foragax.registry import make
-
+        make = _load_exact_foragax_make()
         environment = make(**_task_kwargs())
         params = environment.default_params
         key = jr.key(config.seed)
@@ -1231,6 +1723,58 @@ def run_live_parity_probe(config: FixedActionProbeConfig) -> ParityProbeResult:
     wrapper = _run_wrapper_trace(config)
     direct = _run_direct_trace(config)
     return compare_fixed_action_traces(config, wrapper, direct, runtime)
+
+
+def run_live_collector(
+    config: FixedActionProbeConfig,
+    collector: CollectorKind,
+) -> ParityCollectorResult:
+    """Run one isolated collector for later host-side cross-process qualification."""
+    if collector not in ("wrapper", "direct"):
+        raise ForagerRngParityError("collector must be 'wrapper' or 'direct'")
+    runtime = collect_verified_runtime_identity()
+    raw_trace = _run_wrapper_trace(config) if collector == "wrapper" else _run_direct_trace(config)
+    trace = digest_environment_trace(config, raw_trace, runner_label=collector)
+    draft = ParityCollectorResult(
+        collector=collector,
+        runtime=runtime,
+        config=config,
+        trace=trace,
+        payload_sha256="",
+    )
+    return replace(draft, payload_sha256=_canonical_sha256(draft.unsigned_dict()))
+
+
+def compare_collector_results(
+    wrapper: ParityCollectorResult,
+    direct: ParityCollectorResult,
+) -> ParityProbeResult:
+    """Combine distinct validated collector results into the existing parity result."""
+    if type(wrapper) is not ParityCollectorResult or wrapper.collector != "wrapper":
+        raise ForagerRngParityError("wrapper collector result has the wrong identity")
+    if type(direct) is not ParityCollectorResult or direct.collector != "direct":
+        raise ForagerRngParityError("direct collector result has the wrong identity")
+    wrapper = validate_collector_result(wrapper.canonical_bytes)
+    direct = validate_collector_result(direct.canonical_bytes)
+    if wrapper.runtime != direct.runtime:
+        raise ForagerRngParityError("collector runtime identities differ")
+    if wrapper.config != direct.config:
+        raise ForagerRngParityError("collector probe configurations differ")
+    _validate_runtime_identity(wrapper.runtime)
+    mismatch = _first_trace_mismatch(wrapper.trace, direct.trace)
+    if mismatch is not None:
+        raise ForagerRngParityMismatchError(
+            f"cross-process wrapper/direct parity mismatch at {mismatch}"
+        )
+    draft = ParityProbeResult(
+        runtime=wrapper.runtime,
+        config=wrapper.config,
+        matched_trace=wrapper.trace,
+        wrapper_trace_sha256=wrapper.trace.trace_sha256,
+        direct_trace_sha256=direct.trace.trace_sha256,
+        payload_sha256="",
+    )
+    return replace(draft, payload_sha256=_canonical_sha256(draft.unsigned_dict()))
 
 
 def _parse_key_words(value: Any, path: str) -> tuple[int, int]:
@@ -1531,6 +2075,113 @@ def validate_parity_result(
     )
 
 
+def validate_collector_result(
+    value: Mapping[str, Any] | bytes | str,
+    *,
+    expected_payload_sha256: str | None = None,
+) -> ParityCollectorResult:
+    """Validate one hash-only collector payload without claiming execution authenticity."""
+    if isinstance(value, (bytes, str)):
+        decoded = decode_strict_json(value)
+    else:
+        decoded = decode_strict_json(canonical_json_bytes(value))
+    payload = _require_object(decoded, "collector_result")
+    _require_exact_keys(
+        payload,
+        {
+            "schema_version",
+            "classification",
+            "collector",
+            "evidence_boundary",
+            "promotion_authorized",
+            "runtime",
+            "task",
+            "rng_contract",
+            "probe",
+            "trace",
+            "payload_sha256",
+        },
+        "collector_result",
+    )
+    if payload["schema_version"] != COLLECTOR_RESULT_SCHEMA_VERSION:
+        raise ForagerRngParityError("collector_result.schema_version is unsupported")
+    if payload["classification"] != "open_fixed_action_environment_parity_collector":
+        raise ForagerRngParityError("collector_result.classification differs")
+    collector = payload["collector"]
+    if collector not in ("wrapper", "direct"):
+        raise ForagerRngParityError("collector_result.collector is unsupported")
+    if payload["evidence_boundary"] != CONTENT_IDENTITY_BOUNDARY:
+        raise ForagerRngParityError("collector_result.evidence_boundary was weakened")
+    if payload["promotion_authorized"] is not False:
+        raise ForagerRngParityError("collector_result may never authorize promotion")
+    declared_sha256 = _require_sha256(
+        payload["payload_sha256"],
+        "collector_result.payload_sha256",
+    )
+    unsigned = dict(payload)
+    del unsigned["payload_sha256"]
+    if _canonical_sha256(unsigned) != declared_sha256:
+        raise ForagerRngParityError("collector_result.payload_sha256 does not verify")
+    if expected_payload_sha256 is not None and declared_sha256 != _require_sha256(
+        expected_payload_sha256,
+        "expected_payload_sha256",
+    ):
+        raise ForagerRngParityError("collector result differs from its external hash")
+    if canonical_json_bytes(_require_object(payload["task"], "collector_result.task")) != (
+        canonical_json_bytes(task_descriptor())
+    ):
+        raise ForagerRngParityError("collector_result.task differs")
+    if canonical_json_bytes(
+        _require_object(payload["rng_contract"], "collector_result.rng_contract")
+    ) != canonical_json_bytes(rng_contract_descriptor()):
+        raise ForagerRngParityError("collector_result.rng_contract differs")
+
+    probe = _require_object(payload["probe"], "collector_result.probe")
+    _require_exact_keys(
+        probe,
+        {"seed", "actions", "action_count", "action_sequence_sha256"},
+        "collector_result.probe",
+    )
+    actions = tuple(
+        _require_int(item, f"collector_result.probe.actions[{index}]", minimum=0, maximum=3)
+        for index, item in enumerate(
+            _require_array(probe["actions"], "collector_result.probe.actions")
+        )
+    )
+    config = FixedActionProbeConfig(
+        seed=_require_int(
+            probe["seed"],
+            "collector_result.probe.seed",
+            minimum=0,
+            maximum=MAX_SEED,
+        ),
+        actions=actions,
+    )
+    action_count = _require_int(
+        probe["action_count"],
+        "collector_result.probe.action_count",
+        minimum=1,
+        maximum=MAX_ACTIONS,
+    )
+    if action_count != len(actions):
+        raise ForagerRngParityError("collector_result.probe.action_count does not verify")
+    action_sequence_sha256 = _require_sha256(
+        probe["action_sequence_sha256"],
+        "collector_result.probe.action_sequence_sha256",
+    )
+    if action_sequence_sha256 != config.action_sequence_sha256:
+        raise ForagerRngParityError("collector_result.probe.action_sequence_sha256 does not verify")
+    runtime = _parse_runtime_identity(payload["runtime"])
+    trace = _parse_trace_digest(payload["trace"], config)
+    return ParityCollectorResult(
+        collector=cast(CollectorKind, collector),
+        runtime=runtime,
+        config=config,
+        trace=trace,
+        payload_sha256=declared_sha256,
+    )
+
+
 def _parse_actions_argument(value: str) -> tuple[int, ...]:
     if not value or value.strip() != value:
         raise argparse.ArgumentTypeError("actions must be a comma-separated list")
@@ -1559,6 +2210,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
         required=True,
         help="comma-separated action integers in [0,3]",
     )
+    parser.add_argument(
+        "--collector",
+        choices=("wrapper", "direct"),
+        help=(
+            "emit one isolated collector trace for host-side qualification; "
+            "omit to run the in-process diagnostic comparison"
+        ),
+    )
     return parser
 
 
@@ -1567,7 +2226,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         config = FixedActionProbeConfig(seed=args.seed, actions=args.actions)
-        result = run_live_parity_probe(config)
+        result = (
+            run_live_parity_probe(config)
+            if args.collector is None
+            else run_live_collector(config, cast(CollectorKind, args.collector))
+        )
     except ForagerRngParityError as exc:
         parser.exit(2, f"forager RNG parity probe failed: {exc}\n")
     sys.stdout.buffer.write(result.canonical_bytes + b"\n")
@@ -1576,13 +2239,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "ACTION_SEQUENCE_SCHEMA_VERSION",
+    "COLLECTOR_RESULT_SCHEMA_VERSION",
     "CONTENT_IDENTITY_BOUNDARY",
+    "CollectorKind",
     "FixedActionProbeConfig",
     "ForagerRngParityError",
     "ForagerRngParityMismatchError",
     "KeyFrame",
     "MATCH_STATUS",
     "PARITY_RESULT_SCHEMA_VERSION",
+    "ParityCollectorResult",
     "ParityProbeResult",
     "REQUIRED_OCI_IMAGE_ID",
     "RawEnvironmentTrace",
@@ -1593,14 +2259,17 @@ __all__ = [
     "canonical_json_bytes",
     "collect_verified_runtime_identity",
     "compare_fixed_action_traces",
+    "compare_collector_results",
     "decode_strict_json",
     "digest_environment_trace",
     "expected_key_schedule",
     "fingerprint_pytree",
     "rng_contract_descriptor",
     "run_live_parity_probe",
+    "run_live_collector",
     "task_descriptor",
     "validate_parity_result",
+    "validate_collector_result",
 ]
 
 

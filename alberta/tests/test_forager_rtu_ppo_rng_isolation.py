@@ -92,6 +92,13 @@ def experiment(rng, config):
         return env_step_state
 
     return obs, gymnax_state, action_dim, experiment_step
+
+def main():
+    rngs = []
+    for seed in [0]:
+        rng = jax.random.PRNGKey(seed)
+        rngs.append(rng)
+    return rngs
 """
 
 
@@ -112,6 +119,12 @@ def _allow_fixture(
         "EXPECTED_PATCHED_RTU_PPO_SHA256",
         hashlib.sha256(derived).hexdigest(),
     )
+    patch = isolation._unified_diff(source, derived)
+    monkeypatch.setattr(
+        isolation,
+        "EXPECTED_UNIFIED_DIFF_SHA256",
+        hashlib.sha256(patch).hexdigest(),
+    )
 
 
 def test_frozen_upstream_and_derived_hashes() -> None:
@@ -119,10 +132,22 @@ def test_frozen_upstream_and_derived_hashes() -> None:
         "e75a6762690832067a24a649559a55e0aa89abba005d600f090b1bf284b3fc24"
     )
     assert isolation.EXPECTED_PATCHED_RTU_PPO_SHA256 == (
-        "c47f3e087cb01722e824efc1d62c2e5880e75a2d937ae8fc122af24ce8967f2d"
+        "70bbdd0943d82570c1dc0d28494cf93f9c1b208ef67b3a547585fe5897cdf409"
+    )
+    assert isolation.EXPECTED_UNIFIED_DIFF_SHA256 == (
+        "46ac3d6c1ae5740bee97fea23abf002ffb161ab4b1b35c041b24b717645e076f"
     )
     assert isolation.UPSTREAM_SOURCE_COMMIT == (
         "9710f60fa30da5badc451ad7ce3ff296d5070830"
+    )
+    assert isolation.UPSTREAM_SOURCE_TREE_GIT_SHA1 == (
+        "a5ad878ac4be0567c43dfd9177471c4b5a910bfa"
+    )
+    assert isolation.UPSTREAM_RTU_PPO_BLOB_GIT_SHA1 == (
+        "63bdc359079ef14b0de1e5964ed49b02c62b3e59"
+    )
+    assert isolation.UPSTREAM_SOURCE_ARCHIVE_SHA256 == (
+        "1f6976de38f34a697c947891de26ad3373b294195fe82094e9d1d5b8ddfd43b6"
     )
 
 
@@ -136,21 +161,41 @@ def test_exact_derivation_separates_agent_and_environment_streams(
     second = isolation.derive_isolated_rtu_ppo_source(source)
 
     assert first.source == second.source
+    assert first.upstream_source_sha256 == hashlib.sha256(source).hexdigest()
     assert first.source_sha256 == hashlib.sha256(first.source).hexdigest()
+    assert first.patch == second.patch
+    assert first.patch_sha256 == hashlib.sha256(first.patch).hexdigest()
+    assert first.patch.startswith(b"--- a/src/rtu_ppo.py\n+++ b/src/rtu_ppo.py\n")
+    assert first.descriptor_sha256 == hashlib.sha256(
+        isolation._canonical_json(dict(first.descriptor))
+    ).hexdigest()
     assert first.descriptor == second.descriptor
     assert first.source.count(b"environment_rng: Any") == 1
     assert first.source.count(b"environment_rng=") == 3
     assert first.source.count(b"environment_step_rng") == 2
     assert first.source.count(b"ISOLATED_AGENT_RNG_NAMESPACE") == 2
+    assert first.source.count(
+        b'jax.random.key(seed, impl="threefry2x32")'
+    ) == 1
+    assert b"jax.random.PRNGKey(seed)" not in first.source
     assert b"gymnax_state.env_step(\n        _rng," not in first.source
     assert first.descriptor["environment_rng"]["schedule"] == (
         "dedicated_environment_split_chain_v1"
+    )
+    assert first.descriptor["environment_rng"]["schedule_sha256"] == (
+        "51d811e6fccd2b015b1703f22775f880089bbca3fc8938421ad3e18526882cb0"
     )
     assert first.descriptor["environment_rng"][
         "action_key_shared_with_environment"
     ] is False
     assert first.descriptor["agent_rng"]["namespace"] == 0xA63E7C11
-    assert len(first.descriptor["replacement_records"]) == 7
+    assert first.descriptor["agent_rng"]["identity"] == "isolated_agent_rng_v1"
+    assert first.descriptor["agent_rng"]["environment_key_shared"] is False
+    assert first.descriptor["patch_sha256"] == first.patch_sha256
+    assert first.descriptor["upstream"]["tree_git_sha1"] == (
+        isolation.UPSTREAM_SOURCE_TREE_GIT_SHA1
+    )
+    assert len(first.descriptor["replacement_records"]) == 8
     assert len(first.descriptor["payload_sha256"]) == 64
 
 
@@ -304,6 +349,7 @@ def test_validation_rederives_source_and_descriptor(
     isolation.validate_isolated_rtu_ppo_source(
         source,
         result.source,
+        result.patch,
         descriptor,
     )
 
@@ -318,6 +364,23 @@ def test_validation_rederives_source_and_descriptor(
         isolation.validate_isolated_rtu_ppo_source(
             source,
             tampered_source,
+            result.patch,
+            descriptor,
+        )
+
+    tampered_patch = result.patch.replace(
+        b"ISOLATED_AGENT_RNG_NAMESPACE",
+        b"TAMPERED_AGENT_RNG_NAMESPACE",
+        1,
+    )
+    with pytest.raises(
+        isolation.RTUPPORngIsolationError,
+        match="patch bytes differ",
+    ):
+        isolation.validate_isolated_rtu_ppo_source(
+            source,
+            result.source,
+            tampered_patch,
             descriptor,
         )
 
@@ -330,6 +393,7 @@ def test_validation_rederives_source_and_descriptor(
         isolation.validate_isolated_rtu_ppo_source(
             source,
             result.source,
+            result.patch,
             tampered_descriptor,
         )
 
@@ -344,18 +408,28 @@ def test_validation_rejects_non_detached_or_wrong_types(
         isolation.validate_isolated_rtu_ppo_source(
             cast(Any, "source"),
             result.source,
+            result.patch,
             {},
         )
     with pytest.raises(TypeError, match="derived_source"):
         isolation.validate_isolated_rtu_ppo_source(
             source,
             cast(Any, "derived"),
+            result.patch,
+            {},
+        )
+    with pytest.raises(TypeError, match="patch"):
+        isolation.validate_isolated_rtu_ppo_source(
+            source,
+            result.source,
+            cast(Any, "patch"),
             {},
         )
     with pytest.raises(TypeError, match="descriptor"):
         isolation.validate_isolated_rtu_ppo_source(
             source,
             result.source,
+            result.patch,
             cast(Any, []),
         )
     with pytest.raises(
@@ -365,5 +439,90 @@ def test_validation_rejects_non_detached_or_wrong_types(
         isolation.validate_isolated_rtu_ppo_source(
             source,
             result.source,
+            result.patch,
             result.descriptor,
         )
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "message"),
+    [
+        (
+            b'jax.random.key(seed, impl="threefry2x32")',
+            b'jax.random.key(seed, impl="rbg")',
+            "environment root must be",
+        ),
+        (
+            b'jax.random.key(seed, impl="threefry2x32")',
+            b"jax.random.PRNGKey(seed)",
+            "exactly one explicit environment seed root",
+        ),
+        (
+            b"jax.random.fold_in(rng, ISOLATED_AGENT_RNG_NAMESPACE)",
+            b"jax.random.fold_in(environment_rng, ISOLATED_AGENT_RNG_NAMESPACE)",
+            "root one environment chain",
+        ),
+    ],
+)
+def test_ast_validation_rejects_seed_root_or_agent_root_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    before: bytes,
+    after: bytes,
+    message: str,
+) -> None:
+    source = _upstream_fixture()
+    _allow_fixture(monkeypatch, source)
+    derived = isolation.derive_isolated_rtu_ppo_source(source).source
+    tampered = derived.replace(before, after, 1)
+    assert tampered != derived
+    with pytest.raises(isolation.RTUPPORngIsolationError, match=message):
+        isolation._validate_derived_ast(tampered)
+
+
+def test_public_runtime_probe_is_fixed_nonpromoting_and_agent_invariant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _upstream_fixture()
+    _allow_fixture(monkeypatch, source)
+
+    first = isolation.run_public_rng_isolation_probe(source)
+    second = isolation.run_public_rng_isolation_probe(source)
+
+    assert first == second
+    assert first["seed"] == 0
+    assert first["transition_count"] == 4
+    assert first["prng_impl"] == "threefry2x32"
+    assert first["promotion_authorized"] is False
+    assert first["evidence_boundary"] == (
+        "public_seed_key_schedule_only_no_environment_or_training"
+    )
+    assert first["environment_trace_sha256"] == (
+        isolation.PUBLIC_PROBE_EXPECTED_ENVIRONMENT_TRACE_SHA256
+    )
+    checks = first["agent_consumption_checks"]
+    assert tuple(check["agent_split_count"] for check in checks) == (0, 1, 7, 32)
+    assert {
+        check["environment_trace_sha256"] for check in checks
+    } == {first["environment_trace_sha256"]}
+    detached = cast(dict[str, Any], isolation._plain_json(first))
+    payload_sha256 = detached.pop("payload_sha256")
+    assert payload_sha256 == hashlib.sha256(
+        isolation._canonical_json(detached)
+    ).hexdigest()
+
+
+def test_public_runtime_probe_rejects_frozen_schedule_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _upstream_fixture()
+    _allow_fixture(monkeypatch, source)
+    monkeypatch.setattr(
+        isolation,
+        "PUBLIC_PROBE_EXPECTED_ENVIRONMENT_TRACE_SHA256",
+        "0" * 64,
+    )
+    with pytest.raises(
+        isolation.RTUPPORngIsolationError,
+        match="public environment key trace differs",
+    ):
+        isolation.run_public_rng_isolation_probe(source)

@@ -7,7 +7,7 @@ Runs standalone (no Isaac Sim required) against the URDF to verify:
 - Standing pose is valid (all joints within limits)
 
 Usage:
-    python -m bridge.isaaclab.validate_model [--urdf PATH]
+    python -m eliza_robot.bridge.isaaclab.validate_model [--urdf PATH]
 """
 
 from __future__ import annotations

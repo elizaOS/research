@@ -16,15 +16,24 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from eliza_robot.bridge.backends.base import BridgeBackend
-from eliza_robot.bridge.protocol import CommandEnvelope, EventEnvelope, ResponseEnvelope, utc_now_iso
+from eliza_robot.bridge.protocol import (
+    CommandEnvelope,
+    EventEnvelope,
+    ResponseEnvelope,
+    utc_now_iso,
+)
 from eliza_robot.bridge.types import JsonDict
 from eliza_robot.sim.mujoco.ainex_constants import ALL_JOINT_NAMES
+
+if TYPE_CHECKING:
+    from eliza_robot.sim.mujoco.gait.controller import BezierGaitController
 
 
 @dataclass
@@ -69,7 +78,7 @@ class MuJocoBackend(BridgeBackend):
         # Background gait loop — kicks in when walk.command:start enables
         # walking and idles otherwise.
         self._gait_task: asyncio.Task[None] | None = None
-        self._gait_controller: "BezierGaitController | None" = None  # lazy
+        self._gait_controller: BezierGaitController | None = None  # lazy
         # Active scripted-action task (so .play commands animate joint keyframes).
         self._action_task: asyncio.Task[None] | None = None
         self._profile_id = profile_id
@@ -118,10 +127,8 @@ class MuJocoBackend(BridgeBackend):
             t = getattr(self, task_attr, None)
             if t is not None and not t.done():
                 t.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await t
-                except (asyncio.CancelledError, Exception):
-                    pass
                 setattr(self, task_attr, None)
         self._env.close()
 
@@ -214,6 +221,16 @@ class MuJocoBackend(BridgeBackend):
             "camera_stream_passthrough": False,
             "camera_snapshot": True,
             "mujoco_sim": True,
+            # Orientation/battery fields come from simulated state. The bridge
+            # does not yet prove a profile-derived joint-torque clamp (control
+            # range is not torque), so autonomous start must fail closed.
+            "motion_safety": {
+                "imu_roll": True,
+                "imu_pitch": True,
+                "battery_mv": True,
+                "torque_limit_enforced": False,
+                "walk_stop": True,
+            },
         }
 
     def snapshot_camera(self, _camera: str = "head") -> np.ndarray | None:
@@ -300,8 +317,8 @@ class MuJocoBackend(BridgeBackend):
                 if isinstance(positions, list) and positions:
                     try:
                         from eliza_robot.bridge.isaaclab.joint_map import (
-                            servo_id_to_joint_name,
                             pulse_to_radians,
+                            servo_id_to_joint_name,
                         )
                         targets: dict[str, float] = {}
                         for item in positions:

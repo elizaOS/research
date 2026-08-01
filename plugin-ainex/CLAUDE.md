@@ -95,9 +95,10 @@ bun run --cwd plugins/plugin-ainex clean      # rm dist/ .turbo/
 | Var | Required | Default | Purpose |
 |---|---|---|---|
 | `ELIZA_AINEX_BRIDGE_URL` | triggers auto-enable | `ws://localhost:9100` | WebSocket URL for the bridge server (read in `AinexService._tryConnect`) |
+| `ELIZA_AINEX_BRIDGE_AUTH_TOKEN` | physical bridge only | unset | 32–4096-character visible-ASCII bearer secret sent only in the websocket upgrade header; authenticated URLs must be root `wss://` or loopback `ws://` endpoints and logs are redacted |
 | `ELIZA_AINEX_MODE` | no | `programmatic` | Action surface: `programmatic` (15 actions), `rl` (AINEX_RUN_RL only), `both` (read in `selectActions`) |
 
-These two are the only settings the plugin reads via `runtime.getSetting()`. `ELIZA_AINEX_PROFILE` and `ELIZA_AINEX_CAMERA_FPS` are declared in `package.json` `agentConfig.pluginParameters` but are not consumed by this plugin — the active profile is resolved bridge-side via `profile.describe`. Plugin auto-enables if `ELIZA_AINEX_BRIDGE_URL` is set OR `features.ainex = true` in agent config.
+These three are the only settings the plugin reads via `runtime.getSetting()`. `ELIZA_AINEX_PROFILE` and `ELIZA_AINEX_CAMERA_FPS` are declared in `package.json` `agentConfig.pluginParameters` but are not consumed by this plugin — the active profile is resolved bridge-side via `profile.describe`. Plugin auto-enables if `ELIZA_AINEX_BRIDGE_URL` is set OR `features.ainex = true` in agent config.
 
 ## How to extend
 

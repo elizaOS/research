@@ -292,18 +292,35 @@ all optional and disabled by default. The separate
 [`AlbertaPipeline`](alberta_framework/pipeline.py) explicitly covers Steps 1–4
 only. Neither object is the complete feedback system described by the Plan.
 
-#### 2. Perception is fixed; the committed first-action bug has a candidate fix
+#### 2. State construction has one causal model-gradient training lane
 
-`GRUPerceptionConfig` explicitly defines an echo-state GRU whose sampled weights
-never learn. The downstream controller may learn to use its random history
-features, but the agent does not learn what history is useful. In addition,
-the committed `start()` passed an augmented observation to OaK while `act()`
-passed the raw observation. A GRU-enabled agent therefore presented an
-incompatible dimension to the first-action Q-function; the failure was
-reproduced during the audit. A concurrent working-tree patch now routes the
-observation through `_gru_step()` in `act()` while discarding the transient
-state update. Retain that correction, add a direct regression test, and still
-treat trainable state construction as the substantive open problem.
+The legacy `GRUPerceptionConfig` remains an honestly named fixed-weight
+echo-state baseline. `PrototypeAgent` now also accepts the common
+`StateBuilder` contract with identity, fixed-trace, and online-gated recurrent
+implementations. `start()` advances recurrence once and caches the exact raw
+observation, representation, primitive action, and lifecycle/generation token;
+`act()` only returns that cached decision and cannot advance recurrence.
+Explicit transitions advance a builder once per bootstrap observation, reset
+episode-local recurrence at a boundary, and consume the post-reset decision
+observation once. Eager, JIT, scan, and checkpoint tests cover those counts.
+
+The online-gated builder now exposes a source-bound proposal and destination
+commit boundary. An opt-in Prototype lane uses the bounded ensemble's
+predict-before-update representation gradient: it proposes against the exact
+builder state that emitted the modeled representation, then commits only the
+parameter delta into the already-advanced builder state, preserving its hidden
+state and sensitivity. A second opt-in boundary accepts decision-bound,
+independently attested objective, retention, and safety probes and stores the
+delta only when the complete gradient audit literally reports `sparks_joy` and
+its finite-precision application succeeds. Missing, stale, incomplete, or
+non-finite sidecars veto only builder learning, not the real control/model
+transition.
+
+This is causal mechanism integration, not a learned-state result. The current
+producer is one world-model objective; balanced prediction, Horde, critic, and
+control gradients are not yet wired into this Prototype lane. Until those
+ablations and the matched Forager gate exist, the builder must not be called a
+learned-state success.
 
 #### 3. Representation discovery is not in the prototype loop
 
@@ -314,21 +331,60 @@ required cycle:
 
 `features → world-model quality → planning/control utility → feature ranking → features`.
 
-#### 4. The world model is narrow and its uncertainty is not operational
+#### 4. The world-model ensemble is integrated but not externally calibrated
 
-The prototype uses a single deterministic, one-step MLP over observations and
-discrete actions. A standalone Step 8 ensemble helper exists, but it is not
-integrated. In the prototype:
+WP4 now also has a concrete shallow reference rather than only an architectural
+placeholder. `ShallowRidgeWorldModel` is an action-indexed affine regularized
+follow-the-leader model over grounded next observation, reward, and
+continuation. It retains fixed Gram/cross sufficient statistics, predicts
+before updating, solves only the selected action block, rejects corrupted or
+indefinite statistics atomically, has no RNG or replay state, and exposes a
+pure one-step score using a supplied linear successor value. This is an L0
+interpretable baseline—not a reproduction of an ICML result, a latent model,
+or MPC—and it has no matched retention/control comparison yet.
+
+The prototype now has mutually exclusive legacy single-model, bounded ensemble,
+and ensemble-plus-model-replay lanes over representations and discrete actions.
+The ensemble uses
+distinct initialization and persistent bootstrap RNG/masks, predicts before
+each member update, emits a causal representation gradient, and keeps
+epistemic disagreement, a residual-variance proxy, learning progress, and
+change probability separately typed with explicit warm-up availability. Its
+resource budget and checkpoint include every member, calibrator, RNG, mask,
+and counter. In the prototype:
 
 - the authoritative `PrototypeTransition` path routes an explicit environment
   discount to real control, world-model, and IA exo-cortex targets, while the
   old `update` wrapper retains its configured-gamma compatibility behavior;
-- dream proposals receive no ensemble disagreement and therefore default
-  uncertainty to zero;
+- legacy dream proposals receive no ensemble disagreement and therefore
+  default uncertainty to zero; dreaming is deliberately disabled for the
+  ensemble lane until uncertainty and rollout-validity gates are calibrated;
 - random anchors and uniformly random actions drive imagined updates;
 - accepted dream backups consume the predicted discount; and
 - aggregate error EMA is thresholded without calibration by state/action
   region.
+
+The replay composition commits the real ensemble update, causal typed-signal
+record, fixed-quota dual-memory sample, and model-member rehearsal as one
+transaction. Replay has separate mask RNG, masks, update counters, and event
+counters; it cannot update causal signal calibration, residual variance, the
+real RNG/counters, actor, critic, or state builder. In Prototype, only the
+commit-gated real representation gradient can reach the builder or literal joy
+audit. Stored transitions retain the final/bootstrap observation—not the
+post-reset decision observation—and representation versions make stale/future
+samples explicit. This is bounded L0 composition; there is no replay-retention
+or control comparison and no actor rehearsal.
+
+The explicit transition boundary now distinguishes the final/bootstrap
+observation from the next post-reset decision observation. World-model, Horde,
+and Bellman targets consume the former; OaK/STOMP selection, IA recommendation,
+and the cached next action consume the latter. Positive-discount truncation
+interrupts an active option after its final update without recording a censored
+option-model completion. This repairs episodic/autoreset semantics and
+integrates a bounded development ensemble, but the variance output is still an
+explicitly uncalibrated residual proxy rather than certified aleatoric
+uncertainty. There is no state/action-region calibration, recurrent latent
+dynamics, or validated multi-step dream consumer yet.
 
 This is a useful smoke model, not yet a reliable continual world model or a
 learned search-control process.
@@ -379,16 +435,44 @@ means bounded, continuing operation with a defined allocation policy; it need
 not be marketed as a literal gradient update to every parameter on every
 sample.
 
-### Concurrent evaluation work
+### Continual evaluation mechanism
 
-The working tree now contains a strict reconstructing continual-evaluation
-report for prequential performance, adaptation AUC, recovery,
-backward/forward transfer, forgetting, stability, tail latency, resource
-accounting, safety/near misses, and component/plasticity diagnostics. It
-requires one candidate and at least two exact-budget baselines and keeps regime
-metadata evaluator-only. Every constructed report remains `not-assessed`, and
-no Prototype/baseline report artifact has been run; metrics become evidence
-only after they are wired into preregistered protocols.
+The working tree now contains a strict reconstructing v2 continual-evaluation
+report plus a bounded learner-neutral scalar streaming executor. Together they
+cover prequential performance, post-change adaptation AUC, recovery,
+backward/forward transfer, forgetting, immediate change-point stability, tail
+latency, resource accounting, explicit safety availability, and final
+component/plasticity diagnostics. The executor owns regime scheduling and
+held-out probes, enforces predict-before-update ordering, detects
+serializer-visible learner mutation during predictions/probes and source-state
+mutation during updates, and requires canonical deterministic checkpoints. A
+candidate plus at least two exact-budget baselines is still required and regime
+metadata stays evaluator-only. Its portable bound artifact hashes the exact
+evaluator configuration (including stream/probe digests and learner snapshots)
+and the reconstructing metric core, then cross-validates protocol, budget,
+condition order, trace length, and latency semantics.
+
+The working tree also has a strict continuing-control evaluator with an exact
+`PrototypeAgent` adapter. It gives every condition an independent functional
+environment, binds each action to its dispatched observation and decision ID,
+and reconstructs direction-aware longitudinal return, adaptation, recovery,
+stability, final held-out action score, forgetting, transfer, and worst-window
+metrics from raw traces. Protocol-owned exposure rows, thresholds, references,
+and applicability make sparse comparisons explicitly unavailable instead of
+silently zero. Its v2 report and checkpoints bind canonical environment,
+probe, learner, budget, and metric-core identities.
+
+Every constructed report remains `not-assessed`. There is no completed
+Prototype candidate/baseline report, only simple scalar/control baselines, no
+factorial runner, no longitudinal component traces, and no accelerator-memory,
+energy, or safety backend. A strict paired multi-seed campaign runner now binds
+seeded evaluator identities, embeds every raw report, preserves unavailable
+pairs, and reconstructs deterministic stratified-bootstrap intervals; no
+Prototype campaign has been executed through it. The held-out control probes
+score one action rather than a frozen-policy rollout, and fresh-per-regime,
+oracle-data, stationary-multitask, and realized-resource-matched references are
+still missing. These mechanisms become evidence only after those gaps are
+closed in a preregistered protocol.
 
 The concurrent [research-status matrix](RESEARCH_STATUS.md) is also a strong
 starting point: it separates mechanism, learning, comparison, and integration
@@ -643,6 +727,19 @@ comparison are useful development diagnostics, not substitutes for the
 missing paired protocol. Execution manifests and unsealed development
 receipts without completed matched reports are not performance evidence.
 
+Two subsequent open CPU screens completed all candidates on the same two
+consumed development seeds. Under their fail-closed v4 aggregates,
+`DQN_LN-common-control` ranked first in the feed-forward set (mean FOV
+tail-EMA AUC `1.49084`) and `PPO-RTU_LN_128_1_relu` ranked first in the
+stateful set (`1.78110`). Candidate budgets are not necessarily matched, the
+rankings cannot be compared across screens, and the stateful RTU-PPO path
+retains its documented action/environment RNG reuse confound. A content-level
+fixed-action direct/wrapper parity trace also matched exactly, but the external
+executor receipt is explicitly unverified and nonpromoting. These results are
+useful implementation diagnostics only; they do not replace the missing
+matched held-out Forager protocol or support a learned-state, superiority, or
+SOTA claim.
+
 Two accepted adjacent controls make the state claim falsifiable. A carefully
 implemented [recurrent model-free
 baseline](https://proceedings.mlr.press/v162/ni22a.html) beats specialized
@@ -745,11 +842,19 @@ a_k=-\frac{\langle g_k,u_c\rangle}
 {\lVert g_k\rVert\lVert u_c\rVert}.
 \]
 
-Alignment is zero unless the candidate update clears its configured norm floor
-and the probe norm and norm product are nonzero and representable. Candidate
-cosines are clipped to \([-1,1]\); an exact \(1.0\) threshold uses a
-four-machine-epsilon float32 endpoint tolerance, while other thresholds remain
-exact. Candidate factors produce a tentative scale \(s\) and update
+Alignment uses scale-safe norms and normalized-coordinate dots accumulated by
+a fixed balanced reduction. Conservative float32 roundoff intervals cover the
+norms, normalization, products, and reduction. Non-finite derived dots/norms,
+unresolved nonzero-input norms, raw/normalized sign disagreement, and
+cancellation intervals that cross zero fail the evidence gate. The trust bound
+uses the certified norm upper endpoint and the nonzero floor uses its lower
+endpoint. Positive magnitude gates use the conservative dot-interval edge. For
+exact zero thresholds, both the raw dot and certified normalized direction must
+permit the verdict; a raw dot underflowed to exact zero can still use a resolved
+normalized sign. Candidate cosines are clipped to \([-1,1]\); alignment gates
+and factors use their certified lower endpoints. An exact \(1.0\) threshold
+applies a four-machine-epsilon float32 tolerance to that lower endpoint, while
+other thresholds remain exact. Candidate factors produce a tentative scale \(s\) and update
 \(\tilde u=s u_c\). It accepts only when `probe_independence_attested` is true,
 all three probes and all
 eight named learning-value channels have explicit valid availability, evidence
@@ -758,7 +863,9 @@ magnitude gates, candidate directions meet their alignment thresholds,
 \(u_c\) is inside the trust bound, and \(\tilde u\) clears the update-norm
 floor. The returned scale is \(s\) on acceptance and zero otherwise. This
 two-stage audit prevents soft scaling from violating a required
-objective-improvement floor or rescuing a raw harmful candidate. The factors
+objective-improvement floor or rescuing a raw harmful candidate. The
+elementwise float32 \(\tilde u\) receives fresh norm and dot certificates, so
+rounding in \(s u_c\) cannot hide behind scalar-scaled candidate diagnostics. The factors
 are separately reported and are not a reward/UX score or a sum over
 learning-value channels. Inputs and outputs are detached; no meta-gradient
 claim is made. Numeric controls must survive as finite normal float32 values.
@@ -767,8 +874,10 @@ improve the system.
 
 The corresponding `apply_gradient_joy_update` boundary reassesses the
 candidate internally, derives the effective stored delta after dtype cast and
-parameter addition, and conservatively re-audits that delta under the same
-evidence and thresholds. It atomically commits the exact shape-matched PyTree
+parameter addition by promoting both stored endpoints to at least float32
+before subtraction, and conservatively re-audits that delta under the same
+evidence and thresholds. This prevents low-precision subtraction rounding from
+understating an out-of-bound stored change. It atomically commits the exact shape-matched PyTree
 only when both audits accept, all application values are finite, and at least
 one stored parameter value actually changes. Its typed result keeps the
 formed-candidate assessment, effective-delta assessment, and parameter change

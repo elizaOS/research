@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 
 import chex
 import jax
@@ -16,6 +17,7 @@ import alberta_framework.core.delight as delight_module
 from alberta_framework.core.delight import (
     DelightfulPolicyGradientConfig,
     GradientJoyApplicationResult,
+    GradientJoyAssessment,
     GradientJoyConfig,
     GradientJoyEvidence,
     LearningValue,
@@ -650,6 +652,415 @@ def test_gradient_joy_application_vetoes_quantized_delta_outside_trust_bound() -
     chex.assert_trees_all_equal(result.parameters, parameters)
 
 
+def test_gradient_joy_application_promotes_stored_endpoints_before_delta_audit() -> None:
+    """Float16 subtraction rounding cannot hide an out-of-bound stored delta."""
+    parameters = {
+        "weights": jnp.array([10.7421875], dtype=jnp.float16),
+    }
+    candidate = {
+        "weights": jnp.array([16.36760711669922], dtype=jnp.float32),
+    }
+    descending_probe = {
+        "weights": jnp.array([-1.0], dtype=jnp.float32),
+    }
+    config = GradientJoyConfig(
+        candidate_semantics="update",
+        max_update_norm=16.378,
+        alignment_temperature=1.0e-4,
+        norm_temperature=1.0e-6,
+    )
+    result = jax.jit(
+        lambda params: apply_gradient_joy_update(
+            params,
+            candidate,
+            _gradient_joy_evidence(
+                objective_probe_gradient=descending_probe,
+                retention_probe_gradient=descending_probe,
+                safety_cost_gradient=descending_probe,
+            ),
+            config,
+        )
+    )(parameters)
+
+    assert bool(result.assessment.accepted)
+    assert float(result.assessment.weight) == 1.0
+    chex.assert_trees_all_close(
+        result.effective_assessment.candidate_update["weights"],
+        jnp.array([16.3828125], dtype=jnp.float32),
+    )
+    assert (
+        float(result.effective_assessment.diagnostics.update_norm)
+        > config.max_update_norm
+    )
+    assert not bool(result.effective_assessment.diagnostics.within_trust_region)
+    assert not bool(result.effective_assessment.accepted)
+    assert bool(result.proposed_change_nonzero)
+    assert not bool(result.applied)
+    chex.assert_trees_all_equal(result.parameters, parameters)
+
+
+def test_gradient_joy_certifies_norm_boundary_in_eager_jit_and_application() -> None:
+    """A rounded-down norm point cannot cross an exact trust boundary."""
+    candidate = {
+        "first": jnp.array([-6.4952946559060365e-06], dtype=jnp.float32),
+        "second": (jnp.array([2.201160168624483e-05], dtype=jnp.float32),),
+    }
+    probe = jax.tree_util.tree_map(lambda leaf: -leaf, candidate)
+    max_update_norm = float(jnp.float32(2.294993282703217e-05))
+    exact_norm = math.sqrt(
+        sum(float(value) ** 2 for leaf in jax.tree_util.tree_leaves(candidate) for value in leaf)
+    )
+    assert exact_norm > max_update_norm
+    config = GradientJoyConfig(
+        candidate_semantics="update",
+        max_update_norm=max_update_norm,
+        alignment_temperature=1.0e-8,
+        norm_temperature=1.2e-38,
+    )
+    evidence = _gradient_joy_evidence(
+        objective_probe_gradient=probe,
+        retention_probe_gradient=probe,
+        safety_cost_gradient=probe,
+    )
+
+    for result in (
+        assess_gradient_joy(candidate, evidence, config),
+        jax.jit(lambda update: assess_gradient_joy(update, evidence, config))(candidate),
+    ):
+        assert float(result.diagnostics.update_norm) < max_update_norm
+        assert float(result.diagnostics.update_norm_upper_bound) > max_update_norm
+        assert float(result.diagnostics.update_norm_lower_bound) <= exact_norm
+        assert exact_norm <= float(result.diagnostics.update_norm_upper_bound)
+        assert bool(result.diagnostics.update_norm_resolved)
+        assert not bool(result.diagnostics.within_trust_region)
+        assert not bool(result.accepted)
+        chex.assert_trees_all_equal(
+            result.weighted_update,
+            jax.tree_util.tree_map(jnp.zeros_like, candidate),
+        )
+
+    parameters = jax.tree_util.tree_map(jnp.zeros_like, candidate)
+
+    def apply(params, update):
+        return apply_gradient_joy_update(params, update, evidence, config)
+
+    for result in (
+        apply(parameters, candidate),
+        jax.jit(apply)(parameters, candidate),
+    ):
+        assert not bool(result.assessment.diagnostics.within_trust_region)
+        assert not bool(result.assessment.accepted)
+        assert not bool(result.effective_assessment.accepted)
+        assert not bool(result.applied)
+        chex.assert_trees_all_equal(result.parameters, parameters)
+
+
+def test_gradient_joy_certifies_alignment_boundary_in_eager_jit_and_application() -> None:
+    """A rounded-up point cosine cannot cross an exact alignment threshold."""
+    candidate = jnp.array(
+        [-0.3096868097782135, 0.3673213720321655],
+        dtype=jnp.float32,
+    )
+    probe = jnp.array(
+        [-1.7595300674438477, -2.5661325454711914],
+        dtype=jnp.float32,
+    )
+    threshold = float(jnp.float32(0.26603594422340393))
+    exact_dot = sum(float(left) * float(right) for left, right in zip(probe, candidate))
+    exact_alignment = -exact_dot / math.sqrt(
+        sum(float(value) ** 2 for value in probe)
+        * sum(float(value) ** 2 for value in candidate)
+    )
+    assert exact_alignment < threshold
+    config = GradientJoyConfig(
+        candidate_semantics="update",
+        max_update_norm=1.0,
+        min_objective_descent_alignment=threshold,
+        min_retention_descent_alignment=threshold,
+        min_safety_descent_alignment=threshold,
+    )
+
+    def evidence_for(protected_probe: Array) -> GradientJoyEvidence:
+        return _gradient_joy_evidence(
+            objective_probe_gradient=protected_probe,
+            retention_probe_gradient=protected_probe,
+            safety_cost_gradient=protected_probe,
+        )
+
+    evidence = evidence_for(probe)
+    for result in (
+        assess_gradient_joy(candidate, evidence, config),
+        jax.jit(
+            lambda update, protected_probe: assess_gradient_joy(
+                update,
+                evidence_for(protected_probe),
+                config,
+            )
+        )(candidate, probe),
+    ):
+        assert float(result.diagnostics.objective_descent_alignment) == threshold
+        assert (
+            float(result.diagnostics.objective_descent_alignment_lower_bound)
+            < threshold
+        )
+        assert exact_alignment >= float(
+            result.diagnostics.objective_descent_alignment_lower_bound
+        )
+        assert not bool(result.diagnostics.objective_improves)
+        assert not bool(result.accepted)
+
+    parameters = jnp.zeros_like(candidate)
+
+    def apply(params: Array, update: Array, protected_probe: Array):
+        return apply_gradient_joy_update(
+            params,
+            update,
+            evidence_for(protected_probe),
+            config,
+        )
+
+    for result in (
+        apply(parameters, candidate, probe),
+        jax.jit(apply)(parameters, candidate, probe),
+    ):
+        assert not bool(result.assessment.accepted)
+        assert not bool(result.effective_assessment.accepted)
+        assert not bool(result.applied)
+        chex.assert_trees_all_equal(result.parameters, parameters)
+
+
+def test_gradient_joy_rejects_underflowed_harmful_protected_probe_dot() -> None:
+    """A normal-valued safety probe cannot underflow into a passing zero."""
+    parameters = {"weights": jnp.array([0.0], dtype=jnp.float32)}
+    candidate = {"weights": jnp.array([-8.0e-8], dtype=jnp.float32)}
+    objective_probe = {"weights": jnp.array([1.0e8], dtype=jnp.float32)}
+    safety_probe = {"weights": jnp.array([-1.0e-31], dtype=jnp.float32)}
+    result = jax.jit(
+        lambda params: apply_gradient_joy_update(
+            params,
+            candidate,
+            _gradient_joy_evidence(
+                objective_probe_gradient=objective_probe,
+                retention_probe_gradient=objective_probe,
+                safety_cost_gradient=safety_probe,
+            ),
+            GradientJoyConfig(
+                candidate_semantics="update",
+                max_update_norm=1.0e-6,
+            ),
+        )
+    )(parameters)
+
+    assert bool(result.assessment.diagnostics.candidate_finite)
+    assert bool(result.assessment.diagnostics.safety_probe_finite)
+    assert float(result.assessment.diagnostics.safety_probe_norm) > 0.0
+    assert float(result.assessment.diagnostics.safety_descent_alignment) < 0.0
+    assert not bool(result.assessment.diagnostics.safety_preserved)
+    assert not bool(result.assessment.accepted)
+    assert not bool(result.applied)
+    chex.assert_trees_all_equal(result.parameters, parameters)
+
+
+@pytest.mark.parametrize(
+    ("probe_kind", "verdict_field", "resolved_field"),
+    (
+        ("objective", "objective_improves", "objective_dot_resolved"),
+        ("retention", "retention_preserved", "retention_dot_resolved"),
+        ("safety", "safety_preserved", "safety_dot_resolved"),
+    ),
+)
+def test_gradient_joy_rejects_cancellation_sensitive_dot(
+    probe_kind: str,
+    verdict_field: str,
+    resolved_field: str,
+) -> None:
+    """Cancellation cannot turn a numerically uncertain dot into a verdict."""
+    candidate = {"weights": jnp.array([-1.0, -1.0, -1.0], dtype=jnp.float32)}
+    descending_probe = {
+        "weights": jnp.array([1.0, 1.0, 1.0], dtype=jnp.float32),
+    }
+    cancellation_probe = {
+        "weights": jnp.array([-1.0e20, 1.0e20, -1.0], dtype=jnp.float32),
+    }
+    probe_arguments = {
+        "objective_probe_gradient": descending_probe,
+        "retention_probe_gradient": descending_probe,
+        "safety_cost_gradient": descending_probe,
+    }
+    probe_arguments[
+        {
+            "objective": "objective_probe_gradient",
+            "retention": "retention_probe_gradient",
+            "safety": "safety_cost_gradient",
+        }[probe_kind]
+    ] = cancellation_probe
+
+    result = assess_gradient_joy(
+        candidate,
+        _gradient_joy_evidence(**probe_arguments),
+        GradientJoyConfig(candidate_semantics="update", max_update_norm=2.0),
+    )
+
+    if probe_kind == "objective":
+        assert float(result.diagnostics.predicted_objective_decrease) < 0.0
+    elif probe_kind == "retention":
+        assert float(result.diagnostics.predicted_retention_loss_change) > 0.0
+    else:
+        assert float(result.diagnostics.predicted_safety_cost_change) > 0.0
+    assert not bool(getattr(result.diagnostics, resolved_field))
+    assert not bool(result.diagnostics.derived_numerics_valid)
+    assert not bool(getattr(result.diagnostics, verdict_field))
+    assert not bool(result.accepted)
+    chex.assert_trees_all_equal(
+        result.weighted_update,
+        {"weights": jnp.zeros(3, dtype=jnp.float32)},
+    )
+
+
+def test_gradient_joy_application_vetoes_dot_sign_disagreement_atomically() -> None:
+    """The stored-delta boundary inherits the cancellation fail-closed gate."""
+    parameters = {"weights": jnp.zeros(3, dtype=jnp.float32)}
+    candidate = {"weights": jnp.array([-1.0, -1.0, -1.0], dtype=jnp.float32)}
+    cancellation_probe = {
+        "weights": jnp.array([-1.0e20, 1.0e20, -1.0], dtype=jnp.float32),
+    }
+    descending_probe = {
+        "weights": jnp.array([1.0, 1.0, 1.0], dtype=jnp.float32),
+    }
+    result = jax.jit(
+        lambda params: apply_gradient_joy_update(
+            params,
+            candidate,
+            _gradient_joy_evidence(
+                objective_probe_gradient=cancellation_probe,
+                retention_probe_gradient=descending_probe,
+                safety_cost_gradient=descending_probe,
+            ),
+            GradientJoyConfig(candidate_semantics="update", max_update_norm=2.0),
+        )
+    )(parameters)
+
+    assert float(result.assessment.diagnostics.predicted_objective_decrease) < 0.0
+    assert not bool(result.assessment.diagnostics.derived_numerics_valid)
+    assert not bool(result.assessment.accepted)
+    assert not bool(result.effective_assessment.accepted)
+    assert not bool(result.applied)
+    chex.assert_trees_all_equal(result.parameters, parameters)
+
+
+def test_gradient_joy_rejects_same_sign_cancellation_in_eager_and_jit() -> None:
+    """A roundoff interval must catch two reductions agreeing in the wrong sign."""
+    candidate = jnp.ones(6, dtype=jnp.float32)
+    descending_probe = -jnp.ones(6, dtype=jnp.float32)
+    cancellation_probe = jnp.array(
+        [2.0, 1.0e10, -1.0e10, -1.0e10, 1.0e10, -1.0],
+        dtype=jnp.float32,
+    )
+    assert sum(float(value) for value in cancellation_probe) == 1.0
+    config = GradientJoyConfig(candidate_semantics="update", max_update_norm=3.0)
+
+    def evaluate(
+        update: Array,
+        objective: Array,
+        safety: Array,
+    ) -> GradientJoyAssessment:
+        return assess_gradient_joy(
+            update,
+            _gradient_joy_evidence(
+                objective_probe_gradient=objective,
+                retention_probe_gradient=objective,
+                safety_cost_gradient=safety,
+            ),
+            config,
+        )
+
+    for result in (
+        evaluate(candidate, descending_probe, cancellation_probe),
+        jax.jit(evaluate)(candidate, descending_probe, cancellation_probe),
+    ):
+        assert bool(result.diagnostics.objective_dot_resolved)
+        assert not bool(result.diagnostics.safety_dot_resolved)
+        assert float(result.diagnostics.safety_dot_error_bound) > 0.0
+        assert not bool(result.diagnostics.derived_numerics_valid)
+        assert not bool(result.diagnostics.safety_preserved)
+        assert not bool(result.accepted)
+        chex.assert_trees_all_equal(
+            result.weighted_update,
+            jnp.zeros(6, dtype=jnp.float32),
+        )
+
+
+def test_gradient_joy_application_vetoes_same_sign_cancellation_eager_and_jit() -> None:
+    """Unresolved cancellation is an atomic no-op at the stored-delta boundary."""
+    parameters = jnp.zeros(6, dtype=jnp.float32)
+    candidate = jnp.ones(6, dtype=jnp.float32)
+    descending_probe = -jnp.ones(6, dtype=jnp.float32)
+    cancellation_probe = jnp.array(
+        [2.0, 1.0e10, -1.0e10, -1.0e10, 1.0e10, -1.0],
+        dtype=jnp.float32,
+    )
+    config = GradientJoyConfig(candidate_semantics="update", max_update_norm=3.0)
+
+    def apply(
+        params: Array,
+        update: Array,
+        objective: Array,
+        safety: Array,
+    ) -> GradientJoyApplicationResult:
+        return apply_gradient_joy_update(
+            params,
+            update,
+            _gradient_joy_evidence(
+                objective_probe_gradient=objective,
+                retention_probe_gradient=objective,
+                safety_cost_gradient=safety,
+            ),
+            config,
+        )
+
+    for result in (
+        apply(parameters, candidate, descending_probe, cancellation_probe),
+        jax.jit(apply)(parameters, candidate, descending_probe, cancellation_probe),
+    ):
+        assert not bool(result.assessment.diagnostics.safety_dot_resolved)
+        assert not bool(result.assessment.accepted)
+        assert not bool(result.effective_assessment.accepted)
+        assert not bool(result.applied)
+        chex.assert_trees_all_equal(result.parameters, parameters)
+
+
+def test_gradient_joy_rejects_overflowed_derived_protected_probe_dot() -> None:
+    """Finite leaves whose derived dot overflows must fail the evidence gate."""
+    parameters = {"weights": jnp.array([0.0], dtype=jnp.float32)}
+    candidate = {"weights": jnp.array([-1.0e10], dtype=jnp.float32)}
+    objective_probe = {"weights": jnp.array([1.0], dtype=jnp.float32)}
+    safety_probe = {"weights": jnp.array([-1.0e30], dtype=jnp.float32)}
+    result = jax.jit(
+        lambda params: apply_gradient_joy_update(
+            params,
+            candidate,
+            _gradient_joy_evidence(
+                objective_probe_gradient=objective_probe,
+                retention_probe_gradient=objective_probe,
+                safety_cost_gradient=safety_probe,
+            ),
+            GradientJoyConfig(
+                candidate_semantics="update",
+                max_update_norm=2.0e10,
+                norm_temperature=1.0e9,
+            ),
+        )
+    )(parameters)
+
+    assert bool(result.assessment.diagnostics.candidate_finite)
+    assert bool(result.assessment.diagnostics.safety_probe_finite)
+    assert not bool(result.assessment.diagnostics.derived_numerics_valid)
+    assert not bool(result.assessment.diagnostics.evidence_complete)
+    assert not bool(result.assessment.accepted)
+    assert not bool(result.applied)
+    chex.assert_trees_all_equal(result.parameters, parameters)
+
+
 def test_gradient_joy_application_vetoes_quantization_that_flips_probe_verdicts() -> None:
     """Partially rounded updates cannot discard benefit while retaining harm."""
     parameters = {
@@ -794,10 +1205,10 @@ def test_gradient_joy_alignment_is_scale_invariant_above_the_norm_floor() -> Non
 
 
 @pytest.mark.parametrize("seed", (2, 11))
-def test_gradient_joy_clips_cosine_roundoff_and_tolerates_exact_endpoint(
+def test_gradient_joy_fails_closed_when_endpoint_alignment_is_not_certified(
     seed: int,
 ) -> None:
-    """Collinear float32 reductions behave consistently at threshold one."""
+    """A point cosine near one cannot outrun its certified lower endpoint."""
     probe_values = jax.random.normal(
         jax.random.PRNGKey(seed),
         (1003,),
@@ -821,14 +1232,51 @@ def test_gradient_joy_clips_cosine_roundoff_and_tolerates_exact_endpoint(
         ),
     )
 
-    assert bool(result.accepted)
-    for alignment in (
-        result.diagnostics.objective_descent_alignment,
-        result.diagnostics.retention_descent_alignment,
-        result.diagnostics.safety_descent_alignment,
+    assert not bool(result.accepted)
+    for alignment, lower_bound in (
+        (
+            result.diagnostics.objective_descent_alignment,
+            result.diagnostics.objective_descent_alignment_lower_bound,
+        ),
+        (
+            result.diagnostics.retention_descent_alignment,
+            result.diagnostics.retention_descent_alignment_lower_bound,
+        ),
+        (
+            result.diagnostics.safety_descent_alignment,
+            result.diagnostics.safety_descent_alignment_lower_bound,
+        ),
     ):
         assert -1.0 <= float(alignment) <= 1.0
         assert float(alignment) >= 1.0 - 4.0 * float(jnp.finfo(jnp.float32).eps)
+        assert float(lower_bound) < 1.0 - 4.0 * float(jnp.finfo(jnp.float32).eps)
+
+
+def test_gradient_joy_accepts_exact_one_dimensional_endpoint_alignment() -> None:
+    """An exactly certifiable one-dimensional cosine can meet endpoint one."""
+    candidate = {"weights": jnp.array([-0.25], dtype=jnp.float32)}
+    probe = {"weights": jnp.array([3.0], dtype=jnp.float32)}
+    result = assess_gradient_joy(
+        candidate,
+        _gradient_joy_evidence(
+            objective_probe_gradient=probe,
+            retention_probe_gradient=probe,
+            safety_cost_gradient=probe,
+        ),
+        GradientJoyConfig(
+            candidate_semantics="update",
+            max_update_norm=1.0,
+            min_objective_descent_alignment=1.0,
+            min_retention_descent_alignment=1.0,
+            min_safety_descent_alignment=1.0,
+        ),
+    )
+
+    assert bool(result.accepted)
+    assert float(result.diagnostics.objective_descent_alignment) == 1.0
+    assert float(
+        result.diagnostics.objective_descent_alignment_lower_bound
+    ) >= 1.0 - 4.0 * float(jnp.finfo(jnp.float32).eps)
 
 
 def test_gradient_joy_rejects_tentative_update_below_update_norm_floor() -> None:
@@ -856,6 +1304,99 @@ def test_gradient_joy_rejects_tentative_update_below_update_norm_floor() -> None
         result.weighted_update["weights"],
         jnp.zeros(1, dtype=jnp.float32),
     )
+
+
+def test_gradient_joy_audits_elementwise_rounded_tentative_update() -> None:
+    """Scalar scaling cannot stand in for the actually rounded update tree."""
+    candidate = jnp.array([-2.836829920794233e-32], dtype=jnp.float32)
+    probe = jnp.array([0.8063097596168518], dtype=jnp.float32)
+    result = assess_gradient_joy(
+        candidate,
+        _gradient_joy_evidence(
+            objective_probe_gradient=probe,
+            retention_probe_gradient=probe,
+            safety_cost_gradient=probe,
+        ),
+        GradientJoyConfig(
+            candidate_semantics="update",
+            max_update_norm=1.0e-30,
+            diagnostics_epsilon=1.2e-38,
+            min_objective_descent_alignment=1.0,
+            min_retention_descent_alignment=1.0,
+            min_safety_descent_alignment=1.0,
+            alignment_temperature=0.1,
+            norm_temperature=1.0e-30,
+        ),
+    )
+
+    assert float(result.diagnostics.tentative_weight) > 0.0
+    assert not bool(result.diagnostics.tentative_objective_dot_resolved)
+    assert not bool(result.diagnostics.derived_numerics_valid)
+    assert not bool(result.accepted)
+    chex.assert_trees_all_equal(result.weighted_update, jnp.zeros_like(candidate))
+
+
+def test_gradient_joy_tentative_rounding_boundary_is_atomic_eager_and_jit() -> None:
+    """A resolved candidate cannot lend its certificate to rounded scaling."""
+    candidate = jnp.array(
+        [-0.53493332862854, 0.9215275645256042],
+        dtype=jnp.float32,
+    )
+    probe = jnp.array(
+        [-1.6531749943149495e-32, -1.3062328325207423e-32],
+        dtype=jnp.float32,
+    )
+    config = GradientJoyConfig(
+        candidate_semantics="update",
+        max_update_norm=1.0877355337142944,
+        min_objective_decrease=1.7734800820290934e-33,
+        alignment_temperature=0.001,
+        norm_temperature=0.1,
+    )
+
+    def evidence_for(protected_probe: Array) -> GradientJoyEvidence:
+        return _gradient_joy_evidence(
+            objective_probe_gradient=protected_probe,
+            retention_probe_gradient=protected_probe,
+            safety_cost_gradient=protected_probe,
+        )
+
+    def assess(update: Array, protected_probe: Array) -> GradientJoyAssessment:
+        return assess_gradient_joy(update, evidence_for(protected_probe), config)
+
+    for result in (
+        assess(candidate, probe),
+        jax.jit(assess)(candidate, probe),
+    ):
+        assert float(result.diagnostics.tentative_weight) == pytest.approx(
+            0.5552690029144287
+        )
+        assert bool(result.diagnostics.objective_dot_resolved)
+        assert not bool(result.diagnostics.tentative_objective_dot_resolved)
+        assert float(result.diagnostics.tentative_objective_dot_error_bound) == 0.0
+        assert not bool(result.diagnostics.derived_numerics_valid)
+        assert not bool(result.diagnostics.objective_improves)
+        assert not bool(result.accepted)
+        chex.assert_trees_all_equal(result.weighted_update, jnp.zeros_like(candidate))
+
+    parameters = jnp.zeros_like(candidate)
+
+    def apply(params: Array, update: Array, protected_probe: Array):
+        return apply_gradient_joy_update(
+            params,
+            update,
+            evidence_for(protected_probe),
+            config,
+        )
+
+    for result in (
+        apply(parameters, candidate, probe),
+        jax.jit(apply)(parameters, candidate, probe),
+    ):
+        assert not bool(result.assessment.accepted)
+        assert not bool(result.effective_assessment.accepted)
+        assert not bool(result.applied)
+        chex.assert_trees_all_equal(result.parameters, parameters)
 
 
 def test_gradient_joy_jits_converts_gradient_and_blocks_meta_gradients() -> None:
@@ -1232,6 +1773,11 @@ def test_gradient_joy_nonfinite_probe_channels_fail_closed(
 
 def test_gradient_joy_rejects_ambiguous_shapes_and_non_scalar_channels() -> None:
     candidate = {"weights": jnp.array([-1.0, 0.0], dtype=jnp.float32)}
+    with pytest.raises(ValueError, match="at least one floating value"):
+        assess_gradient_joy(
+            {"weights": jnp.empty((0,), dtype=jnp.float32)},
+            _gradient_joy_evidence(),
+        )
     with pytest.raises(ValueError, match="floating dtypes"):
         assess_gradient_joy(
             {"weights": jnp.array([-1.0 + 1.0j], dtype=jnp.complex64)},

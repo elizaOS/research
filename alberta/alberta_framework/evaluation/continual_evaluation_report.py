@@ -1,4 +1,4 @@
-"""Strict v1 report builder for continual-learning comparisons.
+"""Strict v2 report builder for continual-learning comparisons.
 
 The report is constructed from two deliberately separate evidence surfaces:
 
@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal, NoReturn, TypeGuard, cast
 
-SCHEMA_VERSION = "alberta.continual_evaluation_report.v1"
+SCHEMA_VERSION = "alberta.continual_evaluation_report.v2"
 TRACE_ORDERING_VERSION = "alberta.predict_before_update_trace.v1"
 ACCEPTANCE_STATUS = "not-assessed"
 REPORT_INTERPRETATION = (
@@ -37,15 +37,17 @@ METRIC_DEFINITIONS: Mapping[str, str] = {
         "drop with protocol.dropped_observation_score"
     ),
     "adaptation_auc": (
-        "normalized trapezoid AUC within each contiguous regime segment over lifetime scores"
+        "normalized trapezoid AUC after each regime change over lifetime scores"
     ),
     "recovery": (
         "first sustained threshold window after each regime change, bounded by the next change"
     ),
+    "per_regime_final_performance": "final held-out probe score for each evaluator regime",
+    "mean_final_performance": "mean final held-out probe score across evaluator regimes",
     "forgetting": ("direction-normalized peak-to-final degradation after first exposure"),
     "backward_transfer": ("direction-normalized final minus first-post-exposure performance"),
     "forward_transfer": ("direction-normalized last pre-exposure probe minus frozen reference"),
-    "stability": "non-negative deficit from the per-regime reference",
+    "stability": "immediate post-change deficit from the per-regime reference",
     "worst_window": ("worst rolling lifetime-score mean in the configured metric direction"),
 }
 
@@ -147,6 +149,7 @@ class ContinualEvaluationProtocol:
     recovery_window: int
     worst_window_size: int
     dropped_observation_score: float
+    operation_latency_deadline_ms: float
 
     def __post_init__(self) -> None:
         if not isinstance(self.protocol_id, str) or ".v" not in self.protocol_id:
@@ -196,7 +199,6 @@ class ContinualEvaluationProtocol:
             raise ValueError(
                 "first_exposure_checkpoint keys must exactly match evaluator_regime_ids"
             )
-        exposure_rows: list[int] = []
         for regime_id, row in self.first_exposure_checkpoint.items():
             if (
                 isinstance(row, bool)
@@ -204,9 +206,17 @@ class ContinualEvaluationProtocol:
                 or not 0 <= row < len(self.checkpoint_steps)
             ):
                 raise ValueError(f"first_exposure_checkpoint.{regime_id} must index checkpoints")
-            exposure_rows.append(row)
-        if not any(row > 0 for row in exposure_rows):
-            raise ValueError("at least one regime must have a pre-exposure checkpoint for FWT")
+            first_observation_step = self.regime_schedule.index(regime_id) + 1
+            expected_row = next(
+                index
+                for index, checkpoint_step in enumerate(self.checkpoint_steps)
+                if checkpoint_step >= first_observation_step
+            )
+            if row != expected_row:
+                raise ValueError(
+                    f"first_exposure_checkpoint.{regime_id} must be {expected_row}, "
+                    "the first checkpoint at or after first exposure"
+                )
         _validate_named_float_mapping(
             self.forward_transfer_reference,
             expected_names=self.evaluator_regime_ids,
@@ -230,6 +240,12 @@ class ContinualEvaluationProtocol:
             self.dropped_observation_score,
             name="dropped_observation_score",
         )
+        deadline = _require_finite_float(
+            self.operation_latency_deadline_ms,
+            name="operation_latency_deadline_ms",
+        )
+        if deadline <= 0.0:
+            raise ValueError("operation_latency_deadline_ms must be positive")
 
 
 @dataclass(frozen=True)
@@ -286,6 +302,7 @@ class MatchedBudget:
     backward_call_limit: int
     parameter_count_limit: int
     persistent_state_bytes_limit: int
+    host_high_water_bytes_limit: int
 
     def __post_init__(self) -> None:
         _require_positive_int(self.observation_limit, name="observation_limit")
@@ -296,6 +313,10 @@ class MatchedBudget:
         _require_positive_int(
             self.persistent_state_bytes_limit,
             name="persistent_state_bytes_limit",
+        )
+        _require_positive_int(
+            self.host_high_water_bytes_limit,
+            name="host_high_water_bytes_limit",
         )
 
 
@@ -318,9 +339,7 @@ class OperationCounts:
         for name, value in asdict(self).items():
             _require_nonnegative_int(value, name=name)
         if self.delayed_observations > self.processed_observations:
-            raise ValueError(
-                "delayed_observations must be a subset of processed_observations"
-            )
+            raise ValueError("delayed_observations must be a subset of processed_observations")
 
 
 @dataclass(frozen=True)
@@ -351,6 +370,11 @@ class LatencyMeasurements:
     forward: LatencySummary
     update: LatencySummary
     backward: LatencySummary
+    measurement_method: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.measurement_method, str) or not self.measurement_method:
+            raise ValueError("latency measurement_method must be a non-empty string")
 
 
 @dataclass(frozen=True)
@@ -406,13 +430,8 @@ class EnergyMeasurement:
         _require_nonnegative_float(self.value, name="energy.value")
         if not isinstance(self.unit, str) or not self.unit:
             raise ValueError("energy.unit must be a non-empty string")
-        if (
-            not isinstance(self.measurement_method, str)
-            or not self.measurement_method
-        ):
-            raise ValueError(
-                "energy.measurement_method must be a non-empty string"
-            )
+        if not isinstance(self.measurement_method, str) or not self.measurement_method:
+            raise ValueError("energy.measurement_method must be a non-empty string")
 
     @property
     def measured(self) -> bool:
@@ -438,6 +457,7 @@ class SafetyMeasurements:
     cumulative_cost: float
     cumulative_near_miss_cost: float
     maximum_step_cost: float
+    measurement_method: str | None
 
     def __post_init__(self) -> None:
         checks = _require_nonnegative_int(self.checks, name="safety.checks")
@@ -454,9 +474,7 @@ class SafetyMeasurements:
             name="safety.near_misses",
         )
         if violations > checks or interventions > checks or near_misses > checks:
-            raise ValueError(
-                "safety violations/interventions/near_misses cannot exceed checks"
-            )
+            raise ValueError("safety violations/interventions/near_misses cannot exceed checks")
         cumulative = _require_nonnegative_float(
             self.cumulative_cost,
             name="safety.cumulative_cost",
@@ -473,6 +491,19 @@ class SafetyMeasurements:
             raise ValueError("maximum_step_cost cannot exceed cumulative_cost")
         if near_miss_cost > cumulative:
             raise ValueError("cumulative_near_miss_cost cannot exceed cumulative_cost")
+        if self.measurement_method is None:
+            if (
+                checks != 0
+                or violations != 0
+                or interventions != 0
+                or near_misses != 0
+                or cumulative != 0.0
+                or near_miss_cost != 0.0
+                or maximum != 0.0
+            ):
+                raise ValueError("unmeasured safety fields must all be zero")
+        elif not isinstance(self.measurement_method, str) or not self.measurement_method:
+            raise ValueError("safety.measurement_method must be a non-empty string or None")
 
 
 @dataclass(frozen=True)
@@ -581,7 +612,8 @@ def _adaptation_metrics(
     records: list[dict[str, object]] = []
     auc_values: list[float] = []
     for segment_index, (regime_id, start, stop) in enumerate(
-        _contiguous_segments(protocol.regime_schedule)
+        _contiguous_segments(protocol.regime_schedule)[1:],
+        start=1,
     ):
         auc = _normalized_trapezoid_auc(scores[start:stop])
         auc_values.append(auc)
@@ -717,21 +749,16 @@ def _stability_metrics(
     scores: Sequence[float],
     protocol: ContinualEvaluationProtocol,
 ) -> dict[str, float]:
-    gaps = [
-        max(
-            0.0,
-            (
-                float(protocol.stability_references[regime_id]) - score
-                if protocol.higher_is_better
-                else score - float(protocol.stability_references[regime_id])
-            ),
+    gaps = []
+    for regime_id, start, _ in _contiguous_segments(protocol.regime_schedule)[1:]:
+        score = scores[start]
+        reference = float(protocol.stability_references[regime_id])
+        gaps.append(
+            max(
+                0.0,
+                reference - score if protocol.higher_is_better else score - reference,
+            )
         )
-        for score, regime_id in zip(
-            scores,
-            protocol.regime_schedule,
-            strict=True,
-        )
-    ]
     return {
         "mean_gap": _mean(gaps),
         "maximum_gap": max(gaps),
@@ -754,6 +781,52 @@ def _worst_window_metrics(
         "score": worst_score,
         "start_step": start,
         "end_step_exclusive": start + window,
+    }
+
+
+def _metric_applicability(
+    protocol: ContinualEvaluationProtocol,
+) -> dict[str, object]:
+    online = {
+        "applicable": True,
+        "unavailable_reason": None,
+        "evidence_source": "predict_before_update_trace",
+    }
+    held_out = {
+        "applicable": True,
+        "unavailable_reason": None,
+        "evidence_source": "held_out_non_learning_regime_probes",
+    }
+    forward_available = [
+        regime_id
+        for regime_id in protocol.evaluator_regime_ids
+        if protocol.first_exposure_checkpoint[regime_id] > 0
+    ]
+    forward_unavailable = {
+        regime_id: "no pre-exposure checkpoint exists for this regime"
+        for regime_id in protocol.evaluator_regime_ids
+        if protocol.first_exposure_checkpoint[regime_id] == 0
+    }
+    return {
+        "prequential_score": dict(online),
+        "lifetime_score": dict(online),
+        "adaptation_auc": dict(online),
+        "recovery": dict(online),
+        "per_regime_final_performance": dict(held_out),
+        "mean_final_performance": dict(held_out),
+        "forgetting": dict(held_out),
+        "backward_transfer": dict(held_out),
+        "forward_transfer": {
+            "applicable": bool(forward_available),
+            "unavailable_reason": (
+                None if forward_available else "no regime has a pre-exposure held-out probe"
+            ),
+            "evidence_source": "held_out_non_learning_regime_probes",
+            "available_regimes": forward_available,
+            "unavailable_regimes": forward_unavailable,
+        },
+        "stability": dict(online),
+        "worst_window": dict(online),
     }
 
 
@@ -780,8 +853,10 @@ def _validate_condition_against_protocol(
         raise ValueError(f"{condition.name}: processed observation count does not match trace")
     if counts.dropped_observations != observed_dropped:
         raise ValueError(f"{condition.name}: dropped observation count does not match trace")
-    if counts.forward_calls < observed_processed:
-        raise ValueError(f"{condition.name}: forward_calls cannot be below processed observations")
+    if counts.forward_calls < trace_length:
+        raise ValueError(f"{condition.name}: forward_calls cannot be below scheduled observations")
+    if counts.update_calls < observed_processed:
+        raise ValueError(f"{condition.name}: update_calls cannot be below processed observations")
     budget_checks = (
         (
             counts.forward_calls,
@@ -821,6 +896,8 @@ def _validate_condition_against_protocol(
         raise ValueError(f"{condition.name}: persistent state exceeds the matched budget")
     if memory.parameter_count > condition.budget.parameter_count_limit:
         raise ValueError(f"{condition.name}: parameter count exceeds the matched budget")
+    if memory.host_high_water_bytes > condition.budget.host_high_water_bytes_limit:
+        raise ValueError(f"{condition.name}: host high-water mark exceeds the matched budget")
     if memory.persistent_state_bytes > memory.host_high_water_bytes:
         raise ValueError(f"{condition.name}: persistent state exceeds host memory high-water mark")
 
@@ -852,6 +929,7 @@ def _protocol_payload(
         "recovery_window": protocol.recovery_window,
         "worst_window_size": protocol.worst_window_size,
         "dropped_observation_score": protocol.dropped_observation_score,
+        "operation_latency_deadline_ms": protocol.operation_latency_deadline_ms,
     }
 
 
@@ -884,6 +962,7 @@ def _condition_payload(
     ]
     evaluator = _evaluator_metrics(condition.evaluator_matrix, protocol)
     metrics: dict[str, object] = {
+        "metric_applicability": _metric_applicability(protocol),
         "prequential_score": _mean(processed_scores),
         "lifetime_score": _mean(effective_scores),
         "adaptation_auc": _adaptation_metrics(effective_scores, protocol),
@@ -907,6 +986,7 @@ def _condition_payload(
                 "forward": _latency_payload(operations.latency.forward),
                 "update": _latency_payload(operations.latency.update),
                 "backward": _latency_payload(operations.latency.backward),
+                "measurement_method": operations.latency.measurement_method,
             },
             "memory": asdict(operations.memory),
             "energy": asdict(operations.energy),
@@ -1071,6 +1151,7 @@ def _parse_protocol(value: object) -> ContinualEvaluationProtocol:
             "recovery_window",
             "worst_window_size",
             "dropped_observation_score",
+            "operation_latency_deadline_ms",
         },
         location=location,
     )
@@ -1135,6 +1216,10 @@ def _parse_protocol(value: object) -> ContinualEvaluationProtocol:
             mapping["dropped_observation_score"],
             location=f"{location}.dropped_observation_score",
         ),
+        operation_latency_deadline_ms=_expect_float(
+            mapping["operation_latency_deadline_ms"],
+            location=f"{location}.operation_latency_deadline_ms",
+        ),
     )
 
 
@@ -1148,6 +1233,7 @@ def _parse_budget(value: object) -> MatchedBudget:
         "backward_call_limit",
         "parameter_count_limit",
         "persistent_state_bytes_limit",
+        "host_high_water_bytes_limit",
     }
     _exact_keys(mapping, fields, location=location)
     return MatchedBudget(
@@ -1174,6 +1260,10 @@ def _parse_budget(value: object) -> MatchedBudget:
         persistent_state_bytes_limit=_expect_int(
             mapping["persistent_state_bytes_limit"],
             location=f"{location}.persistent_state_bytes_limit",
+        ),
+        host_high_water_bytes_limit=_expect_int(
+            mapping["host_high_water_bytes_limit"],
+            location=f"{location}.host_high_water_bytes_limit",
         ),
     )
 
@@ -1255,7 +1345,7 @@ def _parse_operations(value: object, *, location: str) -> OperationalMeasurement
     )
     _exact_keys(
         latency_value,
-        {"forward", "update", "backward"},
+        {"forward", "update", "backward", "measurement_method"},
         location=f"{location}.latency",
     )
     latency = LatencyMeasurements(
@@ -1270,6 +1360,10 @@ def _parse_operations(value: object, *, location: str) -> OperationalMeasurement
         backward=_parse_latency(
             latency_value["backward"],
             location=f"{location}.latency.backward",
+        ),
+        measurement_method=_expect_string(
+            latency_value["measurement_method"],
+            location=f"{location}.latency.measurement_method",
         ),
     )
 
@@ -1362,6 +1456,7 @@ def _parse_safety(value: object, *, location: str) -> SafetyMeasurements:
             "cumulative_cost",
             "cumulative_near_miss_cost",
             "maximum_step_cost",
+            "measurement_method",
         },
         location=location,
     )
@@ -1391,6 +1486,14 @@ def _parse_safety(value: object, *, location: str) -> SafetyMeasurements:
             mapping["maximum_step_cost"],
             location=f"{location}.maximum_step_cost",
         ),
+        measurement_method=(
+            None
+            if mapping["measurement_method"] is None
+            else _expect_string(
+                mapping["measurement_method"],
+                location=f"{location}.measurement_method",
+            )
+        ),
     )
 
 
@@ -1416,6 +1519,7 @@ def _validate_metric_shape(value: object, *, location: str) -> None:
         {
             "prequential_score",
             "lifetime_score",
+            "metric_applicability",
             "adaptation_auc",
             "recovery",
             "per_regime_final_performance",
@@ -1459,6 +1563,63 @@ def _validate_metric_shape(value: object, *, location: str) -> None:
             location=f"{location}.{key}",
         )
         _exact_keys(nested, expected, location=f"{location}.{key}")
+
+    applicability = _expect_mapping(
+        mapping["metric_applicability"],
+        location=f"{location}.metric_applicability",
+    )
+    _exact_keys(
+        applicability,
+        {
+            "prequential_score",
+            "lifetime_score",
+            "adaptation_auc",
+            "recovery",
+            "per_regime_final_performance",
+            "mean_final_performance",
+            "forgetting",
+            "backward_transfer",
+            "forward_transfer",
+            "stability",
+            "worst_window",
+        },
+        location=f"{location}.metric_applicability",
+    )
+    common_applicability_keys = {
+        "applicable",
+        "unavailable_reason",
+        "evidence_source",
+    }
+    for metric_name in (
+        "prequential_score",
+        "lifetime_score",
+        "adaptation_auc",
+        "recovery",
+        "per_regime_final_performance",
+        "mean_final_performance",
+        "forgetting",
+        "backward_transfer",
+        "stability",
+        "worst_window",
+    ):
+        metric_applicability = _expect_mapping(
+            applicability[metric_name],
+            location=f"{location}.metric_applicability.{metric_name}",
+        )
+        _exact_keys(
+            metric_applicability,
+            common_applicability_keys,
+            location=f"{location}.metric_applicability.{metric_name}",
+        )
+    forward_applicability = _expect_mapping(
+        applicability["forward_transfer"],
+        location=f"{location}.metric_applicability.forward_transfer",
+    )
+    _exact_keys(
+        forward_applicability,
+        common_applicability_keys | {"available_regimes", "unavailable_regimes"},
+        location=f"{location}.metric_applicability.forward_transfer",
+    )
 
     adaptation = _expect_mapping(
         mapping["adaptation_auc"],
@@ -1733,15 +1894,15 @@ def _reconstruct_report(report: Mapping[str, object]) -> dict[str, object]:
         location="report",
     )
     if report["schema_version"] != SCHEMA_VERSION:
-        raise ValueError("schema_version does not match continual report v1")
+        raise ValueError("schema_version does not match continual report v2")
     if report["trace_ordering_version"] != TRACE_ORDERING_VERSION:
         raise ValueError("trace_ordering_version does not match v1")
     if report["acceptance_status"] != ACCEPTANCE_STATUS:
         raise ValueError("acceptance_status must remain not-assessed")
     if report["interpretation"] != REPORT_INTERPRETATION:
-        raise ValueError("report interpretation does not match the v1 contract")
+        raise ValueError("report interpretation does not match the v2 contract")
     if report["metric_definitions"] != METRIC_DEFINITIONS:
-        raise ValueError("metric_definitions do not match the v1 contract")
+        raise ValueError("metric_definitions do not match the v2 contract")
 
     protocol = _parse_protocol(report["protocol"])
     comparison = _expect_mapping(
@@ -1826,7 +1987,7 @@ def validate_continual_evaluation_report(
 
 
 def continual_evaluation_report_json(report: Mapping[str, object]) -> str:
-    """Serialize only a strict, reconstructable v1 report."""
+    """Serialize only a strict, reconstructable v2 report."""
 
     validation = validate_continual_evaluation_report(report)
     if not validation.valid:

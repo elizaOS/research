@@ -26,6 +26,9 @@ Usage:
 
     # Once a text-conditioned checkpoint exists, swap --use-rl=true and the
     # script routes through policy.start instead of programmatic commands.
+
+The legacy direct physical leg is quarantined and fails before connecting. A
+future physical version must use the authenticated unified bridge.
 """
 
 from __future__ import annotations
@@ -43,6 +46,7 @@ import numpy as np
 from eliza_robot.bridge.backends.ainex_remote import AinexRemoteBackend
 from eliza_robot.bridge.backends.dual_target import DualTargetBackend
 from eliza_robot.bridge.backends.mujoco_backend import MuJocoBackend
+from eliza_robot.bridge.physical_execution import reject_unsupervised_physical_motion
 from eliza_robot.bridge.protocol import CommandEnvelope, utc_now_iso
 from eliza_robot.curriculum.loader import load_curriculum
 from eliza_robot.perception.calibration import CameraIntrinsics
@@ -99,6 +103,7 @@ def _build_drive(task_id: str, curriculum) -> list[tuple[str, dict, bool]]:
 
 
 async def _run(args) -> int:
+    reject_unsupervised_physical_motion("scripts/evidence_sim_real_co_execution.py")
     curriculum = load_curriculum()
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)

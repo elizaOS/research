@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
+import sys
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -102,6 +106,27 @@ def _rehash_trace(payload: dict[str, Any]) -> None:
     _rehash_result(payload)
 
 
+def _collector_result(
+    collector: parity.CollectorKind,
+    config: parity.FixedActionProbeConfig,
+    trace: parity.RawEnvironmentTrace,
+) -> parity.ParityCollectorResult:
+    digest = parity.digest_environment_trace(config, trace, runner_label=collector)
+    draft = parity.ParityCollectorResult(
+        collector=collector,
+        runtime=_runtime_identity(),
+        config=config,
+        trace=digest,
+        payload_sha256="",
+    )
+    return replace(
+        draft,
+        payload_sha256=hashlib.sha256(
+            parity.canonical_json_bytes(draft.unsigned_dict())
+        ).hexdigest(),
+    )
+
+
 def test_matching_traces_produce_canonical_hash_only_result() -> None:
     result = _result()
     payload = result.to_dict()
@@ -125,6 +150,106 @@ def test_matching_traces_produce_canonical_hash_only_result() -> None:
     }
     assert "values" not in transition["reward"]
     assert parity.validate_parity_result(result.canonical_bytes) == result
+
+
+def test_live_orchestration_uses_distinct_collectors_and_detects_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = parity.FixedActionProbeConfig(seed=73, actions=(0, 1, 2))
+    wrapper_trace = _trace(config)
+    direct_trace = _trace(config)
+    calls: list[str] = []
+
+    monkeypatch.setattr(parity, "collect_verified_runtime_identity", _runtime_identity)
+
+    def wrapper_runner(actual: parity.FixedActionProbeConfig) -> parity.RawEnvironmentTrace:
+        assert actual == config
+        calls.append("wrapper")
+        return wrapper_trace
+
+    def direct_runner(actual: parity.FixedActionProbeConfig) -> parity.RawEnvironmentTrace:
+        assert actual == config
+        calls.append("direct")
+        return direct_trace
+
+    monkeypatch.setattr(parity, "_run_wrapper_trace", wrapper_runner)
+    monkeypatch.setattr(parity, "_run_direct_trace", direct_runner)
+    result = parity.run_live_parity_probe(config)
+    assert calls == ["wrapper", "direct"]
+    assert wrapper_trace is not direct_trace
+    assert result.wrapper_trace_sha256 == result.direct_trace_sha256
+
+    first = direct_trace.transitions[0]
+    changed_direct = replace(
+        direct_trace,
+        transitions=(
+            replace(first, reward=np.asarray(123.0, dtype=np.float32)),
+            *direct_trace.transitions[1:],
+        ),
+    )
+    monkeypatch.setattr(parity, "_run_direct_trace", lambda _config: changed_direct)
+    with pytest.raises(parity.ForagerRngParityMismatchError, match="reward"):
+        parity.run_live_parity_probe(config)
+
+
+def test_isolated_collectors_round_trip_and_combine() -> None:
+    config = parity.FixedActionProbeConfig(seed=79, actions=(3, 2, 1, 0))
+    wrapper = _collector_result("wrapper", config, _trace(config))
+    direct = _collector_result("direct", config, _trace(config))
+
+    assert parity.validate_collector_result(wrapper.canonical_bytes) == wrapper
+    assert parity.validate_collector_result(direct.canonical_bytes) == direct
+    combined = parity.compare_collector_results(wrapper, direct)
+    assert combined.wrapper_trace_sha256 == wrapper.trace.trace_sha256
+    assert combined.direct_trace_sha256 == direct.trace.trace_sha256
+
+    with pytest.raises(parity.ForagerRngParityError, match="payload_sha256"):
+        parity.compare_collector_results(
+            wrapper,
+            replace(direct, payload_sha256="0" * 64),
+        )
+
+    changed_trace = _trace(config)
+    changed_first = replace(
+        changed_trace.transitions[0],
+        state={"changed": np.asarray(1, dtype=np.int32)},
+    )
+    changed_direct = _collector_result(
+        "direct",
+        config,
+        replace(
+            changed_trace,
+            transitions=(changed_first, *changed_trace.transitions[1:]),
+        ),
+    )
+    with pytest.raises(parity.ForagerRngParityMismatchError, match="state"):
+        parity.compare_collector_results(wrapper, changed_direct)
+
+
+def test_live_collector_dispatches_only_the_requested_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = parity.FixedActionProbeConfig(seed=83, actions=(0, 3))
+    trace = _trace(config)
+    calls: list[str] = []
+    monkeypatch.setattr(parity, "collect_verified_runtime_identity", _runtime_identity)
+
+    def wrapper_runner(_config: parity.FixedActionProbeConfig) -> parity.RawEnvironmentTrace:
+        calls.append("wrapper")
+        return trace
+
+    def direct_runner(_config: parity.FixedActionProbeConfig) -> parity.RawEnvironmentTrace:
+        calls.append("direct")
+        return trace
+
+    monkeypatch.setattr(parity, "_run_wrapper_trace", wrapper_runner)
+    monkeypatch.setattr(parity, "_run_direct_trace", direct_runner)
+
+    wrapper = parity.run_live_collector(config, "wrapper")
+    assert calls == ["wrapper"]
+    direct = parity.run_live_collector(config, "direct")
+    assert calls == ["wrapper", "direct"]
+    assert parity.compare_collector_results(wrapper, direct).matched_trace == wrapper.trace
 
 
 @pytest.mark.parametrize(
@@ -285,6 +410,79 @@ def test_pytree_fingerprint_is_deterministic_and_rejects_unsafe_leaves() -> None
     ):
         with pytest.raises(parity.ForagerRngParityError):
             parity.fingerprint_pytree(invalid, label="invalid")
+
+
+def test_runtime_verifier_rejects_nonisolated_python() -> None:
+    assert sys.flags.isolated == 0
+    with pytest.raises(parity.ForagerRngParityError, match="-I -B"):
+        parity._validate_isolated_runtime()
+
+
+def test_pinned_upstream_tree_fits_the_fail_closed_verification_budget() -> None:
+    # Git tree a5ad878a... has 12,512 entries, 10,944 blobs, 305,558,868
+    # aggregate blob bytes, and one largest blob of 10,258,251 bytes.
+    assert parity.MAX_TREE_ENTRIES >= 12_512
+    assert parity.MAX_TREE_FILES >= 10_944
+    assert parity.MAX_TREE_BYTES >= 305_558_868
+    assert parity.MAX_TREE_FILE_BYTES >= 10_258_251
+    assert parity.REQUIRED_SOURCE_DIRECTORY_MODES == frozenset({0o555, 0o755})
+
+
+def test_no_follow_tree_walk_rejects_links_and_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"ab")
+    root_mode = stat.S_IMODE(tmp_path.stat().st_mode)
+    file_mode = stat.S_IMODE(payload.stat().st_mode)
+    directories, files = parity._verified_tree_entries(
+        tmp_path,
+        label="synthetic tree",
+        require_read_only=False,
+        capture_contents=True,
+        directory_modes={root_mode},
+        file_modes={file_mode},
+    )
+    assert directories == ()
+    assert files[0].contents == b"ab"
+
+    symlink = tmp_path / "linked.bin"
+    symlink.symlink_to(payload)
+    with pytest.raises(parity.ForagerRngParityError, match="symbolic link"):
+        parity._verified_tree_entries(
+            tmp_path,
+            label="synthetic tree",
+            require_read_only=False,
+            capture_contents=False,
+            directory_modes={root_mode},
+            file_modes={file_mode},
+        )
+    symlink.unlink()
+
+    hardlink = tmp_path / "hard.bin"
+    os.link(payload, hardlink)
+    with pytest.raises(parity.ForagerRngParityError, match="single-link"):
+        parity._verified_tree_entries(
+            tmp_path,
+            label="synthetic tree",
+            require_read_only=False,
+            capture_contents=False,
+            directory_modes={root_mode},
+            file_modes={file_mode},
+        )
+    hardlink.unlink()
+
+    monkeypatch.setattr(parity, "MAX_TREE_BYTES", 1)
+    with pytest.raises(parity.ForagerRngParityError, match="aggregate byte"):
+        parity._verified_tree_entries(
+            tmp_path,
+            label="synthetic tree",
+            require_read_only=False,
+            capture_contents=False,
+            directory_modes={root_mode},
+            file_modes={file_mode},
+        )
 
 
 def test_result_self_hash_detects_plain_tampering_and_external_hash_binds_identity() -> None:

@@ -34,6 +34,7 @@ from eliza_robot.bridge.isaaclab.joint_map import (
     joint_name_to_servo_id,
     radians_to_pulse,
 )
+from eliza_robot.bridge.physical_execution import require_exact_command_ack
 from eliza_robot.bridge.protocol import CommandEnvelope, utc_now_iso
 from eliza_robot.profiles.schema import load_profile
 from eliza_robot.sim2real.sysid import JointFit, _solve_affine
@@ -60,15 +61,15 @@ def _deltas_for(joint_name: str, group: str | None = None) -> tuple[float, ...]:
     return DEFAULT_DELTAS_ARM
 
 
-async def _send(backend: BridgeBackend, cmd: str, payload: dict) -> bool:
-    """Send a command, return True if backend ack was ok."""
+async def _send(backend: BridgeBackend, cmd: str, payload: dict) -> None:
+    """Send a command and fail loudly unless the backend returns exact success."""
     rid = f"sysid-full-{cmd}-{time.time_ns()}"
     env = CommandEnvelope(
         request_id=rid, timestamp=utc_now_iso(),
         command=cmd, payload=payload,
     )
     resp = await backend.handle_command(env)
-    return bool(resp.ok)
+    require_exact_command_ack(resp, command=cmd)
 
 
 async def _read_all_joint_positions(backend: BridgeBackend) -> dict[str, float]:

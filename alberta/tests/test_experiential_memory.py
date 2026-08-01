@@ -71,9 +71,12 @@ def _entry(
     outcome: float = 1.0,
     reward: float = 1.0,
     uncertainty: float = 0.1,
+    uncertainty_available: bool = True,
     safety_cost: float = 0.0,
+    safety_cost_available: bool = True,
     reliability: float = 1.0,
     utility: float = 1.0,
+    utility_available: bool = True,
     representation_version: int = 1,
     valid: bool = True,
     age: int = 0,
@@ -87,9 +90,12 @@ def _entry(
         outcome=jnp.asarray([outcome], dtype=jnp.float32),
         reward=jnp.asarray(reward, dtype=jnp.float32),
         uncertainty=jnp.asarray(uncertainty, dtype=jnp.float32),
+        uncertainty_available=jnp.asarray(uncertainty_available),
         safety_cost=jnp.asarray(safety_cost, dtype=jnp.float32),
+        safety_cost_available=jnp.asarray(safety_cost_available),
         reliability=jnp.asarray(reliability, dtype=jnp.float32),
         utility=jnp.asarray(utility, dtype=jnp.float32),
+        utility_available=jnp.asarray(utility_available),
         representation_version=jnp.asarray(representation_version, dtype=jnp.int32),
         valid=jnp.asarray(valid),
         age=jnp.asarray(age, dtype=jnp.int32),
@@ -209,6 +215,7 @@ def test_empty_query_abstains_with_finite_zero_payload() -> None:
         jnp.asarray([0.0, 0.0]),
         jnp.asarray(1),
         jnp.asarray(0.0),
+        jnp.asarray(True),
     )
 
     assert not bool(retrieval.accepted)
@@ -229,6 +236,7 @@ def test_step_queries_before_writing_current_exemplar() -> None:
         current.key,
         current.representation_version,
         jnp.asarray(0.0),
+        jnp.asarray(True),
         current,
     )
     assert not bool(first.retrieval.accepted)
@@ -242,6 +250,7 @@ def test_step_queries_before_writing_current_exemplar() -> None:
         current.key,
         current.representation_version,
         jnp.asarray(0.0),
+        jnp.asarray(True),
     )
     assert bool(later.accepted)
     np.testing.assert_allclose(later.action, current.action, atol=1e-6)
@@ -268,7 +277,13 @@ def test_similarity_reliability_and_staleness_shape_neighbor_weights() -> None:
         _entry(2, action=(0.0, 1.0), reliability=1.0, age=5),
     )
 
-    retrieval = memory.query(state, jnp.zeros((2,)), jnp.asarray(1), jnp.asarray(0.0))
+    retrieval = memory.query(
+        state,
+        jnp.zeros((2,), dtype=jnp.float32),
+        jnp.asarray(1, dtype=jnp.int32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(True),
+    )
     assert bool(retrieval.accepted)
     assert float(retrieval.action[0]) > 0.98
     assert float(retrieval.action[1]) < 0.02
@@ -287,7 +302,11 @@ def test_similarity_reliability_and_staleness_shape_neighbor_weights() -> None:
         _entry(3, reliability=0.1),
     )
     rejected = low_reliability_memory.query(
-        low_state, jnp.zeros((2,)), jnp.asarray(1), jnp.asarray(0.0)
+        low_state,
+        jnp.zeros((2,), dtype=jnp.float32),
+        jnp.asarray(1, dtype=jnp.int32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(True),
     )
     assert not bool(rejected.accepted)
     assert not bool(rejected.has_neighbors)
@@ -298,12 +317,24 @@ def test_retrieval_gate_fails_closed_for_version_uncertainty_safety_and_distance
     memory = ExperientialMemory(config)
     safe_state = _write(memory, memory.init(), _entry(1))
 
-    wrong_version = memory.query(safe_state, jnp.zeros((2,)), jnp.asarray(2), jnp.asarray(0.0))
+    wrong_version = memory.query(
+        safe_state,
+        jnp.zeros((2,), dtype=jnp.float32),
+        jnp.asarray(2, dtype=jnp.int32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(True),
+    )
     assert not bool(wrong_version.accepted)
     assert not bool(wrong_version.version_compatible)
     np.testing.assert_array_equal(wrong_version.action, jnp.zeros((2,)))
 
-    uncertain_query = memory.query(safe_state, jnp.zeros((2,)), jnp.asarray(1), jnp.asarray(1.01))
+    uncertain_query = memory.query(
+        safe_state,
+        jnp.zeros((2,), dtype=jnp.float32),
+        jnp.asarray(1, dtype=jnp.int32),
+        jnp.asarray(1.01, dtype=jnp.float32),
+        jnp.asarray(True),
+    )
     assert not bool(uncertain_query.accepted)
     assert not bool(uncertain_query.uncertainty_ok)
 
@@ -311,7 +342,11 @@ def test_retrieval_gate_fails_closed_for_version_uncertainty_safety_and_distance
         memory, memory.init(), _entry(2, uncertainty=config.max_uncertainty + 0.1)
     )
     uncertain_memory = memory.query(
-        uncertain_state, jnp.zeros((2,)), jnp.asarray(1), jnp.asarray(0.0)
+        uncertain_state,
+        jnp.zeros((2,), dtype=jnp.float32),
+        jnp.asarray(1, dtype=jnp.int32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(True),
     )
     assert not bool(uncertain_memory.accepted)
     assert not bool(uncertain_memory.uncertainty_ok)
@@ -319,11 +354,23 @@ def test_retrieval_gate_fails_closed_for_version_uncertainty_safety_and_distance
     unsafe_state = _write(
         memory, memory.init(), _entry(3, safety_cost=config.max_safety_cost + 0.1)
     )
-    unsafe = memory.query(unsafe_state, jnp.zeros((2,)), jnp.asarray(1), jnp.asarray(0.0))
+    unsafe = memory.query(
+        unsafe_state,
+        jnp.zeros((2,), dtype=jnp.float32),
+        jnp.asarray(1, dtype=jnp.int32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(True),
+    )
     assert not bool(unsafe.accepted)
     assert not bool(unsafe.safety_ok)
 
-    distant = memory.query(safe_state, jnp.asarray([10.0, 10.0]), jnp.asarray(1), jnp.asarray(0.0))
+    distant = memory.query(
+        safe_state,
+        jnp.asarray([10.0, 10.0], dtype=jnp.float32),
+        jnp.asarray(1, dtype=jnp.int32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(True),
+    )
     assert not bool(distant.accepted)
     assert bool(distant.version_compatible)
     assert not bool(distant.has_neighbors)
@@ -391,6 +438,7 @@ def test_accepted_access_updates_recency_before_deterministic_eviction() -> None
         jnp.asarray([0.0, 0.0]),
         jnp.asarray(1),
         jnp.asarray(0.0),
+        jnp.asarray(True),
         _entry(30, key=(2.0, 0.0)),
     )
 
@@ -434,9 +482,12 @@ def _scan_memory(
             outcome=reward[None],
             reward=reward,
             uncertainty=jnp.asarray(0.1, dtype=jnp.float32),
+            uncertainty_available=jnp.asarray(True),
             safety_cost=jnp.asarray(0.0, dtype=jnp.float32),
+            safety_cost_available=jnp.asarray(True),
             reliability=jnp.asarray(0.9, dtype=jnp.float32),
             utility=jnp.asarray(0.5, dtype=jnp.float32),
+            utility_available=jnp.asarray(True),
             representation_version=jnp.asarray(1, dtype=jnp.int32),
             valid=jnp.asarray(True),
             age=jnp.asarray(0, dtype=jnp.int32),
@@ -448,6 +499,7 @@ def _scan_memory(
             key,
             jnp.asarray(1, dtype=jnp.int32),
             jnp.asarray(0.1, dtype=jnp.float32),
+            jnp.asarray(True),
             entry,
         )
         return result.state, (result.retrieval.accepted, result.retrieval.reward)
@@ -520,6 +572,7 @@ def test_controlled_stale_wrong_version_negative_transfer_is_gated() -> None:
         harmful.key,
         jnp.asarray(2),
         jnp.asarray(0.0),
+        jnp.asarray(True),
     )
     base_action = jnp.asarray([0.4, 0.6], dtype=jnp.float32)
     selected_action = jnp.where(retrieval.accepted, retrieval.action, base_action)
@@ -541,6 +594,122 @@ def test_controlled_stale_wrong_version_negative_transfer_is_gated() -> None:
         fresh.key,
         jnp.asarray(2),
         jnp.asarray(0.0),
+        jnp.asarray(True),
     )
     assert bool(compatible.accepted)
     np.testing.assert_allclose(compatible.action, fresh.action, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("entry_overrides", "missing_field"),
+    [
+        ({"uncertainty": 0.0, "uncertainty_available": False}, "uncertainty_available"),
+        ({"safety_cost": 0.0, "safety_cost_available": False}, "safety_cost_available"),
+    ],
+)
+def test_unavailable_risk_metadata_is_not_treated_as_measured_zero(
+    entry_overrides: dict[str, Any],
+    missing_field: str,
+) -> None:
+    memory = ExperientialMemory(_config(capacity=1, top_k=1))
+    state = _write(memory, memory.init(), _entry(1, **entry_overrides))
+
+    retrieval = memory.query(
+        state,
+        jnp.zeros((2,), dtype=jnp.float32),
+        jnp.asarray(1, dtype=jnp.int32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(True),
+    )
+
+    assert bool(retrieval.state_valid)
+    assert not bool(retrieval.accepted)
+    assert not bool(getattr(retrieval, missing_field))
+    np.testing.assert_array_equal(retrieval.action, jnp.zeros((2,), dtype=jnp.float32))
+
+
+def test_unavailable_query_uncertainty_abstains_even_when_numeric_value_is_zero() -> None:
+    memory = ExperientialMemory(_config(capacity=1, top_k=1))
+    state = _write(memory, memory.init(), _entry(1))
+
+    retrieval = memory.query(
+        state,
+        jnp.zeros((2,), dtype=jnp.float32),
+        jnp.asarray(1, dtype=jnp.int32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(False),
+    )
+
+    assert bool(retrieval.state_valid)
+    assert not bool(retrieval.query_valid)
+    assert not bool(retrieval.uncertainty_available)
+    assert not bool(retrieval.accepted)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        _entry(1, uncertainty=0.1, uncertainty_available=False),
+        _entry(1, safety_cost=0.1, safety_cost_available=False),
+        _entry(1, utility=0.1, utility_available=False),
+    ],
+)
+def test_unavailable_metadata_must_use_an_explicit_zero(
+    entry: ExperientialMemoryEntry,
+) -> None:
+    memory = ExperientialMemory(_config())
+    result = memory.write(memory.init(), entry)
+
+    assert not bool(result.wrote)
+    assert int(result.state.rejected_write_count) == 1
+
+
+def test_same_size_wrong_shapes_and_dtype_aliases_are_rejected_before_tracing() -> None:
+    memory = ExperientialMemory(_config())
+    state = memory.init()
+    wrong_entry = _entry(1).replace(
+        action=jnp.ones((1, 2), dtype=jnp.float32)
+    )
+
+    with pytest.raises(ValueError, match=r"entry\.action must have shape"):
+        memory.write(state, wrong_entry)
+    with pytest.raises(ValueError, match=r"entry\.action must have shape"):
+        jax.jit(lambda current: memory.write(current, wrong_entry))(state)
+    with pytest.raises(TypeError, match="key must have dtype float32"):
+        memory.query(
+            state,
+            jnp.zeros((2,), dtype=jnp.int32),
+            jnp.asarray(1, dtype=jnp.int32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp.asarray(True),
+        )
+
+
+def test_dynamic_state_corruption_makes_query_abstain_and_mutations_exact_noops() -> None:
+    memory = ExperientialMemory(_config())
+    original = memory.init()
+    corrupt = original.replace(active_count=jnp.asarray(1, dtype=jnp.int32))
+    entry = _entry(1)
+    query_args = (
+        jnp.zeros((2,), dtype=jnp.float32),
+        jnp.asarray(1, dtype=jnp.int32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(True),
+    )
+
+    retrieval = memory.query(corrupt, *query_args)
+    write_result = memory.write(corrupt, entry)
+    step_result = memory.step(corrupt, *query_args, entry)
+
+    assert not bool(retrieval.state_valid)
+    assert not bool(retrieval.accepted)
+    chex.assert_tree_all_finite(retrieval)
+    assert not bool(write_result.wrote)
+    assert not bool(step_result.wrote)
+    _assert_trees_equal(write_result.state, corrupt)
+    _assert_trees_equal(step_result.state, corrupt)
+
+    compiled_step = jax.jit(lambda current: memory.step(current, *query_args, entry))
+    compiled_result = compiled_step(corrupt)
+    _assert_trees_equal(compiled_result.state, corrupt)
+    assert not bool(compiled_result.retrieval.state_valid)

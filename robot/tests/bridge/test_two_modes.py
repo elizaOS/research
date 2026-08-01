@@ -92,10 +92,13 @@ async def test_joystick_mode_walk_forward(mock_server: str) -> None:
         telemetry = None
         for _ in range(40):
             frame = json.loads(await ws.recv())
-            if frame.get("type") == "event" and frame.get("event") == "telemetry.basic":
-                if frame["data"]["is_walking"] is True:
-                    telemetry = frame
-                    break
+            if (
+                frame.get("type") == "event"
+                and frame.get("event") == "telemetry.basic"
+                and frame["data"]["is_walking"] is True
+            ):
+                telemetry = frame
+                break
         assert telemetry is not None
         assert telemetry["data"]["walk_x"] == pytest.approx(0.04)
         assert telemetry["data"]["walk_speed"] == 2
@@ -148,7 +151,7 @@ async def test_trained_mode_policy_tick_dispatch(mock_server: str) -> None:
                             "r_hip_pitch": -0.3,
                             "l_hip_pitch": -0.3,
                         },
-                        "duration": 20,
+                        "duration": 0.1,
                     }
                 },
             )
@@ -166,6 +169,10 @@ async def test_trained_mode_policy_tick_dispatch(mock_server: str) -> None:
         assert tick_response is not None
         assert tick_response["ok"], f"tick failed: {tick_response.get('message')}"
         assert tick_response["data"]["step"] == 1
+        assert tick_response["data"]["clamped"]["joint_positions"] == {
+            "r_hip_pitch": -0.3,
+            "l_hip_pitch": -0.3,
+        }
 
         # policy.stop cleans up
         await ws.send(_cmd("policy.stop", {"reason": "test_done"}))
@@ -179,6 +186,64 @@ async def test_trained_mode_policy_tick_dispatch(mock_server: str) -> None:
                 stop_response = frame
                 break
         assert stop_response is not None and stop_response["ok"]
+
+
+@pytest.mark.asyncio
+async def test_trained_mode_enforces_delta_from_last_valid_joint_dispatch(
+    mock_server: str,
+) -> None:
+    """Per-step deltas advance only from successfully dispatched joint targets."""
+    async with connect(mock_server) as ws:
+        json.loads(await ws.recv())
+
+        await ws.send(
+            _cmd(
+                "policy.start",
+                {
+                    "task": "bounded_joint_motion",
+                    "hz": 10,
+                    "max_steps": 100,
+                },
+            )
+        )
+        start_response = await _drain_until_response(ws, "test-policy.start")
+        assert start_response["ok"]
+
+        for target in (0.2, 0.49):
+            await ws.send(
+                _cmd(
+                    "policy.tick",
+                    {
+                        "action": {
+                            "joint_positions": {"r_hip_pitch": target},
+                            "duration": 0.1,
+                        }
+                    },
+                )
+            )
+            tick_response = await _drain_until_response(ws, "test-policy.tick")
+            assert tick_response["ok"], tick_response["message"]
+
+        await ws.send(
+            _cmd(
+                "policy.tick",
+                {
+                    "action": {
+                        # 0.31 rad from the last successful 0.49 target.
+                        "joint_positions": {"r_hip_pitch": 0.8},
+                        "duration": 0.1,
+                    }
+                },
+            )
+        )
+        rejected = await _drain_until_response(ws, "test-policy.tick")
+        assert not rejected["ok"]
+        assert "delta" in rejected["message"]
+        assert "profile max 0.3" in rejected["message"]
+
+        await ws.send(_cmd("policy.status", {}))
+        status = await _drain_until_response(ws, "test-policy.status")
+        assert not status["data"]["active"]
 
 
 @pytest.mark.asyncio
@@ -212,10 +277,12 @@ async def test_manual_command_preempts_active_policy(mock_server: str) -> None:
         saw_preempt = False
         for _ in range(50):
             frame = json.loads(await ws.recv())
-            if frame.get("type") == "event" and frame.get("event") == "policy.status":
-                if frame["data"].get("state") == "idle" and frame["data"].get(
-                    "reason"
-                ) == "manual_preempt":
-                    saw_preempt = True
-                    break
+            if (
+                frame.get("type") == "event"
+                and frame.get("event") == "policy.status"
+                and frame["data"].get("state") == "idle"
+                and frame["data"].get("reason") == "manual_preempt"
+            ):
+                saw_preempt = True
+                break
         assert saw_preempt, "manual command did not preempt active policy"

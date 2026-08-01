@@ -268,7 +268,7 @@ def sweep_joint(joint_name: str, output_path: str, n_frames: int = 60,
     writer = imageio.get_writer(str(out), fps=15, codec="libx264",
                                 quality=8, pixelformat="yuv420p")
 
-    from bridge.isaaclab.ainex_cfg import STAND_JOINT_POSITIONS
+    from eliza_robot.bridge.isaaclab.ainex_cfg import STAND_JOINT_POSITIONS
     base_pose = dict(STAND_JOINT_POSITIONS)
 
     angles = np.linspace(lower * 0.9, upper * 0.9, n_frames)
@@ -315,7 +315,7 @@ def run_viewer(pose: dict[str, float], use_full_mesh: bool = True) -> None:
 
 def run_custom_pose(joint_args: list[str], use_full_mesh: bool = True) -> dict[str, float]:
     """Parse name=value pairs and create a custom pose."""
-    from bridge.isaaclab.ainex_cfg import STAND_JOINT_POSITIONS
+    from eliza_robot.bridge.isaaclab.ainex_cfg import STAND_JOINT_POSITIONS
     pose = dict(STAND_JOINT_POSITIONS)
     for arg in joint_args:
         name, val = arg.split("=")

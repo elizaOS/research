@@ -20,10 +20,8 @@ Pathologies modelled (matching the sim2real research survey):
 from __future__ import annotations
 
 import asyncio
-import math
 import random
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -32,7 +30,6 @@ from eliza_robot.bridge.protocol import (
     CommandEnvelope,
     EventEnvelope,
     ResponseEnvelope,
-    utc_now_iso,
 )
 from eliza_robot.bridge.types import JsonDict
 
@@ -136,9 +133,21 @@ class NoiseInjectorBackend(BridgeBackend):
     def backend_name(self) -> str:
         return f"noisy:{self._inner.backend_name}"
 
+    def physical_motion_resources(self) -> tuple[str, ...]:
+        return self._inner.physical_motion_resources()
+
     def capabilities(self) -> JsonDict:
         caps = dict(self._inner.capabilities())
-        caps.update({"noise_injected": True})
+        # Motor-strength perturbation changes servo targets after an outer
+        # guard. Do not copy the inner backend's safety attestation through a
+        # motion-mutating wrapper.
+        caps.pop("motion_safety", None)
+        caps.update(
+            {
+                "noise_injected": True,
+                "motion_safety_invalidated": "post_guard_noise_transform",
+            }
+        )
         return caps
 
     async def connect(self) -> None:

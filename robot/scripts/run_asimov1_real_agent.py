@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Run the ASIMOV-1 text-conditioned agent against real hardware.
 
-This entrypoint is deliberately gated. Without --allow-motion it only emits a
-launch plan. With --allow-motion it requires a production checkpoint and a
-validated hardware evidence report before connecting to LiveKit or sending
-trajectory commands.
+Without ``--allow-motion`` this entrypoint emits a launch plan. The legacy
+``--allow-motion`` path is quarantined because it called the physical transport
+directly; it fails before connecting until it is replaced by an authenticated
+unified-bridge client.
 """
 
 from __future__ import annotations
@@ -24,6 +24,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from eliza_robot.bridge.backends.asimov_remote import AsimovRemoteBackend  # noqa: E402
+from eliza_robot.bridge.physical_execution import (  # noqa: E402
+    reject_unsupervised_physical_motion,
+)
 from eliza_robot.rl.text_conditioned.inference_loop import (  # noqa: E402
     InferenceLoopConfig,
     run_inference,
@@ -173,6 +176,7 @@ def _write_report(path: Path | None, report: dict[str, Any]) -> None:
 
 
 async def _run_motion(args: argparse.Namespace) -> dict[str, Any]:
+    reject_unsupervised_physical_motion("scripts/run_asimov1_real_agent.py --allow-motion")
     backend = AsimovRemoteBackend(
         mock=False,
         livekit_url=args.url,

@@ -7,6 +7,7 @@ import pytest
 from eliza_robot.asimov_1.livekit_dry_run import DryRunAsimovEdgePb2, DryRunLiveKitRoom
 from eliza_robot.asimov_1.livekit_transport import LiveKitAsimovTransport
 from eliza_robot.asimov_1.real_command_probe import probe_real_command_sequence
+from eliza_robot.bridge.physical_execution import UnsupervisedPhysicalControlError
 
 
 def test_staged_real_command_probe_defaults_to_telemetry_then_damp_only() -> None:
@@ -54,7 +55,7 @@ def test_staged_real_command_probe_rejects_velocity_without_stand_flag() -> None
     asyncio.run(run())
 
 
-def test_staged_real_command_probe_requires_flags_for_stand_and_zero_velocity() -> None:
+def test_staged_real_command_probe_quarantines_stand_and_zero_velocity() -> None:
     async def run() -> None:
         room = DryRunLiveKitRoom()
         transport = LiveKitAsimovTransport(
@@ -64,19 +65,13 @@ def test_staged_real_command_probe_requires_flags_for_stand_and_zero_velocity() 
             edge_pb2=DryRunAsimovEdgePb2,
         )
 
-        async def connect_and_emit(url: str, token: str) -> None:
-            await DryRunLiveKitRoom.connect(room, url, token)
-            room.handlers["data_received"](type("Packet", (), {"topic": "telemetry", "data": b"telemetry"})())
-
-        room.connect = connect_and_emit
-        report = await probe_real_command_sequence(
-            transport,
-            timeout_s=0.1,
-            allow_stand=True,
-            allow_zero_velocity=True,
-        )
-        assert report["ok"] is True
-        assert report["commands_sent"] == ["mode:DAMP", "mode:STAND", "velocity:zero"]
-        assert len(room.local_participant.published) == 3
+        with pytest.raises(UnsupervisedPhysicalControlError, match="quarantined"):
+            await probe_real_command_sequence(
+                transport,
+                timeout_s=0.1,
+                allow_stand=True,
+                allow_zero_velocity=True,
+            )
+        assert room.local_participant.published == []
 
     asyncio.run(run())

@@ -9,7 +9,11 @@ from typing import Any
 from eliza_robot.asimov_1.constants import ASIMOV1_FIRMWARE_JOINT_ORDER
 from eliza_robot.asimov_1.controller import AsimovController
 from eliza_robot.asimov_1.livekit_transport import LiveKitAsimovTransport
-from eliza_robot.bridge.backends.base import BridgeBackend
+from eliza_robot.bridge.backends.base import (
+    BridgeBackend,
+    _physical_motion_authority_error,
+    canonical_physical_resource_id,
+)
 from eliza_robot.bridge.protocol import (
     CommandEnvelope,
     EventEnvelope,
@@ -50,9 +54,21 @@ class AsimovRemoteBackend(BridgeBackend):
         livekit_url: str = "",
         livekit_token: str = "",
         transport: Any | None = None,
+        physical_resource_id: str | None = None,
     ) -> None:
+        if mock:
+            physical_resources: tuple[str, ...] = ()
+        else:
+            if physical_resource_id is None:
+                raise ValueError(
+                    "physical_resource_id is required when mock is false"
+                )
+            physical_resources = (
+                canonical_physical_resource_id(physical_resource_id),
+            )
         self.profile_id = profile_id
         self.mock = mock
+        self._physical_resources = physical_resources
         self.controller = AsimovController()
         self.transport = transport if transport is not None else (
             None if mock else LiveKitAsimovTransport(url=livekit_url, token=livekit_token)
@@ -62,6 +78,9 @@ class AsimovRemoteBackend(BridgeBackend):
     @property
     def backend_name(self) -> str:
         return "asimov_mock" if self.mock else "asimov_remote"
+
+    def physical_motion_resources(self) -> tuple[str, ...]:
+        return self._physical_resources
 
     async def connect(self) -> None:
         if self.transport is not None:
@@ -73,6 +92,14 @@ class AsimovRemoteBackend(BridgeBackend):
             await self.transport.close()
 
     async def handle_command(self, cmd: CommandEnvelope) -> ResponseEnvelope:
+        if not self.mock:
+            authority_error = _physical_motion_authority_error(
+                self.backend_name,
+                self._physical_resources[0],
+                cmd,
+            )
+            if authority_error is not None:
+                return authority_error
         try:
             if cmd.command == "asimov.mode":
                 mode = str(cmd.payload.get("mode", ""))

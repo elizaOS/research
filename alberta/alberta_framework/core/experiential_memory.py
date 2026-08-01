@@ -100,9 +100,12 @@ class ExperientialMemoryEntry:
     outcome: Float[Array, " outcome_dim"]
     reward: Float[Array, ""]
     uncertainty: Float[Array, ""]
+    uncertainty_available: Bool[Array, ""]
     safety_cost: Float[Array, ""]
+    safety_cost_available: Bool[Array, ""]
     reliability: Float[Array, ""]
     utility: Float[Array, ""]
+    utility_available: Bool[Array, ""]
     representation_version: Int[Array, ""]
     valid: Bool[Array, ""]
     age: Int[Array, ""]
@@ -120,9 +123,12 @@ class ExperientialMemoryEntries:
     outcomes: Float[Array, "capacity outcome_dim"]
     rewards: Float[Array, " capacity"]
     uncertainties: Float[Array, " capacity"]
+    uncertainty_available: Bool[Array, " capacity"]
     safety_costs: Float[Array, " capacity"]
+    safety_cost_available: Bool[Array, " capacity"]
     reliabilities: Float[Array, " capacity"]
     utilities: Float[Array, " capacity"]
+    utility_available: Bool[Array, " capacity"]
     representation_versions: Int[Array, " capacity"]
     valid: Bool[Array, " capacity"]
     ages: Int[Array, " capacity"]
@@ -170,9 +176,12 @@ class ExperientialMemoryRetrieval:
     neighbor_reliabilities: Float[Array, " top_k"]
     neighbor_ages: Int[Array, " top_k"]
     neighbor_provenance_ids: Int[Array, " top_k"]
+    state_valid: Bool[Array, ""]
     query_valid: Bool[Array, ""]
     version_compatible: Bool[Array, ""]
     freshness_ok: Bool[Array, ""]
+    uncertainty_available: Bool[Array, ""]
+    safety_cost_available: Bool[Array, ""]
     uncertainty_ok: Bool[Array, ""]
     safety_ok: Bool[Array, ""]
     has_neighbors: Bool[Array, ""]
@@ -296,11 +305,29 @@ def _tree_nbytes(tree: Any) -> int:
 
 def _configured_nbytes(config: ExperientialMemoryConfig) -> tuple[int, int]:
     vector_values = config.observation_dim + config.key_dim + config.action_dim + config.outcome_dim
-    # Five float scalars, six int32 scalars, and one bool per slot.
-    slot_bytes = 4 * (vector_values + 5 + 6) + 1
+    # Five float scalars, six int32 scalars, and four bools per slot.
+    slot_bytes = 4 * (vector_values + 5 + 6) + 4
     # Seven int32 counters and the uint32 byte-count scalar live beside slots.
     persistent_bytes = config.capacity * slot_bytes + 8 * 4
     return persistent_bytes, slot_bytes
+
+
+def _require_array(
+    value: Any,
+    *,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: Any,
+) -> None:
+    """Reject structural drift before eager execution or JAX tracing."""
+    if not hasattr(value, "shape") or not hasattr(value, "dtype"):
+        raise TypeError(f"{name} must be an array with shape and dtype metadata")
+    if tuple(value.shape) != shape:
+        raise ValueError(f"{name} must have shape {shape}; got {tuple(value.shape)}")
+    expected_dtype = jnp.dtype(dtype)
+    actual_dtype = jnp.dtype(value.dtype)
+    if actual_dtype != expected_dtype:
+        raise TypeError(f"{name} must have dtype {expected_dtype}; got {actual_dtype}")
 
 
 class ExperientialMemory:
@@ -351,6 +378,206 @@ class ExperientialMemory:
         inner = cast(dict[str, Any], config["config"])
         return cls(ExperientialMemoryConfig.from_config(inner))
 
+    def _validate_state_static_contract(self, state: ExperientialMemoryState) -> None:
+        """Validate every persistent leaf without reshaping or lossy casting."""
+        if not isinstance(state, ExperientialMemoryState):
+            raise TypeError("state must be an ExperientialMemoryState")
+        if not isinstance(state.entries, ExperientialMemoryEntries):
+            raise TypeError("state.entries must be ExperientialMemoryEntries")
+        cfg = self._config
+        entries = state.entries
+        float_fields = {
+            "observations": (cfg.capacity, cfg.observation_dim),
+            "keys": (cfg.capacity, cfg.key_dim),
+            "actions": (cfg.capacity, cfg.action_dim),
+            "outcomes": (cfg.capacity, cfg.outcome_dim),
+            "rewards": (cfg.capacity,),
+            "uncertainties": (cfg.capacity,),
+            "safety_costs": (cfg.capacity,),
+            "reliabilities": (cfg.capacity,),
+            "utilities": (cfg.capacity,),
+        }
+        for field_name, shape in float_fields.items():
+            _require_array(
+                getattr(entries, field_name),
+                name=f"state.entries.{field_name}",
+                shape=shape,
+                dtype=jnp.float32,
+            )
+        for field_name in (
+            "uncertainty_available",
+            "safety_cost_available",
+            "utility_available",
+            "valid",
+        ):
+            _require_array(
+                getattr(entries, field_name),
+                name=f"state.entries.{field_name}",
+                shape=(cfg.capacity,),
+                dtype=jnp.bool_,
+            )
+        for field_name in (
+            "representation_versions",
+            "ages",
+            "recency_ages",
+            "provenance_ids",
+            "source_ids",
+            "retrieval_counts",
+        ):
+            _require_array(
+                getattr(entries, field_name),
+                name=f"state.entries.{field_name}",
+                shape=(cfg.capacity,),
+                dtype=jnp.int32,
+            )
+        for field_name in (
+            "active_count",
+            "step_count",
+            "query_count",
+            "accepted_query_count",
+            "write_count",
+            "rejected_write_count",
+            "eviction_count",
+        ):
+            _require_array(
+                getattr(state, field_name),
+                name=f"state.{field_name}",
+                shape=(),
+                dtype=jnp.int32,
+            )
+        _require_array(
+            state.persistent_bytes,
+            name="state.persistent_bytes",
+            shape=(),
+            dtype=jnp.uint32,
+        )
+
+    def _validate_entry_static_contract(self, entry: ExperientialMemoryEntry) -> None:
+        """Reject same-size wrong shapes and dtype aliases at the write boundary."""
+        if not isinstance(entry, ExperientialMemoryEntry):
+            raise TypeError("entry must be an ExperientialMemoryEntry")
+        cfg = self._config
+        for field_name, shape in {
+            "observation": (cfg.observation_dim,),
+            "key": (cfg.key_dim,),
+            "action": (cfg.action_dim,),
+            "outcome": (cfg.outcome_dim,),
+            "reward": (),
+            "uncertainty": (),
+            "safety_cost": (),
+            "reliability": (),
+            "utility": (),
+        }.items():
+            _require_array(
+                getattr(entry, field_name),
+                name=f"entry.{field_name}",
+                shape=shape,
+                dtype=jnp.float32,
+            )
+        for field_name in (
+            "uncertainty_available",
+            "safety_cost_available",
+            "utility_available",
+            "valid",
+        ):
+            _require_array(
+                getattr(entry, field_name),
+                name=f"entry.{field_name}",
+                shape=(),
+                dtype=jnp.bool_,
+            )
+        for field_name in (
+            "representation_version",
+            "age",
+            "provenance_id",
+            "source_id",
+        ):
+            _require_array(
+                getattr(entry, field_name),
+                name=f"entry.{field_name}",
+                shape=(),
+                dtype=jnp.int32,
+            )
+
+    def _state_is_valid(self, state: ExperientialMemoryState) -> Bool[Array, ""]:
+        """Return the global dynamic invariant for one structurally valid state."""
+        entries = state.entries
+        valid = entries.valid
+        all_float_payload_finite = (
+            jnp.all(jnp.isfinite(entries.observations))
+            & jnp.all(jnp.isfinite(entries.keys))
+            & jnp.all(jnp.isfinite(entries.actions))
+            & jnp.all(jnp.isfinite(entries.outcomes))
+            & jnp.all(jnp.isfinite(entries.rewards))
+            & jnp.all(jnp.isfinite(entries.uncertainties))
+            & jnp.all(jnp.isfinite(entries.safety_costs))
+            & jnp.all(jnp.isfinite(entries.reliabilities))
+            & jnp.all(jnp.isfinite(entries.utilities))
+        )
+        scalar_ranges_valid = (
+            jnp.all(entries.uncertainties >= 0.0)
+            & jnp.all(entries.safety_costs >= 0.0)
+            & jnp.all((entries.reliabilities >= 0.0) & (entries.reliabilities <= 1.0))
+            & jnp.all(entries.utilities >= 0.0)
+            & jnp.all(entries.ages >= 0)
+            & jnp.all(entries.recency_ages >= 0)
+            & jnp.all(entries.retrieval_counts >= 0)
+        )
+        availability_honest = (
+            jnp.all(entries.uncertainty_available | (entries.uncertainties == 0.0))
+            & jnp.all(entries.safety_cost_available | (entries.safety_costs == 0.0))
+            & jnp.all(entries.utility_available | (entries.utilities == 0.0))
+        )
+        active_metadata_valid = jnp.all(
+            (~valid)
+            | (
+                (entries.representation_versions >= 0)
+                & (entries.provenance_ids >= 0)
+                & (entries.source_ids >= 0)
+            )
+        )
+        inactive_metadata_valid = jnp.all(
+            valid
+            | (
+                (entries.representation_versions == -1)
+                & (entries.provenance_ids == -1)
+                & (entries.source_ids == -1)
+                & (~entries.uncertainty_available)
+                & (~entries.safety_cost_available)
+                & (~entries.utility_available)
+            )
+        )
+        active_count = jnp.sum(valid.astype(jnp.int32))
+        counters_nonnegative = (
+            (state.active_count >= 0)
+            & (state.step_count >= 0)
+            & (state.query_count >= 0)
+            & (state.accepted_query_count >= 0)
+            & (state.write_count >= 0)
+            & (state.rejected_write_count >= 0)
+            & (state.eviction_count >= 0)
+        )
+        counter_relations_valid = (
+            (state.active_count == active_count)
+            & (state.active_count <= self._config.capacity)
+            & (state.accepted_query_count <= state.query_count)
+            & (state.eviction_count <= state.write_count)
+            & (state.write_count >= state.active_count)
+        )
+        return (
+            all_float_payload_finite
+            & scalar_ranges_valid
+            & availability_honest
+            & active_metadata_valid
+            & inactive_metadata_valid
+            & counters_nonnegative
+            & counter_relations_valid
+            & (
+                state.persistent_bytes
+                == jnp.asarray(self._persistent_bytes, dtype=jnp.uint32)
+            )
+        )
+
     def _make_initial_state(self, persistent_bytes: int) -> ExperientialMemoryState:
         cfg = self._config
         zeros = functools.partial(jnp.zeros, dtype=jnp.float32)
@@ -361,9 +588,12 @@ class ExperientialMemory:
             outcomes=zeros((cfg.capacity, cfg.outcome_dim)),
             rewards=zeros((cfg.capacity,)),
             uncertainties=zeros((cfg.capacity,)),
+            uncertainty_available=jnp.zeros((cfg.capacity,), dtype=jnp.bool_),
             safety_costs=zeros((cfg.capacity,)),
+            safety_cost_available=jnp.zeros((cfg.capacity,), dtype=jnp.bool_),
             reliabilities=zeros((cfg.capacity,)),
             utilities=zeros((cfg.capacity,)),
+            utility_available=jnp.zeros((cfg.capacity,), dtype=jnp.bool_),
             representation_versions=jnp.full((cfg.capacity,), -1, dtype=jnp.int32),
             valid=jnp.zeros((cfg.capacity,), dtype=jnp.bool_),
             ages=jnp.zeros((cfg.capacity,), dtype=jnp.int32),
@@ -403,9 +633,16 @@ class ExperientialMemory:
             outcome=jnp.asarray(entry.outcome, dtype=jnp.float32).reshape((cfg.outcome_dim,)),
             reward=jnp.asarray(entry.reward, dtype=jnp.float32).reshape(()),
             uncertainty=jnp.asarray(entry.uncertainty, dtype=jnp.float32).reshape(()),
+            uncertainty_available=jnp.asarray(
+                entry.uncertainty_available, dtype=jnp.bool_
+            ).reshape(()),
             safety_cost=jnp.asarray(entry.safety_cost, dtype=jnp.float32).reshape(()),
+            safety_cost_available=jnp.asarray(
+                entry.safety_cost_available, dtype=jnp.bool_
+            ).reshape(()),
             reliability=jnp.asarray(entry.reliability, dtype=jnp.float32).reshape(()),
             utility=jnp.asarray(entry.utility, dtype=jnp.float32).reshape(()),
+            utility_available=jnp.asarray(entry.utility_available, dtype=jnp.bool_).reshape(()),
             representation_version=jnp.asarray(
                 entry.representation_version, dtype=jnp.int32
             ).reshape(()),
@@ -430,10 +667,13 @@ class ExperientialMemory:
         )
         valid_metadata = (
             (entry.uncertainty >= 0.0)
+            & (entry.uncertainty_available | (entry.uncertainty == 0.0))
             & (entry.safety_cost >= 0.0)
+            & (entry.safety_cost_available | (entry.safety_cost == 0.0))
             & (entry.reliability >= 0.0)
             & (entry.reliability <= 1.0)
             & (entry.utility >= 0.0)
+            & (entry.utility_available | (entry.utility == 0.0))
             & (entry.representation_version >= 0)
             & (entry.age >= 0)
             & (entry.provenance_id >= 0)
@@ -441,26 +681,76 @@ class ExperientialMemory:
         )
         return entry.valid & finite_payload & valid_metadata
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def query(
         self,
         state: ExperientialMemoryState,
         key: Float[Array, " key_dim"],
         representation_version: Int[Array, ""],
         query_uncertainty: Float[Array, ""],
+        query_uncertainty_available: Bool[Array, ""],
     ) -> ExperientialMemoryRetrieval:
-        """Retrieve an eligible weighted neighborhood without mutating state."""
+        """Retrieve an eligible neighborhood without mutating persistent state.
+
+        ``query_uncertainty_available`` is explicit: an unavailable estimate is
+        not interchangeable with a measured zero.  Such a query abstains.
+        """
+        self._validate_state_static_contract(state)
+        _require_array(key, name="key", shape=(self._config.key_dim,), dtype=jnp.float32)
+        _require_array(
+            representation_version,
+            name="representation_version",
+            shape=(),
+            dtype=jnp.int32,
+        )
+        _require_array(
+            query_uncertainty,
+            name="query_uncertainty",
+            shape=(),
+            dtype=jnp.float32,
+        )
+        _require_array(
+            query_uncertainty_available,
+            name="query_uncertainty_available",
+            shape=(),
+            dtype=jnp.bool_,
+        )
+        return cast(
+            ExperientialMemoryRetrieval,
+            self._query_jit(
+                state,
+                key,
+                representation_version,
+                query_uncertainty,
+                query_uncertainty_available,
+            ),
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _query_jit(
+        self,
+        state: ExperientialMemoryState,
+        key: Array,
+        representation_version: Array,
+        query_uncertainty: Array,
+        query_uncertainty_available: Array,
+    ) -> ExperientialMemoryRetrieval:
+        """Compiled query after the public structural contract is established."""
         cfg = self._config
         entries = state.entries
-        query_key = jnp.asarray(key, dtype=jnp.float32).reshape((cfg.key_dim,))
-        query_version = jnp.asarray(representation_version, dtype=jnp.int32).reshape(())
-        query_uncertainty_value = jnp.asarray(query_uncertainty, dtype=jnp.float32).reshape(())
+        query_key = jnp.asarray(key, dtype=jnp.float32)
+        query_version = jnp.asarray(representation_version, dtype=jnp.int32)
+        query_uncertainty_value = jnp.asarray(query_uncertainty, dtype=jnp.float32)
+        query_uncertainty_is_available = jnp.asarray(
+            query_uncertainty_available, dtype=jnp.bool_
+        )
+        state_valid = self._state_is_valid(state)
 
         query_valid = (
             jnp.all(jnp.isfinite(query_key))
             & jnp.isfinite(query_uncertainty_value)
             & (query_uncertainty_value >= 0.0)
             & (query_version >= 0)
+            & query_uncertainty_is_available
         )
 
         finite_rows = (
@@ -491,8 +781,14 @@ class ExperientialMemory:
         )
         same_version = sane_rows & (entries.representation_versions == query_version)
         fresh = same_version & (entries.ages <= cfg.max_age)
-        uncertainty_eligible = fresh & (entries.uncertainties <= cfg.max_uncertainty)
-        safety_eligible = fresh & (entries.safety_costs <= cfg.max_safety_cost)
+        uncertainty_available = fresh & entries.uncertainty_available
+        safety_cost_available = fresh & entries.safety_cost_available
+        uncertainty_eligible = uncertainty_available & (
+            entries.uncertainties <= cfg.max_uncertainty
+        )
+        safety_eligible = safety_cost_available & (
+            entries.safety_costs <= cfg.max_safety_cost
+        )
 
         safe_query_key = jnp.where(jnp.isfinite(query_key), query_key, 0.0)
         safe_keys = jnp.where(finite_rows[:, None], entries.keys, 0.0)
@@ -503,10 +799,19 @@ class ExperientialMemory:
         similarities = jnp.exp(
             -squared_distance / jnp.asarray(cfg.distance_scale, dtype=jnp.float32)
         )
+        safe_ages = jnp.where(entries.ages >= 0, entries.ages, 0)
         staleness = jnp.exp(
-            -entries.ages.astype(jnp.float32) / jnp.asarray(cfg.staleness_scale, dtype=jnp.float32)
+            -safe_ages.astype(jnp.float32)
+            / jnp.asarray(cfg.staleness_scale, dtype=jnp.float32)
         )
-        effective_reliabilities = entries.reliabilities * staleness
+        safe_reliabilities = jnp.where(
+            jnp.isfinite(entries.reliabilities)
+            & (entries.reliabilities >= 0.0)
+            & (entries.reliabilities <= 1.0),
+            entries.reliabilities,
+            0.0,
+        )
+        effective_reliabilities = safe_reliabilities * staleness
         eligible = (
             uncertainty_eligible
             & safety_eligible
@@ -525,21 +830,49 @@ class ExperientialMemory:
         neighbor_ages = entries.ages[indices]
         neighbor_provenance_ids = entries.provenance_ids[indices]
 
-        weighted_observation = jnp.sum(
-            neighbor_weights[:, None] * entries.observations[indices], axis=0
+        safe_observations = jnp.where(
+            jnp.isfinite(entries.observations), entries.observations, 0.0
         )
-        weighted_action = jnp.sum(neighbor_weights[:, None] * entries.actions[indices], axis=0)
-        weighted_outcome = jnp.sum(neighbor_weights[:, None] * entries.outcomes[indices], axis=0)
-        weighted_reward = jnp.sum(neighbor_weights * entries.rewards[indices])
-        weighted_uncertainty = jnp.sum(neighbor_weights * entries.uncertainties[indices])
-        weighted_safety_cost = jnp.sum(neighbor_weights * entries.safety_costs[indices])
+        safe_actions = jnp.where(jnp.isfinite(entries.actions), entries.actions, 0.0)
+        safe_outcomes = jnp.where(jnp.isfinite(entries.outcomes), entries.outcomes, 0.0)
+        safe_rewards = jnp.where(jnp.isfinite(entries.rewards), entries.rewards, 0.0)
+        safe_uncertainties = jnp.where(
+            jnp.isfinite(entries.uncertainties), entries.uncertainties, 0.0
+        )
+        safe_safety_costs = jnp.where(
+            jnp.isfinite(entries.safety_costs), entries.safety_costs, 0.0
+        )
+        weighted_observation = jnp.sum(
+            neighbor_weights[:, None] * safe_observations[indices], axis=0
+        )
+        weighted_action = jnp.sum(
+            neighbor_weights[:, None] * safe_actions[indices], axis=0
+        )
+        weighted_outcome = jnp.sum(
+            neighbor_weights[:, None] * safe_outcomes[indices], axis=0
+        )
+        weighted_reward = jnp.sum(neighbor_weights * safe_rewards[indices])
+        weighted_uncertainty = jnp.sum(
+            neighbor_weights * safe_uncertainties[indices]
+        )
+        weighted_safety_cost = jnp.sum(
+            neighbor_weights * safe_safety_costs[indices]
+        )
         weighted_reliability = jnp.sum(neighbor_weights * effective_reliabilities[indices])
 
         has_neighbors = jnp.sum(neighbor_mask.astype(jnp.int32)) >= cfg.min_neighbors
         version_compatible = jnp.any(same_version)
         freshness_ok = jnp.any(fresh)
-        uncertainty_ok = (query_uncertainty_value <= cfg.max_uncertainty) & jnp.any(
-            uncertainty_eligible
+        uncertainty_is_available = (
+            state_valid
+            & query_uncertainty_is_available
+            & jnp.any(uncertainty_available)
+        )
+        safety_is_available = state_valid & jnp.any(safety_cost_available)
+        uncertainty_ok = (
+            uncertainty_is_available
+            & (query_uncertainty_value <= cfg.max_uncertainty)
+            & jnp.any(uncertainty_eligible)
         )
         safety_ok = jnp.any(safety_eligible)
         aggregate_ok = (
@@ -548,7 +881,8 @@ class ExperientialMemory:
             & jnp.isfinite(weighted_reliability)
         )
         accepted = (
-            query_valid
+            state_valid
+            & query_valid
             & version_compatible
             & freshness_ok
             & uncertainty_ok
@@ -576,9 +910,12 @@ class ExperientialMemory:
             neighbor_reliabilities=neighbor_reliabilities,
             neighbor_ages=neighbor_ages,
             neighbor_provenance_ids=neighbor_provenance_ids,
+            state_valid=state_valid,
             query_valid=query_valid,
             version_compatible=version_compatible,
             freshness_ok=freshness_ok,
+            uncertainty_available=uncertainty_is_available,
+            safety_cost_available=safety_is_available,
             uncertainty_ok=uncertainty_ok,
             safety_ok=safety_ok,
             has_neighbors=has_neighbors,
@@ -606,9 +943,12 @@ class ExperientialMemory:
                 outcomes=entries.outcomes,
                 rewards=entries.rewards,
                 uncertainties=entries.uncertainties,
+                uncertainty_available=entries.uncertainty_available,
                 safety_costs=entries.safety_costs,
+                safety_cost_available=entries.safety_cost_available,
                 reliabilities=entries.reliabilities,
                 utilities=utilities,
+                utility_available=entries.utility_available,
                 representation_versions=entries.representation_versions,
                 valid=entries.valid,
                 ages=ages,
@@ -654,9 +994,12 @@ class ExperientialMemory:
                 outcomes=entries.outcomes,
                 rewards=entries.rewards,
                 uncertainties=entries.uncertainties,
+                uncertainty_available=entries.uncertainty_available,
                 safety_costs=entries.safety_costs,
+                safety_cost_available=entries.safety_cost_available,
                 reliabilities=entries.reliabilities,
                 utilities=entries.utilities,
+                utility_available=entries.utility_available,
                 representation_versions=entries.representation_versions,
                 valid=entries.valid,
                 ages=entries.ages,
@@ -699,9 +1042,14 @@ class ExperientialMemory:
                 + current_entries.recency_ages.astype(jnp.float32)
                 / jnp.asarray(cfg.recency_scale, dtype=jnp.float32)
             )
+            eviction_utilities = jnp.where(
+                current_entries.utility_available,
+                current_entries.utilities,
+                0.0,
+            )
             retention_score = (
                 jnp.asarray(cfg.eviction_utility_weight, dtype=jnp.float32)
-                * current_entries.utilities
+                * eviction_utilities
                 + jnp.asarray(cfg.eviction_recency_weight, dtype=jnp.float32) * recency_score
             )
             retention_score = jnp.where(current_entries.valid, retention_score, jnp.inf)
@@ -719,9 +1067,18 @@ class ExperientialMemory:
                 outcomes=current_entries.outcomes.at[slot].set(entry.outcome),
                 rewards=current_entries.rewards.at[slot].set(entry.reward),
                 uncertainties=current_entries.uncertainties.at[slot].set(entry.uncertainty),
+                uncertainty_available=current_entries.uncertainty_available.at[slot].set(
+                    entry.uncertainty_available
+                ),
                 safety_costs=current_entries.safety_costs.at[slot].set(entry.safety_cost),
+                safety_cost_available=current_entries.safety_cost_available.at[slot].set(
+                    entry.safety_cost_available
+                ),
                 reliabilities=current_entries.reliabilities.at[slot].set(entry.reliability),
                 utilities=current_entries.utilities.at[slot].set(entry.utility),
+                utility_available=current_entries.utility_available.at[slot].set(
+                    entry.utility_available
+                ),
                 representation_versions=current_entries.representation_versions.at[slot].set(
                     entry.representation_version
                 ),
@@ -785,41 +1142,135 @@ class ExperientialMemory:
             evicted_provenance_id=evicted_provenance_id,
         )
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def write(
         self,
         state: ExperientialMemoryState,
         entry: ExperientialMemoryEntry,
     ) -> ExperientialMemoryWriteResult:
-        """Advance time once and attempt one bounded exemplar write."""
-        return self._write_advanced(self._advance(state), entry)
+        """Advance time once and attempt one bounded exemplar write.
+
+        A dynamically corrupt state is an exact no-op rather than a substrate
+        into which new data is partially written.
+        """
+        self._validate_state_static_contract(state)
+        self._validate_entry_static_contract(entry)
+        return cast(ExperientialMemoryWriteResult, self._write_jit(state, entry))
 
     @functools.partial(jax.jit, static_argnums=(0,))
+    def _write_jit(
+        self,
+        state: ExperientialMemoryState,
+        entry: ExperientialMemoryEntry,
+    ) -> ExperientialMemoryWriteResult:
+        def apply(_: None) -> ExperientialMemoryWriteResult:
+            return self._write_advanced(self._advance(state), entry)
+
+        def reject(_: None) -> ExperientialMemoryWriteResult:
+            return ExperientialMemoryWriteResult(
+                state=state,
+                wrote=jnp.asarray(False),
+                slot=jnp.asarray(-1, dtype=jnp.int32),
+                evicted=jnp.asarray(False),
+                evicted_provenance_id=jnp.asarray(-1, dtype=jnp.int32),
+            )
+
+        return cast(
+            ExperientialMemoryWriteResult,
+            jax.lax.cond(self._state_is_valid(state), apply, reject, operand=None),
+        )
+
     def step(
         self,
         state: ExperientialMemoryState,
         query_key: Float[Array, " key_dim"],
         representation_version: Int[Array, ""],
         query_uncertainty: Float[Array, ""],
+        query_uncertainty_available: Bool[Array, ""],
         entry: ExperientialMemoryEntry,
     ) -> ExperientialMemoryStepResult:
         """Query the pre-write state, then age/access/write exactly once."""
-        retrieval = self.query(
+        self._validate_state_static_contract(state)
+        self._validate_entry_static_contract(entry)
+        _require_array(
+            query_key,
+            name="query_key",
+            shape=(self._config.key_dim,),
+            dtype=jnp.float32,
+        )
+        _require_array(
+            representation_version,
+            name="representation_version",
+            shape=(),
+            dtype=jnp.int32,
+        )
+        _require_array(
+            query_uncertainty,
+            name="query_uncertainty",
+            shape=(),
+            dtype=jnp.float32,
+        )
+        _require_array(
+            query_uncertainty_available,
+            name="query_uncertainty_available",
+            shape=(),
+            dtype=jnp.bool_,
+        )
+        return cast(
+            ExperientialMemoryStepResult,
+            self._step_jit(
+                state,
+                query_key,
+                representation_version,
+                query_uncertainty,
+                query_uncertainty_available,
+                entry,
+            ),
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _step_jit(
+        self,
+        state: ExperientialMemoryState,
+        query_key: Array,
+        representation_version: Array,
+        query_uncertainty: Array,
+        query_uncertainty_available: Array,
+        entry: ExperientialMemoryEntry,
+    ) -> ExperientialMemoryStepResult:
+        retrieval = self._query_jit(
             state,
             query_key,
             representation_version,
             query_uncertainty,
+            query_uncertainty_available,
         )
-        advanced = self._advance(state)
-        accessed = self._record_query(advanced, retrieval)
-        write_result = self._write_advanced(accessed, entry)
-        return ExperientialMemoryStepResult(
-            state=write_result.state,
-            retrieval=retrieval,
-            wrote=write_result.wrote,
-            slot=write_result.slot,
-            evicted=write_result.evicted,
-            evicted_provenance_id=write_result.evicted_provenance_id,
+
+        def apply(_: None) -> ExperientialMemoryStepResult:
+            advanced = self._advance(state)
+            accessed = self._record_query(advanced, retrieval)
+            write_result = self._write_advanced(accessed, entry)
+            return ExperientialMemoryStepResult(
+                state=write_result.state,
+                retrieval=retrieval,
+                wrote=write_result.wrote,
+                slot=write_result.slot,
+                evicted=write_result.evicted,
+                evicted_provenance_id=write_result.evicted_provenance_id,
+            )
+
+        def reject(_: None) -> ExperientialMemoryStepResult:
+            return ExperientialMemoryStepResult(
+                state=state,
+                retrieval=retrieval,
+                wrote=jnp.asarray(False),
+                slot=jnp.asarray(-1, dtype=jnp.int32),
+                evicted=jnp.asarray(False),
+                evicted_provenance_id=jnp.asarray(-1, dtype=jnp.int32),
+            )
+
+        return cast(
+            ExperientialMemoryStepResult,
+            jax.lax.cond(self._state_is_valid(state), apply, reject, operand=None),
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))

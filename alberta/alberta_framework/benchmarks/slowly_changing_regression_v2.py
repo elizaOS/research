@@ -146,7 +146,42 @@ _REGULAR_READ_FLAGS = (
 )
 _INT32_MAX = 0x7FFF_FFFF
 _FUTURE_TIMESTAMP_TOLERANCE_SECONDS = 5
-_RUNTIME_DISTRIBUTIONS = ("chex", "jax", "jaxlib", "numpy", "jaxtyping")
+_RUNTIME_DISTRIBUTIONS = (
+    "absl-py",
+    "aiofiles",
+    "chex",
+    "cloudpickle",
+    "etils",
+    "humanize",
+    "jax",
+    "jaxlib",
+    "jaxtyping",
+    "ml-dtypes",
+    "msgpack",
+    "numpy",
+    "opt-einsum",
+    "orbax-checkpoint",
+    "prometheus-client",
+    "protobuf",
+    "psutil",
+    "pygments",
+    "pyyaml",
+    "scipy",
+    "simplejson",
+    "tensorstore",
+    "toolz",
+    "typing-extensions",
+    "uvloop",
+    "wadler-lindig",
+)
+_RUNTIME_DISTRIBUTION_CONTENT_SCOPE = (
+    "explicit_clean_import_observed_plus_required_dependency_set"
+)
+_UNBOUND_RUNTIME_SCOPE = (
+    "system_shared_libraries_loaded_by_python_or_extension_modules",
+    "device_drivers_and_firmware",
+    "dynamically_loaded_code_outside_distribution_file_manifests",
+)
 
 _PLAN_COMMANDS = {
     "run_shard": (
@@ -191,6 +226,12 @@ class SCRV2ValidationReport:
     errors: tuple[str, ...]
     structurally_valid: bool = False
     computational_replay_performed: bool = False
+
+
+def _validation_failure_message(exc: Exception) -> str:
+    if isinstance(exc, (OSError, ValueError, OverflowError)):
+        return str(exc)
+    return f"unexpected validation failure ({type(exc).__name__}): {exc}"
 
 
 @chex.dataclass(frozen=True)
@@ -387,7 +428,10 @@ def _require_not_future_unix(value: object, where: str) -> int:
     timestamp = cast(int, value)
     _require(
         timestamp <= int(time.time()) + _FUTURE_TIMESTAMP_TOLERANCE_SECONDS,
-        f"{where} cannot be in the future",
+        (
+            f"{where} cannot be in the future beyond the "
+            f"{_FUTURE_TIMESTAMP_TOLERANCE_SECONDS}-second clock-skew tolerance"
+        ),
     )
     return timestamp
 
@@ -656,6 +700,31 @@ def _read_regular_bytes(path: Path, *, require_immutable: bool) -> bytes:
         os.close(directory_fd)
 
 
+def _unlink_locator_if_held_identity(
+    name: str,
+    directory_fd: int,
+    held: os.stat_result,
+) -> tuple[bool, bool]:
+    """Unlink only a locator still identifying the descriptor-held inode.
+
+    The first boolean says that the locator was either safely absent or removed;
+    the second says that this call removed it.  An unknown substitution is left
+    untouched for the actor that owns it to recover.
+    """
+
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True, False
+    if (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
+        return False, False
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return True, False
+    return True, True
+
+
 def _atomic_write_new(path: Path, data: bytes) -> Path:
     """Durably publish descriptor-held immutable bytes without replacing paths."""
 
@@ -664,6 +733,7 @@ def _atomic_write_new(path: Path, data: bytes) -> Path:
     file_fd = -1
     target_linked = False
     completed = False
+    held_source: os.stat_result | None = None
     try:
         _assert_parent_locator_stable(destination, directory_fd)
         try:
@@ -697,6 +767,7 @@ def _atomic_write_new(path: Path, data: bytes) -> Path:
             remaining = remaining[written:]
         os.fchmod(file_fd, 0o444)
         os.fsync(file_fd)
+        held_source = os.fstat(file_fd)
         _assert_parent_locator_stable(destination, directory_fd)
         try:
             os.link(
@@ -723,14 +794,16 @@ def _atomic_write_new(path: Path, data: bytes) -> Path:
             or not stat.S_ISREG(target.st_mode)
             or stat.S_IMODE(target.st_mode) != 0o444
         ):
-            os.unlink(destination.name, dir_fd=directory_fd)
-            target_linked = False
-            os.fsync(directory_fd)
             _fail("published path does not identify the descriptor-held temporary file")
-        try:
-            os.unlink(temporary_name, dir_fd=directory_fd)
-        except FileNotFoundError:
-            pass
+        temporary_safe, _ = _unlink_locator_if_held_identity(
+            temporary_name,
+            directory_fd,
+            source,
+        )
+        _require(
+            temporary_safe,
+            "temporary output locator was replaced after publication",
+        )
         temporary_name = ""
         os.fsync(directory_fd)
         final_target = os.stat(
@@ -751,37 +824,55 @@ def _atomic_write_new(path: Path, data: bytes) -> Path:
             published = _read_regular_bytes(destination, require_immutable=True)
             _require(published == data, "published output bytes differ from supplied bytes")
         except BaseException:
-            try:
-                os.unlink(destination.name, dir_fd=directory_fd)
+            target_safe, target_removed = _unlink_locator_if_held_identity(
+                destination.name,
+                directory_fd,
+                source,
+            )
+            if target_safe:
                 target_linked = False
+            if target_removed:
                 os.fsync(directory_fd)
-            except FileNotFoundError:
-                pass
             raise
+        post_read_source = os.fstat(file_fd)
+        post_read_target = os.stat(
+            destination.name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        _require(
+            _stable_stat_signature(final_target)
+            == _stable_stat_signature(post_read_source)
+            == _stable_stat_signature(post_read_target),
+            "published output identity or metadata changed after final readback",
+        )
         _assert_parent_locator_stable(destination, directory_fd)
         completed = True
         return destination
     finally:
-        if target_linked and not completed and file_fd >= 0:
-            try:
-                source = os.fstat(file_fd)
-                target = os.stat(
-                    destination.name,
-                    dir_fd=directory_fd,
-                    follow_symlinks=False,
-                )
-                if (source.st_dev, source.st_ino) == (target.st_dev, target.st_ino):
-                    os.unlink(destination.name, dir_fd=directory_fd)
+        cleanup_source = held_source
+        if cleanup_source is None and file_fd >= 0:
+            cleanup_source = os.fstat(file_fd)
+        if target_linked and not completed and cleanup_source is not None:
+            target_safe, target_removed = _unlink_locator_if_held_identity(
+                destination.name,
+                directory_fd,
+                cleanup_source,
+            )
+            if target_safe:
+                target_linked = False
+                if target_removed:
                     os.fsync(directory_fd)
-            except FileNotFoundError:
-                pass
         if file_fd >= 0:
             os.close(file_fd)
-        if temporary_name:
-            try:
-                os.unlink(temporary_name, dir_fd=directory_fd)
-            except FileNotFoundError:
-                pass
+        if temporary_name and cleanup_source is not None:
+            _, temporary_removed = _unlink_locator_if_held_identity(
+                temporary_name,
+                directory_fd,
+                cleanup_source,
+            )
+            if temporary_removed:
+                os.fsync(directory_fd)
         os.close(directory_fd)
 
 
@@ -998,6 +1089,18 @@ def _runtime_json_value(value: object) -> str | int | float | bool | None:
 def _discover_runtime_manifest() -> dict[str, Any]:
     executable_path = Path(sys.executable).resolve(strict=True)
     executable_raw = _read_regular_bytes(executable_path, require_immutable=False)
+    distribution_content = {
+        name: _distribution_content_identity(name) for name in _RUNTIME_DISTRIBUTIONS
+    }
+    missing_distributions = sorted(
+        name
+        for name, identity in distribution_content.items()
+        if identity["status"] != "content_hashed"
+    )
+    _require(
+        not missing_distributions,
+        f"active runtime distributions are not installed: {missing_distributions}",
+    )
     devices = [
         {
             "id": int(device.id),
@@ -1023,10 +1126,9 @@ def _discover_runtime_manifest() -> dict[str, Any]:
         "numpy": np.__version__,
         "chex": _distribution_version("chex"),
         "jaxtyping": _distribution_version("jaxtyping"),
-        "distribution_content": {
-            name: _distribution_content_identity(name)
-            for name in _RUNTIME_DISTRIBUTIONS
-        },
+        "distribution_content_scope": _RUNTIME_DISTRIBUTION_CONTENT_SCOPE,
+        "distribution_content": distribution_content,
+        "unbound_runtime_scope": list(_UNBOUND_RUNTIME_SCOPE),
         "platform_system": platform.system(),
         "platform_machine": platform.machine(),
         "platform_release": platform.release(),
@@ -1486,7 +1588,9 @@ def _validate_runtime_manifest(value: object, where: str) -> dict[str, Any]:
         "numpy",
         "chex",
         "jaxtyping",
+        "distribution_content_scope",
         "distribution_content",
+        "unbound_runtime_scope",
         "platform_system",
         "platform_machine",
         "platform_release",
@@ -1505,6 +1609,7 @@ def _validate_runtime_manifest(value: object, where: str) -> dict[str, Any]:
         "schema",
         "python_executable",
         "distribution_content",
+        "unbound_runtime_scope",
         "jax_devices",
         "jax_enable_x64",
         "jax_config",
@@ -1515,6 +1620,14 @@ def _validate_runtime_manifest(value: object, where: str) -> dict[str, Any]:
             f"{where}.{key} must be a nonempty string",
         )
     _require(type(runtime["jax_enable_x64"]) is bool, f"{where}.jax_enable_x64 must be boolean")
+    _require(
+        runtime["distribution_content_scope"] == _RUNTIME_DISTRIBUTION_CONTENT_SCOPE,
+        f"{where}.distribution_content_scope differs",
+    )
+    _require(
+        _json_exact_equal(runtime["unbound_runtime_scope"], list(_UNBOUND_RUNTIME_SCOPE)),
+        f"{where}.unbound_runtime_scope differs",
+    )
     executable = _expect_dict(runtime["python_executable"], f"{where}.python_executable")
     _expect_exact_keys(
         executable,
@@ -1814,12 +1927,14 @@ def _read_validated_plan(
     verify_current_bindings: bool,
 ) -> tuple[bytes, dict[str, Any]]:
     raw, plan = _read_strict_json(path)
-    _validate_plan_payload(plan, verify_current_bindings=verify_current_bindings)
+    _validate_plan_payload(plan, verify_current_bindings=False)
     _require(
         raw == _canonical_json_bytes(plan),
         "run plan must use the canonical v2 JSON encoding",
     )
     _require_exact_reread(path, raw, "run plan")
+    if verify_current_bindings:
+        _require_current_plan_bindings(plan, "run-plan validation after final reread")
     return raw, plan
 
 
@@ -1832,8 +1947,8 @@ def validate_scr_v2_run_plan(
 
     try:
         _read_validated_plan(path, verify_current_bindings=verify_current_bindings)
-    except (OSError, ValueError, OverflowError) as exc:
-        return SCRV2ValidationReport(False, False, (str(exc),))
+    except Exception as exc:
+        return SCRV2ValidationReport(False, False, (_validation_failure_message(exc),))
     if not verify_current_bindings:
         return SCRV2ValidationReport(
             False,
@@ -2050,9 +2165,23 @@ def _default_shard_path(plan_path: Path, method_id: str, seed_id: int) -> Path:
     return _lexical_absolute(plan_path).parent / "shards" / method_id / f"seed-{seed_id:04d}.json"
 
 
-def _shard_reservation_path(output_path: Path) -> Path:
-    destination = _lexical_absolute(output_path)
-    return destination.with_name(f"{destination.name}.reservation")
+def _shard_reservation_path(
+    plan_path: Path,
+    plan_raw: bytes,
+    method_id: str,
+    seed_id: int,
+) -> Path:
+    """Return the sole reservation locator for one plan/method/seed identity."""
+
+    canonical_plan = _lexical_absolute(plan_path)
+    plan_digest = _sha256_bytes(plan_raw)
+    return (
+        canonical_plan.parent
+        / "reservations"
+        / plan_digest
+        / method_id
+        / f"seed-{seed_id:010d}.reservation"
+    )
 
 
 def _build_shard_reservation(
@@ -2104,16 +2233,16 @@ def run_scr_v2_shard(
     _validate_seed_ids((seed_id,))
     requested_output = output or _default_shard_path(plan_path, method_id, seed_id)
     destination = _preflight_new_output(requested_output)
-    reservation_path = _shard_reservation_path(destination)
-    _require(
-        reservation_path != _lexical_absolute(plan_path),
-        "shard reservation and plan locators must be distinct",
-    )
-    _preflight_new_output(reservation_path)
     plan_raw, plan = _read_validated_plan(plan_path, verify_current_bindings=True)
     run_spec, config, params, methods, seeds, bin_size = _validate_run_spec(plan["run_spec"])
     _require(method_id in methods, f"method {method_id!r} is not planned")
     _require(_is_int(seed_id) and seed_id in seeds, f"seed {seed_id!r} is not planned")
+    reservation_path = _shard_reservation_path(plan_path, plan_raw, method_id, seed_id)
+    _require(
+        reservation_path not in {_lexical_absolute(plan_path), destination},
+        "plan, shard reservation, and shard locators must be distinct",
+    )
+    _preflight_new_output(reservation_path)
     prescribed_command = _build_command_provenance(
         _canonical_shard_semantic_argv(
             _sha256_bytes(plan_raw), method_id, seed_id, destination
@@ -2162,6 +2291,11 @@ def run_scr_v2_shard(
             "byte_size": len(plan_raw),
             "sha256": _sha256_bytes(plan_raw),
         },
+        "reservation_binding": {
+            "path": _canonical_path(reservation_path),
+            "byte_size": len(reservation_raw),
+            "sha256": _sha256_bytes(reservation_raw),
+        },
         "run_spec_sha256": _sha256_json(run_spec),
         "source_manifest_sha256": plan["source_manifest_sha256"],
         "runtime_manifest_sha256": plan["runtime_manifest_sha256"],
@@ -2183,13 +2317,13 @@ def run_scr_v2_shard(
         },
     }
     encoded = _canonical_json_bytes(shard)
-    _require_current_plan_bindings(plan, "final shard publication")
     _require_exact_reread(plan_path, plan_raw, "external run plan")
     _require_exact_reread(
         reservation_path,
         reservation_raw,
         "persistent shard reservation",
     )
+    _require_current_plan_bindings(plan, "final shard publication after final rereads")
     return _atomic_write_new(destination, encoded)
 
 
@@ -2203,6 +2337,116 @@ def _validate_plan_binding(value: object, plan_raw: bytes, where: str) -> None:
     _require(_is_sha256(binding["sha256"]), f"{where}.sha256 invalid")
     _require(binding["byte_size"] == len(plan_raw), f"{where}.byte_size mismatch")
     _require(binding["sha256"] == _sha256_bytes(plan_raw), f"{where}.sha256 mismatch")
+
+
+def _validate_shard_reservation(
+    value: object,
+    *,
+    plan_path: Path,
+    plan_raw: bytes,
+    method_id: str,
+    seed_id: int,
+    shard_path: Path,
+    prescribed_command: Mapping[str, Any],
+) -> tuple[Path, bytes]:
+    binding = _expect_dict(value, "reservation_binding")
+    _expect_exact_keys(
+        binding,
+        {"path", "byte_size", "sha256"},
+        "reservation_binding",
+    )
+    reservation_locator = _canonical_absolute_locator(
+        binding["path"],
+        "reservation_binding.path",
+    )
+    expected_path = _shard_reservation_path(plan_path, plan_raw, method_id, seed_id)
+    _require(
+        reservation_locator == _canonical_path(expected_path),
+        "reservation locator differs from the canonical plan/method/seed identity",
+    )
+    _require(
+        _is_int(binding["byte_size"]) and binding["byte_size"] >= 0,
+        "reservation_binding.byte_size invalid",
+    )
+    _require(_is_sha256(binding["sha256"]), "reservation_binding.sha256 invalid")
+    reservation_raw, reservation = _read_strict_json(expected_path)
+    _require(
+        reservation_raw == _canonical_json_bytes(reservation),
+        "shard reservation must use the canonical v2 JSON encoding",
+    )
+    _require(
+        binding["byte_size"] == len(reservation_raw)
+        and binding["sha256"] == _sha256_bytes(reservation_raw),
+        "shard reservation size/hash binding mismatch",
+    )
+    _expect_exact_keys(
+        reservation,
+        {
+            "schema",
+            "benchmark",
+            "evidence_role",
+            "scientific_promotion_allowed",
+            "state",
+            "reserved_unix",
+            "timestamp_semantics",
+            "external_chronology_attestation_present",
+            "plan_locator",
+            "plan_binding",
+            "method_id",
+            "seed_id",
+            "target_locator",
+            "prescribed_command",
+        },
+        "shard reservation",
+    )
+    _require(
+        reservation["schema"] == SCR_V2_SHARD_RESERVATION_SCHEMA,
+        "wrong shard reservation schema",
+    )
+    _require(reservation["benchmark"] == SCR_V2_BENCHMARK, "wrong reservation benchmark")
+    _require(
+        reservation["evidence_role"] == SCR_V2_EVIDENCE_ROLE,
+        "wrong reservation evidence role",
+    )
+    _require(
+        reservation["scientific_promotion_allowed"] is False,
+        "reservation must be nonpromoting",
+    )
+    _require(
+        reservation["state"] == "execution_started_development_seed_irrevocably_consumed",
+        "wrong shard reservation state",
+    )
+    _require_not_future_unix(reservation["reserved_unix"], "reservation reserved_unix")
+    _require(
+        reservation["timestamp_semantics"]
+        == "self_reported_diagnostic_only_not_external_chronology",
+        "wrong reservation timestamp semantics",
+    )
+    _require(
+        reservation["external_chronology_attestation_present"] is False,
+        "reservation cannot claim external chronology",
+    )
+    _require(
+        _canonical_absolute_locator(reservation["plan_locator"], "reservation.plan_locator")
+        == _canonical_path(plan_path),
+        "reservation plan locator mismatch",
+    )
+    _validate_plan_binding(reservation["plan_binding"], plan_raw, "reservation.plan_binding")
+    _require(reservation["method_id"] == method_id, "reservation method identity mismatch")
+    _require(reservation["seed_id"] == seed_id, "reservation seed identity mismatch")
+    _require(
+        _canonical_absolute_locator(
+            reservation["target_locator"],
+            "reservation.target_locator",
+        )
+        == _canonical_path(shard_path),
+        "reservation shard target locator mismatch",
+    )
+    _require(
+        _json_exact_equal(reservation["prescribed_command"], dict(prescribed_command)),
+        "reservation prescribed command differs from the shard command",
+    )
+    return expected_path, reservation_raw
 
 
 def _validate_environment_identity(
@@ -2223,8 +2467,9 @@ def _validate_shard_payload(
     value: object,
     plan: dict[str, Any],
     plan_raw: bytes,
+    plan_path: Path,
     shard_path: Path,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], Path, bytes]:
     shard = _expect_dict(value, "shard")
     _expect_exact_keys(
         shard,
@@ -2234,6 +2479,7 @@ def _validate_shard_payload(
             "evidence_role",
             "scientific_promotion_allowed",
             "plan_binding",
+            "reservation_binding",
             "run_spec_sha256",
             "source_manifest_sha256",
             "runtime_manifest_sha256",
@@ -2309,7 +2555,7 @@ def _validate_shard_payload(
         execution["source_manifest_sha256"] == plan["source_manifest_sha256"],
         "worker source differs from plan",
     )
-    _validate_command_provenance(
+    command = _validate_command_provenance(
         execution["command"],
         _canonical_shard_semantic_argv(
             _sha256_bytes(plan_raw),
@@ -2334,7 +2580,16 @@ def _validate_shard_payload(
         all(isinstance(value, float) and math.isfinite(value) and value >= 0.0 for value in curve),
         "shard curve must be finite and nonnegative",
     )
-    return shard
+    reservation_path, reservation_raw = _validate_shard_reservation(
+        shard["reservation_binding"],
+        plan_path=plan_path,
+        plan_raw=plan_raw,
+        method_id=cast(str, shard["method_id"]),
+        seed_id=seed_id,
+        shard_path=shard_path,
+        prescribed_command=command,
+    )
+    return shard, reservation_path, reservation_raw
 
 
 def _validate_replayed_measurements(shard: dict[str, Any], plan: dict[str, Any]) -> None:
@@ -2377,20 +2632,34 @@ def validate_scr_v2_shard(
         )
         raw, shard = _read_strict_json(shard_path)
         _require(raw == _canonical_json_bytes(shard), "shard must use canonical v2 JSON encoding")
-        validated_shard = _validate_shard_payload(shard, plan, plan_raw, shard_path)
+        validated_shard, reservation_path, reservation_raw = _validate_shard_payload(
+            shard,
+            plan,
+            plan_raw,
+            plan_path,
+            shard_path,
+        )
         structurally_valid = True
         if replay_measurements:
             _validate_replayed_measurements(validated_shard, plan)
             replay_performed = True
-        if verify_current_bindings:
-            _require_current_plan_bindings(plan, "final shard validation")
         _require_exact_reread(plan_path, plan_raw, "external run plan")
         _require_exact_reread(shard_path, raw, "validated shard")
-    except (OSError, ValueError, OverflowError) as exc:
+        _require_exact_reread(
+            reservation_path,
+            reservation_raw,
+            "validated shard reservation",
+        )
+        if verify_current_bindings:
+            _require_current_plan_bindings(
+                plan,
+                "final shard validation after final rereads",
+            )
+    except Exception as exc:
         return SCRV2ValidationReport(
             False,
             False,
-            (str(exc),),
+            (_validation_failure_message(exc),),
             structurally_valid=structurally_valid,
             computational_replay_performed=replay_performed,
         )
@@ -2518,10 +2787,17 @@ def merge_scr_v2_shards(
     )
     shards: dict[tuple[str, int], dict[str, Any]] = {}
     raw_by_pair: dict[tuple[str, int], tuple[Path, bytes]] = {}
+    reservation_by_pair: dict[tuple[str, int], tuple[Path, bytes]] = {}
     environment_by_seed: dict[int, str] = {}
     for path in canonical_shard_paths:
         raw, shard = _read_strict_json(path)
-        _validate_shard_payload(shard, plan, plan_raw, path)
+        validated_shard, reservation_path, reservation_raw = _validate_shard_payload(
+            shard,
+            plan,
+            plan_raw,
+            canonical_plan_path,
+            path,
+        )
         _require(raw == _canonical_json_bytes(shard), "shard must use canonical v2 JSON encoding")
         pair = (cast(str, shard["method_id"]), cast(int, shard["seed_id"]))
         _require(pair not in shards, f"duplicate method/seed shard: {pair}")
@@ -2530,9 +2806,14 @@ def merge_scr_v2_shards(
         _require(
             previous == identity, f"methods do not share environment identity for seed {pair[1]}"
         )
-        shards[pair] = shard
+        shards[pair] = validated_shard
         raw_by_pair[pair] = (path, raw)
+        reservation_by_pair[pair] = (reservation_path, reservation_raw)
     _require(set(shards) == expected_pairs, "observed method/seed coverage differs from plan")
+    _require(
+        len({path for path, _ in reservation_by_pair.values()}) == len(expected_pairs),
+        "reservation locators are not unique across planned identities",
+    )
     for method in methods:
         for seed in seeds:
             _validate_replayed_measurements(shards[(method, seed)], plan)
@@ -2611,10 +2892,20 @@ def merge_scr_v2_shards(
     }
     _require(_json_exact_equal(run_spec, plan["run_spec"]), "internal run-spec mismatch")
     encoded = _canonical_json_bytes(artifact)
-    _require_current_plan_bindings(plan, "final artifact publication")
     _require_exact_reread(canonical_plan_path, plan_raw, "external run plan")
-    for path, raw in raw_by_pair.values():
+    for pair in sorted(raw_by_pair):
+        path, raw = raw_by_pair[pair]
         _require_exact_reread(path, raw, f"merge input shard {path}")
+        reservation_path, reservation_raw = reservation_by_pair[pair]
+        _require_exact_reread(
+            reservation_path,
+            reservation_raw,
+            f"merge input shard reservation {reservation_path}",
+        )
+    _require_current_plan_bindings(
+        plan,
+        "final artifact publication after final rereads",
+    )
     return _atomic_write_new(destination, encoded)
 
 
@@ -2671,9 +2962,7 @@ def _validate_artifact_payload(
     _require(artifact["evidence_role"] == SCR_V2_EVIDENCE_ROLE, "wrong artifact evidence role")
     _require(artifact["scientific_promotion_allowed"] is False, "artifact must be nonpromoting")
     _require_not_future_unix(artifact["created_unix"], "artifact created_unix")
-    plan = _validate_plan_payload(
-        artifact["run_plan"], verify_current_bindings=verify_current_bindings
-    )
+    plan = _validate_plan_payload(artifact["run_plan"], verify_current_bindings=False)
     plan_raw = _canonical_json_bytes(plan)
     _validate_plan_binding(artifact["plan_binding"], plan_raw, "artifact.plan_binding")
     external_plan = _expect_dict(artifact["external_plan"], "external_plan")
@@ -2693,7 +2982,7 @@ def _validate_artifact_payload(
     external_plan_path = Path(external_plan_locator)
     external_plan_raw, external_plan_payload = _read_validated_plan(
         external_plan_path,
-        verify_current_bindings=verify_current_bindings,
+        verify_current_bindings=False,
     )
     _require(
         external_plan["byte_size"] == len(external_plan_raw)
@@ -2711,6 +3000,7 @@ def _validate_artifact_payload(
     _require(len(manifest) == len(expected_pairs), "manifest count differs from plan")
     shards: dict[tuple[str, int], dict[str, Any]] = {}
     raw_by_pair: dict[tuple[str, int], tuple[Path, bytes]] = {}
+    reservation_by_pair: dict[tuple[str, int], tuple[Path, bytes]] = {}
     computed_manifest: list[dict[str, Any]] = []
     environment_by_seed: dict[int, str] = {}
     for index, (raw_entry, expected_pair) in enumerate(zip(manifest, expected_pairs, strict=True)):
@@ -2734,7 +3024,13 @@ def _validate_artifact_payload(
         _require(_is_sha256(entry["environment_sha256"]), "manifest environment hash invalid")
         shard_path = _resolve_artifact_shard(artifact_path, entry["path"])
         raw, shard = _read_strict_json(shard_path)
-        _validate_shard_payload(shard, plan, plan_raw, shard_path)
+        validated_shard, reservation_path, reservation_raw = _validate_shard_payload(
+            shard,
+            plan,
+            plan_raw,
+            external_plan_path,
+            shard_path,
+        )
         _require(raw == _canonical_json_bytes(shard), "shard must use canonical v2 JSON encoding")
         pair = (cast(str, shard["method_id"]), cast(int, shard["seed_id"]))
         _require(pair == expected_pair, "manifest identity differs from shard identity")
@@ -2750,8 +3046,9 @@ def _validate_artifact_payload(
             "environment_sha256": identity,
         }
         computed_manifest.append(computed_entry)
-        shards[pair] = shard
+        shards[pair] = validated_shard
         raw_by_pair[pair] = (shard_path, raw)
+        reservation_by_pair[pair] = (reservation_path, reservation_raw)
     _require(
         _json_exact_equal(manifest, computed_manifest),
         "shard manifest size/hash/identity mismatch",
@@ -2815,15 +3112,25 @@ def _validate_artifact_payload(
         for method in methods:
             for seed in seeds:
                 _validate_replayed_measurements(shards[(method, seed)], plan)
-    if verify_current_bindings:
-        _require_current_plan_bindings(plan, "final artifact validation")
     _require_exact_reread(artifact_path, _canonical_json_bytes(artifact), "artifact")
     _require_exact_reread(external_plan_path, external_plan_raw, "external run plan")
-    for shard_path, shard_raw in raw_by_pair.values():
+    for pair in expected_pairs:
+        shard_path, shard_raw = raw_by_pair[pair]
         _require_exact_reread(
             shard_path,
             shard_raw,
             f"artifact input shard {shard_path}",
+        )
+        reservation_path, reservation_raw = reservation_by_pair[pair]
+        _require_exact_reread(
+            reservation_path,
+            reservation_raw,
+            f"artifact input shard reservation {reservation_path}",
+        )
+    if verify_current_bindings:
+        _require_current_plan_bindings(
+            plan,
+            "final artifact validation after final rereads",
         )
 
 
@@ -2851,11 +3158,11 @@ def validate_scr_v2_artifact(
         )
         structurally_valid = True
         replay_performed = replay_measurements
-    except (OSError, ValueError, OverflowError) as exc:
+    except Exception as exc:
         return SCRV2ValidationReport(
             False,
             False,
-            (str(exc),),
+            (_validation_failure_message(exc),),
             structurally_valid=structurally_valid,
             computational_replay_performed=replay_performed,
         )
@@ -2953,7 +3260,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Sequence[str] | None = None) -> Path:
+def _run_cli(argv: Sequence[str] | None = None) -> Path:
     """Run one v2 lifecycle command; no command can promote an artifact."""
 
     args = _parse_args(argv)
@@ -3032,6 +3339,19 @@ def main(argv: Sequence[str] | None = None) -> Path:
         )
         return cast(Path, args.artifact)
     _fail(f"unknown command {args.command!r}")
+
+
+def main(argv: Sequence[str] | None = None) -> Path:
+    """Run one command while presenting every ordinary failure as a closed error."""
+
+    try:
+        return _run_cli(argv)
+    except SCRV2ValidationError:
+        raise
+    except Exception as exc:
+        raise SCRV2ValidationError(
+            f"SCR v2 command failed closed ({type(exc).__name__}): {exc}"
+        ) from exc
 
 
 if __name__ == "__main__":

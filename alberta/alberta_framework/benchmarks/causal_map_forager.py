@@ -124,6 +124,20 @@ class CausalMapForagerConfig:
     channel-agnostic.  Once any mapped cell is observed to reappear, the
     channel's schedule is estimated from observed collection-to-reappearance
     intervals rather than an object-specific constant.
+
+    ``exploration_probability`` only arbitrates between an exploitation target
+    and a genuinely unobserved cell reachable under cost-aware routing.  It
+    never redirects the policy to generic coverage after every reachable cell
+    has been observed.
+    When neither kind of target exists, the planner still uses safe
+    least-visited coverage as a fail-safe, independent of the exploration coin.
+
+    With ``arrival_aware_readiness=True``, a pending collected cell is eligible
+    when its predicted ready step is no later than the last decision state
+    before the action that enters it.  This one-step lead is intentional:
+    public Foragax transitions move and compute collection reward before
+    decrementing respawn timers and returning the next observation.  Setting
+    the option to ``False`` retains decision-time-only readiness.
     """
 
     world_shape: tuple[int, int] = (15, 15)
@@ -145,6 +159,7 @@ class CausalMapForagerConfig:
     retry_penalty: float = 0.2
     tie_break_scale: float = 1e-4
     exploration_probability: float = 0.05
+    arrival_aware_readiness: bool = True
     one_hot_tolerance: float = 1e-5
 
     def __post_init__(self) -> None:
@@ -235,6 +250,8 @@ class CausalMapForagerConfig:
             "exploration_probability",
             float(self.exploration_probability),
         )
+        if not isinstance(self.arrival_aware_readiness, bool):
+            raise ValueError("arrival_aware_readiness must be a boolean")
         positive_int = (
             "initial_retry_delay",
             "maximum_retry_delay",
@@ -1519,6 +1536,71 @@ def _safe_distance_grid(
     return fixed_distances
 
 
+def _cost_aware_route_grid(
+    source: Array,
+    negative_cells: Array,
+    config: CausalMapForagerConfig,
+) -> tuple[Array, Array]:
+    """Return exact minimum-negative-entry counts and shortest tie paths.
+
+    Objects in the stationary public Forager task are traversable, including
+    collectable deathcaps.  Encode one path as ``negative_entries * base +
+    steps``, where ``base`` exceeds every simple-path length.  Ordinary integer
+    shortest-path relaxation then minimizes negative entries lexicographically
+    before distance without treating a learned-negative cell as a wall.
+
+    The source is never charged: an entry cost belongs to the destination of an
+    action, and the policy is already standing at ``source``.  At most ``V - 1``
+    edges are needed by a lexicographically optimal simple path.  ``V`` bounded
+    relaxations preserve the same finite fail-safe used by the safe-only grid.
+    """
+    cell_count = config.height * config.width
+    base = jnp.asarray(cell_count + 1, dtype=jnp.int32)
+    infinity = jnp.asarray((cell_count + 1) * (cell_count + 2), dtype=jnp.int32)
+    source_x, source_y = source[0], source[1]
+    entry_cost = (
+        negative_cells.astype(jnp.int32) * base
+        + jnp.asarray(1, dtype=jnp.int32)
+    )
+    encoded = jnp.full(config.world_shape, infinity, dtype=jnp.int32)
+    encoded = encoded.at[source_y, source_x].set(0)
+
+    def relax(current: Array) -> Array:
+        neighbor_minimum = jnp.minimum(
+            jnp.minimum(
+                jnp.roll(current, 1, axis=0),
+                jnp.roll(current, -1, axis=0),
+            ),
+            jnp.minimum(
+                jnp.roll(current, 1, axis=1),
+                jnp.roll(current, -1, axis=1),
+            ),
+        )
+        return jnp.minimum(current, neighbor_minimum + entry_cost)
+
+    def not_fixed(carry: tuple[Array, Array, Array]) -> Array:
+        _, changed, iteration = carry
+        return changed & (iteration < cell_count)
+
+    def relax_once(
+        carry: tuple[Array, Array, Array],
+    ) -> tuple[Array, Array, Array]:
+        current, _, iteration = carry
+        updated = relax(current)
+        return updated, jnp.any(updated != current), iteration + 1
+
+    encoded, _, _ = jax.lax.while_loop(
+        not_fixed,
+        relax_once,
+        (
+            encoded,
+            jnp.asarray(True),
+            jnp.asarray(0, dtype=jnp.int32),
+        ),
+    )
+    return encoded // base, encoded % base
+
+
 def _choose_action(
     state: CausalMapForagerState,
     config: CausalMapForagerConfig,
@@ -1530,13 +1612,7 @@ def _choose_action(
     safe_channel = jnp.maximum(state.cell_channel, 0)
     known = state.cell_channel >= 0
     negative_cells = known & negative_channels[safe_channel]
-    predicted_ready = (
-        (state.cell_collection_step >= 0)
-        & (state.cell_ready_step >= 0)
-        & (state.step_count >= state.cell_ready_step)
-    )
-    available = state.cell_active | predicted_ready
-    path_distances = _safe_distance_grid(
+    route_negative_entries, route_steps = _cost_aware_route_grid(
         state.position,
         negative_cells,
         config,
@@ -1545,9 +1621,55 @@ def _choose_action(
         config.height * config.width + 1,
         dtype=jnp.int32,
     )
-    reachable = path_distances < path_infinity
+    reachable = route_steps < path_infinity
+    readiness_step = jnp.broadcast_to(
+        state.step_count,
+        state.cell_ready_step.shape,
+    )
+    if config.arrival_aware_readiness:
+        # Foragax computes movement/collection reward from the pre-transition
+        # object grid, then decrements respawn timers and emits the returned
+        # observation.  A target at graph distance d is therefore collectible
+        # on arrival only if it is ready in the decision state after d - 1
+        # transitions.  Saturation prevents a near-lifetime-end wraparound from
+        # making an otherwise due target look indefinitely unavailable.
+        pre_entry_steps = jnp.maximum(
+            route_steps - jnp.asarray(1, dtype=jnp.int32),
+            jnp.asarray(0, dtype=jnp.int32),
+        )
+        readiness_step = _saturating_add_int32(
+            state.step_count,
+            pre_entry_steps,
+        )
+    predicted_ready = (
+        (state.cell_collection_step >= 0)
+        & (state.cell_ready_step >= 0)
+        & (readiness_step >= state.cell_ready_step)
+    )
+    available = state.cell_active | predicted_ready
     candidate = known & available & ~negative_cells & reachable
-    distances = path_distances.astype(jnp.float32)
+    distances = route_steps.astype(jnp.float32)
+    # The public stationary task has one learned-negative deathcap channel.
+    # Price every necessary negative entry at the worst empirical negative
+    # channel mean.  Cap the per-entry price so the bounded V-cell route cannot
+    # overflow float32 scoring even for a corrupted but finite learned mean.
+    maximum_entry_penalty = jnp.asarray(
+        _FLOAT32_SCORE_HEADROOM / (config.height * config.width),
+        dtype=jnp.float32,
+    )
+    negative_entry_penalty = jnp.minimum(
+        jnp.max(
+            jnp.where(
+                negative_channels,
+                -channel_values,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            )
+        ),
+        maximum_entry_penalty,
+    )
+    route_negative_cost = (
+        route_negative_entries.astype(jnp.float32) * negative_entry_penalty
+    )
     target_noise = jr.uniform(
         target_key,
         state.cell_channel.shape,
@@ -1557,6 +1679,7 @@ def _choose_action(
     target_scores = (
         cell_values
         - jnp.asarray(config.distance_cost, dtype=jnp.float32) * distances
+        - route_negative_cost
         - jnp.asarray(config.retry_penalty, dtype=jnp.float32)
         * state.cell_retry_count.astype(jnp.float32)
         + target_noise
@@ -1575,40 +1698,55 @@ def _choose_action(
 
     unobserved = state.cell_last_seen_step < 0
     unknown_reachable = unobserved & ~negative_cells & reachable
-    has_unknown_reachable = jnp.any(unknown_reachable)
-    safe_reachable = ~negative_cells & reachable
-    coverage_candidate = jnp.where(
-        has_unknown_reachable,
-        unknown_reachable,
-        safe_reachable,
-    )
     coverage_scores = (
         -state.visit_count.astype(jnp.float32)
         - jnp.asarray(config.distance_cost, dtype=jnp.float32) * distances
+        - route_negative_cost
         + target_noise
     )
-    finite_coverage_candidate = coverage_candidate & jnp.isfinite(coverage_scores)
-    coverage_scores = jnp.where(
-        finite_coverage_candidate,
+    finite_unknown_candidate = unknown_reachable & jnp.isfinite(coverage_scores)
+    unknown_scores = jnp.where(
+        finite_unknown_candidate,
         coverage_scores,
         -jnp.inf,
     )
-    has_coverage_target = jnp.any(finite_coverage_candidate)
-    coverage_flat = jnp.argmax(coverage_scores.reshape(-1))
-    coverage_target = jnp.asarray(
-        (coverage_flat % config.width, coverage_flat // config.width),
+    has_unknown_target = jnp.any(finite_unknown_candidate)
+    unknown_flat = jnp.argmax(unknown_scores.reshape(-1))
+    unknown_target = jnp.asarray(
+        (unknown_flat % config.width, unknown_flat // config.width),
+        dtype=jnp.int32,
+    )
+    # Generic coverage is not an exploration target.  Retain it solely for the
+    # no-exploitation/no-unknown fail-safe so a completed map cannot make the
+    # exploration coin divert an otherwise useful exploitation trajectory.
+    safe_reachable = ~negative_cells & reachable
+    finite_failsafe_candidate = safe_reachable & jnp.isfinite(coverage_scores)
+    failsafe_scores = jnp.where(
+        finite_failsafe_candidate,
+        coverage_scores,
+        -jnp.inf,
+    )
+    has_failsafe_target = jnp.any(finite_failsafe_candidate)
+    failsafe_flat = jnp.argmax(failsafe_scores.reshape(-1))
+    failsafe_target = jnp.asarray(
+        (failsafe_flat % config.width, failsafe_flat // config.width),
         dtype=jnp.int32,
     )
     explore = jr.uniform(exploration_key, (), dtype=jnp.float32) < jnp.asarray(
         config.exploration_probability,
         dtype=jnp.float32,
     )
-    use_coverage = has_coverage_target & (explore | ~has_exploitation_target)
-    target = jnp.where(use_coverage, coverage_target, exploitation_target)
+    use_unknown = has_unknown_target & (explore | ~has_exploitation_target)
+    use_failsafe = ~has_unknown_target & ~has_exploitation_target & has_failsafe_target
+    target = jnp.where(
+        use_unknown,
+        unknown_target,
+        jnp.where(use_failsafe, failsafe_target, exploitation_target),
+    )
     has_target = jnp.where(
-        use_coverage,
-        has_coverage_target,
-        has_exploitation_target,
+        use_unknown,
+        has_unknown_target,
+        has_exploitation_target | use_failsafe,
     )
 
     neighbor_positions = jnp.mod(
@@ -1621,15 +1759,25 @@ def _choose_action(
     all_neighbors_negative = jnp.all(neighbor_negative)
     allowed = ~neighbor_negative | all_neighbors_negative
 
-    target_distance_grid = _safe_distance_grid(
+    target_negative_entries, target_distance_grid = _cost_aware_route_grid(
         target,
         negative_cells,
         config,
     )
+    target_negative_entries = target_negative_entries[neighbor_y, neighbor_x]
     target_distances_int = target_distance_grid[neighbor_y, neighbor_x]
     target_distances = target_distances_int.astype(jnp.float32)
-    route_available = jnp.any(
-        allowed & (target_distances_int < path_infinity)
+    route_available = jnp.any(target_distances_int < path_infinity)
+    minimum_route_negative_entries = jnp.min(
+        jnp.where(
+            target_distances_int < path_infinity,
+            target_negative_entries,
+            jnp.asarray(path_infinity, dtype=jnp.int32),
+        )
+    )
+    pursuit_allowed = (
+        (target_distances_int < path_infinity)
+        & (target_negative_entries == minimum_route_negative_entries)
     )
     neighbor_visits = state.visit_count[neighbor_y, neighbor_x].astype(jnp.float32)
     reverse_action = jnp.mod(state.last_action + 2, 4)
@@ -1656,8 +1804,10 @@ def _choose_action(
         + reverse_cost
         + action_noise
     )
-    costs = jnp.where(has_target & route_available, pursuit_cost, exploration_cost)
-    finite_allowed = allowed & jnp.isfinite(costs)
+    pursuing = has_target & route_available
+    costs = jnp.where(pursuing, pursuit_cost, exploration_cost)
+    selected_allowed = jnp.where(pursuing, pursuit_allowed, allowed)
+    finite_allowed = selected_allowed & jnp.isfinite(costs)
     has_finite_action = jnp.any(finite_allowed)
     finite_costs = jnp.where(finite_allowed, costs, jnp.inf)
     # ``allowed`` is non-empty by construction: if every neighbor is learned
@@ -1665,7 +1815,7 @@ def _choose_action(
     # is deterministic and finite even if corrupted learned values make every
     # ordinary planner cost non-finite.
     fallback_costs = jnp.where(
-        allowed,
+        selected_allowed,
         jnp.arange(4, dtype=jnp.float32),
         jnp.inf,
     )
@@ -2458,8 +2608,6 @@ def causal_map_state_from_dict(
         raise ValueError(
             "serialized state jax_threefry_partitionable mode does not match runtime"
         )
-    if payload.get("config_sha256") != config.fingerprint():
-        raise ValueError("serialized state configuration does not match")
     declared_config_value = payload.get("config")
     _require_raw_json_value(
         declared_config_value,
@@ -2478,9 +2626,33 @@ def causal_map_state_from_dict(
             separators=(",", ":"),
             allow_nan=False,
         )
+        legacy_config_value = config.to_dict()
+        legacy_config_value.pop("arrival_aware_readiness")
+        legacy_config = json.dumps(
+            legacy_config_value,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
     except (TypeError, ValueError) as exc:
         raise ValueError("serialized state config is not canonical JSON") from exc
-    if declared_config != expected_config:
+    declared_config_sha256 = hashlib.sha256(declared_config.encode()).hexdigest()
+    declared_hash_matches = payload.get("config_sha256") == declared_config_sha256
+    current_config_matches = (
+        declared_config == expected_config
+        and declared_config_sha256 == config.fingerprint()
+    )
+    # State v5 predates the scheduling option but its state tuple is unchanged.
+    # A field-absent checkpoint therefore remains resumable only under the
+    # explicit legacy decision-time policy.  Never silently resume it under the
+    # new arrival-aware default, which would change continuation behavior.
+    legacy_config_matches = (
+        not config.arrival_aware_readiness
+        and declared_config == legacy_config
+    )
+    if not declared_hash_matches or not (
+        current_config_matches or legacy_config_matches
+    ):
         raise ValueError("serialized state embeds a different configuration")
     raw_dtypes = payload.get("dtypes")
     if not isinstance(raw_dtypes, Mapping) or dict(raw_dtypes) != _STATE_SERIALIZED_DTYPES:
@@ -2692,15 +2864,40 @@ class CausalMapForagerAgent:
                     "scheduling uses the exact outward ceiling of the rational "
                     "interval upper mean and may only be raised by exact-delay "
                     "safety statistics, subject to the configured maximum delay "
-                    "ceiling"
+                    "ceiling; optionally, pending targets become eligible when "
+                    "exact cost-aware path travel predicts they will be collectible on "
+                    "arrival under the public move/reward-before-respawn step order"
                 ),
                 "negative_avoidance": (
-                    "exact toroidal shortest-path routing around known learned-negative "
-                    "cells, with an explicit all-neighbors-negative fallback"
+                    "exact toroidal lexicographic routing that minimizes entries into "
+                    "known learned-negative traversable cells before path length; "
+                    "target scores charge the worst empirical negative-channel mean "
+                    "per necessary entry, while no-target motion retains an explicit "
+                    "all-neighbors-negative fallback"
+                ),
+                "negative_route_semantics": (
+                    "known-negative cells are costly, never impassable; a clean route "
+                    "always wins for the same target, but the minimum-loss crossing "
+                    "remains available to profitable or unexplored regions"
+                ),
+                "arrival_aware_readiness": self.config.arrival_aware_readiness,
+                "arrival_readiness_semantics": (
+                    "ready_step <= saturating(step_count + max(route_step_distance "
+                    "- 1, 0)); the subtraction reflects public move/reward-before-"
+                    "respawn transition order"
+                    if self.config.arrival_aware_readiness
+                    else "ready_step <= step_count"
                 ),
                 "coverage": (
-                    "seeded persistent coverage exploration toward reachable unknown "
-                    "or least-visited cells"
+                    "seeded exploration only toward genuinely unobserved reachable "
+                    "cells; generic safe least-visited coverage is reserved for the "
+                    "no-exploitation/no-unknown fail-safe"
+                ),
+                "exploration_probability_semantics": (
+                    "probability of choosing an unobserved reachable target when an "
+                    "exploitation target also exists; unknown coverage is mandatory "
+                    "when no exploitation target exists and never broadens to already "
+                    "observed cells"
                 ),
             },
             "nonprivilege_contract": {

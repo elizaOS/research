@@ -1,0 +1,23 @@
+WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-07-31 11:53:57,098 INFO shard learner=upgd_w seed=100 tasks=400 task_length=2500
+2026-07-31 12:00:56,533 INFO upgd_w task 20/400 online_acc=0.4828 elapsed=417.0s
+2026-07-31 12:08:44,717 INFO upgd_w task 40/400 online_acc=0.5736 elapsed=885.1s
+2026-07-31 12:14:22,414 INFO upgd_w task 60/400 online_acc=0.6144 elapsed=1222.8s
+2026-07-31 12:20:08,742 INFO upgd_w task 80/400 online_acc=0.6464 elapsed=1569.2s
+2026-07-31 12:25:34,355 INFO upgd_w task 100/400 online_acc=0.6720 elapsed=1894.8s
+2026-07-31 12:30:58,978 INFO upgd_w task 120/400 online_acc=0.6592 elapsed=2219.4s
+2026-07-31 12:36:24,290 INFO upgd_w task 140/400 online_acc=0.6732 elapsed=2544.7s
+2026-07-31 12:42:22,329 INFO upgd_w task 160/400 online_acc=0.6780 elapsed=2902.8s
+2026-07-31 12:49:45,449 INFO upgd_w task 180/400 online_acc=0.6796 elapsed=3345.9s
+2026-07-31 12:56:56,727 INFO upgd_w task 200/400 online_acc=0.6912 elapsed=3777.2s
+2026-07-31 13:03:31,548 INFO upgd_w task 220/400 online_acc=0.7084 elapsed=4172.0s
+2026-07-31 13:09:16,537 INFO upgd_w task 240/400 online_acc=0.7156 elapsed=4517.0s
+2026-07-31 13:14:46,201 INFO upgd_w task 260/400 online_acc=0.7136 elapsed=4846.6s
+2026-07-31 13:32:09,301 INFO upgd_w task 280/400 online_acc=0.7172 elapsed=5889.7s
+2026-07-31 13:55:50,117 INFO upgd_w task 300/400 online_acc=0.7212 elapsed=7310.5s
+2026-07-31 14:17:24,356 INFO upgd_w task 320/400 online_acc=0.7148 elapsed=8604.8s
+2026-07-31 14:38:47,444 INFO upgd_w task 340/400 online_acc=0.7100 elapsed=9887.9s
+2026-07-31 15:00:16,296 INFO upgd_w task 360/400 online_acc=0.7124 elapsed=11176.7s
+2026-07-31 15:21:38,442 INFO upgd_w task 380/400 online_acc=0.7308 elapsed=12458.9s
+2026-07-31 15:42:39,135 INFO upgd_w task 400/400 online_acc=0.7232 elapsed=13719.6s
+2026-07-31 15:42:41,435 INFO wrote shard outputs/upgd_label_emnist/partials/upgd_w_seed100.json (avg online acc 0.6675, wall 13719.8s)

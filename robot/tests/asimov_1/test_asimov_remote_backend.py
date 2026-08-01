@@ -5,7 +5,8 @@ from dataclasses import dataclass
 
 from eliza_robot.asimov_1.constants import ASIMOV1_FULL_ACTION_DIM
 from eliza_robot.bridge.backends.asimov_remote import AsimovRemoteBackend
-from eliza_robot.bridge.protocol import CommandEnvelope, utc_now_iso
+from eliza_robot.bridge.backends.base import _supervised_motion_dispatch_authority
+from eliza_robot.bridge.protocol import CommandEnvelope, ResponseEnvelope, utc_now_iso
 
 
 @dataclass(frozen=True)
@@ -77,25 +78,42 @@ def _cmd(command: str, payload: dict) -> CommandEnvelope:
     )
 
 
+async def _authorized(
+    backend: AsimovRemoteBackend,
+    command: CommandEnvelope,
+) -> ResponseEnvelope:
+    with _supervised_motion_dispatch_authority(
+        command,
+        backend.physical_motion_resources(),
+    ):
+        return await backend.handle_command(command)
+
+
 def test_asimov_remote_backend_forwards_real_transport_commands_and_telemetry() -> None:
     async def run() -> None:
         transport = _Transport()
-        backend = AsimovRemoteBackend(mock=False, transport=transport)
+        backend = AsimovRemoteBackend(
+            mock=False,
+            transport=transport,
+            physical_resource_id="test-asimov",
+        )
         await backend.connect()
 
-        mode = await backend.handle_command(_cmd("asimov.mode", {"mode": "STAND"}))
-        velocity = await backend.handle_command(
+        mode = await _authorized(backend, _cmd("asimov.mode", {"mode": "STAND"}))
+        velocity = await _authorized(
+            backend,
             _cmd("asimov.velocity", {"vx_mps": 0.4, "vy_mps": -0.2, "yaw_rad_s": 0.1})
         )
         positions = [0.01 * idx for idx in range(ASIMOV1_FULL_ACTION_DIM)]
         kp = [40.0] * ASIMOV1_FULL_ACTION_DIM
         kd = [2.0] * ASIMOV1_FULL_ACTION_DIM
-        trajectory = await backend.handle_command(
+        trajectory = await _authorized(
+            backend,
             _cmd("asimov.trajectory", {"positions": positions, "kp": kp, "kd": kd})
         )
-        stand = await backend.handle_command(_cmd("action.play", {"name": "stand"}))
-        stop = await backend.handle_command(_cmd("walk.command", {"action": "stop"}))
-        start = await backend.handle_command(_cmd("walk.command", {"action": "start"}))
+        stand = await _authorized(backend, _cmd("action.play", {"name": "stand"}))
+        stop = await _authorized(backend, _cmd("walk.command", {"action": "stop"}))
+        start = await _authorized(backend, _cmd("walk.command", {"action": "start"}))
 
         assert mode.ok and velocity.ok and trajectory.ok and stand.ok and stop.ok and start.ok
         assert transport.calls[0] == ("mode", "STAND")
@@ -125,10 +143,15 @@ def test_asimov_remote_backend_forwards_real_transport_commands_and_telemetry() 
 def test_asimov_remote_backend_rejects_bad_real_trajectory_before_publish() -> None:
     async def run() -> None:
         transport = _Transport()
-        backend = AsimovRemoteBackend(mock=False, transport=transport)
+        backend = AsimovRemoteBackend(
+            mock=False,
+            transport=transport,
+            physical_resource_id="test-asimov",
+        )
         await backend.connect()
 
-        response = await backend.handle_command(
+        response = await _authorized(
+            backend,
             _cmd("asimov.trajectory", {"positions": [0.0] * (ASIMOV1_FULL_ACTION_DIM - 1)})
         )
 
@@ -142,9 +165,14 @@ def test_asimov_remote_backend_rejects_bad_real_trajectory_before_publish() -> N
 def test_asimov_remote_backend_damps_on_invalid_real_telemetry() -> None:
     async def run() -> None:
         transport = _Transport(telemetry_error=ValueError("bad telemetry width"))
-        backend = AsimovRemoteBackend(mock=False, transport=transport)
+        backend = AsimovRemoteBackend(
+            mock=False,
+            transport=transport,
+            physical_resource_id="test-asimov",
+        )
         await backend.connect()
-        await backend.handle_command(
+        await _authorized(
+            backend,
             _cmd("asimov.velocity", {"vx_mps": 0.4, "vy_mps": 0.0, "yaw_rad_s": 0.0})
         )
 

@@ -29,7 +29,7 @@ wheels = [
 
 [[package]]
 name = "alberta-framework"
-version = "0.26.0"
+version = "0.27.0"
 source = { editable = "../alberta" }
 dependencies = [
     { name = "chex" },
@@ -51,10 +51,12 @@ dependencies = [
 requires-dist = [
     { name = "beartype", marker = "extra == 'dev'", specifier = ">=0.18.0" },
     { name = "chex", specifier = ">=0.1.86" },
+    { name = "continual-foragax", marker = "extra == 'forager'", specifier = "==0.55.0" },
     { name = "dm-env", marker = "extra == 'bsuite'", specifier = ">=1.6" },
     { name = "dm-haiku", marker = "extra == 'bsuite'", specifier = ">=0.0.10" },
     { name = "flax", specifier = ">=0.10" },
     { name = "gymnasium", marker = "extra == 'gymnasium'", specifier = ">=0.29.0" },
+    { name = "gymnax", marker = "extra == 'forager'", specifier = "==0.0.9" },
     { name = "jax", specifier = ">=0.4" },
     { name = "jax", extras = ["cuda12"], marker = "extra == 'gpu'", specifier = ">=0.4" },
     { name = "jaxlib", specifier = ">=0.4" },
@@ -80,7 +82,7 @@ requires-dist = [
     { name = "scipy", specifier = ">=1.11" },
     { name = "tqdm", specifier = ">=4.66" },
 ]
-provides-extras = ["dev", "docs", "gymnasium", "bsuite", "gpu"]
+provides-extras = ["dev", "docs", "gymnasium", "forager", "bsuite", "gpu"]
 
 [[package]]
 name = "annotated-doc"

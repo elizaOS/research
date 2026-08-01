@@ -49,11 +49,18 @@ the MuJoCo render react.
 > ⚠ The real robot moves real joints. Always test in a clear space with
 > the deadman-timeout in place (default 1 second).
 
+The bridge host requires `ELIZA_ROBOT_BRIDGE_AUTH_TOKEN` (at least 32
+characters) and a deployment-owned `ELIZA_ROBOT_PHYSICAL_RESOURCE_ID`. The
+plugin process uses the same bearer secret under the different setting name
+`ELIZA_AINEX_BRIDGE_AUTH_TOKEN`; it does not receive the resource ID.
+
 ```bash
 # On the AiNex Pi (one terminal)
 roslaunch ainex_bringup robot.launch
 
-# On your dev box (Terminal 1) — bridge talks ROS1 to the robot
+# On your dev box (Terminal 1) — provision both values, then start the bridge
+: "${ELIZA_ROBOT_BRIDGE_AUTH_TOKEN:?set a random token of at least 32 characters}"
+: "${ELIZA_ROBOT_PHYSICAL_RESOURCE_ID:?set the stable inventory identity for this robot}"
 PYTHONPATH=packages/research/robot uv run --project packages/research/robot \
     python -m eliza_robot.bridge.launch --target real --envelope
 
@@ -63,9 +70,16 @@ PYTHONPATH=packages/research/robot uv run --project packages/research/robot \
         --backend ros_real --port 9100 \
         --camera-device 0 --camera-width 1280 --camera-height 720
 
-# Terminal 2 — Eliza, same as the sim quick start
-ELIZA_AINEX_BRIDGE_URL=ws://<dev-box-ip>:9100 bun run dev
+# Terminal 2 — provision the same bearer secret under the plugin setting
+: "${ELIZA_AINEX_BRIDGE_AUTH_TOKEN:?set this to the bridge bearer secret}"
+ELIZA_AINEX_BRIDGE_URL=ws://127.0.0.1:9100 bun run dev
 ```
+
+The physical endpoint is loopback-only. If the plugin runs on another host,
+connect it through a separately managed secure tunnel whose local endpoint is
+`ws://127.0.0.1:9100`; do not expose the bridge directly on a LAN address.
+These configuration steps do not establish hardware validation or promote the
+hard safety envelope.
 
 The agent has no idea which target it's pointing at — that's the entire
 point of the unified bridge contract.
@@ -75,6 +89,7 @@ point of the unified bridge contract.
 Always run the no-motion smoke harness against the bridge first:
 
 ```bash
+: "${ELIZA_ROBOT_BRIDGE_AUTH_TOKEN:?set this to the running bridge bearer secret}"
 PYTHONPATH=packages/research/robot uv run --project packages/research/robot \
     python packages/research/robot/scripts/check_real_robot.py \
         --url ws://localhost:9100 --save-frame /tmp/smoke.png
@@ -190,23 +205,23 @@ The script returns exit code 0 only if:
 Last green run: yaw -154.72°, mean pixel diff 44.93, 99.99% of pixels
 changed. See `evidence/INDEX.md` for the full artifact map.
 
-For the **real robot** equivalent, run the script against the `ros_real`
+For a future **real robot** equivalent, the intended setup uses the `ros_real`
 target and the Obsbot:
 
 ```bash
 # 1. Park the robot on a clear surface, head pointing at a feature-rich background
 # 2. Start the bridge with Obsbot camera attached
+: "${ELIZA_ROBOT_BRIDGE_AUTH_TOKEN:?set a random token of at least 32 characters}"
+: "${ELIZA_ROBOT_PHYSICAL_RESOURCE_ID:?set the stable inventory identity for this robot}"
 PYTHONPATH=packages/research/robot uv run --project packages/research/robot \
     python -m eliza_robot.bridge.server --backend ros_real --port 9100 \
         --camera-device 0 --camera-width 1280 --camera-height 720
-# 3. Run the evidence script — it sends walk commands at -3.5 rad/s for 1s
-PYTHONPATH=packages/research/robot uv run --project packages/research/robot \
-    python packages/research/robot/scripts/evidence_turn_180.py \
-        --yaw-rate -3.5 --duration 1.0 \
-        --out /tmp/real_turn_evidence/
-# Compare /tmp/real_turn_evidence/before.png and after.png
+# 3. A supervised hardware capture client and external yaw ground truth are
+#    still required; the checked-in evidence_turn_180.py is simulation-only.
 ```
 
+This block is a physical procedure sketch, not captured hardware validation;
+the checked-in `evidence_turn_180.py` currently starts its own MuJoCo bridge.
 The script's yaw-delta check needs to be replaced with an external
 ground-truth source on the real robot — the IMU yaw, an ArUco-tagged
 overhead camera, or vicon if you have it.

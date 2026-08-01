@@ -87,5 +87,6 @@ PYTHONPATH=packages/research/robot python packages/research/robot/scripts/eviden
     --episode-s 3.0 --mirror-period 0.05 --sim-only
 ```
 
-`--sim-only` is the default (safety). Add `--use-real --host <ip>` to
-target the physical robot.
+`--sim-only` is the default. The legacy `--use-real` direct-transport path is
+now quarantined and fails before connecting; a new authenticated unified-bridge
+client is required for any physical rerun.

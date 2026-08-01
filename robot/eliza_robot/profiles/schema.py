@@ -37,7 +37,7 @@ GaitController = Literal["bezier", "rl", "openpi"]
 class JointSpec(BaseModel):
     """One actuated DoF on the robot."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     name: str = Field(description="URDF joint name, e.g. 'r_hip_yaw'.")
     index: int = Field(ge=0, description="Index in the actuator vector.")
@@ -46,10 +46,10 @@ class JointSpec(BaseModel):
     home_rad: float = Field(description="Default stand pose position (rad).")
     group: JointGroup = Field(description="LEG | ARM | HEAD grouping.")
     actuator_torque_nm: float = Field(
-        gt=0.0, description="Max actuator torque (N·m)."
+        gt=0.0, le=10_000.0, description="Max actuator torque (N·m)."
     )
     velocity_max_rad_s: float = Field(
-        gt=0.0, description="Max joint velocity (rad/s)."
+        gt=0.0, le=1_000.0, description="Max joint velocity (rad/s)."
     )
 
     @field_validator("upper_rad")
@@ -77,7 +77,7 @@ class JointSpec(BaseModel):
 class Kinematics(BaseModel):
     """Joint inventory and total DoF count."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     dof: int = Field(gt=0, description="Total number of actuated joints.")
     joints: list[JointSpec]
@@ -106,44 +106,54 @@ class GaitParams(BaseModel):
     targets parameterised by these values.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
-    cycle_hz: float = Field(gt=0.0, description="Steps per second.")
+    cycle_hz: float = Field(gt=0.0, le=100.0, description="Steps per second.")
     swing_height_m: float = Field(
-        gt=0.0, description="Peak foot clearance during swing (m)."
+        gt=0.0, le=10.0, description="Peak foot clearance during swing (m)."
     )
     stance_width_m: float = Field(
-        gt=0.0, description="Lateral foot spacing during stance (m)."
+        gt=0.0, le=10.0, description="Lateral foot spacing during stance (m)."
     )
     step_length_max_m: float = Field(
-        gt=0.0, description="Max forward stride per cycle (m)."
+        gt=0.0, le=10.0, description="Max forward stride per cycle (m)."
     )
     foot_offset_m: float = Field(
+        ge=-10.0,
+        le=10.0,
         description="Z offset from body link to foot sole at stance (m)."
     )
     default_height_m: float = Field(
-        gt=0.0, description="Nominal standing torso height (m)."
+        gt=0.0, le=10.0, description="Nominal standing torso height (m)."
     )
     thigh_length_m: float | None = Field(
         default=None,
         gt=0.0,
+        le=10.0,
         description="Optional analytic gait IK thigh length (hip pitch to knee).",
     )
     shin_length_m: float | None = Field(
         default=None,
         gt=0.0,
+        le=10.0,
         description="Optional analytic gait IK shin length (knee to ankle).",
     )
     neutral_hip_pitch_rad: float | None = Field(
         default=None,
+        ge=-2 * math.pi,
+        le=2 * math.pi,
         description="Optional neutral sagittal hip pitch for analytic gait IK.",
     )
     neutral_knee_rad: float | None = Field(
         default=None,
+        ge=-2 * math.pi,
+        le=2 * math.pi,
         description="Optional neutral sagittal knee angle for analytic gait IK.",
     )
     neutral_ankle_pitch_rad: float | None = Field(
         default=None,
+        ge=-2 * math.pi,
+        le=2 * math.pi,
         description="Optional neutral sagittal ankle pitch for analytic gait IK.",
     )
     controller: GaitController
@@ -152,7 +162,7 @@ class GaitParams(BaseModel):
 class ContactGeoms(BaseModel):
     """Explicit MuJoCo contact geometry declarations for locomotion rewards."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     floor_geom_names: list[str] = Field(
         default_factory=list,
@@ -204,7 +214,7 @@ class CameraSpec(BaseModel):
     x/y/z translation (m) in the mount link frame.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     name: str
     width: int = Field(gt=0)
@@ -216,14 +226,27 @@ class CameraSpec(BaseModel):
         description="(roll, pitch, yaw, x, y, z) relative to mount_link."
     )
 
+    @field_validator("extrinsics_rpy_xyz")
+    @classmethod
+    def _bounded_extrinsics(
+        cls,
+        value: tuple[float, float, float, float, float, float],
+    ) -> tuple[float, float, float, float, float, float]:
+        if any(abs(angle) > 2 * math.pi for angle in value[:3]):
+            raise ValueError("camera rotation extrinsics must be within ±2π")
+        if any(abs(offset) > 1_000.0 for offset in value[3:]):
+            raise ValueError("camera translation extrinsics must be within ±1000 m")
+        return value
+
 
 class SensorSpecs(BaseModel):
     """IMU + cameras + (future) other sensors."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     imu_noise_std: float = Field(
         ge=0.0,
+        le=1_000.0,
         description="Gaussian noise std applied to simulated IMU (rad or m/s²).",
     )
     locomotion_tracking_body: str | None = Field(
@@ -240,9 +263,13 @@ class SensorSpecs(BaseModel):
 class ControlSpec(BaseModel):
     """Low-level control rates and per-step safety clips."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
-    rate_hz: float = Field(gt=0.0, description="Outer control loop frequency.")
+    rate_hz: float = Field(
+        gt=0.0,
+        le=10_000.0,
+        description="Outer control loop frequency.",
+    )
     command_smoothing: float = Field(
         ge=0.0,
         le=1.0,
@@ -250,10 +277,16 @@ class ControlSpec(BaseModel):
     )
     max_joint_delta_rad_per_step: float = Field(
         gt=0.0,
+        le=2 * math.pi,
         description="Max change in commanded joint position per control step.",
     )
     safe_torque_clip_nm: float = Field(
-        gt=0.0, description="Hard torque clip applied at the bridge layer."
+        gt=0.0,
+        le=10_000.0,
+        description=(
+            "Required torque ceiling. Direct/autonomous motion must remain disabled "
+            "unless the backend attests verified enforcement."
+        ),
     )
 
 
@@ -271,7 +304,7 @@ class AssetPaths(BaseModel):
     `mesh_dir` is the directory that XMLs/URDFs reference for STL meshes.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     mjcf_xml: Path
     mjx_xml: Path
@@ -290,24 +323,33 @@ class AssetPaths(BaseModel):
 class Frame(BaseModel):
     """One keyframe in a scripted action."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     t: float = Field(
-        ge=0.0, description="Time offset from action start (seconds)."
+        ge=0.0,
+        le=86_400.0,
+        description="Time offset from action start (seconds).",
     )
     joints: dict[str, float] = Field(
         description="Map of joint name -> target position (rad). "
         "Joints not listed hold their previous commanded value.",
     )
 
+    @field_validator("joints")
+    @classmethod
+    def _bounded_joint_targets(cls, value: dict[str, float]) -> dict[str, float]:
+        if any(abs(target) > 2 * math.pi for target in value.values()):
+            raise ValueError("action joint targets must be within ±2π")
+        return value
+
 
 class ActionGroup(BaseModel):
     """One scripted action — a sequence of timed keyframes."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     name: str
-    duration_s: float = Field(gt=0.0)
+    duration_s: float = Field(gt=0.0, le=86_400.0)
     frames: list[Frame]
 
     @field_validator("frames")
@@ -329,26 +371,31 @@ class ActionGroup(BaseModel):
 class ActionLibrary(BaseModel):
     """Set of named scripted actions playable via `action.play`."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     groups: dict[str, ActionGroup]
 
 
 class SafetyLimits(BaseModel):
-    """Hard safety envelope. Violations trigger deadman / E-stop at the bridge."""
+    """Safety thresholds enforced only from capability-attested telemetry.
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    The bridge fails autonomous/direct motion closed when the backend cannot
+    supply the required trustworthy fields; these limits are not evidence that
+    every backend can observe or stop every violation.
+    """
 
-    fall_pitch_rad: float = Field(gt=0.0)
-    fall_roll_rad: float = Field(gt=0.0)
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
+
+    fall_pitch_rad: float = Field(gt=0.0, le=math.pi)
+    fall_roll_rad: float = Field(gt=0.0, le=math.pi)
     battery_low_mv: int = Field(gt=0)
-    deadman_timeout_s: float = Field(gt=0.0)
+    deadman_timeout_s: float = Field(gt=0.0, le=3_600.0)
 
 
 class RobotProfile(BaseModel):
     """Top-level robot profile. One of these per supported robot."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     id: str = Field(description="Stable profile id, e.g. 'hiwonder-ainex'.")
     name: str

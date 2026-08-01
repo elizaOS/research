@@ -31,7 +31,10 @@ Merge accepts only the complete planned learner-by-seed Cartesian product,
 binds every shard by byte size and SHA-256, and exactly re-executes every
 measurement before publication. Standalone shard validation likewise
 re-executes that shard; artifact validation re-executes the full set again.
-Paths are discovery locators, not shard or dataset identity.
+Shard manifest paths remain discovery locators backed by exact byte identities.
+The issued plan locator, artifact output locator, and data-cache locators in an
+artifact's merge/replay provenance are exact lifecycle bindings and must match
+the external files and cache used for public artifact validation.
 
 Command arrays embedded in v3 records are explicitly **prescribed** argv,
 recomputed from the bound payload. Caller-supplied argv is retained only as
@@ -53,17 +56,25 @@ HTTP. After loading, v3 binds the materialized
 60,000-row train arrays by dtype, shape, and SHA-256. An archive-only cache
 cannot issue a plan. The cache, plans, shards, and artifacts must be regular
 single-link files with no write permission bits; descriptor-anchored reads
-reject symlinks and files that change during a read. Atomic publication also
-removes the exact target link it created if any post-link durability,
-identity, link-count, or byte-readback check fails.
+reject symlinks, ancestor or locator substitution, and files that change
+during a read. Atomic publication rechecks ancestor and target identity
+through readback and removes a failed target only while it still identifies
+the descriptor-owned inode. Temporary-name cleanup is identity-gated on every
+success and failure path as well; an unknown concurrent replacement is never
+deleted.
 
 Before a benchmark runner loads data or consumes compute, it atomically
 publishes an immutable plan-scoped reservation for the exact `(learner,
 seed)` identity. The reservation locator is independent of the requested
-shard output path. Concurrent attempts, or later attempts using a different
-output, therefore cannot execute the same planned identity twice. A
+shard output path and is recomputed during validation; copying the marker to
+another locator cannot satisfy the contract. Concurrent attempts, or later
+attempts using a different output, therefore cannot execute the same planned
+identity twice. Plan issuance, reservation, worker, and merge timestamps reject
+future-dated lifecycle claims. A
 reservation deliberately survives runner or shard-publication failure: that
-seed is consumed and must not be retried.
+seed is consumed and must not be retried. Every later reservation read requires
+the original canonical JSON bytes, exact plan-scoped locator, raw byte binding,
+and semantic digest binding.
 
 The active contract accepts only the selected paper configuration: 200 tasks,
 5,000 updates per task, 784 inputs, hidden widths 300 and 150, ten classes,
@@ -85,11 +96,14 @@ Before issuing a plan, the operator must:
    scikit-learn, pandas, platform, device details, JAX configuration, selected
    JAX/XLA environment, backend, and x64 setting unchanged. V3 hashes the
    resolved Python executable and an explicit execution distribution set:
-   `absl-py`, `chex`, `jax`, `jaxlib`, `jaxtyping`, `joblib`, `ml-dtypes`,
-   `narwhals`, `numpy`, `opt-einsum`, `pandas`, `python-dateutil`,
-   `scikit-learn`, `scipy`, `six`, `threadpoolctl`, `toolz`, and
-   `typing-extensions`. A same-version binary or package edit is drift. This
-   is deliberately narrow: v3 does not claim a complete dynamic-import or
+   `absl-py`, `chex`, `etils`, `jax`, `jaxlib`, `jaxtyping`, `joblib`,
+   `ml-dtypes`, `msgpack`, `narwhals`, `numpy`, `opt-einsum`,
+   `orbax-checkpoint`, `pandas`, `protobuf`, `python-dateutil`,
+   `scikit-learn`, `scipy`, `six`, `tensorstore`, `threadpoolctl`, `toolz`,
+   and `typing-extensions`. The added checkpoint/package-initializer
+   dependencies are active in the import-time runtime used by this tree. A
+   same-version edit to a member of this explicit set is drift. This remains a
+   deliberately enumerated set: v3 does not claim a complete dynamic-import or
    native system-library closure, another reason it remains nonpromoting.
 3. Resolve the exact cached OpenML MNIST archive and keep its bytes unchanged.
    The archive and the three dataset-554 metadata files must be regular
@@ -104,7 +118,9 @@ Before issuing a plan, the operator must:
 5. Choose entirely new output paths. Plan, seed-reservation, shard, and
    artifact publication is atomic, mode `0444`, and refuses overwrite. Never
    target a sealed v1/v2 output, receipt, runbook, snapshot, or reconstructed
-   bundle.
+   bundle. Keep the issued plan at its prescribed immutable locator. Public
+   artifact validation also requires the artifact at its prescribed canonical
+   output locator; copying either file is not a valid substitute.
 
 No benchmark or seed should run until all prerequisites are satisfied.
 
@@ -194,6 +210,16 @@ complete-cache, and materialized-data bindings. They repeat those checks after
 their final plan/shard/artifact rereads, so a long replay cannot turn an early
 binding check into a stale acceptance.
 
+Public artifact validation always requires `--plan`; the external immutable
+plan is read and compared before replay, reread after replay and shard checks,
+and reread again after the final artifact read. The validator also requires the
+artifact's prescribed merge argv to be derived from that exact plan locator,
+the byte-bound shard manifest, the artifact's current canonical output locator,
+and the exact data-home/archive pair supplied to validation. Validating an
+artifact against a different relocated cache therefore fails; create a new
+artifact by merging against that cache if relocated execution provenance is
+required.
+
 ```bash
 UPGD_V3_ARTIFACT=/absolute/new-run/artifact.v3.json
 
@@ -215,10 +241,11 @@ UPGD_V3_ARTIFACT=/absolute/new-run/artifact.v3.json
 
 Merge fails on duplicate, missing, or extra identities; learner/config/seed or
 plan disagreement; noncanonical or nonfinite JSON; nested schema additions;
-source/data/runtime drift; shard byte-size or digest mismatch; or recomputed
-measurement, summary, or comparison disagreement. A structurally plausible
-curve is not valid evidence without exact replay, and a fully valid result
-still remains a nonpromoting development artifact.
+source/data/runtime drift; noncanonical or incorrectly located reservation
+bytes; shard byte-size or digest mismatch; unbound plan/output/data command
+locators; or recomputed measurement, summary, or comparison disagreement. A
+structurally plausible curve is not valid evidence without exact replay, and a
+fully valid result still remains a nonpromoting development artifact.
 
 Worker duration is retained only inside each shard as a self-reported
 diagnostic cross-checked against its Unix interval. It is excluded from

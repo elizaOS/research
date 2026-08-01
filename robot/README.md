@@ -71,7 +71,22 @@ uv run eliza-robot-benchmark-alberta --steps-per-task 16000 --seeds 3
 |---|---|
 | `ELIZA_ROBOT_PROFILES_ROOT` | Override profiles manifest dir (default `profiles/`) |
 | `ELIZA_ROBOT_ASSETS_ROOT` | Override binary assets dir (default `assets/profiles/`) |
+| `ELIZA_ROBOT_BRIDGE_AUTH_TOKEN` | Server-side bearer secret; physical targets require 32–4096 visible ASCII characters |
+| `ELIZA_ROBOT_PHYSICAL_RESOURCE_ID` | Stable, non-secret inventory identity for the physical actuator set; required for physical targets |
 | `JAX_PLATFORMS` | Set to `cpu` to force CPU JAX locally |
+
+Physical bridge processes fail closed unless both physical variables are set.
+The resource ID is a raw deployment identity of 1–128 visible ASCII characters;
+spaces, control characters, and Unicode are rejected. The bridge adds its
+`physical:` namespace; the ID is used for process-local ownership coordination
+and is not a cross-process lock.
+
+The plugin reads a deliberately different setting name,
+`ELIZA_AINEX_BRIDGE_AUTH_TOKEN`. Give it the same secret value as the bridge's
+`ELIZA_ROBOT_BRIDGE_AUTH_TOKEN`. The plugin does not read the physical resource
+ID; that identity belongs only to the bridge host. Physical endpoints remain
+loopback-only, so a client on another host needs a separately managed secure
+tunnel. Configuration alone is not hardware validation or safety promotion.
 
 ## Conventions
 

@@ -41,6 +41,9 @@ from eliza_robot.bridge.backends.noise_injector import (  # noqa: E402
     NoiseProfile,
 )
 from eliza_robot.bridge.backends.state_mirror import StateMirrorBackend  # noqa: E402
+from eliza_robot.bridge.physical_execution import (  # noqa: E402
+    reject_unsupervised_physical_motion,
+)
 from eliza_robot.bridge.protocol import CommandEnvelope, utc_now_iso  # noqa: E402
 from eliza_robot.curriculum.loader import load_curriculum  # noqa: E402
 from eliza_robot.perception.vlm_evaluator import EvalResult, VLMEvaluator  # noqa: E402
@@ -149,6 +152,10 @@ def _panel_with_critique(
 
 
 async def _run(args: argparse.Namespace) -> int:
+    if not args.sim_only:
+        reject_unsupervised_physical_motion(
+            "scripts/evidence_vlm_evaluation_e2e.py --use-real"
+        )
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     manifest = _validate_checkpoint_profile(Path(args.checkpoint))
@@ -321,7 +328,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--use-real", dest="sim_only", action="store_false",
-        help="actually drive the physical AiNex (opt-in)",
+        help="quarantined legacy direct-hardware mode; fails before connecting",
     )
     parser.add_argument(
         "--out", type=Path,

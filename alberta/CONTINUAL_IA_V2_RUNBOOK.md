@@ -43,10 +43,17 @@ The lifecycle is self-issued plan → 30 reserved one-seed shards → merge:
 1. The plan binds the exact configuration, thresholds, conditions, seeds,
    pairwise-distinct canonical output locators, prescribed subcommand argument
    vectors, a static transitive local-source closure, `pyproject.toml`,
-   `uv.lock`, Python executable bytes, installed dependency contents, module
-   origins, interpreter flags and `sys.path`, JAX configuration/environment,
-   backend, and device inventory. `prescribed_argv` is a recipe, not a claim
-   about an observed process invocation.
+   `uv.lock`, Python executable bytes, and aggregate regular-file content hashes
+   for the explicit distribution set observed during a clean IA v2 import
+   plus its installed required-dependency metadata closure: absl-py, aiofiles,
+   Chex, cloudpickle, etils, humanize, JAX, jaxlib, jaxtyping, ml-dtypes,
+   msgpack, NumPy, opt-einsum, orbax-checkpoint, prometheus-client, protobuf,
+   psutil, Pygments, PyYAML, SciPy, simplejson, tensorstore, toolz,
+   typing-extensions, uvloop, and wadler-lindig. A missing set member fails
+   closed. The runtime record also binds module origins, interpreter flags and
+   `sys.path`, JAX configuration/environment, backend, and device inventory.
+   `prescribed_argv` is a recipe, not a claim about an observed process
+   invocation.
 2. Before either execution of a seed, the shard command rejects an occupied
    output and atomically publishes a persistent immutable
    `<shard>.reservation`. The reservation explicitly marks the seed consumed
@@ -66,6 +73,12 @@ The lifecycle is self-issued plan → 30 reserved one-seed shards → merge:
    external immutable files, requires the 30 exact plan-bound reservations,
    replays all 30 seeds, rereads every external input and the artifact, and
    rechecks current source/runtime bindings.
+
+The explicit Python distribution set is not a proof of every dependency an
+alternate execution path might load. Runtime v3 records as unbound: system
+shared libraries loaded by Python or extension modules, device drivers and
+firmware, and dynamically loaded code outside distribution file manifests.
+The runtime record is self-observed rather than image-attested.
 
 Lifecycle files use canonical JSON, descriptor-anchored no-symlink traversal,
 atomic new-path publication, directory syncing, mode `0444`, final single-link

@@ -1,4 +1,4 @@
-"""Compare ROSBridge-compatible behavior between two endpoints."""
+"""Compare two loopback, explicitly nonphysical compatibility endpoints."""
 
 from __future__ import annotations
 
@@ -9,6 +9,10 @@ from dataclasses import dataclass
 
 from websockets.asyncio.client import connect
 
+from eliza_robot.bridge.physical_execution import (
+    reject_unsupervised_physical_motion,
+    require_loopback_simulation_uri,
+)
 from eliza_robot.bridge.types import JsonDict
 
 
@@ -34,11 +38,16 @@ async def _recv_until(ws: object, predicate: object, timeout_sec: float = 3.0) -
 
 
 async def _probe(uri: str) -> EndpointSummary:
+    require_loopback_simulation_uri(uri, entrypoint="rosbridge_parity")
     async with connect(uri) as ws:
         _ = await _recv_until(ws, lambda item: item.get("op") == "status")
         hello = await _recv_until(ws, lambda item: item.get("op") == "hello")
         backend_name_value = hello.get("backend")
         backend_name = str(backend_name_value) if isinstance(backend_name_value, str) else "unknown"
+        if backend_name not in {"mock", "isaac", "ros_sim"}:
+            reject_unsupervised_physical_motion(
+                f"rosbridge_parity backend {backend_name!r}"
+            )
 
         await ws.send(json.dumps({"op": "subscribe", "id": "sub-battery", "topic": "/ros_robot_controller/battery"}))
         _ = await _recv_until(

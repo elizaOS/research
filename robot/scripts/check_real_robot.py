@@ -17,9 +17,10 @@ Usage:
     PYTHONPATH=packages/research/robot python packages/research/robot/scripts/check_real_robot.py
 
     # Real robot (after powering the AiNex and starting its ROS bridge):
+    export ELIZA_ROBOT_BRIDGE_AUTH_TOKEN='<random-secret-of-at-least-32-characters>'
     PYTHONPATH=packages/research/robot python -m eliza_robot.bridge.launch --target real --envelope &
     PYTHONPATH=packages/research/robot python packages/research/robot/scripts/check_real_robot.py \\
-        --url ws://localhost:9100 --camera-device 0
+        --url ws://localhost:9100 --save-frame /tmp/robot_first_frame.png
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import asyncio
 import base64
 import io
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -53,7 +55,7 @@ async def _request(ws, command: str, payload: dict | None = None, timeout: float
     while asyncio.get_event_loop().time() < deadline:
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=deadline - asyncio.get_event_loop().time())
-        except asyncio.TimeoutError:
+        except TimeoutError:
             break
         frame = json.loads(raw)
         if frame.get("type") == "response" and frame.get("request_id") == rid:
@@ -66,7 +68,7 @@ async def _wait_event(ws, event_name: str, timeout: float = 5.0) -> dict:
     while asyncio.get_event_loop().time() < deadline:
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=deadline - asyncio.get_event_loop().time())
-        except asyncio.TimeoutError:
+        except TimeoutError:
             break
         frame = json.loads(raw)
         if frame.get("type") == "event" and frame.get("event") == event_name:
@@ -74,9 +76,10 @@ async def _wait_event(ws, event_name: str, timeout: float = 5.0) -> dict:
     raise TimeoutError(f"no event '{event_name}' within {timeout}s")
 
 
-async def _run(url: str, save_frame_to: Path | None) -> int:
+async def _run(url: str, save_frame_to: Path | None, auth_token: str = "") -> int:
     print(f"[smoke] connecting to {url}...")
-    async with connect(url) as ws:
+    headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else None
+    async with connect(url, additional_headers=headers) as ws:
         # 1. session.hello
         hello = await _wait_event(ws, "session.hello", timeout=5.0)
         backend = hello.get("backend", "?")
@@ -151,7 +154,13 @@ def main() -> int:
     )
     args = parser.parse_args()
     try:
-        return asyncio.run(_run(args.url, args.save_frame))
+        return asyncio.run(
+            _run(
+                args.url,
+                args.save_frame,
+                os.environ.get("ELIZA_ROBOT_BRIDGE_AUTH_TOKEN", ""),
+            )
+        )
     except (ConnectionRefusedError, OSError) as exc:
         print(
             f"[smoke] FAIL could not connect to {args.url}: {exc}",

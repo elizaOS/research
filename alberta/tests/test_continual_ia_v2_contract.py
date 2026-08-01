@@ -187,20 +187,40 @@ def bundle(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Any]]
     trace = cast(dict[str, object], inputs["trace"])
     patch = pytest.MonkeyPatch()
     patch.setattr(ia_v2, "_run_seed_trace", lambda _seed: copy.deepcopy(trace))
-    ia_v2._merge_shards_for_testing(
-        plan_path,
-        artifact_path,
-        replay_runner=lambda _seed: copy.deepcopy(trace),
-    )
-    _raw, artifact, validation = load_artifact(artifact_path)
-    assert validation.valid
-    assert not validation.internally_accepted
+    try:
+        ia_v2._merge_shards_for_testing(
+            plan_path,
+            artifact_path,
+            replay_runner=lambda _seed: copy.deepcopy(trace),
+        )
+        _raw, artifact, validation = load_artifact(artifact_path)
+        assert validation.valid
+        assert not validation.internally_accepted
+    finally:
+        patch.undo()
     yield {
         "root": root,
         "artifact": artifact,
         **inputs,
     }
-    patch.undo()
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_bundle_replay(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Patch replay only for tests that explicitly depend on the synthetic bundle."""
+
+    if "bundle" not in request.fixturenames:
+        return
+    inputs = cast(dict[str, Any], request.getfixturevalue("bundle"))
+    trace = cast(dict[str, object], inputs["trace"])
+    monkeypatch.setattr(
+        ia_v2,
+        "_run_seed_trace",
+        lambda _seed: copy.deepcopy(trace),
+    )
 
 
 def test_plan_binds_exact_namespaced_protocol_and_development_only_claim_scope(
@@ -272,6 +292,42 @@ def test_plan_binds_commands_runtime_devices_static_import_closure_and_lockfiles
     assert runtime["python"]["executable"]["sha256"]
     assert runtime["python"]["flags"]
     assert isinstance(runtime["python"]["sys_path"], list)
+    assert runtime["distribution_content_scope"] == (
+        "explicit_clean_import_observed_plus_required_dependency_set"
+    )
+    assert set(runtime["distribution_content"]) == {
+        "absl-py",
+        "aiofiles",
+        "chex",
+        "cloudpickle",
+        "etils",
+        "humanize",
+        "jax",
+        "jaxlib",
+        "jaxtyping",
+        "ml-dtypes",
+        "msgpack",
+        "numpy",
+        "opt-einsum",
+        "orbax-checkpoint",
+        "prometheus-client",
+        "protobuf",
+        "psutil",
+        "pygments",
+        "pyyaml",
+        "scipy",
+        "simplejson",
+        "tensorstore",
+        "toolz",
+        "typing-extensions",
+        "uvloop",
+        "wadler-lindig",
+    }
+    assert runtime["unbound_runtime_scope"] == [
+        "system_shared_libraries_loaded_by_python_or_extension_modules",
+        "device_drivers_and_firmware",
+        "dynamically_loaded_code_outside_distribution_file_manifests",
+    ]
     assert runtime["distribution_content"]["jaxlib"]["sha256"]
     assert runtime["module_origins"]["jaxlib"]["sha256"]
     assert runtime["jax"]["devices"]
@@ -286,6 +342,33 @@ def test_plan_binds_commands_runtime_devices_static_import_closure_and_lockfiles
         str(bundle["shard_directory"] / "seed-060.v2.json"),
     ]
     assert body["issuance"]["prescribed_argv"] == commands["plan"]
+
+
+def test_runtime_manifest_fails_closed_when_required_distribution_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def synthetic_identity(name: str) -> dict[str, Any]:
+        if name == "tensorstore":
+            return {
+                "status": "not_installed",
+                "file_count": 0,
+                "total_bytes": 0,
+                "sha256": ia_v2.sha256_bytes(b""),
+            }
+        return {
+            "status": "content_hashed",
+            "file_count": 1,
+            "total_bytes": 1,
+            "sha256": ia_v2.sha256_bytes(name.encode("utf-8")),
+        }
+
+    monkeypatch.setattr(ia_v2, "_distribution_content_identity", synthetic_identity)
+
+    with pytest.raises(
+        ContinualIAV2Error,
+        match="required runtime distributions are not installed.*tensorstore",
+    ):
+        ia_v2._build_runtime_manifest()
 
 
 @pytest.mark.parametrize(

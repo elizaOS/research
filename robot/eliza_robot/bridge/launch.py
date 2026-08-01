@@ -4,14 +4,15 @@ Single entrypoint that selects backend (real/sim/isaac/mock) and starts
 both ROSBridge-compatible and command-envelope websocket servers.
 
 Usage:
-    python -m bridge.launch --target isaac
-    python -m bridge.launch --target real
-    python -m bridge.launch --target mock
+    python -m eliza_robot.bridge.launch --target isaac
+    python -m eliza_robot.bridge.launch --target real
+    python -m eliza_robot.bridge.launch --target mock
 
 Environment variable overrides:
     AINEX_BRIDGE_HOST, AINEX_ROSBRIDGE_PORT, AINEX_ENVELOPE_PORT,
     AINEX_PUBLISH_HZ, AINEX_MAX_CMD_SEC, AINEX_DEADMAN_SEC,
-    ASIMOV_LIVEKIT_URL, ASIMOV_LIVEKIT_TOKEN
+    ASIMOV_LIVEKIT_URL, ASIMOV_LIVEKIT_TOKEN,
+    ELIZA_ROBOT_BRIDGE_AUTH_TOKEN, ELIZA_ROBOT_PHYSICAL_RESOURCE_ID
 """
 
 from __future__ import annotations
@@ -19,13 +20,20 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
+from eliza_robot.bridge.backends.base import canonical_physical_resource_id
 from eliza_robot.bridge.types import JsonDict
 
 CONFIG_PATH = Path(__file__).parent / "config" / "bridge_targets.json"
+logger = logging.getLogger(__name__)
+_COMPATIBILITY_BACKENDS = frozenset({"mock", "ros_sim", "isaac"})
+_PHYSICAL_BACKENDS = frozenset(
+    {"ros", "ros_real", "ainex_remote", "ros_remote", "asimov_remote"}
+)
 
 
 @dataclass
@@ -45,7 +53,9 @@ class TargetConfig:
     camera_url: str
     profile_id: str = "hiwonder-ainex"
     asimov_livekit_url: str = ""
-    asimov_livekit_token: str = ""
+    asimov_livekit_token: str = field(default="", repr=False)
+    auth_token: str = field(default="", repr=False)
+    physical_resource_id: str = ""
 
 
 def _load_targets() -> dict[str, JsonDict]:
@@ -68,11 +78,13 @@ def _apply_env_overrides(cfg: dict[str, object]) -> dict[str, object]:
         "AINEX_CAMERA_URL": ("camera_url", str),
         "ASIMOV_LIVEKIT_URL": ("asimov_livekit_url", str),
         "ASIMOV_LIVEKIT_TOKEN": ("asimov_livekit_token", str),
+        "ELIZA_ROBOT_BRIDGE_AUTH_TOKEN": ("auth_token", str),
+        "ELIZA_ROBOT_PHYSICAL_RESOURCE_ID": ("physical_resource_id", str),
     }
-    for env_var, (field, cast) in env_map.items():
+    for env_var, (config_field, cast) in env_map.items():
         value = os.environ.get(env_var)
         if value is not None:
-            cfg[field] = cast(value)
+            cfg[config_field] = cast(value)
     return cfg
 
 
@@ -101,10 +113,57 @@ def resolve_target(name: str) -> TargetConfig:
         profile_id=str(raw.get("profile_id", "hiwonder-ainex")),
         asimov_livekit_url=str(raw.get("asimov_livekit_url", "")),
         asimov_livekit_token=str(raw.get("asimov_livekit_token", "")),
+        auth_token=str(raw.get("auth_token", "")),
+        physical_resource_id=str(raw.get("physical_resource_id", "")),
     )
 
 
+def _resolve_server_modes(
+    target: TargetConfig,
+    *,
+    rosbridge: bool | None,
+    envelope: bool | None,
+) -> tuple[bool, bool]:
+    """Resolve safe defaults and reject compatibility control of hardware."""
+    resolved_rosbridge = (
+        target.backend in _COMPATIBILITY_BACKENDS if rosbridge is None else rosbridge
+    )
+    resolved_envelope = (
+        target.backend not in _COMPATIBILITY_BACKENDS if envelope is None else envelope
+    )
+    if target.backend in _PHYSICAL_BACKENDS and resolved_rosbridge:
+        raise ValueError(
+            "physical targets cannot use the ROSBridge-compatible server; "
+            "use the authenticated unified envelope server"
+        )
+    if target.backend in _PHYSICAL_BACKENDS and not resolved_envelope:
+        raise ValueError("physical targets require the unified envelope server")
+    if target.backend in _PHYSICAL_BACKENDS:
+        if not 32 <= len(target.auth_token) <= 4_096 or any(
+            not 0x21 <= ord(character) <= 0x7E for character in target.auth_token
+        ):
+            raise ValueError(
+                "physical targets require ELIZA_ROBOT_BRIDGE_AUTH_TOKEN "
+                "with 32..4096 visible ASCII characters"
+            )
+        try:
+            canonical_physical_resource_id(target.physical_resource_id)
+        except ValueError as exc:
+            raise ValueError(
+                "physical targets require an explicit canonical "
+                "ELIZA_ROBOT_PHYSICAL_RESOURCE_ID"
+            ) from exc
+    if not resolved_rosbridge and not resolved_envelope:
+        raise ValueError("no server selected")
+    return resolved_rosbridge, resolved_envelope
+
+
 async def _run(target: TargetConfig, rosbridge: bool, envelope: bool) -> None:
+    rosbridge, envelope = _resolve_server_modes(
+        target,
+        rosbridge=rosbridge,
+        envelope=envelope,
+    )
     tasks: list[asyncio.Task[None]] = []
 
     if rosbridge:
@@ -135,16 +194,14 @@ async def _run(target: TargetConfig, rosbridge: bool, envelope: bool) -> None:
             profile_id=target.profile_id,
             asimov_livekit_url=target.asimov_livekit_url,
             asimov_livekit_token=target.asimov_livekit_token,
+            auth_token=target.auth_token,
+            physical_resource_id=target.physical_resource_id,
         )
         tasks.append(
             asyncio.create_task(
                 env_run(target.host, target.envelope_port, target.backend, env_config)
             )
         )
-
-    if not tasks:
-        print("No servers to start. Use --rosbridge and/or --envelope.")
-        return
 
     # Wait until interrupted.
     await asyncio.gather(*tasks)
@@ -171,19 +228,20 @@ def main() -> None:
     parser.add_argument(
         "--rosbridge",
         action="store_true",
-        default=True,
-        help="start ROSBridge-compatible server (default: true)",
+        default=None,
+        help="start ROSBridge-compatible server (simulation targets only)",
     )
     parser.add_argument(
         "--no-rosbridge",
-        action="store_true",
+        action="store_false",
+        dest="rosbridge",
         help="disable ROSBridge-compatible server",
     )
     parser.add_argument(
         "--envelope",
         action="store_true",
-        default=False,
-        help="also start command-envelope server",
+        default=None,
+        help="start the unified command-envelope server",
     )
     parser.add_argument(
         "--list-targets",
@@ -202,17 +260,26 @@ def main() -> None:
         return
 
     target = resolve_target(args.target)
-    rosbridge = not args.no_rosbridge
-    envelope = args.envelope
+    try:
+        rosbridge, envelope = _resolve_server_modes(
+            target,
+            rosbridge=args.rosbridge,
+            envelope=args.envelope,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
-    print(f"Target: {target.name} ({target.description})")
-    print(f"Backend: {target.backend}")
+    logger.info("Target: %s (%s)", target.name, target.description)
+    logger.info("Backend: %s", target.backend)
     if rosbridge:
-        print(f"ROSBridge: ws://{target.host}:{target.rosbridge_port}")
+        logger.info("ROSBridge: ws://%s:%d", target.host, target.rosbridge_port)
     if envelope:
-        print(f"Envelope: ws://{target.host}:{target.envelope_port}")
-    print(f"Safety: rate_limit={target.max_commands_per_sec}/s deadman={target.deadman_timeout_sec}s")
-    print()
+        logger.info("Envelope: ws://%s:%d", target.host, target.envelope_port)
+    logger.info(
+        "Safety: rate_limit=%d/s deadman=%ss",
+        target.max_commands_per_sec,
+        target.deadman_timeout_sec,
+    )
 
     asyncio.run(_run(target, rosbridge=rosbridge, envelope=envelope))
 

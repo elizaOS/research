@@ -476,6 +476,8 @@ class OaKAgent:
         next_observation: Array,
         discount: Array | None = None,
         *,
+        decision_observation: Array | None = None,
+        execution_boundary: Array | bool = False,
         enable_option_planning: bool = True,
     ) -> OaKUpdateResult:
         """Process one real-time primitive STOMP + utility-tracking step.
@@ -489,6 +491,11 @@ class OaKAgent:
             next_observation: Next observation from the environment.
             discount: Effective continuation multiplier. ``None`` preserves
                 STOMP's historical primitive/``option_gamma`` behavior.
+            decision_observation: Optional distinct observation for selecting
+                the next action after an autoreset boundary. Learning always
+                uses ``next_observation``.
+            execution_boundary: Whether this transition interrupts the
+                current option lifecycle without zeroing ``discount``.
 
         Returns:
             :class:`OaKUpdateResult` with new state and per-step diagnostics.
@@ -501,6 +508,8 @@ class OaKAgent:
             env_reward,
             next_observation,
             discount,
+            decision_observation=decision_observation,
+            execution_boundary=execution_boundary,
             enable_planning=enable_option_planning,
         )
 
@@ -579,19 +588,30 @@ class OaKAgent:
         env_rewards: Array,
         next_observations: Array,
         discounts: Array | None = None,
+        *,
+        decision_observations: Array | None = None,
+        execution_boundaries: Array | None = None,
     ) -> OaKArrayResult:
-        """Run OaK over transition arrays, optionally with explicit discounts."""
+        """Run OaK over arrays, optionally with explicit boundary inputs."""
 
         def step_fn(
             carry: OaKState,
-            inputs: tuple[Array, Array, Array],
+            inputs: tuple[Array, Array, Array, Array, Array],
         ) -> tuple[OaKState, tuple[Array, ...]]:
-            reward, next_obs, transition_discount = inputs
+            (
+                reward,
+                next_obs,
+                transition_discount,
+                decision_obs,
+                execution_boundary,
+            ) = inputs
             result = self.update(
                 carry,
                 reward,
                 next_obs,
                 transition_discount if discounts is not None else None,
+                decision_observation=decision_obs,
+                execution_boundary=execution_boundary,
             )
             return result.state, (
                 result.td_error,
@@ -609,6 +629,16 @@ class OaKAgent:
             scan_discounts = jnp.ones_like(env_rewards, dtype=jnp.float32)
         else:
             scan_discounts = jnp.asarray(discounts, dtype=jnp.float32)
+        scan_decision_observations = (
+            next_observations
+            if decision_observations is None
+            else jnp.asarray(decision_observations, dtype=jnp.float32)
+        )
+        scan_execution_boundaries = (
+            jnp.zeros_like(env_rewards, dtype=jnp.bool_)
+            if execution_boundaries is None
+            else jnp.asarray(execution_boundaries, dtype=jnp.bool_)
+        )
 
         final_state, (
             td_errors,
@@ -623,7 +653,13 @@ class OaKAgent:
         ) = jax.lax.scan(
             step_fn,
             state,
-            (env_rewards, next_observations, scan_discounts),
+            (
+                env_rewards,
+                next_observations,
+                scan_discounts,
+                scan_decision_observations,
+                scan_execution_boundaries,
+            ),
         )
 
         return OaKArrayResult(

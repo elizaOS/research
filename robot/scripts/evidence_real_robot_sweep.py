@@ -17,6 +17,9 @@ Safety:
 
 Outputs end up in
 `packages/research/robot/examples/robot-mujoco-demo/evidence/real/` by default.
+
+QUARANTINE: direct physical execution is disabled until this tool becomes an
+authenticated unified-bridge client.
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ import cv2
 import numpy as np
 
 from eliza_robot.bridge.backends.ainex_remote import AinexRemoteBackend
+from eliza_robot.bridge.physical_execution import reject_unsupervised_physical_motion
 from eliza_robot.bridge.protocol import CommandEnvelope, utc_now_iso
 
 
@@ -132,6 +136,7 @@ async def _run(
     fps: float,
     include_locomotion: bool,
 ) -> int:
+    reject_unsupervised_physical_motion("scripts/evidence_real_robot_sweep.py")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[real] connecting to ws://{host}:{port}...")

@@ -1,0 +1,6 @@
+upgd_w_fade_head 0
+upgd_w_fade_head 1
+upgd_w_fade_head 2
+upgd_w_idbd_swift 0
+upgd_w_idbd_swift 1
+upgd_w_idbd_swift 2

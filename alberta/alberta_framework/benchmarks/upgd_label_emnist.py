@@ -1,0 +1,1164 @@
+"""UPGD Label-permuted EMNIST replication runner (Elsayed & Mahmood, ICLR 2024).
+
+This lane implements a development replication diagnostic based on the *online
+Label-permuted EMNIST* protocol of
+
+    Elsayed, M. & Mahmood, A. R. (2024). Addressing Loss of Plasticity and
+    Catastrophic Forgetting in Continual Learning. ICLR 2024.
+    https://openreview.net/forum?id=sKPzAXoylB
+
+using the task, network, horizon, and best statistics-run hyperparameters from
+the authors' MIT-licensed repository (https://github.com/mohmdelsayed/upgd,
+commit ``b75e90ad4b09c28971ac9dbb902a8fd86709b28c`` -- the same commit audited
+by :mod:`alberta_framework.core.canonical_upgd` and the Input-permuted MNIST
+lane in :mod:`alberta_framework.benchmarks.upgd_ipmnist`):
+
+- 1,000,000 training examples presented one per step (batch size 1) from the
+  EMNIST *balanced* split train set (112,800 examples, 47 classes,
+  ``core/task/label_permuted_emnist.py``).
+- Labels are permuted every 2,500 steps => 400 tasks. Upstream's
+  ``change_all_lables`` runs at step 0, so the first task is itself permuted,
+  and it applies ``randperm(47)[targets]`` *to the already-permuted targets*:
+  the label mapping of task ``t`` is the composition of ``t+1`` fresh uniform
+  permutations (statistically equivalent to one fresh uniform permutation per
+  task). This lane reproduces the composition exactly.
+- ``change_all_lables`` also recreates the shuffled ``DataLoader`` at every
+  boundary, so each task presents 2,500 examples drawn without replacement
+  from a fresh shuffle of the train split -- the same per-task sampling shape
+  as the Input-permuted MNIST lane.
+- Inputs scaled to ``[-1, 1]`` (``ToTensor`` then ``Normalize((0.5,), (0.5,))``).
+- Network: 784 -> 300 -> ReLU -> 150 -> ReLU -> 47 MLP
+  (``core/network/fcn_relu.py``), PyTorch-default Linear init.
+- Loss: 47-class softmax cross-entropy on the single example. Metric: online
+  accuracy of the pre-update prediction, averaged per task.
+- Learners (best statistics-run hyperparameters from
+  ``experiments/statistics_output_permuted_emnist.py`` at the audited commit;
+  the ``zip(learners, grids)`` pairing there places
+  ``FirstOrderGlobalUPGDLearner`` (= UPGD-W, protecting) on the second grid --
+  the same pairing convention audited for the Input-permuted MNIST lane):
+
+  * **UPGD-W**: ``lr=0.01, beta_utility=0.9, sigma=0.001, weight_decay=0.0``.
+  * **AdamW** (released decoupled-decay Adam): ``lr=1e-4, beta1=0.0,
+    beta2=0.9999, eps=1e-8, weight_decay=0.1``.
+
+Documented deviations from the released code (this is therefore not a claim of
+complete published-protocol exactness):
+
+- **Dataset plumbing**: upstream loads EMNIST through torchvision; this lane
+  uses OpenML dataset ``EMNIST_Balanced`` (data_id 41039, 131,600 rows =
+  balanced train+test). The loader keeps the first 112,800 rows as the train
+  split only after verifying their class counts match the torchvision train
+  split exactly (2,400/class train, 400/class test remainder); otherwise it
+  fails closed. Row-identity with torchvision is *not* verified, and OpenML's
+  pixel order may be transposed relative to torchvision -- both are fixed
+  input permutations, irrelevant to a fully-connected network's dynamics.
+- Upstream permutation/shuffle streams are unseeded; here every stream
+  derives from the run seed (same policy as the IPMNIST lane).
+- Task metric blocks are exact ``[2500t, 2500(t+1))`` (upstream logging is
+  shifted one step past the boundary).
+- Bias corrections are float32; the UPGD-W inner loop reuses the IPMNIST
+  lane's :func:`~alberta_framework.benchmarks.upgd_ipmnist.lean_upgd_w_update`
+  scan-optimized step, which is pinned by a supplied-noise parity test to the
+  audited ``CanonicalUPGD`` ``official_experiment_global`` protecting profile.
+
+The CLI exposes a ``plan`` / ``shard`` / ``merge`` lifecycle modelled on the
+strict v3 IPMNIST lane, at reduced provenance depth (no source-closure or
+runtime-content binding): a plan pins config, learner arms, seeds, and dataset
+digests; each shard runs one learner x seed and binds the plan hash; merge
+validates the exact planned Cartesian product (or records incomplete coverage
+explicitly). Benchmark executions happen through this CLI, never inside
+pytest.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import math
+import platform
+import time
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
+
+import chex
+import jax
+import jax.numpy as jnp
+import jax.random as jr
+import numpy as np
+from jax import Array
+
+from alberta_framework.benchmarks.upgd_ipmnist import (
+    _LEARNER_FACTORIES,
+    cross_entropy_loss,
+    init_mlp_params,
+    task_index_for_step,
+)
+from alberta_framework.benchmarks.upgd_ipmnist_v3 import atomic_write_new_json
+
+logger = logging.getLogger(__name__)
+
+LabelEMNISTLearner = Literal["upgd_w", "adamw"]
+
+BENCHMARK = "upgd_label_permuted_emnist"
+PLAN_SCHEMA = "alberta.upgd_label_emnist.plan.v1"
+PARTIAL_SCHEMA = "alberta.upgd_label_emnist.partial.v1"
+ARTIFACT_SCHEMA = "alberta.upgd_label_emnist.artifact.v1"
+
+EMNIST_OPENML_DATA_ID = 41039
+EMNIST_OPENML_NAME = "EMNIST_Balanced"
+EMNIST_TOTAL_ROWS = 131_600
+EMNIST_TRAIN_ROWS = 112_800
+EMNIST_TRAIN_PER_CLASS = 2_400
+EMNIST_TEST_PER_CLASS = 400
+
+NONPROMOTING_POLICY: dict[str, object] = {
+    "evidence_class": "development_replication_diagnostic",
+    "development_only": True,
+    "scientific_promotion_allowed": False,
+    "execution_attestation": False,
+}
+
+PROTOCOL_DEVIATIONS: tuple[dict[str, str], ...] = (
+    {
+        "code": "openml_dataset_plumbing",
+        "scope": "dataset",
+        "description": (
+            "OpenML EMNIST_Balanced (41039) first 112800 rows, accepted only when class "
+            "counts match the torchvision balanced train split; row identity and pixel "
+            "orientation with torchvision are unverified (both irrelevant to an MLP)"
+        ),
+    },
+    {
+        "code": "seeded_streams",
+        "scope": "rng_schedule",
+        "description": (
+            "label-permutation and example streams are seed-derived; upstream streams "
+            "are unseeded"
+        ),
+    },
+    {
+        "code": "task_aligned_logging",
+        "scope": "metric_blocks",
+        "description": "task blocks are [t*L, (t+1)*L); upstream logging is shifted one step",
+    },
+    {
+        "code": "float32_bias_corrections",
+        "scope": "numeric_precision",
+        "description": "bias corrections remain float32; upstream mixes float64 scalars",
+    },
+)
+
+#: Best statistics-run hyperparameters for the protecting UPGD-W arm, from
+#: ``experiments/statistics_output_permuted_emnist.py`` (``upgd2_grid`` paired
+#: with ``FirstOrderGlobalUPGDLearner`` under ``zip``) at the audited commit.
+UPGD_W_PROTOCOL_HYPERPARAMETERS: dict[str, float] = {
+    "step_size": 0.01,
+    "utility_decay": 0.9,
+    "noise_std": 0.001,
+    "weight_decay": 0.0,
+}
+#: Best statistics-run hyperparameters for the released decoupled-decay Adam.
+ADAMW_PROTOCOL_HYPERPARAMETERS: dict[str, float] = {
+    "step_size": 1e-4,
+    "beta1": 0.0,
+    "beta2": 0.9999,
+    "eps": 1e-8,
+    "weight_decay": 0.1,
+}
+
+_LEARNER_DEFAULT_HYPERPARAMETERS: dict[str, dict[str, float]] = {
+    "upgd_w": UPGD_W_PROTOCOL_HYPERPARAMETERS,
+    "adamw": ADAMW_PROTOCOL_HYPERPARAMETERS,
+}
+
+#: Published reference numbers. The paper reports curves (its Figure for
+#: label-permuted EMNIST), not a table; these are approximate read-offs.
+#: UPGD-W *rises* over the 400 tasks (feature consolidation helps), while
+#: plasticity-only baselines sit far lower. The AdamW read-off is
+#: low-confidence (curves for the non-consolidating baselines cluster).
+PAPER_REFERENCE: dict[str, Any] = {
+    "citation": (
+        "Elsayed & Mahmood (2024). Addressing Loss of Plasticity and "
+        "Catastrophic Forgetting in Continual Learning. ICLR 2024."
+    ),
+    "openreview": "https://openreview.net/forum?id=sKPzAXoylB",
+    "official_repository": "https://github.com/mohmdelsayed/upgd",
+    "official_commit": "b75e90ad4b09c28971ac9dbb902a8fd86709b28c",
+    "protocol_files": [
+        "core/task/label_permuted_emnist.py",
+        "core/network/fcn_relu.py",
+        "core/run/run_stats.py",
+        "experiments/statistics_output_permuted_emnist.py",
+        "core/optim/weight_upgd/first_order.py",
+        "core/optim/adam.py",
+    ],
+    "n_seeds": 20,
+    "approximate_average_online_accuracy": {
+        "upgd_w": 0.74,
+        "adamw": 0.35,
+    },
+    "qualitative": (
+        "UPGD-W rises toward ~0.73-0.75 across 400 tasks; plasticity-only and "
+        "plain-optimizer baselines sit near ~0.35."
+    ),
+    "reference_kind": "figure_readoff_low_confidence",
+}
+
+#: Reproduction gaps above this are flagged for investigation, never absorbed.
+#: Wider than the IPMNIST threshold because the figure read-off itself is
+#: less certain on this benchmark.
+REPRODUCTION_GAP_THRESHOLD = 0.03
+
+
+@dataclass(frozen=True)
+class LabelEMNISTConfig:
+    """Label-permuted EMNIST protocol configuration.
+
+    Defaults match the selected ICLR-2024 configuration; tests shrink every
+    field. Configuration equality alone is not protocol exactness.
+
+    Args:
+        n_tasks: Number of label-permutation tasks (published: 400).
+        task_length: Online steps per task (published: 2,500).
+        input_dim: Flattened input dimensionality (published: 784).
+        hidden1: First hidden layer width (published: 300).
+        hidden2: Second hidden layer width (published: 150).
+        n_classes: Output classes (published: 47).
+    """
+
+    n_tasks: int = 400
+    task_length: int = 2500
+    input_dim: int = 784
+    hidden1: int = 300
+    hidden2: int = 150
+    n_classes: int = 47
+
+    def __post_init__(self) -> None:
+        for name in ("n_tasks", "task_length", "input_dim", "hidden1", "hidden2", "n_classes"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+
+    @property
+    def n_steps(self) -> int:
+        """Total online steps (examples) in a run."""
+        return self.n_tasks * self.task_length
+
+    @property
+    def matches_selected_publication_configuration(self) -> bool:
+        """Whether shape and horizon match the selected publication configuration."""
+        return self == LabelEMNISTConfig()
+
+    def to_config(self) -> dict[str, int]:
+        """Return a JSON-serializable configuration."""
+        return {
+            "n_tasks": self.n_tasks,
+            "task_length": self.task_length,
+            "input_dim": self.input_dim,
+            "hidden1": self.hidden1,
+            "hidden2": self.hidden2,
+            "n_classes": self.n_classes,
+        }
+
+
+@chex.dataclass(frozen=True)
+class LabelEMNISTSchedule:
+    """Per-seed label-permutation and example schedule.
+
+    Attributes:
+        label_permutations: ``(n_tasks, n_classes)`` int32; row ``t`` maps an
+            original dataset label to the label presented during task ``t``.
+            Row ``t`` is the composition ``r_t o r_{t-1} o ... o r_0`` of
+            fresh uniform permutations, matching upstream's cumulative
+            ``randperm(47)[targets]`` mutation (task 0 is already permuted).
+        example_indices: ``(n_tasks, task_length)`` int32; row ``t`` holds the
+            dataset rows presented during task ``t``, drawn without
+            replacement from a fresh per-task shuffle of the train split.
+    """
+
+    label_permutations: Array
+    example_indices: Array
+
+
+def build_schedule(key: Array, config: LabelEMNISTConfig, n_train: int) -> LabelEMNISTSchedule:
+    """Build the deterministic label/example schedule for one seed.
+
+    Args:
+        key: Per-seed schedule key.
+        config: Protocol configuration.
+        n_train: Number of rows in the train split; must be at least
+            ``config.task_length`` so tasks sample without replacement.
+
+    Returns:
+        The schedule; task ``t`` is exactly steps
+        ``[t * task_length, (t + 1) * task_length)``.
+    """
+    if n_train < config.task_length:
+        raise ValueError(
+            f"n_train={n_train} is smaller than task_length={config.task_length}; "
+            "per-task sampling is without replacement"
+        )
+    key_perm, key_sample = jr.split(key)
+    tasks = jnp.arange(config.n_tasks)
+
+    def compose(previous: Array, task: Array) -> tuple[Array, Array]:
+        fresh = jr.permutation(jr.fold_in(key_perm, task), config.n_classes)
+        current = fresh[previous]
+        return current, current
+
+    identity = jnp.arange(config.n_classes)
+    _, label_permutations = jax.lax.scan(compose, identity, tasks)
+    example_indices = jax.vmap(
+        lambda task: jr.permutation(jr.fold_in(key_sample, task), n_train)[: config.task_length]
+    )(tasks)
+    return LabelEMNISTSchedule(  # type: ignore[call-arg]
+        label_permutations=label_permutations.astype(jnp.int32),
+        example_indices=example_indices.astype(jnp.int32),
+    )
+
+
+@dataclass(frozen=True)
+class LabelEMNISTRunResult:
+    """Host-side result of one learner's multi-seed run.
+
+    Per-task arrays have shape ``(n_seeds, n_tasks)``. ``per_step_accuracy``
+    (``(n_seeds, n_tasks, task_length)``), ``initial_params``,
+    ``label_permutations``, and ``example_indices`` are populated only when
+    the run was invoked with ``return_per_step=True`` (debug/testing scale).
+    """
+
+    learner: str
+    hyperparameters: dict[str, float]
+    seeds: tuple[int, ...]
+    config: LabelEMNISTConfig
+    per_task_accuracy: np.ndarray
+    per_task_loss: np.ndarray
+    per_task_plasticity: np.ndarray
+    average_online_accuracy: np.ndarray
+    wall_clock_seconds: float
+    per_step_accuracy: np.ndarray | None = None
+    initial_params: dict[str, np.ndarray] | None = None
+    label_permutations: np.ndarray | None = None
+    example_indices: np.ndarray | None = None
+
+
+def resolve_hyperparameters(
+    learner: str, overrides: dict[str, float] | None = None
+) -> dict[str, float]:
+    """Merge overrides into the learner's published defaults, rejecting unknown keys."""
+    if learner not in _LEARNER_DEFAULT_HYPERPARAMETERS:
+        raise ValueError(
+            f"unknown learner {learner!r}; expected one of "
+            f"{sorted(_LEARNER_DEFAULT_HYPERPARAMETERS)}"
+        )
+    merged = dict(_LEARNER_DEFAULT_HYPERPARAMETERS[learner])
+    if overrides:
+        unknown = set(overrides) - set(merged)
+        if unknown:
+            raise ValueError(f"unknown hyperparameters for {learner}: {sorted(unknown)}")
+        merged.update({name: float(value) for name, value in overrides.items()})
+    return merged
+
+
+_PLASTICITY_LOSS_FLOOR = 1e-8
+
+
+def run_label_emnist(
+    data_x: np.ndarray | Array,
+    data_y: np.ndarray | Array,
+    learner: LabelEMNISTLearner,
+    seeds: Sequence[int],
+    config: LabelEMNISTConfig | None = None,
+    hyperparameters: dict[str, float] | None = None,
+    return_per_step: bool = False,
+    progress_every: int | None = None,
+) -> LabelEMNISTRunResult:
+    """Run the online Label-permuted EMNIST protocol for one learner.
+
+    Args:
+        data_x: ``(n_train, input_dim)`` float32 inputs, already normalized
+            to ``[-1, 1]`` (see :func:`load_emnist_balanced_train`).
+        data_y: ``(n_train,)`` integer class labels in ``[0, n_classes)``.
+        learner: ``"upgd_w"`` or ``"adamw"``.
+        seeds: Run seeds; all seeds execute in parallel under ``vmap``.
+        config: Task/network configuration (defaults to the selected
+            publication shape).
+        hyperparameters: Optional overrides of the published defaults.
+        return_per_step: Also return per-step accuracies plus the initial
+            parameters and schedules (debug/testing scale only).
+        progress_every: Log progress every N tasks (None = silent).
+
+    Returns:
+        Host-side result arrays; see :class:`LabelEMNISTRunResult`.
+    """
+    if config is None:
+        config = LabelEMNISTConfig()
+    hp = resolve_hyperparameters(learner, hyperparameters)
+    init_fn, step_fn = _LEARNER_FACTORIES[learner](hp)
+
+    data_x = jnp.asarray(data_x, dtype=jnp.float32)
+    data_y = jnp.asarray(data_y, dtype=jnp.int32)
+    if data_x.ndim != 2 or data_x.shape[1] != config.input_dim:
+        raise ValueError(
+            f"data_x must have shape (n_train, {config.input_dim}), got {data_x.shape}"
+        )
+    if data_y.shape != (data_x.shape[0],):
+        raise ValueError("data_y must be (n_train,) aligned with data_x")
+    n_train = int(data_x.shape[0])
+    if n_train < config.task_length:
+        raise ValueError("dataset smaller than task_length; cannot sample without replacement")
+
+    seed_tuple = tuple(int(seed) for seed in seeds)
+    if not seed_tuple:
+        raise ValueError("at least one seed is required")
+    seeds_array = jnp.asarray(seed_tuple, dtype=jnp.uint32)
+
+    def init_seed(seed: Array) -> tuple[dict[str, Array], Any, LabelEMNISTSchedule, Array]:
+        root = jr.key(seed)
+        key_init, key_schedule, key_noise = jr.split(root, 3)
+        params = init_mlp_params(key_init, config)
+        return params, init_fn(params), build_schedule(key_schedule, config, n_train), key_noise
+
+    params, opt_state, schedules, noise_keys = jax.jit(jax.vmap(init_seed))(seeds_array)
+
+    initial_params_host: dict[str, np.ndarray] | None = None
+    if return_per_step:
+        initial_params_host = {name: np.asarray(value) for name, value in params.items()}
+
+    def run_task(
+        params: dict[str, Array],
+        opt_state: Any,
+        noise_key: Array,
+        label_permutation: Array,
+        examples: Array,
+    ) -> tuple[dict[str, Array], Any, Array, Array, Array, Array]:
+        def one_step(
+            carry: tuple[dict[str, Array], Any, Array], example: Array
+        ) -> tuple[tuple[dict[str, Array], Any, Array], tuple[Array, Array, Array]]:
+            step_params, step_state, key = carry
+            x = data_x[example]
+            y = label_permutation[data_y[example]]
+            (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+                step_params, x, y
+            )
+            accuracy = (jnp.argmax(logits) == y).astype(jnp.float32)
+            key, step_key = jr.split(key)
+            new_params, new_state = step_fn(step_params, step_state, grads, step_key)
+            loss_after, _ = cross_entropy_loss(new_params, x, y)
+            plasticity = jnp.clip(
+                1.0 - loss_after / jnp.maximum(loss, _PLASTICITY_LOSS_FLOOR), 0.0, 1.0
+            )
+            return (new_params, new_state, key), (accuracy, loss, plasticity)
+
+        (params, opt_state, noise_key), (accuracies, losses, plasticities) = jax.lax.scan(
+            one_step, (params, opt_state, noise_key), examples
+        )
+        return params, opt_state, noise_key, accuracies, losses, plasticities
+
+    run_task_batched = jax.jit(jax.vmap(run_task))
+
+    task_accuracy: list[np.ndarray] = []
+    task_loss: list[np.ndarray] = []
+    task_plasticity: list[np.ndarray] = []
+    step_accuracy: list[np.ndarray] = []
+    started = time.monotonic()
+    for task in range(config.n_tasks):
+        params, opt_state, noise_keys, accuracies, losses, plasticities = run_task_batched(
+            params,
+            opt_state,
+            noise_keys,
+            schedules.label_permutations[:, task],
+            schedules.example_indices[:, task],
+        )
+        task_accuracy.append(np.asarray(accuracies.mean(axis=1)))
+        task_loss.append(np.asarray(losses.mean(axis=1)))
+        task_plasticity.append(np.asarray(plasticities.mean(axis=1)))
+        if return_per_step:
+            step_accuracy.append(np.asarray(accuracies))
+        if progress_every is not None and (task + 1) % progress_every == 0:
+            elapsed = time.monotonic() - started
+            logger.info(
+                "%s task %d/%d online_acc=%.4f elapsed=%.1fs",
+                learner,
+                task + 1,
+                config.n_tasks,
+                float(task_accuracy[-1].mean()),
+                elapsed,
+            )
+
+    per_task_accuracy = np.stack(task_accuracy, axis=1)
+    return LabelEMNISTRunResult(
+        learner=learner,
+        hyperparameters=hp,
+        seeds=seed_tuple,
+        config=config,
+        per_task_accuracy=per_task_accuracy,
+        per_task_loss=np.stack(task_loss, axis=1),
+        per_task_plasticity=np.stack(task_plasticity, axis=1),
+        average_online_accuracy=per_task_accuracy.mean(axis=1),
+        wall_clock_seconds=time.monotonic() - started,
+        per_step_accuracy=np.stack(step_accuracy, axis=1) if return_per_step else None,
+        initial_params=initial_params_host,
+        label_permutations=np.asarray(schedules.label_permutations) if return_per_step else None,
+        example_indices=np.asarray(schedules.example_indices) if return_per_step else None,
+    )
+
+
+# =============================================================================
+# EMNIST loading (OpenML EMNIST_Balanced, data_id 41039)
+# =============================================================================
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def default_openml_data_home() -> Path:
+    """Return the ``fetch_openml`` ``data_home`` for the EMNIST cache."""
+    return _repo_root() / "outputs" / "upgd_label_emnist" / "openml_cache"
+
+
+def materialized_array_sha256(value: np.ndarray) -> str:
+    """Digest an array's dtype, shape, and C-order bytes."""
+    array = np.asarray(value)
+    digest = hashlib.sha256()
+    digest.update(array.dtype.str.encode("ascii") + b"\0")
+    digest.update(str(tuple(array.shape)).encode("ascii") + b"\0")
+    digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _npy_cache_paths(home: Path) -> tuple[Path, Path, Path]:
+    return (
+        home / "emnist_balanced_train_x.npy",
+        home / "emnist_balanced_train_y.npy",
+        home / "emnist_balanced_train_meta.json",
+    )
+
+
+def load_emnist_balanced_train(
+    data_home: Path | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Load the EMNIST balanced train split, scaled to ``[-1, 1]``.
+
+    Uses ``fetch_openml(data_id=41039)`` (``EMNIST_Balanced``: 131,600 rows =
+    train+test of the balanced split). The first 112,800 rows are kept as the
+    train split only after verifying their per-class counts equal the
+    torchvision balanced train split (2,400/class; remaining 18,800 rows
+    400/class); a mismatch fails closed rather than silently changing the
+    protocol. The transform matches ``ToTensor`` + ``Normalize((0.5,), (0.5,))``.
+
+    The parsed arrays are cached as ``.npy`` beside the OpenML cache (the
+    ARFF parse costs minutes; the cache loads in seconds) with digests pinned
+    in a meta file; cache hits re-verify the digests.
+
+    Returns:
+        ``(x, y, info)`` where ``x`` is ``(112800, 784)`` float32 in
+        ``[-1, 1]``, ``y`` is ``(112800,)`` int32 in ``[0, 47)``, and ``info``
+        records provenance facts bound into plans.
+    """
+    home = data_home if data_home is not None else default_openml_data_home()
+    x_path, y_path, meta_path = _npy_cache_paths(home)
+    if x_path.is_file() and y_path.is_file() and meta_path.is_file():
+        x = np.load(x_path)
+        y = np.load(y_path)
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if (
+            materialized_array_sha256(x) != meta["x_sha256"]
+            or materialized_array_sha256(y) != meta["y_sha256"]
+        ):
+            raise RuntimeError(f"EMNIST npy cache under {home} does not match its pinned digests")
+        return x, y, dict(meta)
+
+    try:
+        from sklearn.datasets import fetch_openml  # type: ignore[import-untyped]
+    except ModuleNotFoundError as exc:  # pragma: no cover - environment dependent
+        raise RuntimeError("scikit-learn is required to load OpenML EMNIST") from exc
+
+    logger.info("fetching OpenML EMNIST_Balanced (data_id=%d) into %s", EMNIST_OPENML_DATA_ID, home)
+    raw = fetch_openml(
+        data_id=EMNIST_OPENML_DATA_ID,
+        as_frame=False,
+        data_home=str(home),
+        n_retries=3,
+        delay=2.0,
+        parser="liac-arff",
+    )
+    x_all = np.asarray(raw.data, dtype=np.float32)
+    y_all = np.asarray(raw.target, dtype=np.int32)
+    if x_all.shape != (EMNIST_TOTAL_ROWS, 784) or y_all.shape != (EMNIST_TOTAL_ROWS,):
+        raise RuntimeError(
+            f"unexpected EMNIST_Balanced shape: x={x_all.shape} y={y_all.shape}"
+        )
+    counts_first = np.bincount(y_all[:EMNIST_TRAIN_ROWS], minlength=47)
+    counts_tail = np.bincount(y_all[EMNIST_TRAIN_ROWS:], minlength=47)
+    ordering_consistent = bool(
+        (counts_first == EMNIST_TRAIN_PER_CLASS).all()
+        and (counts_tail == EMNIST_TEST_PER_CLASS).all()
+    )
+    if not ordering_consistent:
+        raise RuntimeError(
+            "OpenML EMNIST_Balanced row order is not consistent with a "
+            "train-then-test layout (per-class counts differ); refusing to "
+            "guess the train split"
+        )
+    x = np.ascontiguousarray((x_all[:EMNIST_TRAIN_ROWS] / 255.0 - 0.5) / 0.5, dtype=np.float32)
+    y = np.ascontiguousarray(y_all[:EMNIST_TRAIN_ROWS])
+    meta: dict[str, Any] = {
+        "source": f"openml:{EMNIST_OPENML_NAME}:data_id={EMNIST_OPENML_DATA_ID}",
+        "total_rows": EMNIST_TOTAL_ROWS,
+        "train_rows_used": EMNIST_TRAIN_ROWS,
+        "train_order_check": "first_112800_rows_have_2400_per_class_and_tail_400_per_class",
+        "input_scaling": "(x/255 - 0.5) / 0.5",
+        "parser": "liac-arff",
+        "x_sha256": materialized_array_sha256(x),
+        "y_sha256": materialized_array_sha256(y),
+    }
+    home.mkdir(parents=True, exist_ok=True)
+    np.save(x_path, x)
+    np.save(y_path, y)
+    meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return x, y, meta
+
+
+# =============================================================================
+# Summaries, comparison
+# =============================================================================
+
+
+def _stderr(values: np.ndarray) -> float:
+    if values.shape[0] < 2:
+        return 0.0
+    return float(values.std(ddof=1) / math.sqrt(values.shape[0]))
+
+
+def summarize_result(result: LabelEMNISTRunResult) -> dict[str, Any]:
+    """Reduce one learner's run to JSON-serializable summary statistics."""
+    accuracy = result.average_online_accuracy
+    quarter = max(1, result.config.n_tasks // 4)
+    per_seed_first = result.per_task_accuracy[:, :quarter].mean(axis=1)
+    per_seed_last = result.per_task_accuracy[:, -quarter:].mean(axis=1)
+    return {
+        "learner": result.learner,
+        "hyperparameters": result.hyperparameters,
+        "seeds": list(result.seeds),
+        "n_seeds": int(accuracy.shape[0]),
+        "average_online_accuracy_mean": float(accuracy.mean()),
+        "average_online_accuracy_stderr": _stderr(accuracy),
+        "per_seed_average_online_accuracy": [round(float(v), 6) for v in accuracy],
+        "first_quarter_accuracy_mean": float(per_seed_first.mean()),
+        "last_quarter_accuracy_mean": float(per_seed_last.mean()),
+        "accuracy_drift_last_minus_first": float(per_seed_last.mean() - per_seed_first.mean()),
+        "average_plasticity_mean": float(result.per_task_plasticity.mean()),
+        "per_task_accuracy_mean": [
+            round(float(v), 6) for v in result.per_task_accuracy.mean(axis=0)
+        ],
+        "per_task_accuracy_stderr": [
+            round(_stderr(result.per_task_accuracy[:, t]), 6)
+            for t in range(result.config.n_tasks)
+        ],
+        "per_seed_per_task_accuracy": [
+            [round(float(v), 6) for v in row] for row in result.per_task_accuracy
+        ],
+        "wall_clock_seconds": round(result.wall_clock_seconds, 2),
+    }
+
+
+def build_comparison(summaries: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Compare run summaries against the published reference read-offs."""
+    reference = PAPER_REFERENCE["approximate_average_online_accuracy"]
+    comparison: dict[str, Any] = {
+        "reference": PAPER_REFERENCE,
+        "gap_threshold": REPRODUCTION_GAP_THRESHOLD,
+        "learners": {},
+    }
+    for learner, summary in summaries.items():
+        if learner not in reference:
+            continue
+        ours = summary["average_online_accuracy_mean"]
+        published = float(reference[learner])
+        gap = ours - published
+        comparison["learners"][learner] = {
+            "ours": round(ours, 6),
+            "published_approximate": published,
+            "gap": round(gap, 6),
+            "reproduction_gap_flagged": bool(abs(gap) > REPRODUCTION_GAP_THRESHOLD),
+        }
+    if "upgd_w" in summaries and "adamw" in summaries:
+        comparison["upgd_w_beats_adamw"] = bool(
+            summaries["upgd_w"]["average_online_accuracy_mean"]
+            > summaries["adamw"]["average_online_accuracy_mean"]
+        )
+        drift = summaries["upgd_w"]["accuracy_drift_last_minus_first"]
+        comparison["upgd_w_rises"] = bool(drift > 0.0)
+    return comparison
+
+
+def _environment_payload() -> dict[str, str]:
+    return {
+        "jax": jax.__version__,
+        "numpy": np.__version__,
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "device": str(jax.devices()[0]),
+    }
+
+
+# =============================================================================
+# plan / shard / merge lifecycle
+# =============================================================================
+
+
+def canonical_json_sha256(value: object) -> str:
+    """Hash a JSON value independently of its locator or pretty encoding."""
+    encoded = json.dumps(
+        value, allow_nan=False, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def build_plan_payload(
+    config: LabelEMNISTConfig,
+    seed_ids: Sequence[int],
+    dataset_meta: Mapping[str, Any],
+    learners: Sequence[str] = ("upgd_w", "adamw"),
+    hyperparameter_overrides: Mapping[str, Mapping[str, float]] | None = None,
+    notes: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Build the pre-run plan binding config, arms, seeds, and dataset digests."""
+    seeds = tuple(int(seed) for seed in seed_ids)
+    if not seeds:
+        raise ValueError("a plan requires at least one seed")
+    if any(seed < 0 for seed in seeds):
+        raise ValueError("seed IDs must be non-negative")
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("seed IDs must be unique")
+    if seeds != tuple(sorted(seeds)):
+        raise ValueError("seed IDs must be sorted")
+    learner_ids = tuple(learners)
+    if not learner_ids or len(set(learner_ids)) != len(learner_ids):
+        raise ValueError("learner IDs must be a non-empty unique sequence")
+    overrides = hyperparameter_overrides or {}
+    unknown_override_learners = set(overrides) - set(learner_ids)
+    if unknown_override_learners:
+        raise ValueError(f"overrides name unplanned learners: {sorted(unknown_override_learners)}")
+    hyperparameters = {
+        learner: resolve_hyperparameters(learner, dict(overrides.get(learner, {})))
+        for learner in learner_ids
+    }
+    required_meta = {"source", "train_rows_used", "x_sha256", "y_sha256"}
+    missing = required_meta - set(dataset_meta)
+    if missing:
+        raise ValueError(f"dataset_meta is missing required fields: {sorted(missing)}")
+    body = {
+        "benchmark": BENCHMARK,
+        "config": {**config.to_config(), "n_steps": config.n_steps},
+        "matches_selected_publication_configuration": (
+            config.matches_selected_publication_configuration
+        ),
+        "learner_ids": list(learner_ids),
+        "hyperparameters": hyperparameters,
+        "seed_ids": list(seeds),
+        "planned_shard_count": len(learner_ids) * len(seeds),
+        "dataset": dict(dataset_meta),
+        "deviations": [dict(deviation) for deviation in PROTOCOL_DEVIATIONS],
+        "paper_reference": PAPER_REFERENCE,
+        "notes": list(notes),
+    }
+    return {
+        "schema": PLAN_SCHEMA,
+        "schema_version": 1,
+        "evidence_policy": dict(NONPROMOTING_POLICY),
+        "created_unix": int(time.time()),
+        "plan": body,
+        "plan_sha256": canonical_json_sha256(body),
+    }
+
+
+def _strict_json_object(path: Path) -> dict[str, Any]:
+    def pairs_hook(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        parsed: dict[str, object] = {}
+        for key, value in pairs:
+            if key in parsed:
+                raise ValueError(f"duplicate JSON key: {key!r}")
+            parsed[key] = value
+        return parsed
+
+    def reject_constant(value: str) -> object:
+        raise ValueError(f"non-finite JSON constant is forbidden: {value}")
+
+    payload = json.loads(
+        Path(path).read_text(encoding="utf-8"),
+        object_pairs_hook=pairs_hook,
+        parse_constant=reject_constant,
+    )
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path}: payload must be one JSON object")
+    return payload
+
+
+def load_plan(path: Path) -> dict[str, Any]:
+    """Load and structurally validate a v1 plan file."""
+    payload = _strict_json_object(path)
+    if payload.get("schema") != PLAN_SCHEMA or payload.get("schema_version") != 1:
+        raise ValueError(f"{path} is not a {PLAN_SCHEMA} payload")
+    if payload.get("evidence_policy") != NONPROMOTING_POLICY:
+        raise ValueError(f"{path}: evidence policy must remain permanently nonpromoting")
+    body = payload.get("plan")
+    if not isinstance(body, dict):
+        raise ValueError(f"{path}: plan body must be an object")
+    if payload.get("plan_sha256") != canonical_json_sha256(body):
+        raise ValueError(f"{path}: plan_sha256 does not match the plan body")
+    if body.get("benchmark") != BENCHMARK:
+        raise ValueError(f"{path}: plan benchmark is not {BENCHMARK}")
+    config_payload = dict(body["config"])
+    n_steps = config_payload.pop("n_steps", None)
+    config = LabelEMNISTConfig(**config_payload)
+    if n_steps != config.n_steps:
+        raise ValueError(f"{path}: plan n_steps is inconsistent with config")
+    learner_ids = body["learner_ids"]
+    if sorted(body["hyperparameters"]) != sorted(learner_ids):
+        raise ValueError(f"{path}: hyperparameter learner keys differ from learner_ids")
+    for learner in learner_ids:
+        resolved = resolve_hyperparameters(
+            learner,
+            {k: float(v) for k, v in body["hyperparameters"][learner].items()},
+        )
+        if resolved != {k: float(v) for k, v in body["hyperparameters"][learner].items()}:
+            raise ValueError(f"{path}: {learner} hyperparameters have unknown keys")
+    seeds = body["seed_ids"]
+    if len(set(seeds)) != len(seeds) or seeds != sorted(seeds):
+        raise ValueError(f"{path}: plan seed_ids must be unique and sorted")
+    if body["planned_shard_count"] != len(learner_ids) * len(seeds):
+        raise ValueError(f"{path}: planned_shard_count is inconsistent")
+    return payload
+
+
+def partial_payload(
+    result: LabelEMNISTRunResult, plan_sha256: str
+) -> dict[str, Any]:
+    """Serialize one single-seed run shard bound to its plan hash."""
+    if len(result.seeds) != 1:
+        raise ValueError("a v1 partial must contain exactly one seed")
+    return {
+        "schema": PARTIAL_SCHEMA,
+        "schema_version": 1,
+        "evidence_policy": dict(NONPROMOTING_POLICY),
+        "plan_sha256": plan_sha256,
+        "learner": result.learner,
+        "hyperparameters": result.hyperparameters,
+        "seed_id": result.seeds[0],
+        "config": result.config.to_config(),
+        "per_task_accuracy": [round(float(v), 6) for v in result.per_task_accuracy[0]],
+        "per_task_loss": [round(float(v), 6) for v in result.per_task_loss[0]],
+        "per_task_plasticity": [round(float(v), 6) for v in result.per_task_plasticity[0]],
+        "average_online_accuracy": round(float(result.average_online_accuracy[0]), 6),
+        "wall_clock_seconds": round(result.wall_clock_seconds, 2),
+    }
+
+
+def _validated_partial(path: Path, plan: dict[str, Any]) -> dict[str, Any]:
+    payload = _strict_json_object(path)
+    if payload.get("schema") != PARTIAL_SCHEMA or payload.get("schema_version") != 1:
+        raise ValueError(f"{path} is not a {PARTIAL_SCHEMA} payload")
+    if payload.get("evidence_policy") != NONPROMOTING_POLICY:
+        raise ValueError(f"{path}: evidence policy must remain permanently nonpromoting")
+    body = plan["plan"]
+    if payload.get("plan_sha256") != plan["plan_sha256"]:
+        raise ValueError(f"{path}: shard is bound to a different plan")
+    learner = payload.get("learner")
+    if learner not in body["learner_ids"]:
+        raise ValueError(f"{path}: learner {learner!r} is not planned")
+    if payload.get("hyperparameters") != body["hyperparameters"][learner]:
+        raise ValueError(f"{path}: hyperparameters differ from the plan")
+    seed = payload.get("seed_id")
+    if not isinstance(seed, int) or isinstance(seed, bool) or seed not in body["seed_ids"]:
+        raise ValueError(f"{path}: seed_id {seed!r} is not planned")
+    plan_config = {k: v for k, v in body["config"].items() if k != "n_steps"}
+    if payload.get("config") != plan_config:
+        raise ValueError(f"{path}: config differs from the plan")
+    n_tasks = plan_config["n_tasks"]
+    for field, (lower, upper) in {
+        "per_task_accuracy": (0.0, 1.0),
+        "per_task_loss": (0.0, None),
+        "per_task_plasticity": (0.0, 1.0),
+    }.items():
+        values = payload.get(field)
+        if not isinstance(values, list) or len(values) != n_tasks:
+            raise ValueError(f"{path}: {field} must be a list of {n_tasks} numbers")
+        array = np.asarray(values, dtype=np.float64)
+        if not np.all(np.isfinite(array)) or not np.all(array >= lower):
+            raise ValueError(f"{path}: {field} values are outside the allowed range")
+        if upper is not None and not np.all(array <= upper):
+            raise ValueError(f"{path}: {field} values are outside the allowed range")
+    mean_accuracy = float(np.asarray(payload["per_task_accuracy"], dtype=np.float64).mean())
+    if abs(mean_accuracy - float(payload["average_online_accuracy"])) > 1e-5:
+        raise ValueError(f"{path}: average_online_accuracy does not match per-task mean")
+    return payload
+
+
+def merge_partials(
+    plan: dict[str, Any],
+    paths: Sequence[Path],
+    allow_incomplete: bool = False,
+) -> tuple[dict[str, LabelEMNISTRunResult], dict[str, Any]]:
+    """Merge shard files against a plan, enforcing exact planned coverage.
+
+    Args:
+        plan: A validated plan payload (see :func:`load_plan`).
+        paths: Shard JSON paths.
+        allow_incomplete: Permit missing planned pairs; the coverage payload
+            then records them explicitly and marks the merge incomplete.
+
+    Returns:
+        ``(results_by_learner, coverage)``.
+    """
+    if not paths:
+        raise ValueError("no partial result files given")
+    body = plan["plan"]
+    config = LabelEMNISTConfig(
+        **{k: v for k, v in body["config"].items() if k != "n_steps"}
+    )
+    seen: dict[tuple[str, int], dict[str, Any]] = {}
+    for path in paths:
+        payload = _validated_partial(Path(path), plan)
+        identity = (payload["learner"], payload["seed_id"])
+        if identity in seen:
+            raise ValueError(f"duplicate shard for learner={identity[0]} seed={identity[1]}")
+        seen[identity] = payload
+    planned = {
+        (learner, seed) for learner in body["learner_ids"] for seed in body["seed_ids"]
+    }
+    missing = sorted(planned - set(seen))
+    if missing and not allow_incomplete:
+        raise ValueError(f"missing planned shards: {missing}")
+    coverage = {
+        "planned_shard_count": len(planned),
+        "merged_shard_count": len(seen),
+        "complete": not missing,
+        "missing_pairs": [[learner, seed] for learner, seed in missing],
+    }
+    results: dict[str, LabelEMNISTRunResult] = {}
+    for learner in body["learner_ids"]:
+        shards = sorted(
+            (payload for (name, _), payload in seen.items() if name == learner),
+            key=lambda payload: payload["seed_id"],
+        )
+        if not shards:
+            continue
+        per_task_accuracy = np.asarray(
+            [shard["per_task_accuracy"] for shard in shards], dtype=np.float64
+        )
+        results[learner] = LabelEMNISTRunResult(
+            learner=learner,
+            hyperparameters=dict(shards[0]["hyperparameters"]),
+            seeds=tuple(shard["seed_id"] for shard in shards),
+            config=config,
+            per_task_accuracy=per_task_accuracy,
+            per_task_loss=np.asarray(
+                [shard["per_task_loss"] for shard in shards], dtype=np.float64
+            ),
+            per_task_plasticity=np.asarray(
+                [shard["per_task_plasticity"] for shard in shards], dtype=np.float64
+            ),
+            average_online_accuracy=per_task_accuracy.mean(axis=1),
+            wall_clock_seconds=float(sum(shard["wall_clock_seconds"] for shard in shards)),
+        )
+    return results, coverage
+
+
+def build_artifact(
+    plan: dict[str, Any],
+    results: dict[str, LabelEMNISTRunResult],
+    coverage: dict[str, Any],
+    partial_paths: Sequence[Path] = (),
+    notes: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Assemble the permanently nonpromoting merge artifact."""
+    if not results:
+        raise ValueError("at least one learner result is required")
+    summaries = {learner: summarize_result(result) for learner, result in results.items()}
+    manifest = []
+    for path_value in sorted(Path(p) for p in partial_paths):
+        raw = path_value.read_bytes()
+        manifest.append(
+            {
+                "path": path_value.as_posix(),
+                "size_bytes": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        )
+    return {
+        "schema": ARTIFACT_SCHEMA,
+        "schema_version": 1,
+        "benchmark": BENCHMARK,
+        "created_unix": int(time.time()),
+        "evidence_policy": dict(NONPROMOTING_POLICY),
+        "plan_sha256": plan["plan_sha256"],
+        "plan": plan["plan"],
+        "coverage": coverage,
+        "partial_manifest": manifest,
+        "learners": summaries,
+        "comparison": build_comparison(summaries),
+        "environment": _environment_payload(),
+        "notes": list(notes),
+    }
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+
+def _cmd_plan(args: argparse.Namespace) -> None:
+    config = LabelEMNISTConfig(n_tasks=args.n_tasks, task_length=args.task_length)
+    data_home = args.data_home if args.data_home is not None else default_openml_data_home()
+    _, _, meta = load_emnist_balanced_train(data_home)
+    seeds = [int(part) for part in args.seed_list.split(",") if part.strip()]
+    learners = [name.strip() for name in args.learners.split(",") if name.strip()]
+    payload = build_plan_payload(config, seeds, meta, learners, notes=args.note)
+    atomic_write_new_json(args.plan_out, payload)
+    logger.info("wrote plan %s (plan_sha256=%s)", args.plan_out, payload["plan_sha256"])
+
+
+def _cmd_shard(args: argparse.Namespace) -> None:
+    plan = load_plan(args.plan)
+    body = plan["plan"]
+    if args.learner_id not in body["learner_ids"]:
+        raise SystemExit(f"learner {args.learner_id!r} is not planned")
+    if args.seed_id not in body["seed_ids"]:
+        raise SystemExit(f"seed {args.seed_id} is not planned")
+    data_home = args.data_home if args.data_home is not None else default_openml_data_home()
+    data_x, data_y, meta = load_emnist_balanced_train(data_home)
+    for field in ("x_sha256", "y_sha256"):
+        if meta[field] != body["dataset"][field]:
+            raise SystemExit(f"dataset {field} differs from the plan; refusing to run")
+    config = LabelEMNISTConfig(
+        **{k: v for k, v in body["config"].items() if k != "n_steps"}
+    )
+    hp = {k: float(v) for k, v in body["hyperparameters"][args.learner_id].items()}
+    logger.info(
+        "shard learner=%s seed=%d tasks=%d task_length=%d",
+        args.learner_id,
+        args.seed_id,
+        config.n_tasks,
+        config.task_length,
+    )
+    result = run_label_emnist(
+        data_x,
+        data_y,
+        args.learner_id,
+        [args.seed_id],
+        config=config,
+        hyperparameters=hp,
+        progress_every=args.progress_every,
+    )
+    atomic_write_new_json(args.partial_out, partial_payload(result, plan["plan_sha256"]))
+    logger.info(
+        "wrote shard %s (avg online acc %.4f, wall %.1fs)",
+        args.partial_out,
+        float(result.average_online_accuracy[0]),
+        result.wall_clock_seconds,
+    )
+
+
+def _cmd_merge(args: argparse.Namespace) -> None:
+    plan = load_plan(args.plan)
+    results, coverage = merge_partials(
+        plan, args.partials, allow_incomplete=args.allow_incomplete
+    )
+    artifact = build_artifact(
+        plan, results, coverage, partial_paths=args.partials, notes=args.note
+    )
+    atomic_write_new_json(args.output, artifact)
+    logger.info(
+        "merged %d shards -> %s (coverage complete=%s)",
+        coverage["merged_shard_count"],
+        args.output,
+        coverage["complete"],
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """CLI entry point: ``plan`` / ``shard`` / ``merge``."""
+    parser = argparse.ArgumentParser(
+        description="UPGD Label-permuted EMNIST replication lane (nonpromoting)"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    plan_parser = sub.add_parser("plan", help="issue an immutable pre-run plan")
+    plan_parser.add_argument("--plan-out", type=Path, required=True)
+    plan_parser.add_argument("--seed-list", required=True,
+                             help="explicit comma-separated sorted unique seeds")
+    plan_parser.add_argument("--learners", default="upgd_w,adamw")
+    plan_parser.add_argument("--n-tasks", type=int, default=400)
+    plan_parser.add_argument("--task-length", type=int, default=2500)
+    plan_parser.add_argument("--data-home", type=Path, default=None)
+    plan_parser.add_argument("--note", action="append", default=[])
+    plan_parser.set_defaults(func=_cmd_plan)
+
+    shard_parser = sub.add_parser("shard", help="run exactly one planned learner x seed")
+    shard_parser.add_argument("--plan", type=Path, required=True)
+    shard_parser.add_argument("--learner-id", required=True)
+    shard_parser.add_argument("--seed-id", type=int, required=True)
+    shard_parser.add_argument("--partial-out", type=Path, required=True)
+    shard_parser.add_argument("--data-home", type=Path, default=None)
+    shard_parser.add_argument("--progress-every", type=int, default=10)
+    shard_parser.set_defaults(func=_cmd_shard)
+
+    merge_parser = sub.add_parser("merge", help="merge planned shards into an artifact")
+    merge_parser.add_argument("--plan", type=Path, required=True)
+    merge_parser.add_argument("--partials", type=Path, nargs="+", required=True)
+    merge_parser.add_argument("--output", type=Path, required=True)
+    merge_parser.add_argument("--allow-incomplete", action="store_true",
+                              help="permit missing planned shards; coverage records them")
+    merge_parser.add_argument("--note", action="append", default=[])
+    merge_parser.set_defaults(func=_cmd_merge)
+
+    args = parser.parse_args(argv)
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True
+    )
+    args.func(args)
+
+
+__all__ = [
+    "ADAMW_PROTOCOL_HYPERPARAMETERS",
+    "ARTIFACT_SCHEMA",
+    "BENCHMARK",
+    "EMNIST_OPENML_DATA_ID",
+    "EMNIST_TRAIN_ROWS",
+    "LabelEMNISTConfig",
+    "LabelEMNISTRunResult",
+    "LabelEMNISTSchedule",
+    "PAPER_REFERENCE",
+    "PARTIAL_SCHEMA",
+    "PLAN_SCHEMA",
+    "PROTOCOL_DEVIATIONS",
+    "REPRODUCTION_GAP_THRESHOLD",
+    "UPGD_W_PROTOCOL_HYPERPARAMETERS",
+    "build_artifact",
+    "build_comparison",
+    "build_plan_payload",
+    "build_schedule",
+    "canonical_json_sha256",
+    "default_openml_data_home",
+    "load_emnist_balanced_train",
+    "load_plan",
+    "main",
+    "materialized_array_sha256",
+    "merge_partials",
+    "partial_payload",
+    "resolve_hyperparameters",
+    "run_label_emnist",
+    "summarize_result",
+    "task_index_for_step",
+]
+
+
+if __name__ == "__main__":
+    main()

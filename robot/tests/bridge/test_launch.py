@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import unittest
+from unittest import mock
 
-from eliza_robot.bridge.launch import resolve_target
+from eliza_robot.bridge.launch import _resolve_server_modes, resolve_target
 
 
 class LaunchConfigTests(unittest.TestCase):
@@ -46,9 +48,6 @@ class LaunchConfigTests(unittest.TestCase):
             self.assertGreater(target.deadman_timeout_sec, 0)
 
     def test_resolve_asimov_real_uses_livekit_env(self) -> None:
-        import os
-        from unittest import mock
-
         with mock.patch.dict(
             os.environ,
             {
@@ -64,6 +63,70 @@ class LaunchConfigTests(unittest.TestCase):
         self.assertEqual(target.envelope_port, 9104)
         self.assertEqual(target.asimov_livekit_url, "wss://asimov.example.invalid")
         self.assertEqual(target.asimov_livekit_token, "token-123")
+
+    def test_physical_target_requires_explicit_stable_resource_identity(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"ELIZA_ROBOT_BRIDGE_AUTH_TOKEN": "a" * 32},
+            clear=True,
+        ):
+            target = resolve_target("real")
+
+        with self.assertRaisesRegex(ValueError, "ELIZA_ROBOT_PHYSICAL_RESOURCE_ID"):
+            _resolve_server_modes(target, rosbridge=False, envelope=True)
+
+    def test_physical_target_requires_bridge_authentication(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"ELIZA_ROBOT_PHYSICAL_RESOURCE_ID": "lab-ainex-01"},
+            clear=True,
+        ):
+            target = resolve_target("real")
+
+        with self.assertRaisesRegex(ValueError, "ELIZA_ROBOT_BRIDGE_AUTH_TOKEN"):
+            _resolve_server_modes(target, rosbridge=False, envelope=True)
+
+    def test_physical_target_accepts_explicit_auth_and_resource_identity(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ELIZA_ROBOT_BRIDGE_AUTH_TOKEN": "a" * 32,
+                "ELIZA_ROBOT_PHYSICAL_RESOURCE_ID": "lab-ainex-01",
+            },
+            clear=True,
+        ):
+            target = resolve_target("real")
+
+        self.assertEqual(
+            _resolve_server_modes(target, rosbridge=False, envelope=True),
+            (False, True),
+        )
+
+    def test_physical_target_rejects_non_header_safe_authentication(self) -> None:
+        for token in ("a" * 31, "a" * 4097, "a" * 31 + " ", "a" * 31 + "\n"):
+            with (
+                self.subTest(token_length=len(token)),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "ELIZA_ROBOT_BRIDGE_AUTH_TOKEN": token,
+                        "ELIZA_ROBOT_PHYSICAL_RESOURCE_ID": "lab-ainex-01",
+                    },
+                    clear=True,
+                ),
+            ):
+                target = resolve_target("real")
+                with self.assertRaisesRegex(ValueError, "32..4096 visible ASCII"):
+                    _resolve_server_modes(target, rosbridge=False, envelope=True)
+
+    def test_simulation_target_needs_no_physical_identity_or_auth(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            target = resolve_target("mock")
+
+        self.assertEqual(
+            _resolve_server_modes(target, rosbridge=True, envelope=False),
+            (True, False),
+        )
 
 
 if __name__ == "__main__":

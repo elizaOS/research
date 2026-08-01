@@ -114,15 +114,26 @@ class InteractionFeatureState:
 
 
 @chex.dataclass(frozen=True)
+class InteractionCurationPriorityOverride:
+    """Transient fixed-shape ranks used only at the curation boundary."""
+
+    enabled: Bool[Array, ""]
+    active_ranks: Float[Array, " n_features"]
+    candidate_ranks: Float[Array, " n_candidates"]
+
+
+@chex.dataclass(frozen=True)
 class InteractionFeatureUpdateResult:
     """Result of one pairwise interaction feature update."""
 
     state: InteractionFeatureState
+    pre_curation_state: InteractionFeatureState
     predictions: Float[Array, " n_tasks"]
     errors: Float[Array, " n_tasks"]
     metrics: Float[Array, " 7"]
     replaced_slot: Int[Array, ""]
     promoted_candidate: Int[Array, ""]
+    refreshed_candidate: Int[Array, ""]
     retired_slot: Int[Array, ""]
     retired_left: Int[Array, ""]
     retired_right: Int[Array, ""]
@@ -143,6 +154,12 @@ class InteractionFeatureUpdateResult:
     live_feature_count: Int[Array, ""]
     vacancy_count: Int[Array, ""]
     promoted_into_vacancy: Bool[Array, ""]
+    curation_priority_override_enabled: Bool[Array, ""]
+    curation_attempted: Bool[Array, ""]
+    curation_priority_override_applied: Bool[Array, ""]
+    curation_selected_active_worst_slot: Int[Array, ""]
+    curation_selected_promotion_candidate: Int[Array, ""]
+    curation_selected_refresh_candidate: Int[Array, ""]
     update_rejected: Bool[Array, ""]
 
 
@@ -348,12 +365,13 @@ class FixedBudgetInteractionLearner:
                 "candidate_reacquisition_confirmation_steps must be a positive "
                 "int32-safe integer"
             )
-        if candidate_reacquisition_confirmation_steps > 1 and (
-            not independent_relevance_probe or not retire_stale_features
-        ):
+        # Only a retirement raises candidate_reacquisition_required. A value
+        # above one is intentionally allowed in the matched no-retirement arm,
+        # where the threshold remains inert and all fixed-shape state is kept.
+        if candidate_reacquisition_confirmation_steps > 1 and not independent_relevance_probe:
             raise ValueError(
                 "candidate_reacquisition_confirmation_steps greater than one "
-                "requires independent_relevance_probe and retire_stale_features"
+                "requires independent_relevance_probe"
             )
         if candidate_utility_retention_decay is not None and not (
             utility_decay <= candidate_utility_retention_decay < 1.0
@@ -1356,6 +1374,7 @@ class FixedBudgetInteractionLearner:
         observation: Array,
         targets: Array,
         external_read_mask: Array | None = None,
+        curation_priority_override: InteractionCurationPriorityOverride | None = None,
     ) -> InteractionFeatureUpdateResult:
         """Perform one temporally-uniform interaction-feature update.
 
@@ -1388,8 +1407,60 @@ class FixedBudgetInteractionLearner:
                 dtype=jnp.dtype(jnp.bool_),
             )
         )
-        input_valid = jnp.all(jnp.isfinite(raw_observation)) & jnp.all(
-            jnp.isfinite(raw_targets) | jnp.isnan(raw_targets)
+        if curation_priority_override is None:
+            priority_override = InteractionCurationPriorityOverride(
+                enabled=jnp.asarray(False, dtype=jnp.bool_),
+                active_ranks=jnp.zeros((self._n_features,), dtype=jnp.float32),
+                candidate_ranks=jnp.zeros(
+                    (self._candidate_count,),
+                    dtype=jnp.float32,
+                ),
+            )
+        elif isinstance(
+            curation_priority_override,
+            InteractionCurationPriorityOverride,
+        ):
+            priority_override = curation_priority_override
+        else:
+            raise TypeError(
+                "curation_priority_override must be an "
+                "InteractionCurationPriorityOverride"
+            )
+        priority_override_enabled = _require_array_contract(
+            priority_override.enabled,
+            name="curation_priority_override.enabled",
+            shape=(),
+            dtype=jnp.dtype(jnp.bool_),
+        )
+        raw_active_priority_ranks = _require_array_contract(
+            priority_override.active_ranks,
+            name="curation_priority_override.active_ranks",
+            shape=(self._n_features,),
+            dtype=jnp.dtype(jnp.float32),
+        )
+        raw_candidate_priority_ranks = _require_array_contract(
+            priority_override.candidate_ranks,
+            name="curation_priority_override.candidate_ranks",
+            shape=(self._candidate_count,),
+            dtype=jnp.dtype(jnp.float32),
+        )
+        priority_override_valid = jnp.all(
+            jnp.isfinite(raw_active_priority_ranks)
+        ) & jnp.all(jnp.isfinite(raw_candidate_priority_ranks))
+        active_priority_ranks = jnp.where(
+            jnp.isfinite(raw_active_priority_ranks),
+            raw_active_priority_ranks,
+            0.0,
+        )
+        candidate_priority_ranks = jnp.where(
+            jnp.isfinite(raw_candidate_priority_ranks),
+            raw_candidate_priority_ranks,
+            0.0,
+        )
+        input_valid = (
+            jnp.all(jnp.isfinite(raw_observation))
+            & jnp.all(jnp.isfinite(raw_targets) | jnp.isnan(raw_targets))
+            & priority_override_valid
         )
         observation = jnp.where(jnp.isfinite(raw_observation), raw_observation, 0.0)
         active_mask = jnp.isfinite(raw_targets)
@@ -1834,8 +1905,52 @@ class FixedBudgetInteractionLearner:
         candidate_parent_b = state.candidate_parent_b
         candidate_generator = state.candidate_generator
 
+        # Exact matched-control boundary.  This snapshot includes every
+        # ordinary online-learning and recurrence update above, but precedes
+        # retirement, promotion, replacement, candidate refresh, and all
+        # resets coupled to those descriptor transactions.  In particular,
+        # identities and lineage are copied from the entry state while the RNG
+        # key, counters, ages, moments, evidence, and learned heads advance.
+        pre_curation_state = InteractionFeatureState(
+            key=key,
+            feature_left=state.feature_left,
+            feature_right=state.feature_right,
+            output_weights=output_weights,
+            relevance_probe_weights=relevance_probe_weights,
+            relevance_probe_biases=relevance_probe_biases,
+            output_biases=output_biases,
+            utilities=new_utilities,
+            evidence_idle_steps=evidence_idle_steps,
+            utility_evidence_streak=utility_evidence_streak,
+            active_output_memory_committed=active_output_memory_committed,
+            task_activity_ema=task_activity_ema,
+            ages=ages,
+            candidate_left=state.candidate_left,
+            candidate_right=state.candidate_right,
+            candidate_output_weights=candidate_output_weights,
+            candidate_utilities=new_candidate_utilities,
+            candidate_ages=candidate_ages,
+            candidate_promotion_evidence_streak=(
+                candidate_promotion_evidence_streak
+            ),
+            candidate_reacquisition_required=candidate_reacquisition_required,
+            feature_second_moments=feature_second_moments,
+            candidate_second_moments=candidate_second_moments,
+            target_second_moments=target_second_moments,
+            feature_parent_a=state.feature_parent_a,
+            feature_parent_b=state.feature_parent_b,
+            feature_generator=state.feature_generator,
+            candidate_parent_a=state.candidate_parent_a,
+            candidate_parent_b=state.candidate_parent_b,
+            candidate_generator=state.candidate_generator,
+            step_count=step_count,
+            birth_timestamp=state.birth_timestamp,
+            uptime_s=state.uptime_s,
+        )
+
         replaced_slot = jnp.array(-1, dtype=jnp.int32)
         promoted_candidate = jnp.array(-1, dtype=jnp.int32)
+        refreshed_candidate = jnp.array(-1, dtype=jnp.int32)
         retired_slot = jnp.array(-1, dtype=jnp.int32)
         retired_left = jnp.array(-1, dtype=jnp.int32)
         retired_right = jnp.array(-1, dtype=jnp.int32)
@@ -1984,9 +2099,23 @@ class FixedBudgetInteractionLearner:
         first_inactive = jnp.argmax(inactive_slots).astype(jnp.int32)
         has_inactive_slot = jnp.any(inactive_slots)
         eligible_active = live_after_retirement & (ages >= self._min_feature_age)
-        active_scores = jnp.where(eligible_active, new_utilities, jnp.inf)
+        active_selection_scores = jnp.where(
+            priority_override_enabled,
+            active_priority_ranks,
+            new_utilities,
+        )
+        active_scores = jnp.where(
+            eligible_active,
+            active_selection_scores,
+            jnp.inf,
+        )
         worst_active = jnp.argmin(active_scores).astype(jnp.int32)
         has_active_slot = jnp.any(eligible_active)
+        curation_selected_active_worst_slot = jnp.where(
+            has_active_slot,
+            worst_active,
+            jnp.asarray(-1, dtype=jnp.int32),
+        )
         destination_slot = jnp.where(
             has_inactive_slot,
             first_inactive,
@@ -1998,6 +2127,8 @@ class FixedBudgetInteractionLearner:
             new_utilities[worst_active],
         )
         has_destination = has_inactive_slot | has_active_slot
+        curation_selected_promotion_candidate = jnp.asarray(-1, dtype=jnp.int32)
+        curation_selected_refresh_candidate = jnp.asarray(-1, dtype=jnp.int32)
 
         if self._candidate_count > 0:
             # Promoting a pair that is already active wastes a fixed-budget
@@ -2014,10 +2145,25 @@ class FixedBudgetInteractionLearner:
             eligible_candidates = (
                 candidate_ages >= self._candidate_min_age
             ) & ~candidate_matches_active & candidate_promotion_confirmed
-            candidate_scores = jnp.where(eligible_candidates, new_candidate_utilities, -jnp.inf)
+            candidate_selection_scores = jnp.where(
+                priority_override_enabled,
+                candidate_priority_ranks,
+                new_candidate_utilities,
+            )
+            candidate_scores = jnp.where(
+                eligible_candidates,
+                candidate_selection_scores,
+                -jnp.inf,
+            )
             best_candidate = jnp.argmax(candidate_scores).astype(jnp.int32)
-            worst_candidate = jnp.argmin(new_candidate_utilities).astype(jnp.int32)
+            worst_candidate = jnp.argmin(candidate_selection_scores).astype(jnp.int32)
             has_candidate = jnp.any(eligible_candidates)
+            curation_selected_promotion_candidate = jnp.where(
+                has_candidate,
+                best_candidate,
+                curation_selected_promotion_candidate,
+            )
+            curation_selected_refresh_candidate = worst_candidate
             should_promote = (
                 should_try_replace
                 & ~should_retire
@@ -2033,6 +2179,24 @@ class FixedBudgetInteractionLearner:
                         self._promotion_margin * destination_utility,
                     )
                 )
+            )
+            should_refresh_candidate = (
+                ~should_promote
+                & should_try_replace
+                & ~should_retire
+                & self._refresh_candidates
+            )
+            should_refresh_promoted_candidate = (
+                should_promote & self._refresh_promoted_candidate
+            )
+            refreshed_candidate = jnp.where(
+                should_refresh_promoted_candidate,
+                best_candidate,
+                jnp.where(
+                    should_refresh_candidate,
+                    worst_candidate,
+                    refreshed_candidate,
+                ),
             )
 
             def promote_branch(
@@ -2444,6 +2608,12 @@ class FixedBudgetInteractionLearner:
             lambda _: state,
             operand=None,
         )
+        committed_pre_curation_state = jax.lax.cond(
+            input_valid,
+            lambda _: pre_curation_state,
+            lambda _: state,
+            operand=None,
+        )
         rejected_index = jnp.asarray(-1, dtype=jnp.int32)
         false_features = jnp.zeros((self._n_features,), dtype=jnp.bool_)
         false_candidates = jnp.zeros((self._candidate_count,), dtype=jnp.bool_)
@@ -2467,6 +2637,7 @@ class FixedBudgetInteractionLearner:
 
         return InteractionFeatureUpdateResult(
             state=committed_state,
+            pre_curation_state=committed_pre_curation_state,
             predictions=jnp.where(
                 input_valid,
                 predictions,
@@ -2482,6 +2653,11 @@ class FixedBudgetInteractionLearner:
             promoted_candidate=jnp.where(
                 input_valid,
                 promoted_candidate,
+                rejected_index,
+            ),
+            refreshed_candidate=jnp.where(
+                input_valid,
+                refreshed_candidate,
                 rejected_index,
             ),
             retired_slot=jnp.where(input_valid, retired_slot, rejected_index),
@@ -2579,6 +2755,28 @@ class FixedBudgetInteractionLearner:
                 input_valid,
                 (promoted_candidate >= 0) & has_inactive_slot,
                 False,
+            ),
+            curation_priority_override_enabled=priority_override_enabled,
+            curation_attempted=input_valid & should_try_replace,
+            curation_priority_override_applied=(
+                input_valid
+                & should_try_replace
+                & priority_override_enabled
+            ),
+            curation_selected_active_worst_slot=jnp.where(
+                input_valid & should_try_replace,
+                curation_selected_active_worst_slot,
+                rejected_index,
+            ),
+            curation_selected_promotion_candidate=jnp.where(
+                input_valid & should_try_replace,
+                curation_selected_promotion_candidate,
+                rejected_index,
+            ),
+            curation_selected_refresh_candidate=jnp.where(
+                input_valid & should_try_replace,
+                curation_selected_refresh_candidate,
+                rejected_index,
             ),
             update_rejected=~input_valid,
         )
