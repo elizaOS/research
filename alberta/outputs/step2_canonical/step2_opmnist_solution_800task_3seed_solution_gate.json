@@ -1,0 +1,41 @@
+{
+  "artifact_path": "outputs/step2_opmnist_solution_full/step2_opmnist_solution_800task_3seed_results.json",
+  "schema": "alberta.step2.opmnist_solution_gate.audit.v1",
+  "status": {
+    "artifact_provenance": {
+      "direct_runner_manifest_complete": false,
+      "manifest_schema": "alberta.step2.upgd_memory_opmnist.merge_manifest.v1",
+      "merged_split_manifest_complete": true,
+      "mixed_method_manifest_complete": false,
+      "provenance_complete": true,
+      "schema": "alberta.step2.opmnist_artifact_provenance_status.v1"
+    },
+    "candidate_metric_wins": {
+      "step2_hybrid_memory_trace": {
+        "final_window_accuracy": true,
+        "final_window_mse": true,
+        "online_mean_accuracy": true,
+        "online_mean_mse": true,
+        "test_accuracy": false,
+        "test_mse": false
+      },
+      "step2_hybrid_memory_trace_adaptive_sharp": {
+        "final_window_accuracy": true,
+        "final_window_mse": true,
+        "online_mean_accuracy": true,
+        "online_mean_mse": true,
+        "test_accuracy": false,
+        "test_mse": false
+      }
+    },
+    "candidates_winning_all_metrics": [],
+    "claim_scope": "limited_opmnist_evidence_not_step2_solution",
+    "completed_record_seed_count": 3,
+    "configured_seed_count": 3,
+    "min_seeds": 3,
+    "multi_seed_full_scale": true,
+    "protocol_complete": true,
+    "schema": "alberta.step2.opmnist_solution_status.v1",
+    "solved_opmnist_step2": false
+  }
+}

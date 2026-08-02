@@ -7,6 +7,139 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added the L0 shared control/linear-Horde extension to the bounded Prototype
+  pair-feature lifecycle. Channel zero is the owner-bound control target and
+  later channels are `HordeUpdateResult.td_targets` in declared demon order;
+  linear OaK and Horde first update under the old bank, then a committed bank
+  change routes their post-update feature axes atomically in exactly two
+  router calls. Scale-normalized proxy utility gives control `0.5` and each
+  of `D` demons `0.5/D`, making the Horde group `0.5` in aggregate. An atomic
+  OaK/Horde/binding bundle and ordered-schema digest require the v4 Prototype
+  checkpoint, while an exhausted lifecycle is an audited no-op that preserves
+  already-advanced, step-aligned consumers. The lane fails closed for
+  nonlinear OaK/Horde state, non-LMS Horde optimizers, or a Horde normalizer.
+  Resource accounting is exact for lifecycle-owned state and routed consumer
+  axes, not the complete caller-owned Prototype/OaK/Horde footprint.
+  This is a scale/group-balanced shadow-prediction proxy, not causal deletion
+  benefit, empirical benefit, WP7 completion, promotion, or L3 evidence; it
+  does not renew any registered artifact whose source hashes differ.
+- Added the opt-in WP7.1b `PrototypeFeatureUtilityAuditor` on that exact shared
+  lane. It forms each active-feature score from the old descriptor bank's
+  frozen, predict-before-update control/Horde targets, predictions, and linear
+  tail weights: the intervention is the exact normalized one-step
+  half-squared-loss increase from deleting that contribution. A separate
+  matched shadow-candidate cohort uses its own normalized-LMS contributions
+  to score insertion loss reduction before the shadow weights, utility EMAs,
+  or scale moments update; the active and candidate cohorts are not a router
+  ranking. Task mass stays fixed at `0.5` for control and `0.5/D` for each of
+  `D` ordered demons. After a committed two-call lifecycle route, the auditor
+  explicitly rebinds its private state by descriptor identity without making
+  another router call. Enabling the auditor wraps the existing consumer bundle
+  and audit state in a nested atomic bundle serialized only under the v5
+  Prototype checkpoint schema; with the auditor disabled, the v4 bundle and
+  behavior are unchanged. This is bounded L0 diagnostic
+  instrumentation with no curation authority, empirical return or benefit
+  claim, promotion authority, WP7 completion, or evidence-artifact renewal.
+- Completed the WP7.1c L0 mechanism with an opt-in, stateless
+  `PrototypeFeatureUtilityCurationPolicy`. It converts the auditor's
+  post-observation feature-gradient utility (the local "does this gradient
+  spark joy?" signal, distinct from paper-defined actor-sample delight) into
+  ranking influence only: lower deletion utility ranks active slots within the
+  active cohort, while higher insertion utility ranks candidates within the
+  candidate cohort. The two cohorts are never compared. Every configured task
+  must meet the per-slot evidence floor, and the fixed control/Horde task mass
+  is never renormalized. Existing ages, maintenance cadence, candidate
+  confirmation, proxy promotion floor and margin, and safe routing retain all
+  promotion and go/no-go authority. The exact v6 Prototype checkpoint shell
+  binds this configuration and digest around the v5 utility/consumer bundle;
+  disabling it leaves v5 behavior unchanged. The adapter owns no persistent
+  state and adds no RNG draw, backward pass, consumer update, or router call.
+  This establishes no empirical benefit, evidence renewal, scientific
+  promotion, WP7 completion, or Alberta Plan completion.
+- Added the standalone WP7.2 v1 `CumulantSubtaskDiscovery` L0 mechanism. Its
+  fixed candidate universe spans controllable events, feature changes,
+  reward-relevant transition atoms, and typed prediction bottlenecks. A
+  two-phase, forward-shifted `arm`/`observe` transaction prevents an atom born
+  from the current outcome from scoring that same transition. Learnability,
+  randomized-propensity controllability, incumbent/selected-proposal novelty,
+  and frozen pre-update reward/model insertion contribution are
+  noncompensating gates; prediction-bottleneck candidates additionally require
+  epistemic and progress floors and pass a persistent running-mean aleatoric
+  veto. Fixed positive per-family quotas admit only a complete discovered
+  bundle. A once-sampled frozen random-projection cohort and an identity-bound
+  hand-authored cohort each use the same exact option budget `B`; all three
+  materialize into compact tail slots rather than candidate IDs. Strict v1
+  schemas, transition/source/canonical bindings, tamper checks, static
+  ceilings, and an exact logical resource declaration bound the mechanism. It
+  invokes neither Kondo nor delight and declares zero backward passes, consumer updates,
+  router calls, Horde updates, and option updates. It does not mutate OaK,
+  STOMP, Prototype, or Horde and has no curation, promotion, go/no-go, or
+  scientific-promotion authority. The tests establish proposal mechanics and
+  a fresh one-update STOMP consumer smoke check only—not empirical benefit,
+  option discovery/lifecycle, a WP7 exit, evidence promotion, or Alberta Plan
+  completion.
+- Expanded the read-only Forager comparator audit to distinguish immutable historical v1
+  artifacts from the unexecuted v2 compatibility surface, enumerate every configured family
+  in the pinned upstream tree, and record the missing popular-comparator orientations. The
+  next-cycle source recommendations pin Apache-2.0 Dopamine Full Rainbow and POBAX PPO-GRU
+  revisions, with Acme R2D2 retained as a higher-risk optional orientation. These are adapter
+  provenance anchors and roadmap entries only; they add no run, performance result, winner,
+  or SOTA claim.
+- Added nonpromoting matched-v3 design contracts for the exact 499,712-step cumulative-reward
+  metric, domain-separated trial-block seeds, the broader development candidate universe,
+  exact-decimal typed configuration transforms, and simultaneous named-panel empirical-
+  Bernstein inference. The contracts are uninstantiated and do not yet bind every candidate
+  to an executable configuration/runtime closure; they authorize no qualification, benchmark
+  execution, evidence promotion, performance result, winner, or SOTA claim.
+- **Completed the never-promoting IPMNIST screening campaign** (36-arm
+  registry, `benchmarks/ipmnist_screening.py`, ~80 tests). Full-horizon
+  200-task confirmations against the repository's 10-seed published-config
+  UPGD-W reproduction (`0.7791`), all under
+  `outputs/ipmnist_screening/confirm_full/`: protocol-pure `adamw_cbp`
+  10 seeds `0.79876 ± 0.00009` and tuned `upgd_w_wd0005` 10 seeds
+  `0.78431 ± 0.00014` (both from 0.28.0), joined by `upgd_l2init`
+  `0.78042 ± 0.00030` and the protocol-extended EMA-input-normalization
+  family: `upgd_ema_norm` completed all 10 seeds at `0.8536 ± 0.0001`,
+  `upgd_ema_norm_sigma0` `0.85051 ± 0.00025`, `upgd_ema_norm_wd0005`
+  `0.84745 ± 0.00008`. `upgd_idbd` ties the control (`0.77895`). These are
+  development-grade measurements only — no scientific-evidence or SOTA
+  claim; promotion still requires a fresh source-bound preregistered v3 run.
+- **Dissection cascade** (mechanism decomposition of the 0.854-class result;
+  addendum in `CONTINUAL_LEARNING_THEORY.md`): input conditioning `+0.061`
+  (`sgd_ema_norm` vs the `0.7791` reproduction), utility gate `+0.011`
+  (`upgd_ema_norm_sigma0` vs `sgd_ema_norm`), perturbation `+0.003` when
+  normalization is present — contributions stable across the 60→200-task
+  horizon extension. Raw-input contrast: disabling the perturbation in the
+  published configuration (`upgd_w_sigma0`, 60-task proxy) costs `−0.035`,
+  so the noise is load-bearing without normalization and input conditioning
+  substitutes for it. Nonpromoting development analysis.
+- **`sgd_ema_norm` and hyperparameter-star confirmation arms** (200 tasks,
+  3 seeds each, `confirm_full/`): bare SGD+decay+normalization
+  (`sgd_ema_norm`) reaches `0.83991 ± 0.00007` — above every protocol-pure
+  arm; the `adamw_cbp` star places `adamw_cbp_r3e4` best at
+  `0.80126 ± 0.00022` (+0.0025 over `adamw_cbp`), with `m200`/`m50`
+  `0.79899`/`0.79887`, `noreset` `0.79815`, `r3e5` `0.79248`, and the
+  `adamw_cbp_ema_norm` composition eroding to `0.76895` at full horizon
+  (normalization is redundant-to-harmful under Adam's own conditioning).
+  Nonpromoting development results.
+- **OPMNIST 800-task three-seed closure** (Step 2, published Dohare et al.
+  scale): all three seeds completed 48,000,000 online updates over 800
+  true-MNIST task blocks with held-out evaluation over all 800 permutation
+  views; the merged artifact and solution-gate audit report
+  `protocol_complete=true`, `multi_seed_full_scale=true`, and
+  `solved_opmnist_step2=false`
+  (`claim_scope="limited_opmnist_evidence_not_step2_solution"`). Both
+  hybrid-memory candidates beat the best fair MLP on all four
+  online/tracking metrics (including `final_window_accuracy`, which flips
+  to the candidates relative to the 1-seed artifact) while the fair MLPs
+  retain `test_mse`/`test_accuracy` — the prior 1-seed mixed-wins
+  conclusion confirmed at scale, NOT a solved-Step-2 claim. Byte-identical
+  snapshots of the merged results, gate JSON, and summary are vendored at
+  new paths under `outputs/step2_canonical/` with a provenance note
+  (`step2_opmnist_solution_800task_3seed_PROVENANCE.md`).
+
 ## [0.28.0] - 2026-08-01
 
 ### Added
@@ -33,6 +166,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   development lane: per-step accounting of delight-selected channel compute
   as a measured counterfactual. Actual compute gating remains unimplemented
   and `KONDO_IMPLEMENTED` remains false.
+- **Development-only IPMNIST confirmations**: `adamw_cbp` completed 10 matched
+  200-task seeds at mean online accuracy `0.79876` and `upgd_w_wd0005`
+  completed 10 at `0.78431`, versus the repository's matched UPGD-W
+  reproduction at `0.779147`. These are nonpromoting development results,
+  not scientific evidence or a SOTA claim. The three-seed `upgd_ema_norm`
+  result and its still-running extension, `upgd_idbd`, and subsequent
+  composition screening are deferred to `[Unreleased]`.
 - **STOMP checkpoint migration loader** (`core/options.py`): pre-expansion
   checkpoints (missing env-return/duration/baseline-mass fields) now restore
   with documented zero-fill semantics instead of failing on template
@@ -59,9 +199,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   update.
 - `steps/step7.py` vestigial zero-multiplied reward term removed from
   planning action scoring; `streams/gymnasium.py` VALUE mode no longer a
-  silent stub; `feature_discovery.replace_fraction` now wired or refused
-  rather than silently ignored; duplicate candidate-imprint formula in
-  `compositional_features.py` consolidated.
+  silent stub; the unused `feature_discovery.replace_fraction` knob was
+  removed while legacy serialized configs still load; duplicate
+  candidate-imprint formula in `compositional_features.py` consolidated.
 - Test hygiene: `test_integrated_hidden_partner.py` marked `slow`;
   Step 1/Step 2 replication suites now skip loudly with a registered
   `replication` marker and a terminal summary of skipped counts; missing
@@ -106,10 +246,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   open-tuning campaign is prepared and frozen with **zero executed cells**
   (`outputs/forager/matched_current_open_tuning_2c3b214c_v1` has empty
   `runs/` and `completions/`); the sealed stage is implemented and
-  contract-tested but has no console script and has never been executed.
-  Every authority-bearing path terminates at an external trust resolver that
-  does not exist in-tree, so all outputs remain content-only, unendorsed, and
-  nonpromoting (`promotion_authorized: false`).
+  contract-tested with the `alberta-forager-matched-sealed-evaluation`
+  console script, but has never been executed. A reference receipt resolver
+  exists in-tree, but no operational external anchor/key ceremony or fresh
+  authority receipts have been provisioned, so all outputs remain
+  content-only, unendorsed, and nonpromoting
+  (`promotion_authorized: false`).
 - **Matched-current Forager qualification provenance v2**: the exact canonical
   UTF-8 qualification-manifest bytes and SHA-256 now flow into the execution
   plan/executor manifest, score evidence, execution closure, verification

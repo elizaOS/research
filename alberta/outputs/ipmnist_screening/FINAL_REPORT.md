@@ -1,82 +1,384 @@
-# Beat-SOTA campaign: final report
+# Beat-SOTA screening: final report (all arms incl. wave-4)
 
-Baseline: published-config UPGD-W, our 10-seed exact reproduction = 0.7791
-(published ICLR-2024 figure ~0.78). All results development-grade/nonpromoting.
+Proxy validation: {"all_prefixes_match": false, "atol": 1e-06, "checks": [{"config_name": "upgd_w_control", "max_abs_per_task_diff": 0.009199980408630348, "prefix_match": false, "reference_partial": "outputs/upgd_ipmnist/partials/upgd_w_seed0.json", "seed": 0}, {"config_name": "upgd_w_control", "max_abs_per_task_diff": 0.00959998573562626, "prefix_match": false, "reference_partial": "outputs/upgd_ipmnist/partials/u
 
-## Full-protocol (200-task) confirmations
+## Full-protocol pool64 confirmations (200 tasks, seeds 0-2)
 
-| arm | n | mean | stderr | vs SOTA | verdict |
-|---|---|---|---|---|---|
-| upgd_ema_norm | 9 | 0.85359 | 0.00008 | +0.0745 | BEATS-SOTA |
-| upgd_ema_norm_sigma0 | 3 | 0.85051 | 0.00025 | +0.0714 | BEATS-SOTA |
-| upgd_ema_norm_wd0005 | 3 | 0.84745 | 0.00008 | +0.0683 | BEATS-SOTA |
-| sgd_ema_norm | 3 | 0.83991 | 0.00007 | +0.0608 | BEATS-SOTA |
-| adamw_cbp | 10 | 0.79876 | 0.00009 | +0.0197 | BEATS-SOTA |
-| upgd_w_wd0005 | 10 | 0.78431 | 0.00014 | +0.0052 | BEATS-SOTA |
-| upgd_l2init | 3 | 0.78042 | 0.00030 | +0.0013 | TIES |
-| upgd_idbd | 3 | 0.77895 | 0.00020 | -0.0002 | TIES |
-| adamw_cbp_ema_norm | 1 | 0.76909 | 0.00000 | -0.0100 | BELOW |
+Pool64 upgd_w_control: {1: 0.7787729776000001, 2: 0.77910898075, 0: 0.7786109820999999} (exact controls {0: 0.77906, 1: 0.77903, 2: 0.77932}, known pool-vs-exact delta -0.00012)
 
-Pool64 paired controls (seeds 0-2): {1: 0.7787729776000001, 2: 0.77910898075, 0: 0.7786109820999999}; exact partials 0.77906/0.77903/0.77932;
-pool-vs-exact delta -0.00012. adamw_cbp + idbd arms ran exact/step mode.
+- adamw_cbp: mean 0.79876 seeds [0.7986989801, 0.7991469797, 0.7989199793999999, 0.7988729805999999, 0.79886197865, 0.7983859769, 0.7982899786500001, 0.79915698075, 0.798724981, 0.7985119803499999] -> BEATS-SOTA
+- adamw_cbp_ema_norm: mean 0.76895 seeds [0.7690859817500001, 0.7649679803000001, 0.7727819801499999] -> BELOW
+- adamw_cbp_m200: mean 0.79899 seeds [0.7994669811999999, 0.7989409802999999, 0.79855198015] -> BEATS-SOTA
+- adamw_cbp_m50: mean 0.79887 seeds [0.79878298145, 0.7988639799499999, 0.7989629795000001] -> BEATS-SOTA
+- adamw_cbp_noreset: mean 0.79815 seeds [0.7981189816500001, 0.7978509797500002, 0.7984729809499999] -> BEATS-SOTA
+- adamw_cbp_r3e4: mean 0.80126 seeds [0.80084197825, 0.8013829826, 0.8015579771] -> BEATS-SOTA
+- adamw_cbp_r3e5: mean 0.79248 seeds [0.7923509806999999, 0.7925649773000001, 0.7925309789499999] -> BEATS-SOTA
+- sgd_ema_norm: mean 0.83991 seeds [0.8399779789, 0.8399759790499999, 0.8397639792999999] -> BEATS-SOTA
+- upgd_ema_norm: mean 0.85362 seeds [0.8532449779999999, 0.8535339758500001, 0.8539249773500001, 0.8534429807000001, 0.8537239767, 0.85365698035, 0.8537729774999999, 0.8533049790000001, 0.8537279788000001, 0.8538869819999999] -> BEATS-SOTA
+- upgd_ema_norm_sigma0: mean 0.85051 seeds [0.8507669786, 0.8500219771499999, 0.8507559773499999] -> BEATS-SOTA
+- upgd_ema_norm_wd0005: mean 0.84745 seeds [0.84757997795, 0.8473079781499999, 0.8474579769] -> BEATS-SOTA
+- upgd_idbd: mean 0.77895 seeds [0.7788619779999999, 0.77865597975, 0.7793299802999999] -> TIES
+- upgd_l2init: mean 0.78042 seeds [0.7801939792, 0.7800519805499999, 0.78101797995] -> BEATS-SOTA
+- upgd_w_wd0005: mean 0.78431 seeds [0.78418497905, 0.7842689812499999, 0.7844669820500001, 0.7839469789, 0.7847349790500001, 0.7835629804500001, 0.7840389796000001, 0.7841219829499999, 0.7848029797000001, 0.7849659790000001] -> BEATS-SOTA
 
-## Screening ranked table (60-task validated proxy, paired vs upgd_w_control)
+## Screening ranked table (proxy, 60 tasks, all arms)
 
-| arm | mean | paired | candidate |
-|---|---|---|---|
-| upgd_ema_norm | 0.8529 | +0.0751 | True |
-| upgd_ema_norm_sigma0 | 0.8520 | +0.0742 | True |
-| upgd_ema_norm_wd0005 | 0.8469 | +0.0691 | True |
-| upgd_ema_norm_lr0003 | 0.8421 | +0.0644 | True |
-| adamw_cbp_ema_norm | 0.7995 | +0.0217 | True |
-| adamw_cbp_r3e4 | 0.7983 | +0.0205 | True |
-| adamw_cbp | 0.7965 | +0.0188 | True |
-| adamw_cbp_m50 | 0.7962 | +0.0185 | True |
-| adamw_cbp_m200 | 0.7959 | +0.0181 | True |
-| adamw_cbp_noreset | 0.7955 | +0.0177 | True |
-| adamw_cbp_r3e5 | 0.7905 | +0.0127 | True |
-| upgd_w_wd0005 | 0.7833 | +0.0056 | True |
-| upgd_l2init | 0.7792 | +0.0014 | False |
-| upgd_idbd | 0.7778 | +0.0001 | False |
-| upgd_w_control | 0.7778 | +0.0000 | False |
-| upgd_alpha_utility | 0.7777 | -0.0000 | False |
-| upgd_w_udecay099999 | 0.7772 | -0.0006 | False |
-| upgd_w_localgate | 0.7770 | -0.0008 | False |
-| upgd_idbd_meta1e2 | 0.7768 | -0.0010 | False |
-| upgd_cbp | 0.7766 | -0.0012 | False |
-| upgd_w_udecay0999 | 0.7764 | -0.0014 | False |
-| upgd_w_sigma005 | 0.7760 | -0.0018 | False |
-| upgd_ema_norm_lr003 | 0.7747 | -0.0030 | False |
-| guarded_cbp_adam | 0.7723 | -0.0055 | False |
-| upgd_w_wclip_k2 | 0.7721 | -0.0056 | False |
-| upgd_w_wclip_k2_wd0 | 0.7709 | -0.0068 | False |
-| upgd_w_sigma02 | 0.7689 | -0.0089 | False |
-| upgd_w_wd002 | 0.7600 | -0.0178 | False |
-| upgd_w_fade_head | 0.7587 | -0.0190 | False |
-| adamw_control | 0.7556 | -0.0222 | False |
-| upgd_w_wclip_k1_wd0 | 0.7453 | -0.0324 | False |
-| upgd_w_sigma0 | 0.7429 | -0.0349 | False |
-| upgd_w_wclip_k1 | 0.7396 | -0.0381 | False |
-| upgd_autostep | 0.6863 | -0.0915 | False |
-| upgd_w_idbd_swift | 0.6029 | -0.1749 | False |
-
-## Mechanism decomposition (full-horizon confirmed)
-
-Stable across 60- and 200-task horizons: input conditioning +0.061 (dominant),
-utility gate +0.011 (real, orthogonal), perturbation +0.003 (marginal).
-Bare normalize+SGD+decay (0.83991) beats the published SOTA method (0.7791).
-Best form: normalized utility-gated SGD (sigma=0) = 0.85051 at ~1/7th compute.
-
-## Mechanistic findings (see CONTINUAL_LEARNING_THEORY.md)
-
-1. adamw_cbp 0.79876±0.00009 (n=10, exact, protocol-pure): CBP recycling fully
-   arrests Adam plasticity decay; never previously run on this protocol.
-2. upgd_ema_norm 0.85357 (n=3, protocol-extended): EMA input normalization
-   transforms gated-SGD (+0.075); Alberta Step-1 tenet the published setup omitted.
-3. Composition adamw_cbp_ema_norm 0.7995 ~ adamw_cbp: Adam second moment IS input
-   conditioning; normalization redundant on Adam. Normalized gated-SGD > conditioned Adam+CBP.
-4. upgd_ema_norm_sigma0 0.8520 ~ base: perturbation not load-bearing under conditioning
-   (7x cheaper); 200-task confirmation + gate ablation (sgd_ema_norm) in flight.
-5. Refutation: guarded_cbp_adam -0.0055 — protection costs on no-recurrence protocols.
-6. Honest negatives: weight clipping hurts on relu; UPGD+CBP redundant; FADE-head,
-   SwiftTD-IDBD ports negative; Autostep batch-1 meta-instability.
+```json
+{
+ "confirmation_threshold": 0.005,
+ "control_name": "upgd_w_control",
+ "created_unix": 1785662512.5236602,
+ "evidence_policy": {
+  "development_only": true,
+  "evidence_class": "development_screening_diagnostic",
+  "scientific_promotion_allowed": false
+ },
+ "n_shards": 105,
+ "noise_mode": "step",
+ "protocol_config": {
+  "hidden1": 300,
+  "hidden2": 150,
+  "input_dim": 784,
+  "n_classes": 10,
+  "n_tasks": 60,
+  "task_length": 5000
+ },
+ "results": [
+  {
+   "average_online_accuracy_mean": 0.8528599768888888,
+   "average_online_accuracy_stderr": 0.00046428305163735635,
+   "average_plasticity_mean": 0.3832127976111111,
+   "base_learner": "upgd_w",
+   "config_name": "upgd_ema_norm",
+   "hyperparameters": {
+    "noise_std": 0.1,
+    "norm_decay": 0.999,
+    "norm_epsilon": 1e-08,
+    "step_size": 0.01,
+    "utility_decay": 0.9999,
+    "weight_decay": 0.01
+   },
+   "late_window_slope_mean": -0.00020142914285714176,
+   "n_seeds": 3,
+   "paired_vs_control": {
+    "all_seeds_improve": true,
+    "beats_control": true,
+    "confirmation_candidate": true,
+    "control": "upgd_w_control",
+    "mean_diff": 0.07510110966666657,
+    "per_seed_diff": [
+     0.074467,
+     0.07463,
+     0.076207
+    ],
+    "seeds": [
+     0,
+     1,
+     2
+    ],
+    "stderr_diff": 0.0005547853158951784
+   },
+   "per_seed_average_online_accuracy": [
+    0.851943,
+    0.85319,
+    0.853447
+   ],
+   "per_seed_late_window_slope": [
+    -3.286e-05,
+    -0.00021714,
+    -0.00035429
+   ],
+   "seeds": [
+    0,
+    1,
+    2
+   ],
+   "wall_clock_seconds_total": 8007.99
+  },
+  {
+   "average_online_accuracy_mean": 0.8519722013333334,
+   "average_online_accuracy_stderr": 8.402754877330571e-05,
+   "average_plasticity_mean": 0.32709838050000006,
+   "base_learner": "upgd_w",
+   "config_name": "upgd_ema_norm_sigma0",
+   "hyperparameters": {
+    "noise_std": 0.0,
+    "norm_decay": 0.999,
+    "norm_epsilon": 1e-08,
+    "step_size": 0.01,
+    "utility_decay": 0.9999,
+    "weight_decay": 0.01
+   },
+   "late_window_slope_mean": -0.00022404717857142813,
+   "n_seeds": 3,
+   "paired_vs_control": {
+    "all_seeds_improve": true,
+    "beats_control": true,
+    "confirmation_candidate": true,
+    "control": "upgd_w_control",
+    "mean_diff": 0.07421333411111097,
+    "per_seed_diff": [
+     0.07466,
+     0.07336,
+     0.07462
+    ],
+    "seeds": [
+     0,
+     1,
+     2
+    ],
+    "stderr_diff": 0.00042682323386305875
+   },
+   "per_seed_average_online_accuracy": [
+    0.852137,
+    0.85192,
+    0.85186
+   ],
+   "per_seed_late_window_slope": [
+    0.00031,
+    -0.000615,
+    -0.00036714
+   ],
+   "seeds": [
+    0,
+    1,
+    2
+   ],
+   "wall_clock_seconds_total": 9487.55
+  },
+  {
+   "average_online_accuracy_mean": 0.8468710877777778,
+   "average_online_accuracy_stderr": 7.397019254071422e-05,
+   "average_plasticity_mean": 0.39587734249999995,
+   "base_learner": "upgd_w",
+   "config_name": "upgd_ema_norm_wd0005",
+   "hyperparameters": {
+    "noise_std": 0.1,
+    "norm_decay": 0.999,
+    "norm_epsilon": 1e-08,
+    "step_size": 0.01,
+    "utility_decay": 0.9999,
+    "weight_decay": 0.005
+   },
+   "late_window_slope_mean": -0.0004902371190476181,
+   "n_seeds": 3,
+   "paired_vs_control": {
+    "all_seeds_improve": true,
+    "beats_control": true,
+    "confirmation_candidate": true,
+    "control": "upgd_w_control",
+    "mean_diff": 0.06911222055555548,
+    "per_seed_diff": [
+     0.069257,
+     0.068427,
+     0.069653
+    ],
+    "seeds": [
+     0,
+     1,
+     2
+    ],
+    "stderr_diff": 0.00036139819340986123
+   },
+   "per_seed_average_online_accuracy": [
+    0.846733,
+    0.846987,
+    0.846893
+   ],
+   "per_seed_late_window_slope": [
+    -0.00045857,
+    -0.00052928,
+    -0.00048286
+   ],
+   "seeds": [
+    0,
+    1,
+    2
+   ],
+   "wall_clock_seconds_total": 8804.62
+  },
+  {
+   "average_online_accuracy_mean": 0.842128869388889,
+   "average_online_accuracy_stderr": 0.0003142188703131245,
+   "average_plasticity_mean": 0.21502089561111107,
+   "base_learner": "upgd_w",
+   "config_name": "upgd_ema_norm_lr0003",
+   "hyperparameters": {
+    "noise_std": 0.1,
+    "norm_decay": 0.999,
+    "norm_epsilon": 1e-08,
+    "step_size": 0.003,
+    "utility_decay": 0.9999,
+    "weight_decay": 0.01
+   },
+   "late_window_slope_mean": -6.761820238095126e-05,
+   "n_seeds": 3,
+   "paired_vs_control": {
+    "all_seeds_improve": true,
+    "beats_control": true,
+    "confirmation_candidate": true,
+    "control": "upgd_w_control",
+    "mean_diff": 0.06437000216666659,
+    "per_seed_diff": [
+     0.064363,
+     0.06323,
+     0.065517
+    ],
+    "seeds": [
+     0,
+     1,
+     2
+    ],
+    "stderr_diff": 0.0006601121142203985
+   },
+   "per_seed_average_online_accuracy": [
+    0.84184,
+    0.84179,
+    0.842757
+   ],
+   "per_seed_late_window_slope": [
+    0.00016929,
+    -0.00029428,
+    -7.786e-05
+   ],
+   "seeds": [
+    0,
+    1,
+    2
+   ],
+   "wall_clock_seconds_total": 9201.12
+  },
+  {
+   "average_online_accuracy_mean": 0.7994544242777777,
+   "average_online_accuracy_stderr": 0.0006451718943619212,
+   "average_plasticity_mean": 0.34612086038888884,
+   "base_learner": "adamw",
+   "config_name": "adamw_cbp_ema_norm",
+   "hyperparameters": {
+    "beta1": 0.0,
+    "beta2": 0.99,
+    "cbp_decay_rate": 0.99,
+    "cbp_maturity_threshold": 100.0,
+    "cbp_replacement_rate": 0.0001,
+    "eps": 1e-08,
+    "norm_decay": 0.999,
+    "norm_enabled": 1.0,
+    "norm_epsilon": 1e-08,
+    "step_size": 0.0001,
+    "weight_decay": 0.0
+   },
+   "late_window_slope_mean": -0.00012452354761905015,
+   "n_seeds": 3,
+   "paired_vs_control": {
+    "all_seeds_improve": true,
+    "beats_control": true,
+    "confirmation_candidate": true,
+    "control": "upgd_w_control",
+    "mean_diff": 0.021695557055555443,
+    "per_seed_diff": [
+     0.022987,
+     0.019693,
+     0.022407
+    ],
+    "seeds": [
+     0,
+     1,
+     2
+    ],
+    "stderr_diff": 0.0010150174728200006
+   },
+   "per_seed_average_online_accuracy": [
+    0.800463,
+    0.798253,
+    0.799647
+   ],
+   "per_seed_late_window_slope": [
+    -1.714e-05,
+    -3.643e-05,
+    -0.00032
+   ],
+   "seeds": [
+    0,
+    1,
+    2
+   ],
+   "wall_clock_seconds_total": 8217.19
+  },
+  {
+   "average_online_accuracy_mean": 0.7982755348333334,
+   "average_online_accuracy_stderr": 0.00018623443527240156,
+   "average_plasticity_mean": 0.41667774511111116,
+   "base_learner": "adamw",
+   "config_name": "adamw_cbp_r3e4",
+   "hyperparameters": {
+    "beta1": 0.0,
+    "beta2": 0.99,
+    "cbp_decay_rate": 0.99,
+    "cbp_maturity_threshold": 100.0,
+    "cbp_replacement_rate": 0.0003,
+    "eps": 1e-08,
+    "step_size": 0.0001,
+    "weight_decay": 0.0
+   },
+   "late_window_slope_mean": 5.9523642857142464e-05,
+   "n_seeds": 3,
+   "paired_vs_control": {
+    "all_seeds_improve": true,
+    "beats_control": true,
+    "confirmation_candidate": true,
+    "control": "upgd_w_control",
+    "mean_diff": 0.02051666761111104,
+    "per_seed_diff": [
+     0.020463,
+     0.020023,
+     0.021063
+    ],
+    "seeds": [
+     0,
+     1,
+     2
+    ],
+    "stderr_diff": 0.00030140294673027706
+   },
+   "per_seed_average_online_accuracy": [
+    0.79794,
+    0.798583,
+    0.798303
+   ],
+   "per_seed_late_window_slope": [
+    0.00065072,
+    -0.00013714,
+    -0.000335
+   ],
+   "seeds": [
+    0,
+    1,
+    2
+   ],
+   "wall_clock_seconds_total": 7855.03
+  },
+  {
+   "average_online_accuracy_mean": 0.7965133136666666,
+   "average_online_accuracy_stderr": 0.00031850977600019766,
+   "average_plasticity_mean": 0.41223621083333334,
+   "base_learner": "adamw",
+   "config_name": "adamw_cbp",
+   "hyperparameters": {
+    "beta1": 0.0,
+    "beta2": 0.99,
+    "cbp_decay_rate": 0.99,
+    "cbp_maturity_threshold": 100.0,
+    "cbp_replacement_rate": 0.0001,
+    "eps": 1e-08,
+    "step_size": 0.0001,
+    "weight_decay": 0.0
+   },
+   "late_window_slope_mean": -0.00011904728571428772,
+   "n_seeds": 3,
+   "paired_vs_control": {
+    "all_seeds_improve": true,
+    "beats_control": true,
+    "confirmation_candidate": true,
+    "control": "upgd_w_control",
+    "mean_diff": 0.01875444644444439,
+```

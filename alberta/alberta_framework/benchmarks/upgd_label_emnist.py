@@ -68,6 +68,24 @@ digests; each shard runs one learner x seed and binds the plan hash; merge
 validates the exact planned Cartesian product (or records incomplete coverage
 explicitly). Benchmark executions happen through this CLI, never inside
 pytest.
+
+**EMA input-conditioning transfer arms** (mechanism-transfer diagnostic from
+the IPMNIST screening campaign; factories imported from
+:mod:`alberta_framework.benchmarks.ipmnist_screening`, so the normalizer and
+update equations are exactly the pinned screening-lane ones):
+
+- ``upgd_ema_norm`` — published EMNIST UPGD-W behind the screening lane's EMA
+  input normalizer (``norm_decay=0.999``, ``norm_epsilon=1e-8``).
+- ``upgd_ema_norm_sigma0`` — same, without the perturbation
+  (``noise_std=0.0``).
+- ``sgd_ema_norm`` — bare-conditioning control: plain SGD + decoupled decay
+  behind the same normalizer; weight decay matched to the published EMNIST
+  UPGD-W value (0.0 here — the IPMNIST screening arm used 0.01 to match that
+  protocol's UPGD-W decay).
+
+Unlike Input-permuted MNIST, the Label-permuted EMNIST input marginal is
+STATIONARY (features never permute; labels do), so these arms test whether
+input conditioning helps when there is no input non-stationarity to fix.
 """
 
 from __future__ import annotations
@@ -79,7 +97,7 @@ import logging
 import math
 import platform
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -91,9 +109,15 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework.benchmarks.ipmnist_screening import (
+    ScreeningStepFn,
+    _make_sgd_ema_norm_learner,
+    _make_upgd_ema_norm_learner,
+    _wrap_grad_learner,
+)
 from alberta_framework.benchmarks.upgd_ipmnist import (
     _LEARNER_FACTORIES,
-    cross_entropy_loss,
+    LearnerInitFn,
     init_mlp_params,
     task_index_for_step,
 )
@@ -101,7 +125,9 @@ from alberta_framework.benchmarks.upgd_ipmnist_v3 import atomic_write_new_json
 
 logger = logging.getLogger(__name__)
 
-LabelEMNISTLearner = Literal["upgd_w", "adamw"]
+LabelEMNISTLearner = Literal[
+    "upgd_w", "adamw", "upgd_ema_norm", "upgd_ema_norm_sigma0", "sgd_ema_norm"
+]
 
 BENCHMARK = "upgd_label_permuted_emnist"
 PLAN_SCHEMA = "alberta.upgd_label_emnist.plan.v1"
@@ -170,9 +196,68 @@ ADAMW_PROTOCOL_HYPERPARAMETERS: dict[str, float] = {
     "weight_decay": 0.1,
 }
 
+#: Screening-lane EMA input-normalizer settings (the exact values screened and
+#: confirmed on IPMNIST: ``upgd_ema_norm`` in
+#: :mod:`alberta_framework.benchmarks.ipmnist_screening`).
+_EMA_NORM_SETTINGS: dict[str, float] = {"norm_decay": 0.999, "norm_epsilon": 1e-8}
+
+#: Published EMNIST UPGD-W behind the screening lane's EMA input normalizer.
+UPGD_EMA_NORM_HYPERPARAMETERS: dict[str, float] = {
+    **UPGD_W_PROTOCOL_HYPERPARAMETERS,
+    **_EMA_NORM_SETTINGS,
+}
+#: The same arm without the perturbation (is noise load-bearing here?).
+UPGD_EMA_NORM_SIGMA0_HYPERPARAMETERS: dict[str, float] = {
+    **UPGD_EMA_NORM_HYPERPARAMETERS,
+    "noise_std": 0.0,
+}
+#: Bare-conditioning control: plain SGD + decoupled decay behind the same
+#: normalizer. Weight decay matches the published EMNIST UPGD-W decay (0.0;
+#: the IPMNIST screening arm used 0.01 to match that protocol's UPGD-W).
+SGD_EMA_NORM_HYPERPARAMETERS: dict[str, float] = {
+    "step_size": 0.01,
+    "weight_decay": 0.0,
+    **_EMA_NORM_SETTINGS,
+}
+
 _LEARNER_DEFAULT_HYPERPARAMETERS: dict[str, dict[str, float]] = {
     "upgd_w": UPGD_W_PROTOCOL_HYPERPARAMETERS,
     "adamw": ADAMW_PROTOCOL_HYPERPARAMETERS,
+    "upgd_ema_norm": UPGD_EMA_NORM_HYPERPARAMETERS,
+    "upgd_ema_norm_sigma0": UPGD_EMA_NORM_SIGMA0_HYPERPARAMETERS,
+    "sgd_ema_norm": SGD_EMA_NORM_HYPERPARAMETERS,
+}
+
+
+def _wrapped_v1_factory(
+    name: str,
+) -> Callable[[dict[str, float]], tuple[LearnerInitFn, ScreeningStepFn]]:
+    """Adapt a grads-interface ``upgd_ipmnist`` learner to the full-step API.
+
+    :func:`~alberta_framework.benchmarks.ipmnist_screening._wrap_grad_learner`
+    mirrors this lane's original inner-step ordering exactly (pre-update
+    accuracy, post-update plasticity), so the v1 arms are behavior-preserving
+    under the registry refactor (pinned by tiny-trajectory regression tests).
+    """
+
+    def factory(hp: dict[str, float]) -> tuple[LearnerInitFn, ScreeningStepFn]:
+        return _wrap_grad_learner(*_LEARNER_FACTORIES[name](hp))
+
+    return factory
+
+
+#: Full-step learner factories (``(params, state, x, y, key) ->
+#: (params, state, (accuracy, loss, plasticity))``). Normalized arms reuse the
+#: pinned screening-lane factories so the EMA normalizer equations and state
+#: threading are exactly the IPMNIST-screened ones.
+_FULL_STEP_FACTORIES: dict[
+    str, Callable[[dict[str, float]], tuple[LearnerInitFn, ScreeningStepFn]]
+] = {
+    "upgd_w": _wrapped_v1_factory("upgd_w"),
+    "adamw": _wrapped_v1_factory("adamw"),
+    "upgd_ema_norm": _make_upgd_ema_norm_learner,
+    "upgd_ema_norm_sigma0": _make_upgd_ema_norm_learner,
+    "sgd_ema_norm": _make_sgd_ema_norm_learner,
 }
 
 #: Published reference numbers. The paper reports curves (its Figure for
@@ -364,9 +449,6 @@ def resolve_hyperparameters(
     return merged
 
 
-_PLASTICITY_LOSS_FLOOR = 1e-8
-
-
 def run_label_emnist(
     data_x: np.ndarray | Array,
     data_y: np.ndarray | Array,
@@ -398,7 +480,7 @@ def run_label_emnist(
     if config is None:
         config = LabelEMNISTConfig()
     hp = resolve_hyperparameters(learner, hyperparameters)
-    init_fn, step_fn = _LEARNER_FACTORIES[learner](hp)
+    init_fn, step_fn = _FULL_STEP_FACTORIES[learner](hp)
 
     data_x = jnp.asarray(data_x, dtype=jnp.float32)
     data_y = jnp.asarray(data_y, dtype=jnp.int32)
@@ -442,15 +524,9 @@ def run_label_emnist(
             step_params, step_state, key = carry
             x = data_x[example]
             y = label_permutation[data_y[example]]
-            (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
-                step_params, x, y
-            )
-            accuracy = (jnp.argmax(logits) == y).astype(jnp.float32)
             key, step_key = jr.split(key)
-            new_params, new_state = step_fn(step_params, step_state, grads, step_key)
-            loss_after, _ = cross_entropy_loss(new_params, x, y)
-            plasticity = jnp.clip(
-                1.0 - loss_after / jnp.maximum(loss, _PLASTICITY_LOSS_FLOOR), 0.0, 1.0
+            new_params, new_state, (accuracy, loss, plasticity) = step_fn(
+                step_params, step_state, x, y, step_key
             )
             return (new_params, new_state, key), (accuracy, loss, plasticity)
 
@@ -1140,6 +1216,9 @@ __all__ = [
     "PLAN_SCHEMA",
     "PROTOCOL_DEVIATIONS",
     "REPRODUCTION_GAP_THRESHOLD",
+    "SGD_EMA_NORM_HYPERPARAMETERS",
+    "UPGD_EMA_NORM_HYPERPARAMETERS",
+    "UPGD_EMA_NORM_SIGMA0_HYPERPARAMETERS",
     "UPGD_W_PROTOCOL_HYPERPARAMETERS",
     "build_artifact",
     "build_comparison",

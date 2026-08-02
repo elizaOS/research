@@ -6,3 +6,9 @@ WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a 
 2026-08-02 03:31:17,285 INFO adamw_cbp_ema_norm seed=2 task 60/200 online_acc=0.7866 elapsed=1343.9s
 2026-08-02 03:38:34,386 INFO adamw_cbp_ema_norm seed=2 task 80/200 online_acc=0.7762 elapsed=1781.0s
 2026-08-02 03:46:08,565 INFO adamw_cbp_ema_norm seed=2 task 100/200 online_acc=0.7772 elapsed=2235.2s
+2026-08-02 03:50:15,972 INFO adamw_cbp_ema_norm seed=2 task 120/200 online_acc=0.7568 elapsed=2482.6s
+2026-08-02 03:54:19,393 INFO adamw_cbp_ema_norm seed=2 task 140/200 online_acc=0.7684 elapsed=2726.0s
+2026-08-02 03:58:08,408 INFO adamw_cbp_ema_norm seed=2 task 160/200 online_acc=0.7432 elapsed=2955.1s
+2026-08-02 04:01:45,661 INFO adamw_cbp_ema_norm seed=2 task 180/200 online_acc=0.7466 elapsed=3172.3s
+2026-08-02 04:05:21,471 INFO adamw_cbp_ema_norm seed=2 task 200/200 online_acc=0.7376 elapsed=3388.1s
+2026-08-02 04:05:22,122 INFO adamw_cbp_ema_norm seed=2 done: avg online acc 0.7728 (wall 3388.1s) -> outputs/ipmnist_screening/confirm_full/adamw_cbp_ema_norm_seed2.json

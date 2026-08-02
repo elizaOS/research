@@ -15,6 +15,53 @@ default construction does not exercise every mechanism on every transition.
 See [RESEARCH_STATUS.md](RESEARCH_STATUS.md) for the evidence matrix and
 fail-closed completion criteria.
 
+## Continual-learning SOTA campaign (development-grade, nonpromoting)
+
+The IPMNIST screening campaign is complete. Everything below is a
+**development-grade, permanently nonpromoting** measurement under the
+repository's evidence rules — our own protocol-exact instrumentation, matched
+seeds, and paired controls, but no preregistered frozen protocol, so no
+scientific-evidence or SOTA claim. Protocol: input-permuted MNIST from the
+UPGD paper (Elsayed & Mahmood, ICLR 2024) — 1M examples one-per-step,
+permutation every 5,000 steps, 200 tasks, 300×150 ReLU MLP, average online
+accuracy. Baseline: our 10-seed published-config UPGD-W reproduction at
+**0.7791**.
+
+Full-horizon (200-task) confirmed improvements over that baseline
+(`outputs/ipmnist_screening/confirm_full/`):
+
+| Arm | Seeds | Mean online acc. | Scoping |
+|---|---:|---:|---|
+| `adamw_cbp_r3e4` (AdamW + CBP, tuned replacement rate) | 3 | 0.80126 ± 0.00022 | protocol-pure |
+| `adamw_cbp` (AdamW + continual-backprop recycling) | 10 | 0.79876 ± 0.00009 | protocol-pure |
+| `upgd_w_wd0005` (published method, tuned decay) | 10 | 0.78431 ± 0.00014 | protocol-pure (tuned) |
+| `upgd_l2init` | 3 | 0.78042 ± 0.00030 | protocol-pure |
+| `upgd_ema_norm` (UPGD-W + online EMA input normalization) | 10 | 0.8536 ± 0.0001 | protocol-extended |
+| `upgd_ema_norm_sigma0` (same, perturbation off) | 3 | 0.85051 ± 0.00025 | protocol-extended |
+| `upgd_ema_norm_wd0005` | 3 | 0.84745 ± 0.00008 | protocol-extended |
+| `sgd_ema_norm` (bare SGD + decay + normalization) | 3 | 0.83991 ± 0.00007 | protocol-extended |
+
+"Protocol-pure" arms keep the published raw input encoding;
+"protocol-extended" arms prepend online EMA input normalization — an
+input-encoding change the published architecture does not include — and are
+always reported on their own rows, never as the headline.
+
+The dissection cascade decomposes the 0.854-class result into stable
+mechanism contributions (stable across the 60→200-task horizon extension):
+**input conditioning +0.061** (`sgd_ema_norm` vs the 0.7791 reproduction),
+**utility gate +0.011** (`upgd_ema_norm_sigma0` vs `sgd_ema_norm`), and
+**perturbation +0.003 when normalization is present** (`upgd_ema_norm` vs
+`sigma0`). The contrast on raw inputs: disabling the perturbation in the
+published configuration (`upgd_w_sigma0`, 60-task proxy) *costs* −0.035 —
+the noise IS load-bearing without normalization, and input conditioning
+substitutes for it.
+
+Mechanism analysis and the pre-registered outcome matrix are in
+[CONTINUAL_LEARNING_THEORY.md](CONTINUAL_LEARNING_THEORY.md); the complete
+arm-by-arm record is `outputs/ipmnist_screening/FINAL_REPORT.md`. None of
+these results is promotable without a fresh source-bound preregistered run
+under the v3 contract (`UPGD_IPMNIST_V3_RUNBOOK.md`).
+
 ## Evidence status at a glance
 
 Registered scientific artifacts can be checked without rerunning their
@@ -121,7 +168,7 @@ This framework provides the following implementation surfaces:
 | 5–6 | Average-reward continuing control | `AverageRewardHordeLearner`, `DifferentialSARSAAgent` |
 | 7–8 | Dyna planning + one-step world model | `OneStepWorldModel`, `ActionConditionedWorldModel` |
 | 9 | Guarded dreaming (error-gated imagined transitions) | `GuardedDreamer` |
-| 10 | STOMP temporal abstraction (options) | `STOMPAgent` |
+| 10 | Proposal-only cumulant/subtask discovery + STOMP temporal abstraction | `CumulantSubtaskDiscovery`, `STOMPAgent` |
 | 11 | OaK option keyboard (utility tracking + curation) | `OaKAgent` |
 | 12 | Prototype-IA (exo-cerebellum + exo-cortex) | `PrototypeAgent` |
 
@@ -182,14 +229,71 @@ runs.
   audit stores the mixed delta only when its formed-candidate and effective
   finite-precision checks both pass. This is integration evidence, not
   evidence that the online-gated representation improves control.
-- **Bounded Prototype pair-feature lifecycle.** A mutually restricted opt-in
-  lane trains a fixed pair bank from one owner-bound behavior TD target and
-  atomically descriptor-routes every linear OaK feature axis. Gradient
-  pullback and the enabled OaK subtree carry the exact generation plus full
-  descriptor bank, rejecting stale and same-generation forked consumers even
-  when their observation caches collide. Standalone callers must checkpoint
-  the returned binding with their OaK state. This is L0 plumbing, not a
-  multi-consumer utility, control-benefit, or WP7 completion result.
+- **Bounded Prototype pair-feature lifecycle and WP7.1b/WP7.1c audit
+  ranking.** The original restricted lane
+  trains a fixed pair bank from one owner-bound behavior TD target. A second,
+  still narrow lane shares that bank with linear OaK and an ordered linear
+  Horde: task channel zero is the control target and later channels are the
+  Horde update's TD targets in declared demon order. Both consumers first
+  update under the old descriptor bank; a committed descriptor change then
+  routes their post-update feature axes atomically in exactly two router
+  calls. Gradient pullback remains bound to the exact pre-route generation and
+  full descriptor bank. Scale-normalized proxy utility assigns `0.5` to
+  control and `0.5/D` to each of `D` demons, so the Horde receives `0.5` in
+  aggregate. The shared state binds OaK, Horde, descriptors, and ordered
+  semantics under a digest in the v4 Prototype checkpoint; exhausted lifecycle
+  capacity is an audited no-op that leaves already-advanced, step-aligned
+  consumers untouched. The shared lane fails closed unless OaK and Horde are
+  linear and the Horde uses exact LMS scalar optimizer state with no
+  normalizer. Standalone callers must checkpoint every consumer with the
+  returned binding. An additional opt-in diagnostic forms active deletion
+  scores from the old-bank, frozen predict-before-update consumer snapshot and
+  evaluates exact normalized one-step half-squared-loss change. It keeps a
+  matched shadow-candidate insertion cohort separate, scoring before its
+  normalized-LMS shadow weights, utility EMAs, or scale moments update. Task
+  mass is fixed at `0.5` for control and `0.5/D` per ordered demon. After a
+  committed two-call route, audit state explicitly rebinds by descriptor
+  identity without another router call. Audit-enabled state uses a nested
+  atomic bundle and requires the v5 checkpoint schema; with the audit disabled,
+  v4 remains unchanged. WP7.1c adds an opt-in stateless adapter over the
+  post-observation audit EMAs. Its feature-gradient utility—the local "does
+  this gradient spark joy?" signal, distinct from paper-defined actor-sample
+  delight—ranks lower deletion utility only within active slots and higher
+  insertion utility only within candidates; it never compares the cohorts.
+  Every configured task must meet the evidence floor for a slot, and fixed
+  task mass is never renormalized. Existing ages, cadence, candidate
+  confirmation, proxy promotion floor and margin, and safe routing retain
+  go/no-go authority. The adapter adds no state, RNG, backward, consumer, or
+  router work and requires the exact v6 checkpoint shell around v5; disabling
+  it preserves v5 behavior. This is L0 ranking instrumentation only: it has no
+  curation, promotion, or go/no-go authority and makes no adapted deletion,
+  empirical return or benefit, planning, control, safety, evidence-renewal,
+  scientific-promotion, WP7-completion, Alberta Plan-completion, or L3 claim.
+- **Standalone WP7.2 v1 cumulant/subtask proposals.**
+  `CumulantSubtaskDiscovery` owns a fixed candidate universe spanning
+  controllable events, feature changes, reward-relevant transition atoms, and
+  typed prediction bottlenecks. Its two-phase `arm`/`observe` boundary freezes
+  predict-before-update values and moves successor semantics forward; an atom
+  born from the current reward-relevant transition receives no same-transition
+  evidence. Learnability, randomized-propensity controllability, novelty
+  against incumbents and earlier selected proposals, and frozen reward/model
+  insertion contribution are noncompensating gates. Bottleneck candidates
+  additionally need epistemic/progress evidence and pass a persistent
+  running-mean aleatoric veto.
+  Four fixed positive family quotas sum to the exact budget `B`; quotas are not
+  reassigned and no partial discovered bundle is emitted. A random projection
+  bank sampled once supplies one cohort, and an exactly `B`-entry
+  identity-bound hand cohort supplies the other comparator. All three use the
+  same budget and materialize into compact appended tail slots, not candidate
+  IDs. Strict v1 config/checkpoint and live source/transaction bindings, tamper
+  checks, static ceilings, and exact resource declarations bound the mechanism.
+  Unlike WP7.1c's feature-gradient utility ranker, this
+  path invokes neither Kondo nor delight and performs no backward pass. It
+  mutates no OaK, STOMP, Prototype, or Horde state and owns no curation,
+  promotion, go/no-go, or scientific-promotion authority. This is L0 proposal
+  and one-update fresh-STOMP smoke coverage only—not empirical benefit, option
+  discovery/lifecycle, persistent consumer integration, a WP7 exit, evidence
+  promotion, or Alberta Plan completion.
 - **Continuing-control companions.** The separate bounded
   `ContinuousAverageRewardActorCriticAgent` closes the L0 continuous mechanism
   gap: direct affine-`tanh` actions with cached pre-`tanh` ownership, stable
@@ -227,8 +331,9 @@ runs.
   calibration, or SOTA result, and the recurrent Gaussian objective is not a
   calibrated-likelihood claim.
 
-Empirical objective balancing, GVF/inverse/feature-utility gradient sources,
-causal feature selection, and the matched Forager result remain absent.
+Empirical objective calibration, world-model/inverse/planning utility sources,
+causal feature deletion and selection, and the matched Forager result remain
+absent.
 
 ## Quick start
 

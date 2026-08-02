@@ -6,3 +6,9 @@ WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a 
 2026-08-02 03:32:31,596 INFO upgd_ema_norm seed=9 task 60/200 online_acc=0.8628 elapsed=1223.9s
 2026-08-02 03:39:26,695 INFO upgd_ema_norm seed=9 task 80/200 online_acc=0.8498 elapsed=1639.0s
 2026-08-02 03:46:30,825 INFO upgd_ema_norm seed=9 task 100/200 online_acc=0.8566 elapsed=2063.1s
+2026-08-02 03:50:19,398 INFO upgd_ema_norm seed=9 task 120/200 online_acc=0.8572 elapsed=2291.7s
+2026-08-02 03:54:07,853 INFO upgd_ema_norm seed=9 task 140/200 online_acc=0.8586 elapsed=2520.1s
+2026-08-02 03:57:47,280 INFO upgd_ema_norm seed=9 task 160/200 online_acc=0.8444 elapsed=2739.6s
+2026-08-02 04:01:18,261 INFO upgd_ema_norm seed=9 task 180/200 online_acc=0.8520 elapsed=2950.5s
+2026-08-02 04:04:55,368 INFO upgd_ema_norm seed=9 task 200/200 online_acc=0.8612 elapsed=3167.6s
+2026-08-02 04:04:56,077 INFO upgd_ema_norm seed=9 done: avg online acc 0.8539 (wall 3167.7s) -> outputs/ipmnist_screening/confirm_full/upgd_ema_norm_seed9.json

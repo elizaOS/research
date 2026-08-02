@@ -6,3 +6,9 @@ WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a 
 2026-08-02 03:31:24,665 INFO adamw_cbp_r3e4 seed=1 task 60/200 online_acc=0.8044 elapsed=1344.3s
 2026-08-02 03:38:50,785 INFO adamw_cbp_r3e4 seed=1 task 80/200 online_acc=0.8050 elapsed=1790.5s
 2026-08-02 03:46:29,380 INFO adamw_cbp_r3e4 seed=1 task 100/200 online_acc=0.8046 elapsed=2249.1s
+2026-08-02 03:50:30,617 INFO adamw_cbp_r3e4 seed=1 task 120/200 online_acc=0.7978 elapsed=2490.3s
+2026-08-02 03:54:40,355 INFO adamw_cbp_r3e4 seed=1 task 140/200 online_acc=0.8108 elapsed=2740.0s
+2026-08-02 03:58:27,702 INFO adamw_cbp_r3e4 seed=1 task 160/200 online_acc=0.7930 elapsed=2967.4s
+2026-08-02 04:02:11,319 INFO adamw_cbp_r3e4 seed=1 task 180/200 online_acc=0.8062 elapsed=3191.0s
+2026-08-02 04:05:39,234 INFO adamw_cbp_r3e4 seed=1 task 200/200 online_acc=0.8040 elapsed=3398.9s
+2026-08-02 04:05:39,873 INFO adamw_cbp_r3e4 seed=1 done: avg online acc 0.8014 (wall 3398.9s) -> outputs/ipmnist_screening/confirm_full/adamw_cbp_r3e4_seed1.json

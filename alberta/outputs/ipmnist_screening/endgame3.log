@@ -63,3 +63,32 @@ retrying adamw_cbp_ema_norm seed 1 with --noise-mode step (noise-free arm)
 retrying adamw_cbp_ema_norm seed 2 with --noise-mode step (noise-free arm)
 retrying adamw_cbp_r3e4 seed 0 with --noise-mode step (noise-free arm)
 retrying adamw_cbp_r3e4 seed 1 with --noise-mode step (noise-free arm)
+retrying adamw_cbp_r3e4 seed 2 with --noise-mode step (noise-free arm)
+retrying adamw_cbp_m50 seed 0 with --noise-mode step (noise-free arm)
+retrying adamw_cbp_m50 seed 1 with --noise-mode step (noise-free arm)
+retrying adamw_cbp_m50 seed 2 with --noise-mode step (noise-free arm)
+retrying adamw_cbp_m200 seed 0 with --noise-mode step (noise-free arm)
+retrying adamw_cbp_m200 seed 1 with --noise-mode step (noise-free arm)
+retrying adamw_cbp_m200 seed 2 with --noise-mode step (noise-free arm)
+retrying adamw_cbp_noreset seed 0 with --noise-mode step (noise-free arm)
+retrying adamw_cbp_noreset seed 1 with --noise-mode step (noise-free arm)
+retrying adamw_cbp_noreset seed 2 with --noise-mode step (noise-free arm)
+retrying adamw_cbp_r3e5 seed 0 with --noise-mode step (noise-free arm)
+retrying adamw_cbp_r3e5 seed 1 with --noise-mode step (noise-free arm)
+retrying adamw_cbp_r3e5 seed 2 with --noise-mode step (noise-free arm)
+FINAL VERDICTS:
+- adamw_cbp: mean 0.79876 seeds [0.7986989801, 0.7991469797, 0.7989199793999999, 0.7988729805999999, 0.79886197865, 0.7983859769, 0.7982899786500001, 0.79915698075, 0.798724981, 0.7985119803499999] -> BEATS-SOTA
+- adamw_cbp_ema_norm: mean 0.76895 seeds [0.7690859817500001, 0.7649679803000001, 0.7727819801499999] -> BELOW
+- adamw_cbp_m200: mean 0.79899 seeds [0.7994669811999999, 0.7989409802999999, 0.79855198015] -> BEATS-SOTA
+- adamw_cbp_m50: mean 0.79887 seeds [0.79878298145, 0.7988639799499999, 0.7989629795000001] -> BEATS-SOTA
+- adamw_cbp_noreset: mean 0.79815 seeds [0.7981189816500001, 0.7978509797500002, 0.7984729809499999] -> BEATS-SOTA
+- adamw_cbp_r3e4: mean 0.80126 seeds [0.80084197825, 0.8013829826, 0.8015579771] -> BEATS-SOTA
+- adamw_cbp_r3e5: mean 0.79248 seeds [0.7923509806999999, 0.7925649773000001, 0.7925309789499999] -> BEATS-SOTA
+- sgd_ema_norm: mean 0.83991 seeds [0.8399779789, 0.8399759790499999, 0.8397639792999999] -> BEATS-SOTA
+- upgd_ema_norm: mean 0.85362 seeds [0.8532449779999999, 0.8535339758500001, 0.8539249773500001, 0.8534429807000001, 0.8537239767, 0.85365698035, 0.8537729774999999, 0.8533049790000001, 0.8537279788000001, 0.8538869819999999] -> BEATS-SOTA
+- upgd_ema_norm_sigma0: mean 0.85051 seeds [0.8507669786, 0.8500219771499999, 0.8507559773499999] -> BEATS-SOTA
+- upgd_ema_norm_wd0005: mean 0.84745 seeds [0.84757997795, 0.8473079781499999, 0.8474579769] -> BEATS-SOTA
+- upgd_idbd: mean 0.77895 seeds [0.7788619779999999, 0.77865597975, 0.7793299802999999] -> TIES
+- upgd_l2init: mean 0.78042 seeds [0.7801939792, 0.7800519805499999, 0.78101797995] -> BEATS-SOTA
+- upgd_w_wd0005: mean 0.78431 seeds [0.78418497905, 0.7842689812499999, 0.7844669820500001, 0.7839469789, 0.7847349790500001, 0.7835629804500001, 0.7840389796000001, 0.7841219829499999, 0.7848029797000001, 0.7849659790000001] -> BEATS-SOTA
+=== endgame3 done 2026-08-02T05:35:04-07:00

@@ -14,6 +14,9 @@ import pytest
 
 from alberta_framework.benchmarks.upgd_label_emnist import (
     ADAMW_PROTOCOL_HYPERPARAMETERS,
+    SGD_EMA_NORM_HYPERPARAMETERS,
+    UPGD_EMA_NORM_HYPERPARAMETERS,
+    UPGD_EMA_NORM_SIGMA0_HYPERPARAMETERS,
     UPGD_W_PROTOCOL_HYPERPARAMETERS,
     LabelEMNISTConfig,
     build_artifact,
@@ -81,6 +84,35 @@ class TestConfig:
             resolve_hyperparameters("upgd_w", {"sigma": 0.1})
         with pytest.raises(ValueError, match="unknown learner"):
             resolve_hyperparameters("sgd")
+
+    def test_normalized_arm_hyperparameters(self):
+        """EMA-norm transfer arms: published EMNIST UPGD-W values + the exact
+        screening-lane normalizer settings (norm_decay=0.999, eps=1e-8)."""
+        assert UPGD_EMA_NORM_HYPERPARAMETERS == {
+            **UPGD_W_PROTOCOL_HYPERPARAMETERS,
+            "norm_decay": 0.999,
+            "norm_epsilon": 1e-8,
+        }
+        assert UPGD_EMA_NORM_SIGMA0_HYPERPARAMETERS == {
+            **UPGD_EMA_NORM_HYPERPARAMETERS,
+            "noise_std": 0.0,
+        }
+        # Bare-conditioning control: weight decay matched to the published
+        # EMNIST UPGD-W decay (0.0 here, unlike the IPMNIST lane's 0.01).
+        assert SGD_EMA_NORM_HYPERPARAMETERS == {
+            "step_size": 0.01,
+            "weight_decay": 0.0,
+            "norm_decay": 0.999,
+            "norm_epsilon": 1e-8,
+        }
+        for learner, expected in (
+            ("upgd_ema_norm", UPGD_EMA_NORM_HYPERPARAMETERS),
+            ("upgd_ema_norm_sigma0", UPGD_EMA_NORM_SIGMA0_HYPERPARAMETERS),
+            ("sgd_ema_norm", SGD_EMA_NORM_HYPERPARAMETERS),
+        ):
+            assert resolve_hyperparameters(learner) == expected
+        with pytest.raises(ValueError, match="unknown hyperparameters"):
+            resolve_hyperparameters("sgd_ema_norm", {"noise_std": 0.001})
 
 
 class TestScheduleExactness:
@@ -203,6 +235,102 @@ class TestTinySmokeRun:
         first = run_label_emnist(x, y, "adamw", seeds=[5], config=TINY)
         second = run_label_emnist(x, y, "adamw", seeds=[5], config=TINY)
         np.testing.assert_array_equal(first.per_task_accuracy, second.per_task_accuracy)
+
+    def test_upgd_w_tiny_trajectory_pinned_across_registry_refactor(self):
+        """Tiny-run trajectories captured BEFORE the full-step registry refactor.
+
+        The refactor (grads-interface learners wrapped into the screening-style
+        full-step API) must be behavior-preserving for the v1 arms: same RNG
+        stream, same metric definitions, same values.
+        """
+        x, y = _tiny_data()
+        result = run_label_emnist(x, y, "upgd_w", seeds=[0, 1], config=TINY)
+        np.testing.assert_array_equal(
+            result.per_task_accuracy, [[0.0, 0.25, 0.125], [0.0, 0.125, 0.125]]
+        )
+        np.testing.assert_allclose(
+            result.per_task_loss,
+            [
+                [1.648679256439209, 1.5686269998550415, 1.6457500457763672],
+                [1.6169909238815308, 1.736443042755127, 1.7514290809631348],
+            ],
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            result.per_task_plasticity,
+            [
+                [0.004521459806710482, 0.004360879771411419, 0.004870759788900614],
+                [0.0034332401119172573, 0.004289050120860338, 0.005140929948538542],
+            ],
+            atol=1e-6,
+        )
+
+    def test_adamw_tiny_trajectory_pinned_across_registry_refactor(self):
+        x, y = _tiny_data()
+        result = run_label_emnist(x, y, "adamw", seeds=[0, 1], config=TINY)
+        np.testing.assert_array_equal(
+            result.per_task_accuracy, [[0.0, 0.25, 0.125], [0.0, 0.125, 0.125]]
+        )
+        np.testing.assert_allclose(
+            result.per_task_loss,
+            [
+                [1.6493254899978638, 1.5711777210235596, 1.6426843404769897],
+                [1.6191235780715942, 1.7410117387771606, 1.7633652687072754],
+            ],
+            atol=1e-6,
+        )
+
+
+class TestNormalizedTransferArms:
+    """EMA input-conditioning transfer arms (screening-lane factories)."""
+
+    def test_upgd_ema_norm_runs_and_normalizer_is_engaged(self):
+        x, y = _tiny_data()
+        norm = run_label_emnist(x, y, "upgd_ema_norm", seeds=[0, 1], config=TINY)
+        raw = run_label_emnist(x, y, "upgd_w", seeds=[0, 1], config=TINY)
+        assert norm.per_task_accuracy.shape == (2, TINY.n_tasks)
+        assert np.all(norm.per_task_accuracy >= 0.0)
+        assert np.all(norm.per_task_accuracy <= 1.0)
+        assert np.all(norm.per_task_loss > 0.0)
+        assert np.all(norm.per_task_plasticity >= 0.0)
+        assert np.all(norm.per_task_plasticity <= 1.0)
+        # The normalizer must actually change the trajectory vs raw UPGD-W.
+        assert not np.array_equal(norm.per_task_loss, raw.per_task_loss)
+
+    def test_sigma0_arm_equals_ema_norm_with_zero_noise_override(self):
+        x, y = _tiny_data()
+        sigma0 = run_label_emnist(x, y, "upgd_ema_norm_sigma0", seeds=[3], config=TINY)
+        override = run_label_emnist(
+            x, y, "upgd_ema_norm", seeds=[3], config=TINY,
+            hyperparameters={"noise_std": 0.0},
+        )
+        np.testing.assert_array_equal(
+            sigma0.per_task_accuracy, override.per_task_accuracy
+        )
+        np.testing.assert_array_equal(sigma0.per_task_loss, override.per_task_loss)
+
+    def test_sgd_ema_norm_runs_and_is_deterministic(self):
+        x, y = _tiny_data()
+        first = run_label_emnist(x, y, "sgd_ema_norm", seeds=[5], config=TINY)
+        second = run_label_emnist(x, y, "sgd_ema_norm", seeds=[5], config=TINY)
+        np.testing.assert_array_equal(first.per_task_accuracy, second.per_task_accuracy)
+        np.testing.assert_array_equal(first.per_task_loss, second.per_task_loss)
+
+    def test_plan_binds_normalized_arm_hyperparameters(self, tmp_path):
+        from alberta_framework.benchmarks.upgd_ipmnist_v3 import atomic_write_new_json
+
+        learners = ("upgd_ema_norm", "upgd_ema_norm_sigma0", "sgd_ema_norm")
+        payload = build_plan_payload(TINY, [0, 1], DATASET_META, learners=learners)
+        assert payload["plan"]["hyperparameters"] == {
+            "upgd_ema_norm": UPGD_EMA_NORM_HYPERPARAMETERS,
+            "upgd_ema_norm_sigma0": UPGD_EMA_NORM_SIGMA0_HYPERPARAMETERS,
+            "sgd_ema_norm": SGD_EMA_NORM_HYPERPARAMETERS,
+        }
+        path = tmp_path / "plan.json"
+        atomic_write_new_json(path, payload)
+        loaded = load_plan(path)
+        assert loaded["plan"]["learner_ids"] == list(learners)
+        assert loaded["plan"]["planned_shard_count"] == 6
 
 
 class TestPlanShardMergeAccounting:

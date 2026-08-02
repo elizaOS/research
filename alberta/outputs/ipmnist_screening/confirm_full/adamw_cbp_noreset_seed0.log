@@ -1,0 +1,14 @@
+WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-08-02 04:33:17,628 INFO loading MNIST from data_home=/home/shaw/milady/alberta/outputs/step2_published_mnist_openml_cache
+2026-08-02 04:33:21,136 INFO running adamw_cbp_noreset seed=0 for 200 tasks x 5000 steps (noise_mode=step)
+2026-08-02 04:35:29,785 INFO adamw_cbp_noreset seed=0 task 20/200 online_acc=0.7886 elapsed=121.7s
+2026-08-02 04:37:29,665 INFO adamw_cbp_noreset seed=0 task 40/200 online_acc=0.7910 elapsed=241.5s
+2026-08-02 04:39:27,414 INFO adamw_cbp_noreset seed=0 task 60/200 online_acc=0.8038 elapsed=359.3s
+2026-08-02 04:41:25,271 INFO adamw_cbp_noreset seed=0 task 80/200 online_acc=0.8052 elapsed=477.1s
+2026-08-02 04:43:25,056 INFO adamw_cbp_noreset seed=0 task 100/200 online_acc=0.8112 elapsed=596.9s
+2026-08-02 04:45:22,723 INFO adamw_cbp_noreset seed=0 task 120/200 online_acc=0.7988 elapsed=714.6s
+2026-08-02 04:47:20,147 INFO adamw_cbp_noreset seed=0 task 140/200 online_acc=0.8012 elapsed=832.0s
+2026-08-02 04:49:19,918 INFO adamw_cbp_noreset seed=0 task 160/200 online_acc=0.7948 elapsed=951.8s
+2026-08-02 04:51:17,981 INFO adamw_cbp_noreset seed=0 task 180/200 online_acc=0.7936 elapsed=1069.8s
+2026-08-02 04:53:15,404 INFO adamw_cbp_noreset seed=0 task 200/200 online_acc=0.8006 elapsed=1187.3s
+2026-08-02 04:53:15,462 INFO adamw_cbp_noreset seed=0 done: avg online acc 0.7981 (wall 1187.3s) -> outputs/ipmnist_screening/confirm_full/adamw_cbp_noreset_seed0.json
