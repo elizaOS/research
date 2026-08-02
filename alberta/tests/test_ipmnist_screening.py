@@ -1789,10 +1789,18 @@ class TestUpdateRuleFamily:
         """Each arm carries the champion's conditioning (norm decay 0.99,
         sigma=0) plus only its own update-rule constants."""
         expected = {
-            "colnorm_gate": {"col_decay": 0.99, "col_epsilon": 1e-8},
-            "muon_gate": {"muon_momentum": 0.95, "muon_ns_steps": 5.0},
+            # step sizes re-calibrated after the lr-transfer failure: the
+            # champion's raw-gradient lr 0.01 is ~10-100x too large for
+            # normalized/orthogonalized/sign updates (all three scored chance
+            # at 0.01; 2-task sweeps picked the values below).
+            "colnorm_gate": {
+                "step_size": 0.001, "col_decay": 0.99, "col_epsilon": 1e-8
+            },
+            "muon_gate": {
+                "step_size": 0.003, "muon_momentum": 0.95, "muon_ns_steps": 5.0
+            },
             "lion_gate": {
-                "step_size": 0.001,
+                "step_size": 0.0001,
                 "weight_decay": 0.05,
                 "lion_beta1": 0.9,
                 "lion_beta2": 0.99,

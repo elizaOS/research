@@ -3216,28 +3216,37 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 name="colnorm_gate",
                 base_learner="upgd_w",
                 mechanism="update_rule_family",
-                hyperparameters=_update_rule_hp(col_decay=0.99, col_epsilon=1e-8),
+                hyperparameters=_update_rule_hp(
+                    step_size=0.001, col_decay=0.99, col_epsilon=1e-8
+                ),
                 factory=_make_colnorm_gate_learner,
                 frozen_probe_input=_ema_frozen_probe_input,
                 description=(
                     "Column-wise RMS-scaled gated SGD under the champion's "
                     "conditioning: per-fan-in-dimension EMA of the squared "
                     "gradient scales the gated step (activation conditioning "
-                    "at the weight level); per-element EMA on biases."
+                    "at the weight level); per-element EMA on biases. lr 1e-3 "
+                    "(normalized updates: the champion's raw-gradient lr 0.01 "
+                    "random-walked to chance; 2-task sweep 3e-4/1e-3/3e-3 -> "
+                    ".786/.787/.679 vs champion .719 in the same loop)."
                 ),
             ),
             ScreeningSpec(
                 name="muon_gate",
                 base_learner="upgd_w",
                 mechanism="update_rule_family",
-                hyperparameters=_update_rule_hp(muon_momentum=0.95, muon_ns_steps=5.0),
+                hyperparameters=_update_rule_hp(
+                    step_size=0.003, muon_momentum=0.95, muon_ns_steps=5.0
+                ),
                 factory=_make_muon_gate_learner,
                 frozen_probe_input=_ema_frozen_probe_input,
                 description=(
                     "Muon-style gated update under the champion's conditioning: "
                     "Nesterov momentum + 5-step Newton-Schulz orthogonalization "
                     "of the 2-D weight updates, sqrt(max/min) shape scaling; "
-                    "plain gated SGD on biases."
+                    "plain gated SGD on biases. lr 3e-3 (orthogonalized "
+                    "updates: lr 0.01 was chance; 2-task sweep 1e-3/3e-3/6e-3/"
+                    "1e-2 -> .764/.808/.775/.723 vs champion .719)."
                 ),
             ),
             ScreeningSpec(
@@ -3245,7 +3254,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 base_learner="upgd_w",
                 mechanism="update_rule_family",
                 hyperparameters=_update_rule_hp(
-                    step_size=0.001,
+                    step_size=0.0001,
                     weight_decay=0.05,
                     lion_beta1=0.9,
                     lion_beta2=0.99,
@@ -3254,8 +3263,9 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 frozen_probe_input=_ema_frozen_probe_input,
                 description=(
                     "Gated Lion under the champion's conditioning: sign of the "
-                    "beta1-interpolated momentum, ~0.1x step size, decoupled "
-                    "decay 0.05."
+                    "beta1-interpolated momentum, decoupled decay 0.05. lr 1e-4 "
+                    "(sign updates: lr 1e-3 diverged by task 2; 2-task sweep "
+                    "1e-4/3e-4 -> .762/.681 vs champion .719)."
                 ),
             ),
         ]
