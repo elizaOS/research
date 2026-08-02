@@ -1,0 +1,9 @@
+colnorm_gate 0
+colnorm_gate 1
+colnorm_gate 2
+muon_gate 0
+muon_gate 1
+muon_gate 2
+lion_gate 0
+lion_gate 1
+lion_gate 2

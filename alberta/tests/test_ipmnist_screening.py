@@ -26,18 +26,26 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     CBPState,
     EMANormState,
     ScreeningSpec,
+    UPGDAdaptiveNormState,
     _atomic_write_json,
+    _ema_frozen_probe_input,
     _hidden_rms_normalize,
     _make_adamw_cbp_ema_norm_learner,
     _make_adamw_cbp_learner,
     _make_adamw_cbp_noreset_learner,
+    _make_colnorm_gate_learner,
     _make_guarded_cbp_adam_learner,
+    _make_lion_gate_learner,
+    _make_muon_gate_learner,
     _make_sgd_ema_norm_learner,
     _make_upgd_alpha_utility_learner,
     _make_upgd_ema_norm_ext_learner,
     _make_upgd_idbd_learner,
+    _make_upgd_shiftnorm_learner,
     _make_upgd_w_fade_head_learner,
     _make_upgd_w_wclip_learner,
+    _make_upgd_warmnorm_learner,
+    _newton_schulz_orthogonalize,
     adam_elem_step,
     adam_elem_update,
     cbp_maybe_replace_layer,
@@ -49,6 +57,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     run_screening_config,
     screening_spec,
     shard_payload,
+    shift_adaptive_normalize,
     upgd_alpha_utility_update,
     upgd_idbd_swift_update,
     upgd_idbd_update,
@@ -57,6 +66,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     upgd_w_localgate_update,
     upgd_w_wclip_update,
     validate_proxy,
+    warm_restart_normalize,
 )
 from alberta_framework.benchmarks.upgd_ipmnist import (
     UPGD_W_PROTOCOL_HYPERPARAMETERS,
@@ -135,6 +145,14 @@ class TestRegistry:
             "sigma0_gate_beta05",
             "sigma0_gate_beta2",
             "sigma0_localgate",
+            "sigma0_shiftnorm",
+            "sigma0_shiftnorm_k05",
+            "sigma0_shiftnorm_d099",
+            "sigma0_warmnorm",
+            "sigma0_gateplus",
+            "colnorm_gate",
+            "muon_gate",
+            "lion_gate",
         }
         assert expected == set(SCREENING_REGISTRY)
 
@@ -689,6 +707,7 @@ class TestSmokeRuns:
         "sgd_ema_norm", "sigma0_ndecay099", "sigma0_ndecay09999",
         "sigma0_eps1e6", "sigma0_eps1e4", "sigma0_hidden_norm",
         "sigma0_gate_beta05", "sigma0_gate_beta2", "sigma0_localgate",
+        "sigma0_shiftnorm", "sigma0_warmnorm", "sigma0_gateplus",
     ])
     def test_combo_runs_and_is_finite(self, small_data, name):
         x, y = small_data
@@ -815,6 +834,38 @@ class TestShardsAndMerge:
 
         assert output.read_bytes() == original
         assert list(tmp_path.iterdir()) == [output]
+
+    @pytest.mark.parametrize(("accepted", "expected_status"), [(True, 0), (False, 2)])
+    def test_proxy_cli_publishes_receipt_and_returns_fail_closed_status(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        accepted: bool,
+        expected_status: int,
+    ) -> None:
+        import alberta_framework.benchmarks.ipmnist_screening as screening
+
+        report = {
+            "schema": "synthetic.proxy.receipt",
+            "proxy_validated": accepted,
+            "all_prefixes_match": accepted,
+            "proxy_preserves_upgd_over_adamw": accepted,
+        }
+        monkeypatch.setattr(screening, "validate_proxy", lambda *_args, **_kwargs: report)
+        output = tmp_path / f"proxy-{accepted}.json"
+
+        status = screening.main(
+            [
+                "validate-proxy",
+                "--shards",
+                "unused-shard",
+                "--output",
+                str(output),
+            ]
+        )
+
+        assert status == expected_status
+        assert json.loads(output.read_text(encoding="utf-8")) == report
 
     def test_merge_rejects_duplicate_seed(self, tmp_path, small_data):
         p1 = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
@@ -1709,6 +1760,127 @@ class TestSigma0Frontier:
             assert not np.array_equal(ours.per_task_loss, ref.per_task_loss), name
 
 
+class TestUpdateRuleFamily:
+    """Wave-8 update-rule family swaps under the sigma0_ndecay099 champion's
+    conditioning: colnorm_gate, muon_gate, lion_gate."""
+
+    NAMES = ("colnorm_gate", "muon_gate", "lion_gate")
+    CHAMPION = {"norm_decay": 0.99, "norm_epsilon": 1e-8, "noise_std": 0.0}
+    FACTORIES = {
+        "colnorm_gate": _make_colnorm_gate_learner,
+        "muon_gate": _make_muon_gate_learner,
+        "lion_gate": _make_lion_gate_learner,
+    }
+
+    def _learnable_stream(self, n_examples=400, seed=88):
+        """Deterministically learnable labels (argmax of a fixed linear map)
+        so a short smoke run can rise above chance."""
+        kx, kw = jr.split(jr.key(seed))
+        x = jr.uniform(kx, (n_examples, SMALL.input_dim), jnp.float32, -1.0, 1.0)
+        w_true = jr.normal(kw, (SMALL.input_dim, SMALL.n_classes), jnp.float32)
+        y = jnp.argmax(x @ w_true, axis=1).astype(jnp.int32)
+        return np.asarray(x), np.asarray(y)
+
+    def test_registry_arms(self):
+        """Each arm carries the champion's conditioning (norm decay 0.99,
+        sigma=0) plus only its own update-rule constants."""
+        expected = {
+            "colnorm_gate": {"col_decay": 0.99, "col_epsilon": 1e-8},
+            "muon_gate": {"muon_momentum": 0.95, "muon_ns_steps": 5.0},
+            "lion_gate": {
+                "step_size": 0.001,
+                "weight_decay": 0.05,
+                "lion_beta1": 0.9,
+                "lion_beta2": 0.99,
+            },
+        }
+        for name, extras in expected.items():
+            spec = screening_spec(name)
+            assert spec.base_learner == "upgd_w", name
+            assert spec.mechanism == "update_rule_family", name
+            assert spec.noise_update is None, name
+            assert spec.factory is self.FACTORIES[name], name
+            assert spec.frozen_probe_input is _ema_frozen_probe_input, name
+            assert spec.hyperparameters == {
+                **UPGD_W_PROTOCOL_HYPERPARAMETERS,
+                **self.CHAMPION,
+                **extras,
+            }, name
+            # the champion's utility gate is unchanged
+            assert spec.hyperparameters["utility_decay"] == 0.9999, name
+
+    def test_colnorm_vcol_has_fan_in_dimension(self):
+        """v_col is per input dimension (axis 0 of the (fan_in, fan_out)
+        weights); biases keep their full per-element shape."""
+        spec = screening_spec("colnorm_gate")
+        params = init_mlp_params(jr.key(5), SMALL)
+        init_fn, step_fn = spec.factory(spec.hyperparameters)
+        state = init_fn(params)
+        assert state.vcol["w1"].shape == (SMALL.input_dim,)
+        assert state.vcol["w2"].shape == (SMALL.hidden1,)
+        assert state.vcol["w3"].shape == (SMALL.hidden2,)
+        assert state.vcol["b1"].shape == params["b1"].shape
+        assert state.vcol["b2"].shape == params["b2"].shape
+        assert state.vcol["b3"].shape == params["b3"].shape
+        x = jr.normal(jr.key(51), (SMALL.input_dim,))
+        _, new_state, _ = step_fn(params, state, x, jnp.array(2, jnp.int32), jr.key(0))
+        for name in state.vcol:
+            assert new_state.vcol[name].shape == state.vcol[name].shape, name
+            assert bool(jnp.all(jnp.isfinite(new_state.vcol[name]))), name
+
+    def test_key_is_unused_on_every_arm(self):
+        """No perturbation: different RNG keys give the identical step."""
+        params = init_mlp_params(jr.key(14), SMALL)
+        x = jr.normal(jr.key(42), (SMALL.input_dim,))
+        y = jnp.array(1, jnp.int32)
+        for name in self.NAMES:
+            spec = screening_spec(name)
+            init_fn, step_fn = spec.factory(spec.hyperparameters)
+            state = init_fn(params)
+            p_a, _, _ = step_fn(params, state, x, y, jr.key(0))
+            p_b, _, _ = step_fn(params, state, x, y, jr.key(987654))
+            for n in params:
+                np.testing.assert_array_equal(np.asarray(p_a[n]), np.asarray(p_b[n]), name)
+
+    def test_newton_schulz_orthogonalizes(self):
+        """Scaled identity input lands in the Muon singular-value band around
+        1 with near-zero off-diagonals, and the Frobenius normalization makes
+        the output scale-invariant."""
+        eye = 0.5 * jnp.eye(4, dtype=jnp.float32)
+        out = _newton_schulz_orthogonalize(eye, 5)
+        diag = np.diag(np.asarray(out))
+        assert np.all(diag > 0.6) and np.all(diag < 1.3)
+        off = np.asarray(out) - np.diag(diag)
+        np.testing.assert_allclose(off, np.zeros_like(off), atol=1e-5)
+        m = jr.normal(jr.key(3), (4, 6), jnp.float32)
+        np.testing.assert_allclose(
+            np.asarray(_newton_schulz_orthogonalize(m, 5)),
+            np.asarray(_newton_schulz_orthogonalize(3.0 * m, 5)),
+            rtol=1e-4,
+            atol=1e-5,
+        )
+        # a tall matrix is handled through the transposed branch
+        tall = _newton_schulz_orthogonalize(jr.normal(jr.key(7), (6, 3)), 5)
+        assert tall.shape == (6, 3)
+        assert bool(jnp.all(jnp.isfinite(tall)))
+
+    def test_smoke_runs_above_chance(self):
+        """2 tasks x 200 steps on a learnable stream: finite metrics, online
+        accuracy above the 1/n_classes chance floor for every arm."""
+        x, y = self._learnable_stream()
+        config = IPMNISTConfig(
+            n_tasks=2, task_length=200, input_dim=12, hidden1=8, hidden2=6, n_classes=5
+        )
+        for name in self.NAMES:
+            result = run_screening_config(
+                x, y, screening_spec(name), seed=2, config=config
+            )
+            acc = np.asarray(result.per_task_accuracy)
+            assert np.all(np.isfinite(acc)), name
+            assert np.all(np.isfinite(np.asarray(result.per_task_loss))), name
+            assert float(acc.mean()) > 1.0 / config.n_classes, name
+
+
 class TestAdamElemStep:
     def test_update_composes_step(self):
         """adam_elem_update == param - adam_elem_step delta, same moments."""
@@ -1753,3 +1925,267 @@ class TestSpecShape:
             "upgd_w_wd0005",
             "upgd_w_wd002",
         }
+
+
+class TestShiftNorm:
+    """Next-rung wave: per-feature shift-triggered re-conditioning normalizer.
+
+    ``shift_adaptive_normalize`` keeps the champion's slow EMA statistics but
+    tracks a fast per-feature mean; when the fast mean diverges from the slow
+    mean beyond ``shift_k * std + shift_delta`` the feature's anneal count is
+    reset, so its effective decay drops (fast re-conditioning) and then
+    anneals back toward the slow ``norm_decay``.
+    """
+
+    HP = {"fast_decay": 0.9, "shift_k": 1.0, "shift_delta": 0.02}
+
+    def test_registry_configs(self):
+        base = screening_spec("upgd_ema_norm_sigma0").hyperparameters
+        expected = {
+            "sigma0_shiftnorm": {"norm_decay": 0.999, **self.HP},
+            "sigma0_shiftnorm_k05": {"norm_decay": 0.999, **self.HP, "shift_k": 0.5},
+            "sigma0_shiftnorm_d099": {"norm_decay": 0.99, **self.HP},
+        }
+        ext_defaults = {"gate_beta": 1.0, "local_gate": 0.0, "hidden_rms": 0.0}
+        for name, overrides in expected.items():
+            spec = screening_spec(name)
+            assert spec.base_learner == "upgd_w", name
+            assert spec.noise_update is None, name
+            assert spec.factory is _make_upgd_shiftnorm_learner, name
+            assert spec.frozen_probe_input is _ema_frozen_probe_input, name
+            assert spec.hyperparameters == {**base, **ext_defaults, **overrides}, name
+            assert spec.hyperparameters["noise_std"] == 0.0, name
+
+    def test_no_trigger_reduces_to_ema_normalize_bitwise(self):
+        """With an untriggerable threshold the chain equals ema_normalize."""
+        d = 5
+        key = jr.key(11)
+        xs = jr.uniform(key, (40, d), jnp.float32, -1.0, 1.0)
+        plain = EMANormState(mean=jnp.zeros(d), var=jnp.ones(d), count=jnp.array(0.0))
+        shift = EMANormState(mean=jnp.zeros(d), var=jnp.ones(d), count=jnp.zeros(d))
+        fast = jnp.zeros(d)
+        for t in range(40):
+            n_plain, plain = ema_normalize(plain, xs[t], 0.999, 1e-8)
+            n_shift, shift, fast, mask = shift_adaptive_normalize(
+                shift, fast, xs[t], decay=0.999, fast_decay=0.9, epsilon=1e-8,
+                shift_k=1e9, shift_delta=1e9,
+            )
+            assert not bool(jnp.any(mask))
+            np.testing.assert_array_equal(np.asarray(n_plain), np.asarray(n_shift))
+            np.testing.assert_array_equal(np.asarray(plain.mean), np.asarray(shift.mean))
+            np.testing.assert_array_equal(np.asarray(plain.var), np.asarray(shift.var))
+            np.testing.assert_array_equal(
+                np.full(d, float(plain.count)), np.asarray(shift.count)
+            )
+
+    @staticmethod
+    def _run_constant_then_shift(
+        n_pre: int, v_pre: np.ndarray, v_post: np.ndarray, n_post: int,
+        **kwargs: float,
+    ):
+        d = v_pre.shape[0]
+        state = EMANormState(mean=jnp.zeros(d), var=jnp.ones(d), count=jnp.zeros(d))
+        fast = jnp.zeros(d)
+        masks = []
+        for _ in range(n_pre):
+            _, state, fast, _ = shift_adaptive_normalize(
+                state, fast, jnp.asarray(v_pre, jnp.float32), **kwargs
+            )
+        for _ in range(n_post):
+            _, state, fast, mask = shift_adaptive_normalize(
+                state, fast, jnp.asarray(v_post, jnp.float32), **kwargs
+            )
+            masks.append(np.asarray(mask))
+        return state, fast, masks
+
+    def test_shift_resets_only_the_shifted_feature(self):
+        v_pre = np.array([0.0, 0.5, -0.3, 1.0], np.float32)
+        v_post = v_pre.copy()
+        v_post[0] = 2.0
+        state, _, masks = self._run_constant_then_shift(
+            200, v_pre, v_post, 1,
+            decay=0.999, fast_decay=0.9, epsilon=1e-8, shift_k=1.0, shift_delta=0.02,
+        )
+        assert masks[0][0], "shifted feature must trigger detection"
+        assert not masks[0][1:].any(), "unshifted features must not trigger"
+        count = np.asarray(state.count)
+        assert count[0] == 1.0, "triggered feature's anneal count resets"
+        np.testing.assert_array_equal(count[1:], np.full(3, 201.0))
+
+    def test_post_shift_reconditioning_is_faster_than_slow_ema(self):
+        v_pre = np.array([0.0, 0.5, -0.3, 1.0], np.float32)
+        v_post = v_pre.copy()
+        v_post[0] = 2.0
+        state, _, _ = self._run_constant_then_shift(
+            200, v_pre, v_post, 30,
+            decay=0.999, fast_decay=0.9, epsilon=1e-8, shift_k=1.0, shift_delta=0.02,
+        )
+        plain = EMANormState(
+            mean=jnp.zeros(4), var=jnp.ones(4), count=jnp.array(0.0)
+        )
+        for _ in range(200):
+            _, plain = ema_normalize(plain, jnp.asarray(v_pre, jnp.float32), 0.999, 1e-8)
+        for _ in range(30):
+            _, plain = ema_normalize(plain, jnp.asarray(v_post, jnp.float32), 0.999, 1e-8)
+        err_shift = abs(float(state.mean[0]) - 2.0)
+        err_plain = abs(float(plain.mean[0]) - 2.0)
+        assert err_shift < 0.1, f"reset feature must recondition fast, err={err_shift}"
+        assert err_plain > 1.0, f"slow EMA must still lag, err={err_plain}"
+
+    def test_learner_key_unused_and_state_shape(self):
+        spec = screening_spec("sigma0_shiftnorm")
+        init_fn, step_fn = spec.factory(spec.hyperparameters)
+        params = init_mlp_params(jr.key(4), SMALL)
+        state = init_fn(params)
+        assert isinstance(state, UPGDAdaptiveNormState)
+        assert isinstance(state.norm, EMANormState)
+        assert state.norm.count.shape == (SMALL.input_dim,)
+        assert state.fast_mean.shape == (SMALL.input_dim,)
+        x = jr.normal(jr.key(41), (SMALL.input_dim,))
+        y = jnp.array(1, jnp.int32)
+        p_a, s_a, _ = step_fn(params, state, x, y, jr.key(0))
+        p_b, s_b, _ = step_fn(params, state, x, y, jr.key(987654))
+        for n in params:
+            np.testing.assert_array_equal(np.asarray(p_a[n]), np.asarray(p_b[n]))
+        np.testing.assert_array_equal(
+            np.asarray(s_a.norm.mean), np.asarray(s_b.norm.mean)
+        )
+
+
+class TestWarmNorm:
+    """Next-rung wave: globally shift-reset annealed normalizer decay.
+
+    ``warm_restart_normalize`` detects a global distribution shift from
+    fast/slow EMA divergence (never task boundaries) and resets the scalar
+    anneal clock, so the effective decay warms up again from 1/2 toward
+    ``norm_decay`` exactly as at stream start.
+    """
+
+    KW = {
+        "decay": 0.999, "fast_decay": 0.9, "epsilon": 1e-8,
+        "warm_threshold": 1.0, "warm_pad": 0.01, "warm_refractory": 50.0,
+    }
+
+    def test_registry_config(self):
+        base = screening_spec("upgd_ema_norm_sigma0").hyperparameters
+        spec = screening_spec("sigma0_warmnorm")
+        assert spec.base_learner == "upgd_w"
+        assert spec.noise_update is None
+        assert spec.factory is _make_upgd_warmnorm_learner
+        assert spec.frozen_probe_input is _ema_frozen_probe_input
+        assert spec.hyperparameters == {
+            **base,
+            "gate_beta": 1.0, "local_gate": 0.0, "hidden_rms": 0.0,
+            "fast_decay": 0.9, "warm_threshold": 1.0, "warm_pad": 0.01,
+            "warm_refractory": 50.0,
+        }
+
+    def test_threshold_inf_reduces_to_ema_normalize_bitwise(self):
+        d = 5
+        xs = jr.uniform(jr.key(13), (40, d), jnp.float32, -1.0, 1.0)
+        plain = EMANormState(mean=jnp.zeros(d), var=jnp.ones(d), count=jnp.array(0.0))
+        warm = EMANormState(mean=jnp.zeros(d), var=jnp.ones(d), count=jnp.array(0.0))
+        fast = jnp.zeros(d)
+        kw = dict(self.KW, warm_threshold=float("inf"))
+        for t in range(40):
+            n_plain, plain = ema_normalize(plain, xs[t], 0.999, 1e-8)
+            n_warm, warm, fast, trig = warm_restart_normalize(warm, fast, xs[t], **kw)
+            assert not bool(trig)
+            np.testing.assert_array_equal(np.asarray(n_plain), np.asarray(n_warm))
+            np.testing.assert_array_equal(np.asarray(plain.mean), np.asarray(warm.mean))
+            np.testing.assert_array_equal(np.asarray(plain.var), np.asarray(warm.var))
+            assert float(plain.count) == float(warm.count)
+
+    def test_global_shift_resets_clock_with_refractory(self):
+        d = 6
+        v_a = jnp.asarray(np.linspace(-1.0, 1.0, d), jnp.float32)
+        v_b = v_a + 3.0
+        state = EMANormState(mean=jnp.zeros(d), var=jnp.ones(d), count=jnp.array(0.0))
+        fast = jnp.zeros(d)
+        for _ in range(300):
+            _, state, fast, trig = warm_restart_normalize(state, fast, v_a, **self.KW)
+            assert not bool(trig), "steady within-task stream must never trigger"
+        assert float(state.count) == 300.0
+        counts = []
+        for _ in range(50):
+            _, state, fast, trig = warm_restart_normalize(state, fast, v_b, **self.KW)
+            counts.append(float(state.count))
+        assert counts[0] == 1.0, "detected global shift must reset the anneal clock"
+        np.testing.assert_array_equal(
+            np.asarray(counts), np.arange(1.0, 51.0)
+        ), "refractory must block re-triggering while the clock re-anneals"
+        err_warm = float(jnp.max(jnp.abs(state.mean - v_b)))
+        assert err_warm < 0.1, f"warm restart must recondition fast, err={err_warm}"
+
+    def test_learner_smoke_state_shape(self):
+        spec = screening_spec("sigma0_warmnorm")
+        init_fn, step_fn = spec.factory(spec.hyperparameters)
+        params = init_mlp_params(jr.key(4), SMALL)
+        state = init_fn(params)
+        assert isinstance(state, UPGDAdaptiveNormState)
+        assert state.norm.count.shape == ()
+        assert state.fast_mean.shape == (SMALL.input_dim,)
+        x = jr.normal(jr.key(42), (SMALL.input_dim,))
+        y = jnp.array(3, jnp.int32)
+        p_a, s_a, _ = step_fn(params, state, x, y, jr.key(0))
+        p_b, s_b, _ = step_fn(params, state, x, y, jr.key(5))
+        for n in params:
+            np.testing.assert_array_equal(np.asarray(p_a[n]), np.asarray(p_b[n]))
+        assert float(s_a.norm.count) == 1.0
+
+
+class TestGatePlus:
+    """Next-rung wave: composed gate refinement on the fast-decay champion —
+    per-tensor gate normalization AND temperature 2 together over
+    ``sigma0_ndecay099``'s conditioning."""
+
+    def test_registry_config(self):
+        base = screening_spec("upgd_ema_norm_sigma0").hyperparameters
+        spec = screening_spec("sigma0_gateplus")
+        assert spec.base_learner == "upgd_w"
+        assert spec.noise_update is None
+        assert spec.factory is _make_upgd_ema_norm_ext_learner
+        assert spec.frozen_probe_input is _ema_frozen_probe_input
+        assert spec.hyperparameters == {
+            **base,
+            "gate_beta": 2.0, "local_gate": 1.0, "hidden_rms": 0.0,
+            "norm_decay": 0.99,
+        }
+
+    def test_hand_computed_composition(self):
+        hp = screening_spec("sigma0_gateplus").hyperparameters
+        init_fn, step_fn = _make_upgd_ema_norm_ext_learner(hp)
+        params = init_mlp_params(jr.key(7), SMALL)
+        x = jr.uniform(jr.key(71), (SMALL.input_dim,), jnp.float32, -1.0, 1.0)
+        y = jnp.array(2, jnp.int32)
+        state = init_fn(params)
+        new_params, new_state, _ = step_fn(params, state, x, y, jr.key(0))
+
+        norm0 = EMANormState(
+            mean=jnp.zeros(SMALL.input_dim), var=jnp.ones(SMALL.input_dim),
+            count=jnp.array(0.0),
+        )
+        x_n, _ = ema_normalize(norm0, x, hp["norm_decay"], hp["norm_epsilon"])
+        (_, _), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+            params, x_n, y
+        )
+        beta_u = hp["utility_decay"]
+        bias = 1.0 - jnp.power(
+            jnp.asarray(beta_u, dtype=jnp.float32), jnp.asarray(1, jnp.int32).astype(jnp.float32)
+        )
+        param_decay = 1.0 - hp["step_size"] * hp["weight_decay"]
+        for name in params:
+            u = beta_u * jnp.zeros_like(params[name]) + (1.0 - beta_u) * (
+                -grads[name] * params[name]
+            )
+            local_max = jnp.max(u)
+            divisor = jnp.where(local_max == 0.0, 1.0, local_max)
+            scaled = (u / bias) / divisor
+            gate = jax.nn.sigmoid(2.0 * scaled)
+            zeros = jnp.zeros_like(params[name])
+            expected = params[name] * param_decay - hp["step_size"] * (
+                (grads[name] + zeros) * (1.0 - gate)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(new_params[name]), np.asarray(expected), err_msg=name
+            )

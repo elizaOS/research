@@ -92,6 +92,13 @@ identical seeds):
   temperature ``sigmoid(beta * scaled_utility)`` with beta {0.5, 2}, and
   the per-tensor (local) gate normalization retested under conditioning
   (``sigma0_localgate``; measured -0.0008 on raw inputs).
+- ``colnorm_gate`` / ``muon_gate`` / ``lion_gate``: update-rule family swaps
+  under the ``sigma0_ndecay099`` champion's conditioning (EMA input
+  normalizer decay 0.99 + the exact UPGD utility gate, no perturbation).
+  Only the descent direction changes: per-fan-in-dimension RMS-scaled gated
+  SGD (activation conditioning at the weight level), Nesterov momentum +
+  Newton-Schulz orthogonalized 2-D updates (Muon), and gated Lion
+  (sign of the interpolated momentum at ~0.1x step size, decay 0.05).
 
 Everything here is a development screening diagnostic — never promotable
 scientific evidence. Benchmark executions happen through the CLI
@@ -1070,6 +1077,236 @@ def _make_upgd_ema_norm_ext_learner(
 
 
 # =============================================================================
+# (o) Adaptive-decay normalizers: shift-triggered re-conditioning
+# =============================================================================
+#
+# The wave-7/frontier-2 decomposition attributes the conditioning win to input
+# -statistics *tracking speed*: decay 0.99 beats the 0.999 champion because it
+# re-conditions faster after each pixel permutation, while slower decay is
+# stabler within a task.  These normalizers try to get both: keep the slow
+# champion statistics, but *detect* distribution shift online (never task
+# boundaries — no oracle) and temporarily accelerate adaptation by resetting
+# the count that drives ``ema_normalize``'s annealed effective decay
+# ``min(decay, 1 - 1/(count + 1))``.
+
+
+@chex.dataclass(frozen=True)
+class UPGDAdaptiveNormState:
+    """Lean UPGD state plus adaptive-decay normalizer state.
+
+    ``norm.count`` is per-feature ``f32[d]`` for the shift-triggered
+    normalizer and scalar for the warm-restart normalizer; ``fast_mean`` is
+    the fast detection EMA in both.
+    """
+
+    utility: dict[str, Array]
+    step: Array
+    norm: EMANormState
+    fast_mean: Array
+
+
+def shift_adaptive_normalize(
+    state: EMANormState,
+    fast_mean: Array,
+    observation: Array,
+    *,
+    decay: float,
+    fast_decay: float,
+    epsilon: float,
+    shift_k: float,
+    shift_delta: float,
+) -> tuple[Array, EMANormState, Array, Array]:
+    """Per-feature shift-triggered re-conditioning EMA normalizer.
+
+    A fast per-feature mean EMA (``fast_decay``) runs beside the slow
+    statistics.  When ``|fast_mean - mean| > shift_k * sqrt(var) +
+    shift_delta`` for a feature, that feature's anneal count resets to zero,
+    so its effective decay drops to 1/2 and re-anneals toward ``decay`` —
+    fast re-conditioning exactly where the input distribution moved, slow
+    stable statistics everywhere else.  With an untriggerable threshold the
+    equations are bitwise :func:`ema_normalize` (per-feature count).
+
+    Returns ``(normalized, new_state, new_fast_mean, shifted_mask)``.
+    """
+    effective_fast = jnp.minimum(fast_decay, 1.0 - 1.0 / (state.count + 2.0))
+    new_fast = effective_fast * fast_mean + (1.0 - effective_fast) * observation
+    threshold = shift_k * jnp.sqrt(state.var) + shift_delta
+    shifted = jnp.abs(new_fast - state.mean) > threshold
+    new_count = jnp.where(shifted, 0.0, state.count) + 1.0
+    effective_decay = jnp.minimum(decay, 1.0 - 1.0 / (new_count + 1.0))
+    delta = observation - state.mean
+    new_mean = state.mean + (1.0 - effective_decay) * delta
+    delta2 = observation - new_mean
+    new_var = jnp.maximum(
+        effective_decay * state.var + (1.0 - effective_decay) * delta * delta2, epsilon
+    )
+    normalized = (observation - new_mean) / (jnp.sqrt(new_var) + epsilon)
+    return normalized, EMANormState(  # type: ignore[call-arg]
+        mean=new_mean, var=new_var, count=new_count
+    ), new_fast, shifted
+
+
+def warm_restart_normalize(
+    state: EMANormState,
+    fast_mean: Array,
+    observation: Array,
+    *,
+    decay: float,
+    fast_decay: float,
+    epsilon: float,
+    warm_threshold: float,
+    warm_pad: float,
+    warm_refractory: float,
+) -> tuple[Array, EMANormState, Array, Array]:
+    """Globally shift-reset annealed-decay EMA normalizer (batch-stats warmup).
+
+    Divergence score = mean over features of ``|fast_mean - mean| /
+    (sqrt(var) + warm_pad)``.  When the score exceeds ``warm_threshold`` and
+    the scalar anneal clock has passed ``warm_refractory`` steps, the clock
+    resets, so the effective decay warms up again from 1/2 toward ``decay``
+    (``min(decay, 1 - 1/(t + 2))`` with ``t`` = steps since the last detected
+    shift) exactly as at stream start.  Detection is purely observational —
+    never a task-boundary oracle.  With an infinite threshold the equations
+    are bitwise :func:`ema_normalize`.
+
+    Returns ``(normalized, new_state, new_fast_mean, triggered)``.
+    """
+    effective_fast = jnp.minimum(fast_decay, 1.0 - 1.0 / (state.count + 2.0))
+    new_fast = effective_fast * fast_mean + (1.0 - effective_fast) * observation
+    score = jnp.mean(jnp.abs(new_fast - state.mean) / (jnp.sqrt(state.var) + warm_pad))
+    triggered = (score > warm_threshold) & (state.count >= warm_refractory)
+    new_count = jnp.where(triggered, 0.0, state.count) + 1.0
+    effective_decay = jnp.minimum(decay, 1.0 - 1.0 / (new_count + 1.0))
+    delta = observation - state.mean
+    new_mean = state.mean + (1.0 - effective_decay) * delta
+    delta2 = observation - new_mean
+    new_var = jnp.maximum(
+        effective_decay * state.var + (1.0 - effective_decay) * delta * delta2, epsilon
+    )
+    normalized = (observation - new_mean) / (jnp.sqrt(new_var) + epsilon)
+    return normalized, EMANormState(  # type: ignore[call-arg]
+        mean=new_mean, var=new_var, count=new_count
+    ), new_fast, triggered
+
+
+_AdaptiveNormalizeFn = Callable[
+    [EMANormState, Array, Array], tuple[Array, EMANormState, Array, Array]
+]
+
+
+def _make_adaptive_norm_sigma0_learner(
+    hp: Mapping[str, float],
+    normalize: _AdaptiveNormalizeFn,
+    init_count: Callable[[int], Array],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Shared sigma0 (normalize + utility-gated SGD + decay) learner over an
+    adaptive normalizer.  The update equations are exactly the sigma0
+    champion's (``_make_upgd_ema_norm_ext_learner`` defaults): explicit zero
+    perturbation, bias-corrected utility EMA, global-max sigmoid gate,
+    decoupled decay.  The RNG key is deliberately untouched."""
+    step_size = hp["step_size"]
+    utility_decay = hp["utility_decay"]
+    param_decay = 1.0 - step_size * hp["weight_decay"]
+
+    def init_fn(params: dict[str, Array]) -> UPGDAdaptiveNormState:
+        input_dim = params["w1"].shape[0]
+        return UPGDAdaptiveNormState(  # type: ignore[call-arg]
+            utility={name: jnp.zeros_like(value) for name, value in params.items()},
+            step=jnp.array(0, dtype=jnp.int32),
+            norm=EMANormState(  # type: ignore[call-arg]
+                mean=jnp.zeros(input_dim, dtype=jnp.float32),
+                var=jnp.ones(input_dim, dtype=jnp.float32),
+                count=init_count(input_dim),
+            ),
+            fast_mean=jnp.zeros(input_dim, dtype=jnp.float32),
+        )
+
+    def full_step(
+        params: dict[str, Array],
+        state: UPGDAdaptiveNormState,
+        x: Array,
+        y: Array,
+        key: Array,
+    ) -> tuple[dict[str, Array], UPGDAdaptiveNormState, StepMetrics]:
+        del key  # sigma=0: no perturbation, the per-step noise key is unused
+        x_norm, new_norm, new_fast, _ = normalize(state.norm, state.fast_mean, x)
+        (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+            params, x_norm, y
+        )
+        count = state.step + jnp.array(1, dtype=jnp.int32)
+        utility = {
+            name: utility_decay * state.utility[name]
+            + (1.0 - utility_decay) * (-grads[name] * params[name])
+            for name in params
+        }
+        bias_correction = 1.0 - jnp.power(
+            jnp.asarray(utility_decay, dtype=jnp.float32), count.astype(jnp.float32)
+        )
+        global_max = jnp.max(
+            jnp.stack([jnp.max(utility[name]) for name in sorted(params)])
+        )
+        new_params = {
+            name: params[name] * param_decay
+            - step_size
+            * (grads[name] * (1.0 - jax.nn.sigmoid(
+                (utility[name] / bias_correction) / global_max
+            )))
+            for name in params
+        }
+        metrics = _step_metrics(new_params, x_norm, y, loss, logits)
+        return new_params, UPGDAdaptiveNormState(  # type: ignore[call-arg]
+            utility=utility, step=count, norm=new_norm, fast_mean=new_fast
+        ), metrics
+
+    return init_fn, full_step
+
+
+def _make_upgd_shiftnorm_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """sigma0 champion update behind :func:`shift_adaptive_normalize`."""
+
+    def normalize(
+        state: EMANormState, fast_mean: Array, x: Array
+    ) -> tuple[Array, EMANormState, Array, Array]:
+        return shift_adaptive_normalize(
+            state, fast_mean, x,
+            decay=hp["norm_decay"],
+            fast_decay=hp["fast_decay"],
+            epsilon=hp["norm_epsilon"],
+            shift_k=hp["shift_k"],
+            shift_delta=hp["shift_delta"],
+        )
+
+    return _make_adaptive_norm_sigma0_learner(
+        hp, normalize, lambda d: jnp.zeros(d, dtype=jnp.float32)
+    )
+
+
+def _make_upgd_warmnorm_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """sigma0 champion update behind :func:`warm_restart_normalize`."""
+
+    def normalize(
+        state: EMANormState, fast_mean: Array, x: Array
+    ) -> tuple[Array, EMANormState, Array, Array]:
+        return warm_restart_normalize(
+            state, fast_mean, x,
+            decay=hp["norm_decay"],
+            fast_decay=hp["fast_decay"],
+            epsilon=hp["norm_epsilon"],
+            warm_threshold=hp["warm_threshold"],
+            warm_pad=hp["warm_pad"],
+            warm_refractory=hp["warm_refractory"],
+        )
+
+    return _make_adaptive_norm_sigma0_learner(
+        hp, normalize, lambda d: jnp.array(0.0, dtype=jnp.float32)
+    )
+
+
+# =============================================================================
 # (f) UPGD-W + per-layer weight clipping (Elsayed, Lan, Lyle & Mahmood, 2024)
 # =============================================================================
 
@@ -1869,6 +2106,304 @@ def _make_upgd_alpha_utility_learner(
 
 
 # =============================================================================
+# (o) Update-rule family swaps under the sigma0_ndecay099 champion conditioning
+# =============================================================================
+
+#: Quintic Newton-Schulz coefficients from the Muon reference implementation
+#: (Jordan et al.); tuned for slope at zero, so the iteration oscillates the
+#: singular values into a band around 1 rather than converging monotonically.
+_MUON_NS_COEFFS = (3.4445, -4.7750, 2.0315)
+
+
+def _newton_schulz_orthogonalize(matrix: Array, n_steps: int) -> Array:
+    """Approximately orthogonalize a 2-D matrix via quintic Newton-Schulz.
+
+    The Muon reference procedure: normalize by the Frobenius norm (plus a
+    1e-7 guard), run ``n_steps`` iterations of
+    ``X <- a*X + (b*A + c*A@A) @ X`` with ``A = X @ X^T`` and the
+    :data:`_MUON_NS_COEFFS` coefficients, operating on the transposed matrix
+    whenever it has more rows than columns so ``A`` is the smaller Gram
+    matrix. Scale-invariant by construction (the Frobenius normalization
+    absorbs any positive scalar on the input).
+    """
+    a, b, c = _MUON_NS_COEFFS
+    transposed = matrix.shape[0] > matrix.shape[1]
+    x = matrix.T if transposed else matrix
+    x = x / (jnp.linalg.norm(x) + 1e-7)
+    for _ in range(n_steps):
+        gram = x @ x.T
+        x = a * x + (b * gram + c * (gram @ gram)) @ x
+    return x.T if transposed else x
+
+
+def _init_input_norm_state(params: dict[str, Array]) -> EMANormState:
+    """Fresh EMA input-normalizer state sized from the first-layer fan-in."""
+    input_dim = params["w1"].shape[0]
+    return EMANormState(  # type: ignore[call-arg]
+        mean=jnp.zeros(input_dim, dtype=jnp.float32),
+        var=jnp.ones(input_dim, dtype=jnp.float32),
+        count=jnp.array(0.0, dtype=jnp.float32),
+    )
+
+
+@chex.dataclass(frozen=True)
+class ColNormGateState:
+    """UPGD utility EMA/clock, per-fan-in gradient mean-square EMAs, normalizer.
+
+    ``vcol`` holds one entry per parameter: shape ``(fan_in,)`` for the 2-D
+    weights (one EMA per input dimension, axis 0 of the ``(fan_in, fan_out)``
+    protocol orientation) and the full parameter shape for biases.
+    """
+
+    utility: dict[str, Array]
+    step: Array
+    vcol: dict[str, Array]
+    norm: EMANormState
+
+
+def _make_colnorm_gate_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Column-wise RMS-scaled gated SGD behind the champion's conditioning.
+
+    The ``sigma0_ndecay099`` champion's EMA input normalizer (decay
+    ``norm_decay``) and exact UPGD utility gate
+    (:func:`_upgd_utility_and_gate`) are kept; only the descent direction
+    changes. Per 2-D weight ``W`` of shape ``(fan_in, fan_out)`` the state
+    keeps ``v_col``, an EMA (``col_decay``) of the per-input-dimension
+    mean-square gradient ``mean_j(G_ij^2)``; at batch size 1 the dense-layer
+    gradient is the rank-1 outer product of the input activation and the
+    backprop delta, so ``sqrt(v_col)`` is input/hidden-activation
+    conditioning expressed at the weight level. The applied step is
+
+    ``W <- W * (1 - lr*wd) - lr * (G * (1 - gate)) / (sqrt(v_col) + eps)``
+
+    with ``v_col`` broadcast along the fan-out axis. Biases are scaled by an
+    EMA of the per-element squared gradient (same decay/epsilon) — the exact
+    1-D specialization of the column statistic. No perturbation and no bias
+    correction on the EMA (RMSProp-style; documented, not an oversight); the
+    RNG key is deliberately unused.
+    """
+    step_size = hp["step_size"]
+    utility_decay = hp["utility_decay"]
+    param_decay = 1.0 - step_size * hp["weight_decay"]
+    norm_decay = hp["norm_decay"]
+    norm_epsilon = hp["norm_epsilon"]
+    col_decay = hp["col_decay"]
+    col_epsilon = hp["col_epsilon"]
+
+    def init_fn(params: dict[str, Array]) -> ColNormGateState:
+        return ColNormGateState(  # type: ignore[call-arg]
+            utility={name: jnp.zeros_like(value) for name, value in params.items()},
+            step=jnp.array(0, dtype=jnp.int32),
+            vcol={
+                name: jnp.zeros(value.shape[0] if value.ndim == 2 else value.shape,
+                                dtype=jnp.float32)
+                for name, value in params.items()
+            },
+            norm=_init_input_norm_state(params),
+        )
+
+    def full_step(
+        params: dict[str, Array], state: ColNormGateState, x: Array, y: Array, key: Array
+    ) -> tuple[dict[str, Array], ColNormGateState, StepMetrics]:
+        del key  # no perturbation: the step consumes no randomness
+        x_norm, new_norm = ema_normalize(state.norm, x, norm_decay, norm_epsilon)
+        (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+            params, x_norm, y
+        )
+        count = state.step + jnp.array(1, dtype=jnp.int32)
+        utility, gate = _upgd_utility_and_gate(
+            params, grads, state.utility, count, utility_decay
+        )
+        new_params: dict[str, Array] = {}
+        new_vcol: dict[str, Array] = {}
+        for name in params:
+            g = grads[name]
+            if params[name].ndim == 2:
+                stat = jnp.mean(g * g, axis=1)
+                v = col_decay * state.vcol[name] + (1.0 - col_decay) * stat
+                denom = jnp.sqrt(v)[:, None] + col_epsilon
+            else:
+                v = col_decay * state.vcol[name] + (1.0 - col_decay) * (g * g)
+                denom = jnp.sqrt(v) + col_epsilon
+            new_params[name] = params[name] * param_decay - step_size * (
+                g * (1.0 - gate[name]) / denom
+            )
+            new_vcol[name] = v
+        metrics = _step_metrics(new_params, x_norm, y, loss, logits)
+        return new_params, ColNormGateState(  # type: ignore[call-arg]
+            utility=utility, step=count, vcol=new_vcol, norm=new_norm
+        ), metrics
+
+    return init_fn, full_step
+
+
+@chex.dataclass(frozen=True)
+class MuonGateState:
+    """UPGD utility EMA/clock, per-weight momentum buffers, input normalizer.
+
+    ``momentum`` carries entries for the 2-D weight matrices only; biases
+    take the plain gated-SGD step and keep no optimizer state.
+    """
+
+    utility: dict[str, Array]
+    step: Array
+    momentum: dict[str, Array]
+    norm: EMANormState
+
+
+def _make_muon_gate_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Muon-style orthogonalized gated update behind the champion's conditioning.
+
+    EMA input normalizer and UPGD utility gate exactly as
+    ``sigma0_ndecay099``; the 2-D weight step is the Muon recipe: momentum
+    ``M <- mu * M + G`` (``mu = muon_momentum``), Nesterov update input
+    ``G + mu * M`` (with the *new* ``M``, matching the reference
+    ``buf.mul_(mu).add_(g); g.add_(buf, alpha=mu)``), then
+    :func:`_newton_schulz_orthogonalize` (``muon_ns_steps`` iterations,
+    :data:`_MUON_NS_COEFFS`), scaled by ``sqrt(max(m, n) / min(m, n))``:
+
+    ``W <- W * (1 - lr*wd) - lr * (1 - gate) * scale * NS(G + mu*M)``
+
+    The gate multiplies the orthogonalized direction elementwise (protection
+    stays per-weight; orthogonalization sees raw momentum). Biases take the
+    plain gated SGD step with the same decoupled decay. No perturbation; the
+    RNG key is deliberately unused.
+    """
+    step_size = hp["step_size"]
+    utility_decay = hp["utility_decay"]
+    param_decay = 1.0 - step_size * hp["weight_decay"]
+    norm_decay = hp["norm_decay"]
+    norm_epsilon = hp["norm_epsilon"]
+    mu = hp["muon_momentum"]
+    ns_steps = int(hp["muon_ns_steps"])
+
+    def init_fn(params: dict[str, Array]) -> MuonGateState:
+        return MuonGateState(  # type: ignore[call-arg]
+            utility={name: jnp.zeros_like(value) for name, value in params.items()},
+            step=jnp.array(0, dtype=jnp.int32),
+            momentum={
+                name: jnp.zeros_like(value)
+                for name, value in params.items()
+                if value.ndim == 2
+            },
+            norm=_init_input_norm_state(params),
+        )
+
+    def full_step(
+        params: dict[str, Array], state: MuonGateState, x: Array, y: Array, key: Array
+    ) -> tuple[dict[str, Array], MuonGateState, StepMetrics]:
+        del key  # no perturbation: the step consumes no randomness
+        x_norm, new_norm = ema_normalize(state.norm, x, norm_decay, norm_epsilon)
+        (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+            params, x_norm, y
+        )
+        count = state.step + jnp.array(1, dtype=jnp.int32)
+        utility, gate = _upgd_utility_and_gate(
+            params, grads, state.utility, count, utility_decay
+        )
+        new_params: dict[str, Array] = {}
+        new_momentum: dict[str, Array] = {}
+        for name in params:
+            keep = 1.0 - gate[name]
+            g = grads[name]
+            if params[name].ndim == 2:
+                momentum = mu * state.momentum[name] + g
+                direction = _newton_schulz_orthogonalize(g + mu * momentum, ns_steps)
+                m_dim, n_dim = params[name].shape
+                scale = math.sqrt(max(m_dim, n_dim) / min(m_dim, n_dim))
+                new_params[name] = params[name] * param_decay - step_size * (
+                    keep * scale * direction
+                )
+                new_momentum[name] = momentum
+            else:
+                new_params[name] = params[name] * param_decay - step_size * (keep * g)
+        metrics = _step_metrics(new_params, x_norm, y, loss, logits)
+        return new_params, MuonGateState(  # type: ignore[call-arg]
+            utility=utility, step=count, momentum=new_momentum, norm=new_norm
+        ), metrics
+
+    return init_fn, full_step
+
+
+@chex.dataclass(frozen=True)
+class LionGateState:
+    """UPGD utility EMA/clock, Lion momentum, and the input-normalizer state."""
+
+    utility: dict[str, Array]
+    step: Array
+    momentum: dict[str, Array]
+    norm: EMANormState
+
+
+def _make_lion_gate_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Gated Lion behind the champion's conditioning.
+
+    EMA input normalizer and UPGD utility gate exactly as
+    ``sigma0_ndecay099``; the descent direction is Lion (Chen et al. 2023),
+    with the published two-beta form — the sign direction interpolates the
+    *pre-update* momentum with the fresh gradient:
+
+    - ``c = lion_beta1 * m + (1 - lion_beta1) * g`` (old ``m``),
+    - ``w <- w * (1 - lr*wd) - lr * (1 - gate) * sign(c)``,
+    - ``m <- lion_beta2 * m + (1 - lion_beta2) * g``.
+
+    Sign updates are scale-free, so the arm runs at ~0.1x the champion's
+    step size with a correspondingly larger decoupled decay. Applied to every
+    parameter (weights and biases). No perturbation; the RNG key is
+    deliberately unused.
+    """
+    step_size = hp["step_size"]
+    utility_decay = hp["utility_decay"]
+    param_decay = 1.0 - step_size * hp["weight_decay"]
+    norm_decay = hp["norm_decay"]
+    norm_epsilon = hp["norm_epsilon"]
+    beta1 = hp["lion_beta1"]
+    beta2 = hp["lion_beta2"]
+
+    def init_fn(params: dict[str, Array]) -> LionGateState:
+        return LionGateState(  # type: ignore[call-arg]
+            utility={name: jnp.zeros_like(value) for name, value in params.items()},
+            step=jnp.array(0, dtype=jnp.int32),
+            momentum={name: jnp.zeros_like(value) for name, value in params.items()},
+            norm=_init_input_norm_state(params),
+        )
+
+    def full_step(
+        params: dict[str, Array], state: LionGateState, x: Array, y: Array, key: Array
+    ) -> tuple[dict[str, Array], LionGateState, StepMetrics]:
+        del key  # no perturbation: the step consumes no randomness
+        x_norm, new_norm = ema_normalize(state.norm, x, norm_decay, norm_epsilon)
+        (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+            params, x_norm, y
+        )
+        count = state.step + jnp.array(1, dtype=jnp.int32)
+        utility, gate = _upgd_utility_and_gate(
+            params, grads, state.utility, count, utility_decay
+        )
+        new_params: dict[str, Array] = {}
+        new_momentum: dict[str, Array] = {}
+        for name in params:
+            g = grads[name]
+            interpolated = beta1 * state.momentum[name] + (1.0 - beta1) * g
+            new_params[name] = params[name] * param_decay - step_size * (
+                (1.0 - gate[name]) * jnp.sign(interpolated)
+            )
+            new_momentum[name] = beta2 * state.momentum[name] + (1.0 - beta2) * g
+        metrics = _step_metrics(new_params, x_norm, y, loss, logits)
+        return new_params, LionGateState(  # type: ignore[call-arg]
+            utility=utility, step=count, momentum=new_momentum, norm=new_norm
+        ), metrics
+
+    return init_fn, full_step
+
+
+# =============================================================================
 # Config registry
 # =============================================================================
 
@@ -1965,6 +2500,18 @@ def _sigma0_ext_hp(**overrides: float) -> dict[str, float]:
         local_gate=0.0,
         hidden_rms=0.0,
     )
+    merged.update(overrides)
+    return merged
+
+
+def _update_rule_hp(**overrides: float) -> dict[str, float]:
+    """``sigma0_ndecay099``'s conditioning for the update-rule family swaps.
+
+    Published UPGD-W hyperparameters plus the champion's EMA input-normalizer
+    decay 0.99 and ``noise_std = 0`` (no perturbation); each arm adds only
+    its own update-rule constants on top.
+    """
+    merged = _upgd_hp(norm_decay=0.99, norm_epsilon=1e-8, noise_std=0.0)
     merged.update(overrides)
     return merged
 
@@ -2427,6 +2974,128 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 ),
             )
         )
+    # --- Wave 8: update-rule family swaps under the sigma0_ndecay099 champion's
+    # conditioning (EMA input normalizer decay 0.99 + the exact UPGD utility
+    # gate, no perturbation).  Only the descent direction changes per arm.
+    specs.extend(
+        [
+            ScreeningSpec(
+                name="colnorm_gate",
+                base_learner="upgd_w",
+                mechanism="update_rule_family",
+                hyperparameters=_update_rule_hp(col_decay=0.99, col_epsilon=1e-8),
+                factory=_make_colnorm_gate_learner,
+                frozen_probe_input=_ema_frozen_probe_input,
+                description=(
+                    "Column-wise RMS-scaled gated SGD under the champion's "
+                    "conditioning: per-fan-in-dimension EMA of the squared "
+                    "gradient scales the gated step (activation conditioning "
+                    "at the weight level); per-element EMA on biases."
+                ),
+            ),
+            ScreeningSpec(
+                name="muon_gate",
+                base_learner="upgd_w",
+                mechanism="update_rule_family",
+                hyperparameters=_update_rule_hp(muon_momentum=0.95, muon_ns_steps=5.0),
+                factory=_make_muon_gate_learner,
+                frozen_probe_input=_ema_frozen_probe_input,
+                description=(
+                    "Muon-style gated update under the champion's conditioning: "
+                    "Nesterov momentum + 5-step Newton-Schulz orthogonalization "
+                    "of the 2-D weight updates, sqrt(max/min) shape scaling; "
+                    "plain gated SGD on biases."
+                ),
+            ),
+            ScreeningSpec(
+                name="lion_gate",
+                base_learner="upgd_w",
+                mechanism="update_rule_family",
+                hyperparameters=_update_rule_hp(
+                    step_size=0.001,
+                    weight_decay=0.05,
+                    lion_beta1=0.9,
+                    lion_beta2=0.99,
+                ),
+                factory=_make_lion_gate_learner,
+                frozen_probe_input=_ema_frozen_probe_input,
+                description=(
+                    "Gated Lion under the champion's conditioning: sign of the "
+                    "beta1-interpolated momentum, ~0.1x step size, decoupled "
+                    "decay 0.05."
+                ),
+            ),
+        ]
+    )
+    # --- Next-rung wave: shift-triggered re-conditioning normalizers +
+    # composed gate refinement, informed by the tracking-speed mechanism
+    # (decay 0.99 wins by re-conditioning faster after each permutation).
+    shiftnorm_defaults = {"fast_decay": 0.9, "shift_k": 1.0, "shift_delta": 0.02}
+    for name, shift_overrides in (
+        ("sigma0_shiftnorm", {}),
+        ("sigma0_shiftnorm_k05", {"shift_k": 0.5}),
+        ("sigma0_shiftnorm_d099", {"norm_decay": 0.99}),
+    ):
+        specs.append(
+            ScreeningSpec(
+                name=name,
+                base_learner="upgd_w",
+                mechanism="adaptive_input_normalization",
+                hyperparameters=_sigma0_ext_hp(
+                    **{**shiftnorm_defaults, **shift_overrides}
+                ),
+                factory=_make_upgd_shiftnorm_learner,
+                frozen_probe_input=_ema_frozen_probe_input,
+                description=(
+                    "upgd_ema_norm_sigma0 with per-feature shift-triggered "
+                    "re-conditioning: a fast detection EMA resets a feature's "
+                    "anneal count when it diverges from the slow statistics ("
+                    + ", ".join(
+                        f"{k}={v}"
+                        for k, v in {**shiftnorm_defaults, **shift_overrides}.items()
+                    )
+                    + ")."
+                ),
+            )
+        )
+    specs.append(
+        ScreeningSpec(
+            name="sigma0_warmnorm",
+            base_learner="upgd_w",
+            mechanism="adaptive_input_normalization",
+            hyperparameters=_sigma0_ext_hp(
+                fast_decay=0.9,
+                warm_threshold=1.0,
+                warm_pad=0.01,
+                warm_refractory=50.0,
+            ),
+            factory=_make_upgd_warmnorm_learner,
+            frozen_probe_input=_ema_frozen_probe_input,
+            description=(
+                "upgd_ema_norm_sigma0 with batch-stats warmup: a global "
+                "fast/slow divergence detector (no task-boundary oracle) "
+                "resets the scalar anneal clock so the effective decay warms "
+                "up from 1/2 toward 0.999 after each detected shift."
+            ),
+        )
+    )
+    specs.append(
+        ScreeningSpec(
+            name="sigma0_gateplus",
+            base_learner="upgd_w",
+            mechanism="gate_refinement_composition",
+            hyperparameters=_sigma0_ext_hp(
+                norm_decay=0.99, local_gate=1.0, gate_beta=2.0
+            ),
+            factory=_make_upgd_ema_norm_ext_learner,
+            frozen_probe_input=_ema_frozen_probe_input,
+            description=(
+                "sigma0_ndecay099 champion with the two near-flat gate "
+                "refinements composed: per-tensor gate normalization AND "
+                "temperature beta=2 on the conditioned-gradient utilities."
+            ),
+        )
+    )
     return {spec.name: spec for spec in specs}
 
 
@@ -3432,7 +4101,7 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     atomic_write_new(Path(path), encoded)
 
 
-def main(argv: Sequence[str] | None = None) -> None:
+def main(argv: Sequence[str] | None = None) -> int:
     """Screening CLI: ``run`` one (config, seed); ``merge``; ``validate-proxy``."""
     parser = argparse.ArgumentParser(description="IPMNIST mechanism-combination screening")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -3520,7 +4189,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             report["proxy_preserves_upgd_over_adamw"],
             args.output,
         )
+        if not report["proxy_validated"]:
+            logger.error("proxy validation rejected; receipt was preserved at %s", args.output)
+            return 2
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
