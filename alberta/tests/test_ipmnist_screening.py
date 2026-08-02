@@ -23,12 +23,14 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     CBPState,
     EMANormState,
     ScreeningSpec,
+    _hidden_rms_normalize,
     _make_adamw_cbp_ema_norm_learner,
     _make_adamw_cbp_learner,
     _make_adamw_cbp_noreset_learner,
     _make_guarded_cbp_adam_learner,
     _make_sgd_ema_norm_learner,
     _make_upgd_alpha_utility_learner,
+    _make_upgd_ema_norm_ext_learner,
     _make_upgd_idbd_learner,
     _make_upgd_w_fade_head_learner,
     _make_upgd_w_wclip_learner,
@@ -116,6 +118,14 @@ class TestRegistry:
             "upgd_ema_norm_lr0003",
             "upgd_ema_norm_sigma0",
             "sgd_ema_norm",
+            "sigma0_ndecay099",
+            "sigma0_ndecay09999",
+            "sigma0_eps1e6",
+            "sigma0_eps1e4",
+            "sigma0_hidden_norm",
+            "sigma0_gate_beta05",
+            "sigma0_gate_beta2",
+            "sigma0_localgate",
         }
         assert expected == set(SCREENING_REGISTRY)
 
@@ -667,7 +677,9 @@ class TestSmokeRuns:
         "upgd_w_localgate", "upgd_w_fade_head", "upgd_w_idbd_swift",
         "guarded_cbp_adam", "adamw_cbp_noreset", "adamw_cbp_ema_norm",
         "upgd_w_sigma0", "upgd_alpha_utility", "adamw_cbp_r3e4",
-        "sgd_ema_norm",
+        "sgd_ema_norm", "sigma0_ndecay099", "sigma0_ndecay09999",
+        "sigma0_eps1e6", "sigma0_eps1e4", "sigma0_hidden_norm",
+        "sigma0_gate_beta05", "sigma0_gate_beta2", "sigma0_localgate",
     ])
     def test_combo_runs_and_is_finite(self, small_data, name):
         x, y = small_data
@@ -1322,6 +1334,283 @@ class TestAdamCBPTunedStar:
             for key, value in base.items():
                 if key not in overrides:
                     assert hp[key] == value, (name, key)
+
+
+class TestSigma0Frontier:
+    """Wave-7 frontier extensions on the ``upgd_ema_norm_sigma0`` champion:
+    normalizer statistics (decay/epsilon), hidden-layer RMS conditioning, and
+    gate temperature/normalization under input conditioning."""
+
+    AXES = {
+        "sigma0_ndecay099": {"norm_decay": 0.99},
+        "sigma0_ndecay09999": {"norm_decay": 0.9999},
+        "sigma0_eps1e6": {"norm_epsilon": 1e-6},
+        "sigma0_eps1e4": {"norm_epsilon": 1e-4},
+        "sigma0_hidden_norm": {"hidden_rms": 1.0, "hidden_rms_epsilon": 1e-8},
+        "sigma0_gate_beta05": {"gate_beta": 0.5},
+        "sigma0_gate_beta2": {"gate_beta": 2.0},
+        "sigma0_localgate": {"local_gate": 1.0},
+    }
+    EXT_DEFAULTS = {"gate_beta": 1.0, "local_gate": 0.0, "hidden_rms": 0.0}
+
+    def test_registry_single_axis_arms(self):
+        """Every arm varies exactly one axis over the sigma0 champion's
+        hyperparameters plus inert extension defaults."""
+        base = screening_spec("upgd_ema_norm_sigma0").hyperparameters
+        for name, overrides in self.AXES.items():
+            spec = screening_spec(name)
+            assert spec.base_learner == "upgd_w", name
+            assert spec.noise_update is None, name
+            assert spec.factory is _make_upgd_ema_norm_ext_learner, name
+            assert spec.hyperparameters == {
+                **base,
+                **self.EXT_DEFAULTS,
+                **overrides,
+            }, name
+            assert spec.hyperparameters["noise_std"] == 0.0, name
+
+    def test_ext_defaults_reduce_to_upgd_ema_norm_sigma0_bitwise(self, small_data):
+        """gate_beta=1, local_gate=0, hidden_rms=0: the extension factory's
+        whole trajectory equals upgd_ema_norm_sigma0's bit-for-bit."""
+        x, y = small_data
+        base = screening_spec("upgd_ema_norm_sigma0")
+        spec = ScreeningSpec(
+            name="upgd_ema_norm_sigma0",  # reuse registry identity for plumbing
+            base_learner="upgd_w",
+            mechanism="input_normalization",
+            hyperparameters={**base.hyperparameters, **self.EXT_DEFAULTS},
+            factory=_make_upgd_ema_norm_ext_learner,
+        )
+        ours = run_screening_config(x, y, spec, seed=17, config=SMALL)
+        ref = run_screening_config(x, y, base, seed=17, config=SMALL)
+        np.testing.assert_array_equal(ours.per_task_accuracy, ref.per_task_accuracy)
+        np.testing.assert_array_equal(ours.per_task_loss, ref.per_task_loss)
+        np.testing.assert_array_equal(ours.per_task_plasticity, ref.per_task_plasticity)
+
+    def test_key_is_unused_on_every_arm(self):
+        """sigma0 arms consume no randomness: different RNG keys, same step."""
+        params = init_mlp_params(jr.key(4), SMALL)
+        x = jr.normal(jr.key(41), (SMALL.input_dim,))
+        y = jnp.array(1, jnp.int32)
+        for name in self.AXES:
+            spec = screening_spec(name)
+            init_fn, step_fn = spec.factory(spec.hyperparameters)
+            state = init_fn(params)
+            p_a, s_a, _ = step_fn(params, state, x, y, jr.key(0))
+            p_b, s_b, _ = step_fn(params, state, x, y, jr.key(987654))
+            for n in params:
+                np.testing.assert_array_equal(np.asarray(p_a[n]), np.asarray(p_b[n]), name)
+            for field in ("mean", "var", "count"):
+                np.testing.assert_array_equal(
+                    np.asarray(getattr(s_a.norm, field)),
+                    np.asarray(getattr(s_b.norm, field)),
+                    name,
+                )
+
+    def test_gate_temperature_hand_computed(self):
+        """sigma0_gate_beta2 equals normalize -> grads -> utility EMA ->
+        sigmoid(2 * scaled utility) -> gated decayed step, bit-for-bit."""
+        hp = screening_spec("sigma0_gate_beta2").hyperparameters
+        init_fn, step_fn = _make_upgd_ema_norm_ext_learner(hp)
+        params = init_mlp_params(jr.key(9), SMALL)
+        state = init_fn(params)
+        ref_params = params
+        ref_utility = {n: jnp.zeros_like(v) for n, v in params.items()}
+        norm_state = EMANormState(
+            mean=jnp.zeros(SMALL.input_dim),
+            var=jnp.ones(SMALL.input_dim),
+            count=jnp.array(0.0),
+        )
+        beta = hp["utility_decay"]
+        decay = 1.0 - hp["step_size"] * hp["weight_decay"]
+        for i in range(3):
+            x = jr.normal(jr.fold_in(jr.key(50), i), (SMALL.input_dim,)) * 1.5
+            y = jnp.array(i % SMALL.n_classes, jnp.int32)
+            params, state, _ = step_fn(params, state, x, y, jr.key(1000 + i))
+            x_norm, norm_state = ema_normalize(
+                norm_state, x, hp["norm_decay"], hp["norm_epsilon"]
+            )
+            _, grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+                ref_params, x_norm, y
+            )
+            ref_utility = {
+                n: beta * ref_utility[n] + (1.0 - beta) * (-grads[n] * ref_params[n])
+                for n in ref_params
+            }
+            global_max = jnp.max(
+                jnp.stack([jnp.max(ref_utility[n]) for n in sorted(ref_params)])
+            )
+            bias_correction = 1.0 - jnp.power(
+                jnp.asarray(beta, jnp.float32), jnp.asarray(i + 1, jnp.float32)
+            )
+            new_ref = {}
+            for n in ref_params:
+                gate = jax.nn.sigmoid(
+                    hp["gate_beta"] * ((ref_utility[n] / bias_correction) / global_max)
+                )
+                new_ref[n] = ref_params[n] * decay - hp["step_size"] * (
+                    grads[n] * (1.0 - gate)
+                )
+            ref_params = new_ref
+            for n in ref_params:
+                np.testing.assert_array_equal(
+                    np.asarray(params[n]), np.asarray(ref_params[n])
+                )
+
+    def test_localgate_matches_localgate_update_behind_normalizer(self):
+        """sigma0_localgate equals upgd_w_localgate_update (zero noise) applied
+        to the EMA-normalized input, bit-for-bit, with threaded state."""
+        hp = screening_spec("sigma0_localgate").hyperparameters
+        init_fn, step_fn = _make_upgd_ema_norm_ext_learner(hp)
+        params = init_mlp_params(jr.key(11), SMALL)
+        state = init_fn(params)
+        ref_params = params
+        ref_state = LeanUPGDState(
+            utility={n: jnp.zeros_like(v) for n, v in params.items()},
+            step=jnp.array(0, jnp.int32),
+        )
+        norm_state = EMANormState(
+            mean=jnp.zeros(SMALL.input_dim),
+            var=jnp.ones(SMALL.input_dim),
+            count=jnp.array(0.0),
+        )
+        zeros = {n: jnp.zeros_like(v) for n, v in params.items()}
+        for i in range(3):
+            x = jr.normal(jr.fold_in(jr.key(60), i), (SMALL.input_dim,)) * 2.0
+            y = jnp.array((2 * i) % SMALL.n_classes, jnp.int32)
+            params, state, _ = step_fn(params, state, x, y, jr.key(2000 + i))
+            x_norm, norm_state = ema_normalize(
+                norm_state, x, hp["norm_decay"], hp["norm_epsilon"]
+            )
+            _, grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+                ref_params, x_norm, y
+            )
+            ref_params, ref_state = upgd_w_localgate_update(
+                ref_params, ref_state, grads, zeros, hp
+            )
+            for n in ref_params:
+                np.testing.assert_array_equal(
+                    np.asarray(params[n]), np.asarray(ref_params[n])
+                )
+            for n in ref_params:
+                np.testing.assert_array_equal(
+                    np.asarray(state.utility[n]), np.asarray(ref_state.utility[n])
+                )
+
+    def test_hidden_rms_normalize_properties(self):
+        """Unit RMS on nonzero vectors; an all-zero ReLU vector stays finite."""
+        v = jnp.array([3.0, 4.0, 0.0, 1.0], jnp.float32)
+        out = _hidden_rms_normalize(v, 1e-8)
+        rms = float(jnp.sqrt(jnp.mean(out * out)))
+        assert math.isclose(rms, 1.0, rel_tol=1e-5)
+        zeros = jnp.zeros(4, jnp.float32)
+        out_zero = _hidden_rms_normalize(zeros, 1e-8)
+        assert bool(jnp.all(jnp.isfinite(out_zero)))
+        np.testing.assert_array_equal(np.asarray(out_zero), np.zeros(4, np.float32))
+
+    def test_hidden_rms_step_hand_computed(self):
+        """sigma0_hidden_norm equals a manual RMS-normalized forward/backward
+        plus the global-gate sigma0 update, bit-for-bit."""
+        hp = screening_spec("sigma0_hidden_norm").hyperparameters
+        init_fn, step_fn = _make_upgd_ema_norm_ext_learner(hp)
+        params = init_mlp_params(jr.key(13), SMALL)
+        state = init_fn(params)
+        rms_eps = hp["hidden_rms_epsilon"]
+
+        def manual_loss(p, x, y):
+            z1 = x @ p["w1"] + p["b1"]
+            a1 = jax.nn.relu(z1)
+            h1 = a1 / jnp.sqrt(jnp.mean(a1 * a1) + rms_eps)
+            z2 = h1 @ p["w2"] + p["b2"]
+            a2 = jax.nn.relu(z2)
+            h2 = a2 / jnp.sqrt(jnp.mean(a2 * a2) + rms_eps)
+            logits = h2 @ p["w3"] + p["b3"]
+            return -jax.nn.log_softmax(logits)[y], logits
+
+        ref_params = params
+        ref_utility = {n: jnp.zeros_like(v) for n, v in params.items()}
+        norm_state = EMANormState(
+            mean=jnp.zeros(SMALL.input_dim),
+            var=jnp.ones(SMALL.input_dim),
+            count=jnp.array(0.0),
+        )
+        beta = hp["utility_decay"]
+        decay = 1.0 - hp["step_size"] * hp["weight_decay"]
+        for i in range(3):
+            x = jr.normal(jr.fold_in(jr.key(70), i), (SMALL.input_dim,)) + 0.25
+            y = jnp.array((i + 1) % SMALL.n_classes, jnp.int32)
+            params, state, _ = step_fn(params, state, x, y, jr.key(3000 + i))
+            x_norm, norm_state = ema_normalize(
+                norm_state, x, hp["norm_decay"], hp["norm_epsilon"]
+            )
+            _, grads = jax.value_and_grad(manual_loss, has_aux=True)(
+                ref_params, x_norm, y
+            )
+            ref_utility = {
+                n: beta * ref_utility[n] + (1.0 - beta) * (-grads[n] * ref_params[n])
+                for n in ref_params
+            }
+            global_max = jnp.max(
+                jnp.stack([jnp.max(ref_utility[n]) for n in sorted(ref_params)])
+            )
+            bias_correction = 1.0 - jnp.power(
+                jnp.asarray(beta, jnp.float32), jnp.asarray(i + 1, jnp.float32)
+            )
+            new_ref = {}
+            for n in ref_params:
+                gate = jax.nn.sigmoid((ref_utility[n] / bias_correction) / global_max)
+                new_ref[n] = ref_params[n] * decay - hp["step_size"] * (
+                    grads[n] * (1.0 - gate)
+                )
+            ref_params = new_ref
+            for n in ref_params:
+                np.testing.assert_array_equal(
+                    np.asarray(params[n]), np.asarray(ref_params[n])
+                )
+
+    def test_hidden_norm_frozen_probe_rejected(self):
+        """The plain-MLP sentinel probe cannot describe the RMS-normalized
+        forward pass; the arm must refuse instead of probing the wrong model."""
+        spec = screening_spec("sigma0_hidden_norm")
+        with pytest.raises(NotImplementedError, match="hidden"):
+            spec.frozen_probe_input(
+                None, jnp.zeros((2, SMALL.input_dim)), spec.hyperparameters
+            )
+
+    def test_each_axis_changes_the_trajectory(self, small_data):
+        """Sanity against silently-ignored hyperparameters: every arm's
+        trajectory separates from the sigma0 champion's."""
+        x, y = small_data
+        ref = run_screening_config(
+            x, y, screening_spec("upgd_ema_norm_sigma0"), seed=9, config=SMALL
+        )
+        for name in self.AXES:
+            if name.startswith("sigma0_ndecay"):
+                continue  # inert during the effective-decay warmup; below
+            ours = run_screening_config(
+                x, y, screening_spec(name), seed=9, config=SMALL
+            )
+            assert not np.array_equal(ours.per_task_loss, ref.per_task_loss), name
+
+    def test_norm_decay_changes_the_trajectory_past_warmup(self):
+        """``ema_normalize`` clamps the decay to ``1 - 1/(count+1)`` during
+        warmup, so 0.99/0.999/0.9999 coincide for the first ~100/1000 steps;
+        past 1,000 steps each ndecay arm must separate from the champion."""
+        key = jr.key(4321)
+        kx, ky = jr.split(key)
+        x = np.asarray(jr.uniform(kx, (700, SMALL.input_dim), jnp.float32, -1.0, 1.0))
+        y = np.asarray(jr.randint(ky, (700,), 0, SMALL.n_classes))
+        config = IPMNISTConfig(
+            n_tasks=3, task_length=600, input_dim=12, hidden1=8, hidden2=6, n_classes=5
+        )
+        ref = run_screening_config(
+            x, y, screening_spec("upgd_ema_norm_sigma0"), seed=9, config=config
+        )
+        for name in ("sigma0_ndecay099", "sigma0_ndecay09999"):
+            ours = run_screening_config(
+                x, y, screening_spec(name), seed=9, config=config
+            )
+            assert not np.array_equal(ours.per_task_loss, ref.per_task_loss), name
 
 
 class TestAdamElemStep:

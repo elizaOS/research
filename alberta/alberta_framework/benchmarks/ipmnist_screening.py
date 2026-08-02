@@ -81,6 +81,17 @@ identical seeds):
   EMA input normalizer (same decay/eps/state threading); no utility, no gate,
   no noise. Pinned against a hand-computed trajectory, and the normalizer
   states are pinned bitwise against ``upgd_ema_norm``'s on a shared stream.
+- ``sigma0_*``: single-axis frontier extensions on the confirmed
+  ``upgd_ema_norm_sigma0`` champion (normalize + utility-gated SGD + decay,
+  no noise), all built by one factory whose defaults reduce bit-exactly to
+  that champion (pinned): normalizer decay {0.99, 0.9999} and epsilon
+  {1e-6, 1e-4} stars (``ema_normalize`` already centers with the EMA mean,
+  so the statistics themselves are the unexplored axis), stateless
+  per-example RMS normalization of both hidden ReLU layers
+  (``sigma0_hidden_norm``; no learnable parameters), utility-gate
+  temperature ``sigmoid(beta * scaled_utility)`` with beta {0.5, 2}, and
+  the per-tensor (local) gate normalization retested under conditioning
+  (``sigma0_localgate``; measured -0.0008 on raw inputs).
 
 Everything here is a development screening diagnostic — never promotable
 scientific evidence. Benchmark executions happen through the CLI
@@ -90,6 +101,7 @@ scientific evidence. Benchmark executions happen through the CLI
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -98,6 +110,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import chex
@@ -125,6 +138,16 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     init_mlp_params,
     lean_upgd_w_update,
     load_mnist_train,
+    mlp_logits,
+)
+from alberta_framework.evaluation.recurring_ipmnist_retention import (
+    RecurringIPMNISTPhase,
+    RecurringIPMNISTProtocol,
+    RecurringIPMNISTRetentionReport,
+    RecurringIPMNISTTrace,
+    SentinelProbeBinding,
+    SentinelProbeSnapshot,
+    build_recurring_ipmnist_retention_report,
 )
 
 logger = logging.getLogger(__name__)
@@ -165,6 +188,7 @@ NoiseUpdateFn = Callable[
     [dict[str, Array], Any, dict[str, Array], dict[str, Array], Mapping[str, float]],
     tuple[dict[str, Array], Any],
 ]
+FrozenProbeInputFn = Callable[[Any, Array, Mapping[str, float]], Array]
 
 
 # =============================================================================
@@ -906,6 +930,137 @@ def _make_sgd_ema_norm_learner(
         }
         metrics = _step_metrics(new_params, x_norm, y, loss, logits)
         return new_params, SGDNormState(norm=new_norm), metrics  # type: ignore[call-arg]
+
+    return init_fn, full_step
+
+
+# =============================================================================
+# (n) sigma0_* frontier extensions on the normalized sigma0 champion
+# =============================================================================
+
+
+def _hidden_rms_normalize(activation: Array, epsilon: float) -> Array:
+    """Stateless per-example RMS normalization of one hidden activation vector.
+
+    ``a / sqrt(mean(a^2) + eps)`` — layer-norm-style conditioning with no
+    learnable parameters and no running statistics (the stream-x recipe).
+    The epsilon keeps an all-zero ReLU vector (fully dormant layer) exactly
+    zero instead of NaN.
+    """
+    return activation / jnp.sqrt(jnp.mean(activation * activation) + epsilon)
+
+
+#: Loss callable ``(params, x, y) -> (loss, logits)`` used by the extension
+#: factory (protocol MLP or its hidden-RMS-normalized variant).
+_ExtLossFn = Callable[[dict[str, Array], Array, Array], tuple[Array, Array]]
+
+
+def _make_upgd_ema_norm_ext_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Frontier-extension factory on the ``upgd_ema_norm_sigma0`` champion.
+
+    One factory, three orthogonal switches over the normalize + utility-gated
+    SGD + decoupled-decay step (each inert at its default):
+
+    - ``hidden_rms`` (default 0): RMS-normalize both hidden ReLU activation
+      vectors per example (:func:`_hidden_rms_normalize`,
+      ``hidden_rms_epsilon``) inside the forward pass — gradients, utilities,
+      and metrics all see the normalized network.
+    - ``gate_beta`` (default 1): utility-gate temperature — the sigmoid
+      argument (bias-corrected utility over its max) is scaled by beta.
+    - ``local_gate`` (default 0): normalize the gate by the per-tensor
+      utility max (zero-guarded exactly as :func:`upgd_w_localgate_update`)
+      instead of the network-global max.
+
+    With every switch at its default the trajectory is bit-exact against
+    ``upgd_ema_norm_sigma0`` (pinned by a unit test): the perturbation term
+    is the same explicit zeros the champion's ``noise_std=0`` draw produces,
+    without paying for the 282,160-element normal draw, and the RNG key is
+    left untouched.  ``noise_std > 0`` keeps the champion's exact noise
+    stream (``_sorted_flat_noise``) for completeness.
+    """
+    noise_std = hp["noise_std"]
+    step_size = hp["step_size"]
+    utility_decay = hp["utility_decay"]
+    param_decay = 1.0 - step_size * hp["weight_decay"]
+    norm_decay = hp["norm_decay"]
+    norm_epsilon = hp["norm_epsilon"]
+    gate_beta = hp.get("gate_beta", 1.0)
+    local_gate = hp.get("local_gate", 0.0) != 0.0
+    hidden_rms = hp.get("hidden_rms", 0.0) != 0.0
+    rms_epsilon = hp.get("hidden_rms_epsilon", 1e-8)
+
+    def _hidden_rms_loss(
+        params: dict[str, Array], x: Array, y: Array
+    ) -> tuple[Array, Array]:
+        z1 = x @ params["w1"] + params["b1"]
+        h1 = _hidden_rms_normalize(jax.nn.relu(z1), rms_epsilon)
+        z2 = h1 @ params["w2"] + params["b2"]
+        h2 = _hidden_rms_normalize(jax.nn.relu(z2), rms_epsilon)
+        logits = h2 @ params["w3"] + params["b3"]
+        return -jax.nn.log_softmax(logits)[y], logits
+
+    loss_fn: _ExtLossFn = _hidden_rms_loss if hidden_rms else cross_entropy_loss
+
+    def init_fn(params: dict[str, Array]) -> UPGDNormState:
+        input_dim = params["w1"].shape[0]
+        return UPGDNormState(  # type: ignore[call-arg]
+            utility={name: jnp.zeros_like(value) for name, value in params.items()},
+            step=jnp.array(0, dtype=jnp.int32),
+            norm=EMANormState(  # type: ignore[call-arg]
+                mean=jnp.zeros(input_dim, dtype=jnp.float32),
+                var=jnp.ones(input_dim, dtype=jnp.float32),
+                count=jnp.array(0.0, dtype=jnp.float32),
+            ),
+        )
+
+    def full_step(
+        params: dict[str, Array], state: UPGDNormState, x: Array, y: Array, key: Array
+    ) -> tuple[dict[str, Array], UPGDNormState, StepMetrics]:
+        x_norm, new_norm = ema_normalize(state.norm, x, norm_decay, norm_epsilon)
+        (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+            params, x_norm, y
+        )
+        if noise_std == 0.0:
+            # Exactly the zeros the sigma=0 draw produces, minus the draw.
+            noise = {name: jnp.zeros_like(value) for name, value in params.items()}
+        else:
+            noise = _sorted_flat_noise(key, params, noise_std)
+        count = state.step + jnp.array(1, dtype=jnp.int32)
+        utility = {
+            name: utility_decay * state.utility[name]
+            + (1.0 - utility_decay) * (-grads[name] * params[name])
+            for name in params
+        }
+        bias_correction = 1.0 - jnp.power(
+            jnp.asarray(utility_decay, dtype=jnp.float32), count.astype(jnp.float32)
+        )
+        global_max = jnp.max(
+            jnp.stack([jnp.max(utility[name]) for name in sorted(params)])
+        )
+        new_params: dict[str, Array] = {}
+        for name in params:
+            if local_gate:
+                local_max = jnp.max(utility[name])
+                divisor = jnp.where(local_max == 0.0, 1.0, local_max)
+            else:
+                divisor = global_max
+            scaled = (utility[name] / bias_correction) / divisor
+            if gate_beta != 1.0:
+                scaled = gate_beta * scaled
+            gate = jax.nn.sigmoid(scaled)
+            new_params[name] = params[name] * param_decay - step_size * (
+                (grads[name] + noise[name]) * (1.0 - gate)
+            )
+        accuracy = (jnp.argmax(logits) == y).astype(jnp.float32)
+        loss_after, _ = loss_fn(new_params, x_norm, y)
+        plasticity = jnp.clip(
+            1.0 - loss_after / jnp.maximum(loss, _PLASTICITY_LOSS_FLOOR), 0.0, 1.0
+        )
+        return new_params, UPGDNormState(  # type: ignore[call-arg]
+            utility=utility, step=count, norm=new_norm
+        ), (accuracy, loss, plasticity)
 
     return init_fn, full_step
 
@@ -1714,6 +1869,54 @@ def _make_upgd_alpha_utility_learner(
 # =============================================================================
 
 
+def _raw_frozen_probe_input(
+    state: Any, observation: Array, hyperparameters: Mapping[str, float]
+) -> Array:
+    """Return the fixed protocol input for learners without preprocessing."""
+    del state, hyperparameters
+    return observation
+
+
+def _ema_frozen_probe_input(
+    state: Any, observation: Array, hyperparameters: Mapping[str, float]
+) -> Array:
+    """Apply an EMA learner's current statistics without updating them.
+
+    Online normalized arms update their EMA before predicting each training
+    example.  A sentinel probe must be non-learning, so it uses the frozen
+    checkpoint statistics.  The normalizer state is part of the checkpoint
+    hash and the fixed pixel-permuted sentinel input is separately bound by
+    :func:`ipmnist_sentinel_set_sha256`.
+    """
+    if hyperparameters.get("norm_enabled", 1.0) == 0.0:
+        return observation
+    norm = getattr(state, "norm", None)
+    if not isinstance(norm, EMANormState):
+        raise TypeError("an EMA frozen probe requires an EMANormState-backed learner")
+    epsilon = hyperparameters.get("norm_epsilon")
+    if epsilon is None or not math.isfinite(epsilon) or epsilon <= 0.0:
+        raise ValueError("an EMA frozen probe requires finite positive norm_epsilon")
+    return (observation - norm.mean) / (jnp.sqrt(norm.var) + epsilon)
+
+
+def _hidden_rms_frozen_probe_input(
+    state: Any, observation: Array, hyperparameters: Mapping[str, float]
+) -> Array:
+    """Refuse sentinel probes for arms whose forward pass is not the plain MLP.
+
+    ``sigma0_hidden_norm`` RMS-normalizes the hidden activations inside the
+    forward pass; the probe harness computes logits with ``mlp_logits``, so
+    any input-side transform would silently probe the wrong model.  Failing
+    closed here is the honest option until the probe harness can accept a
+    per-arm forward function.
+    """
+    del state, observation, hyperparameters
+    raise NotImplementedError(
+        "sentinel probes are unsupported for hidden-RMS-normalized arms: the "
+        "deployed forward pass is not the plain protocol MLP"
+    )
+
+
 @dataclass(frozen=True)
 class ScreeningSpec:
     """One screening arm: a named learner configuration.
@@ -1727,6 +1930,9 @@ class ScreeningSpec:
         description: One-line description for the summary.
         noise_update: Pure noise-consuming update for the pool-noise
             confirmation path (``None`` = pool mode unsupported for this arm).
+        frozen_probe_input: Applies the learner's current input preprocessing
+            without updating its state.  Raw-input learners use the identity
+            transform; adaptive normalizers must opt in explicitly.
     """
 
     name: str
@@ -1736,10 +1942,25 @@ class ScreeningSpec:
     factory: Callable[[Mapping[str, float]], tuple[LearnerInitFn, ScreeningStepFn]]
     description: str = ""
     noise_update: NoiseUpdateFn | None = None
+    frozen_probe_input: FrozenProbeInputFn = _raw_frozen_probe_input
 
 
 def _upgd_hp(**overrides: float) -> dict[str, float]:
     merged = dict(UPGD_W_PROTOCOL_HYPERPARAMETERS)
+    merged.update(overrides)
+    return merged
+
+
+def _sigma0_ext_hp(**overrides: float) -> dict[str, float]:
+    """``upgd_ema_norm_sigma0``'s hyperparameters plus inert extension defaults."""
+    merged = _upgd_hp(
+        norm_decay=0.999,
+        norm_epsilon=1e-8,
+        noise_std=0.0,
+        gate_beta=1.0,
+        local_gate=0.0,
+        hidden_rms=0.0,
+    )
     merged.update(overrides)
     return merged
 
@@ -1848,6 +2069,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             mechanism="input_normalization",
             hyperparameters=_upgd_hp(norm_decay=0.999, norm_epsilon=1e-8),
             factory=_make_upgd_ema_norm_learner,
+            frozen_probe_input=_ema_frozen_probe_input,
             description="UPGD-W behind an EMA input normalizer on the 784 pixels.",
         ),
         ScreeningSpec(
@@ -1872,6 +2094,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 norm_decay=0.999, norm_epsilon=1e-8, weight_decay=0.005
             ),
             factory=_make_upgd_ema_norm_learner,
+            frozen_probe_input=_ema_frozen_probe_input,
             description=(
                 "upgd_ema_norm with the independently confirmed better weight "
                 "decay 0.005 (composition of the two confirmed wins)."
@@ -1885,6 +2108,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 norm_decay=0.999, norm_epsilon=1e-8, step_size=0.03
             ),
             factory=_make_upgd_ema_norm_learner,
+            frozen_probe_input=_ema_frozen_probe_input,
             description="upgd_ema_norm at 3x step size (normalized inputs change scale).",
         ),
         ScreeningSpec(
@@ -1895,6 +2119,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 norm_decay=0.999, norm_epsilon=1e-8, step_size=0.003
             ),
             factory=_make_upgd_ema_norm_learner,
+            frozen_probe_input=_ema_frozen_probe_input,
             description="upgd_ema_norm at 1/3 step size.",
         ),
         ScreeningSpec(
@@ -1905,6 +2130,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 norm_decay=0.999, norm_epsilon=1e-8, noise_std=0.0
             ),
             factory=_make_upgd_ema_norm_learner,
+            frozen_probe_input=_ema_frozen_probe_input,
             description=(
                 "upgd_ema_norm without the perturbation: is the noise "
                 "load-bearing once inputs are conditioned?"
@@ -1924,6 +2150,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 "norm_epsilon": 1e-8,
             },
             factory=_make_sgd_ema_norm_learner,
+            frozen_probe_input=_ema_frozen_probe_input,
             description=(
                 "Gate ablation of upgd_ema_norm_sigma0: plain SGD + decoupled "
                 "decay behind the exact EMA input normalizer — no utility, no "
@@ -1937,6 +2164,40 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             hyperparameters={**ADAMW_PROTOCOL_HYPERPARAMETERS, **_CBP_DEFAULTS},
             factory=_make_adamw_cbp_learner,
             description="AdamW with CBP-style recycling (Nature-combination reference arm).",
+        ),
+        # --- Wave 7: single-axis frontier extensions on the confirmed
+        # upgd_ema_norm_sigma0 champion (0.85051 at 200 tasks).  The
+        # decomposition attributes +0.061 to input conditioning and +0.011 to
+        # the utility gate; these arms push the normalizer statistics
+        # (ema_normalize already centers with the EMA mean, so decay/epsilon
+        # are the unexplored axes), extend conditioning to the hidden layers,
+        # and refine the gate under conditioning.  One axis per arm; the
+        # shared factory's defaults reduce bit-exactly to the champion.
+        ScreeningSpec(
+            name="sigma0_hidden_norm",
+            base_learner="upgd_w",
+            mechanism="hidden_normalization",
+            hyperparameters=_sigma0_ext_hp(hidden_rms=1.0, hidden_rms_epsilon=1e-8),
+            factory=_make_upgd_ema_norm_ext_learner,
+            frozen_probe_input=_hidden_rms_frozen_probe_input,
+            description=(
+                "upgd_ema_norm_sigma0 plus stateless per-example RMS "
+                "normalization of both hidden ReLU layers (no learnable "
+                "parameters — conditioning extended past the input)."
+            ),
+        ),
+        ScreeningSpec(
+            name="sigma0_localgate",
+            base_learner="upgd_w",
+            mechanism="local_gate_normalization",
+            hyperparameters=_sigma0_ext_hp(local_gate=1.0),
+            factory=_make_upgd_ema_norm_ext_learner,
+            frozen_probe_input=_ema_frozen_probe_input,
+            description=(
+                "upgd_ema_norm_sigma0 with the per-tensor gate normalization "
+                "(-0.0008 on raw inputs; retested where conditioning rescales "
+                "the utilities)."
+            ),
         ),
         ScreeningSpec(
             name="guarded_cbp_adam",
@@ -1977,6 +2238,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 "norm_enabled": 1.0,
             },
             factory=_make_adamw_cbp_ema_norm_learner,
+            frozen_probe_input=_ema_frozen_probe_input,
             description=(
                 "adamw_cbp behind the exact upgd_ema_norm EMA input "
                 "normalizer (composition of the two orthogonal wins)."
@@ -2096,10 +2358,55 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 noise_update=lean_upgd_w_update,
             )
         )
+    for value, tag in ((0.99, "ndecay099"), (0.9999, "ndecay09999")):
+        specs.append(
+            ScreeningSpec(
+                name=f"sigma0_{tag}",
+                base_learner="upgd_w",
+                mechanism="input_normalization",
+                hyperparameters=_sigma0_ext_hp(norm_decay=value),
+                factory=_make_upgd_ema_norm_ext_learner,
+                frozen_probe_input=_ema_frozen_probe_input,
+                description=(
+                    f"upgd_ema_norm_sigma0 with normalizer decay {value} "
+                    "(champion 0.999)."
+                ),
+            )
+        )
+    for value, tag in ((1e-6, "eps1e6"), (1e-4, "eps1e4")):
+        specs.append(
+            ScreeningSpec(
+                name=f"sigma0_{tag}",
+                base_learner="upgd_w",
+                mechanism="input_normalization",
+                hyperparameters=_sigma0_ext_hp(norm_epsilon=value),
+                factory=_make_upgd_ema_norm_ext_learner,
+                frozen_probe_input=_ema_frozen_probe_input,
+                description=(
+                    f"upgd_ema_norm_sigma0 with normalizer epsilon {value} "
+                    "(champion 1e-8; floors the variance and pads the divisor)."
+                ),
+            )
+        )
+    for value, tag in ((0.5, "gate_beta05"), (2.0, "gate_beta2")):
+        specs.append(
+            ScreeningSpec(
+                name=f"sigma0_{tag}",
+                base_learner="upgd_w",
+                mechanism="gate_temperature",
+                hyperparameters=_sigma0_ext_hp(gate_beta=value),
+                factory=_make_upgd_ema_norm_ext_learner,
+                frozen_probe_input=_ema_frozen_probe_input,
+                description=(
+                    f"upgd_ema_norm_sigma0 with utility-gate temperature beta={value} "
+                    "(sigmoid of beta times the scaled utility)."
+                ),
+            )
+        )
     return {spec.name: spec for spec in specs}
 
 
-SCREENING_REGISTRY: dict[str, ScreeningSpec] = _build_registry()
+SCREENING_REGISTRY: Mapping[str, ScreeningSpec] = MappingProxyType(_build_registry())
 
 
 def screening_spec(name: str) -> ScreeningSpec:
@@ -2110,6 +2417,550 @@ def screening_spec(name: str) -> ScreeningSpec:
             f"{sorted(SCREENING_REGISTRY)}"
         )
     return SCREENING_REGISTRY[name]
+
+
+# =============================================================================
+# Development-only recurring A/B/A retention adapter
+# =============================================================================
+
+
+RECURRING_IPMNIST_ADAPTER_SCHEMA = "alberta.ipmnist-screening.recurring-adapter.v1"
+_MAX_UINT32 = 2**32 - 1
+
+
+def _canonical_hash_array(array: object) -> np.ndarray:
+    """Return a contiguous, little-endian, non-object array for hashing."""
+    resolved = np.asarray(jax.device_get(array))
+    if resolved.dtype.hasobject:
+        raise TypeError("object arrays cannot enter a canonical SHA-256 binding")
+    canonical_dtype = resolved.dtype.newbyteorder("<")
+    return np.ascontiguousarray(resolved.astype(canonical_dtype, copy=False))
+
+
+def _array_bundle_sha256(domain: str, arrays: Mapping[str, object]) -> str:
+    digest = hashlib.sha256()
+    digest.update(domain.encode("ascii") + b"\0")
+    for name in sorted(arrays):
+        encoded_name = name.encode("ascii")
+        array = _canonical_hash_array(arrays[name])
+        header = json.dumps(
+            {"dtype": array.dtype.str, "shape": list(array.shape)},
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        digest.update(len(encoded_name).to_bytes(4, "little"))
+        digest.update(encoded_name)
+        digest.update(len(header).to_bytes(8, "little"))
+        digest.update(header)
+        payload = array.tobytes(order="C")
+        digest.update(len(payload).to_bytes(8, "little"))
+        digest.update(payload)
+    return digest.hexdigest()
+
+
+def _validated_permutation(permutation: object, *, input_dim: int) -> np.ndarray:
+    raw = np.asarray(jax.device_get(permutation))
+    if raw.dtype.kind not in {"i", "u"} or raw.ndim != 1:
+        raise ValueError("each permutation must be a one-dimensional integer array")
+    if raw.shape != (input_dim,):
+        raise ValueError(f"each permutation must have shape ({input_dim},)")
+    resolved = np.asarray(raw, dtype=np.int64)
+    if not np.array_equal(np.sort(resolved), np.arange(input_dim, dtype=np.int64)):
+        raise ValueError("each permutation must contain every input index exactly once")
+    return np.asarray(resolved, dtype=np.int32)
+
+
+def _validated_sentinel_indices(
+    sentinel_indices: Sequence[int] | np.ndarray | Array, *, n_examples: int
+) -> np.ndarray:
+    raw = np.asarray(jax.device_get(sentinel_indices))
+    if raw.ndim != 1 or raw.dtype.kind not in {"i", "u"}:
+        raise TypeError("sentinel_indices must be a one-dimensional integer sequence")
+    if raw.size == 0:
+        raise ValueError("sentinel_indices must be non-empty")
+    if np.any(raw < 0) or np.any(raw >= n_examples):
+        raise ValueError("sentinel_indices must be in range for the supplied data")
+    indices = np.asarray(raw, dtype=np.int64)
+    if len(set(int(index) for index in indices)) != len(indices):
+        raise ValueError("sentinel_indices must be unique and ordered explicitly")
+    return indices
+
+
+def _validated_recurring_phase_lengths(
+    phase_lengths: Sequence[int],
+) -> tuple[int, int, int]:
+    lengths = tuple(phase_lengths)
+    if len(lengths) != 3 or any(
+        not isinstance(length, int) or isinstance(length, bool) or length <= 0
+        for length in lengths
+    ):
+        raise ValueError("phase_lengths must contain exactly three positive integers")
+    resolved = (int(lengths[0]), int(lengths[1]), int(lengths[2]))
+    if resolved[0] != resolved[2]:
+        raise ValueError("the two A phase lengths must be equal")
+    return resolved
+
+
+def _validated_recurring_seed(seed: int) -> int:
+    if not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed <= _MAX_UINT32:
+        raise ValueError("seed must be a canonical uint32 integer")
+    return seed
+
+
+def build_recurring_ipmnist_online_indices(
+    *,
+    seed: int,
+    n_examples: int,
+    phase_lengths: Sequence[int],
+    sentinel_indices: Sequence[int] | np.ndarray | Array,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build the evaluator-owned held-out A/B/A online example schedule.
+
+    The first and recurring A exposures use the exact same ordered example
+    indices (common random numbers); B uses an independent seed fold.  Every
+    sentinel row is removed before any phase permutation is drawn.  This
+    helper is intentionally public so those two properties can be checked
+    without executing a learner.
+    """
+    resolved_seed = _validated_recurring_seed(seed)
+    if (
+        not isinstance(n_examples, int)
+        or isinstance(n_examples, bool)
+        or n_examples <= 0
+    ):
+        raise ValueError("n_examples must be a positive integer")
+    lengths = _validated_recurring_phase_lengths(phase_lengths)
+    indices = _validated_sentinel_indices(sentinel_indices, n_examples=n_examples)
+    eligible_mask = np.ones(n_examples, dtype=np.bool_)
+    eligible_mask[indices] = False
+    eligible = np.flatnonzero(eligible_mask).astype(np.int32)
+    if any(length > len(eligible) for length in lengths):
+        raise ValueError(
+            "each phase length must fit a without-replacement draw after holding out sentinels"
+        )
+
+    root = jr.key(jnp.uint32(resolved_seed))
+    _, key_schedule, _ = jr.split(root, 3)
+    _, key_sample = jr.split(key_schedule)
+
+    def phase_order(fold_index: int, length: int) -> np.ndarray:
+        offsets = np.asarray(
+            jr.permutation(jr.fold_in(key_sample, fold_index), len(eligible))[:length]
+        )
+        return np.asarray(eligible[offsets], dtype=np.int32)
+
+    a_order = phase_order(0, lengths[0])
+    b_order = phase_order(1, lengths[1])
+    return a_order, b_order, a_order.copy()
+
+
+def _validated_ipmnist_data(
+    data_x: np.ndarray | Array,
+    data_y: np.ndarray | Array,
+    *,
+    input_dim: int | None,
+    n_classes: int | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    raw_x = np.asarray(jax.device_get(data_x))
+    raw_y = np.asarray(jax.device_get(data_y))
+    if raw_x.ndim != 2:
+        raise ValueError("data_x must be a two-dimensional example matrix")
+    if input_dim is not None and raw_x.shape[1] != input_dim:
+        raise ValueError(f"data_x must have shape (n_train, {input_dim})")
+    if raw_y.shape != (raw_x.shape[0],):
+        raise ValueError("data_y must be (n_train,) aligned with data_x")
+    if raw_y.dtype.kind not in {"i", "u"}:
+        raise ValueError("data_y must contain integer class labels")
+    if np.any(raw_y < 0) or np.any(raw_y > np.iinfo(np.int32).max):
+        raise ValueError("data_y class labels must fit non-negative int32")
+    resolved_x = np.asarray(raw_x, dtype=np.float32)
+    resolved_y = np.asarray(raw_y, dtype=np.int32)
+    if not np.all(np.isfinite(resolved_x)):
+        raise ValueError("data_x must contain only finite values")
+    if n_classes is not None and np.any(resolved_y >= n_classes):
+        raise ValueError(f"data_y class labels must be smaller than {n_classes}")
+    return resolved_x, resolved_y
+
+
+def ipmnist_permutation_sha256(permutation: np.ndarray | Array) -> str:
+    """Bind one complete integer pixel permutation deterministically."""
+    raw = np.asarray(jax.device_get(permutation))
+    if raw.ndim != 1:
+        raise ValueError("permutation must be one-dimensional")
+    resolved = _validated_permutation(permutation, input_dim=int(raw.shape[0]))
+    return _array_bundle_sha256(
+        "alberta.ipmnist-screening.pixel-permutation.v1",
+        {"permutation": resolved},
+    )
+
+
+def ipmnist_sentinel_set_sha256(
+    data_x: np.ndarray | Array,
+    data_y: np.ndarray | Array,
+    permutation: np.ndarray | Array,
+    sentinel_indices: Sequence[int] | np.ndarray | Array,
+) -> str:
+    """Bind ordered sentinel identities, labels, and pixel-permuted inputs.
+
+    The digest covers the exact float32 source rows as well as the transformed
+    rows.  Adaptive learner preprocessing (for example EMA normalization) is
+    derived from the bound transformed rows and the separately hashed frozen
+    learner state at each checkpoint.
+    """
+    resolved_x, resolved_y = _validated_ipmnist_data(
+        data_x,
+        data_y,
+        input_dim=None,
+        n_classes=None,
+    )
+    resolved_permutation = _validated_permutation(
+        permutation, input_dim=int(resolved_x.shape[1])
+    )
+    indices = _validated_sentinel_indices(
+        sentinel_indices, n_examples=int(resolved_x.shape[0])
+    )
+    raw_examples = resolved_x[indices]
+    return _array_bundle_sha256(
+        "alberta.ipmnist-screening.ordered-sentinel-set.v1",
+        {
+            "example_indices": indices,
+            "labels": resolved_y[indices],
+            "permutation": resolved_permutation,
+            "pixel_permuted_inputs": raw_examples[:, resolved_permutation],
+            "raw_examples": raw_examples,
+        },
+    )
+
+
+def _declared_learner_state_sha256(
+    params: dict[str, Array], state: Any, learner_key: Array
+) -> str:
+    """Hash parameters, optimizer/mechanism state, and the next learner RNG key."""
+    bundle = {
+        "learner_key": jr.key_data(learner_key),
+        "optimizer_and_mechanism_state": state,
+        "params": params,
+    }
+    path_leaves, tree = jax.tree_util.tree_flatten_with_path(bundle)
+    digest = hashlib.sha256()
+    digest.update(b"alberta.ipmnist-screening.full-learner-state.v1\0")
+    tree_bytes = str(tree).encode("utf-8")
+    digest.update(len(tree_bytes).to_bytes(8, "little"))
+    digest.update(tree_bytes)
+    for path, leaf in path_leaves:
+        path_bytes = repr(path).encode("utf-8")
+        digest.update(len(path_bytes).to_bytes(8, "little"))
+        digest.update(path_bytes)
+        array = _canonical_hash_array(leaf)
+        header = json.dumps(
+            {"dtype": array.dtype.str, "shape": list(array.shape)},
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        digest.update(len(header).to_bytes(8, "little"))
+        digest.update(header)
+        payload = array.tobytes(order="C")
+        digest.update(len(payload).to_bytes(8, "little"))
+        digest.update(payload)
+    return digest.hexdigest()
+
+
+def _recurring_protocol_id(
+    *,
+    spec: ScreeningSpec,
+    seed: int,
+    config: IPMNISTConfig,
+    phase_lengths: tuple[int, int, int],
+    permutation_sha256: tuple[str, str, str],
+    sentinel_indices_sha256: str,
+    online_indices_sha256: tuple[str, str, str],
+    relearning_window: int,
+) -> str:
+    manifest = {
+        "schema": RECURRING_IPMNIST_ADAPTER_SCHEMA,
+        "development_only": True,
+        "config_name": spec.name,
+        "base_learner": spec.base_learner,
+        "hyperparameters": dict(spec.hyperparameters),
+        "seed": seed,
+        "config": config.to_config(),
+        "phase_lengths": list(phase_lengths),
+        "permutation_sha256": list(permutation_sha256),
+        "sentinel_indices_sha256": sentinel_indices_sha256,
+        "online_indices_sha256": list(online_indices_sha256),
+        "relearning_window": relearning_window,
+    }
+    encoded = json.dumps(
+        manifest,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"ipmnist-screening-aba-{hashlib.sha256(encoded).hexdigest()}.v1"
+
+
+def run_recurring_ipmnist_retention_development(
+    data_x: np.ndarray | Array,
+    data_y: np.ndarray | Array,
+    spec: ScreeningSpec,
+    *,
+    seed: int,
+    config: IPMNISTConfig,
+    phase_lengths: Sequence[int],
+    permutations: Sequence[np.ndarray | Array],
+    sentinel_indices: Sequence[int] | np.ndarray | Array,
+    relearning_window: int,
+) -> RecurringIPMNISTRetentionReport:
+    """Run an explicit, threshold-free A/B/A retention diagnostic.
+
+    This adapter reuses the screening arm's initialization, online update,
+    input preprocessing, and same-example plasticity equations.  The learner
+    receives only ``(x, y, rng_key)`` in a continuous key chain: phase,
+    permutation, exposure, and sentinel identities remain evaluator-only.
+
+    ``spec`` must be the exact object returned by :func:`screening_spec` for
+    its name.  Cloned or custom specs are rejected even when their visible
+    fields match: otherwise a substituted factory or stateful probe callback
+    could silently change the semantics committed by the protocol identity.
+
+    Every argument governing the recurrence is mandatory.  Sentinel rows are
+    held out from the online examples, and every phase samples the remaining
+    rows without replacement using the caller's seed.  There is deliberately
+    no default protocol, threshold, artifact writer, or evidence path.
+
+    The evaluator report schema stores the SHA-256 commitment to the adapter
+    manifest in ``protocol_id``, not the manifest preimage.  Callers must keep
+    these explicit arguments with the in-memory development report if they
+    need standalone reconstruction; this function does not create artifacts.
+    """
+    if not isinstance(spec, ScreeningSpec):
+        raise TypeError("spec must be a ScreeningSpec")
+    if SCREENING_REGISTRY.get(spec.name) is not spec:
+        raise ValueError(
+            "spec must be the exact registered object returned by screening_spec(name)"
+        )
+    if not isinstance(config, IPMNISTConfig):
+        raise TypeError("config must be an IPMNISTConfig")
+    resolved_seed = _validated_recurring_seed(seed)
+    if (
+        not isinstance(relearning_window, int)
+        or isinstance(relearning_window, bool)
+        or relearning_window <= 0
+    ):
+        raise ValueError("relearning_window must be a positive integer")
+
+    typed_lengths = _validated_recurring_phase_lengths(phase_lengths)
+    if config.n_tasks != 3 or typed_lengths[0] != config.task_length:
+        raise ValueError(
+            "config must describe three phases and bind task_length to both A exposures"
+        )
+    if relearning_window > typed_lengths[0]:
+        raise ValueError("relearning_window cannot exceed an A phase length")
+
+    resolved_x, resolved_y = _validated_ipmnist_data(
+        data_x,
+        data_y,
+        input_dim=config.input_dim,
+        n_classes=config.n_classes,
+    )
+    raw_permutations = tuple(permutations)
+    if len(raw_permutations) != 3:
+        raise ValueError("permutations must contain the exact A/B/A phase tuple")
+    resolved_permutations = tuple(
+        _validated_permutation(permutation, input_dim=config.input_dim)
+        for permutation in raw_permutations
+    )
+    if not np.array_equal(resolved_permutations[0], resolved_permutations[2]):
+        raise ValueError("the first and third phase permutations must be exactly identical")
+    if np.array_equal(resolved_permutations[0], resolved_permutations[1]):
+        raise ValueError("the B permutation must be distinct from A")
+
+    indices = _validated_sentinel_indices(
+        sentinel_indices, n_examples=int(resolved_x.shape[0])
+    )
+    online_indices = build_recurring_ipmnist_online_indices(
+        seed=resolved_seed,
+        n_examples=int(resolved_x.shape[0]),
+        phase_lengths=typed_lengths,
+        sentinel_indices=indices,
+    )
+
+    root = jr.key(jnp.uint32(resolved_seed))
+    key_init, _, key_noise = jr.split(root, 3)
+
+    permutation_hashes = (
+        ipmnist_permutation_sha256(resolved_permutations[0]),
+        ipmnist_permutation_sha256(resolved_permutations[1]),
+        ipmnist_permutation_sha256(resolved_permutations[2]),
+    )
+    sentinel_hashes = tuple(
+        ipmnist_sentinel_set_sha256(resolved_x, resolved_y, permutation, indices)
+        for permutation in resolved_permutations[:2]
+    )
+    online_hashes = tuple(
+        _array_bundle_sha256(
+            "alberta.ipmnist-screening.online-example-order.v1",
+            {"example_indices": phase_indices},
+        )
+        for phase_indices in online_indices
+    )
+    typed_online_hashes = (online_hashes[0], online_hashes[1], online_hashes[2])
+    sentinel_indices_hash = _array_bundle_sha256(
+        "alberta.ipmnist-screening.sentinel-index-order.v1",
+        {"sentinel_indices": indices},
+    )
+    protocol_id = _recurring_protocol_id(
+        spec=spec,
+        seed=resolved_seed,
+        config=config,
+        phase_lengths=typed_lengths,
+        permutation_sha256=permutation_hashes,
+        sentinel_indices_sha256=sentinel_indices_hash,
+        online_indices_sha256=typed_online_hashes,
+        relearning_window=relearning_window,
+    )
+    permutation_ids = (
+        f"ipmnist-permutation-{permutation_hashes[0]}.v1",
+        f"ipmnist-permutation-{permutation_hashes[1]}.v1",
+    )
+    sentinel_ids = (
+        f"ipmnist-sentinel-{sentinel_hashes[0]}.v1",
+        f"ipmnist-sentinel-{sentinel_hashes[1]}.v1",
+    )
+    phase_permutation_ids = (
+        permutation_ids[0],
+        permutation_ids[1],
+        permutation_ids[0],
+    )
+    starts = (0, typed_lengths[0], typed_lengths[0] + typed_lengths[1])
+    protocol = RecurringIPMNISTProtocol(
+        protocol_id=protocol_id,
+        phases=tuple(
+            RecurringIPMNISTPhase(
+                phase_index=index,
+                start_step=starts[index],
+                length=typed_lengths[index],
+                permutation_id=phase_permutation_ids[index],
+                exposure_index=0 if index < 2 else 1,
+            )
+            for index in range(3)
+        ),
+        sentinel_bindings=tuple(
+            SentinelProbeBinding(
+                permutation_id=permutation_ids[index],
+                permutation_sha256=permutation_hashes[index],
+                sentinel_set_id=sentinel_ids[index],
+                sentinel_set_sha256=sentinel_hashes[index],
+                sentinel_case_count=len(indices),
+            )
+            for index in range(2)
+        ),
+        relearning_window=relearning_window,
+    )
+
+    data_x_array = jnp.asarray(resolved_x, dtype=jnp.float32)
+    data_y_array = jnp.asarray(resolved_y, dtype=jnp.int32)
+    init_fn, step_fn = spec.factory(spec.hyperparameters)
+    params = init_mlp_params(key_init, config)
+    state = init_fn(params)
+
+    def run_phase(
+        phase_params: dict[str, Array],
+        phase_state: Any,
+        learner_key: Array,
+        permutation: Array,
+        examples: Array,
+    ) -> tuple[dict[str, Array], Any, Array, Array, Array]:
+        def one_step(
+            carry: tuple[dict[str, Array], Any, Array], example: Array
+        ) -> tuple[tuple[dict[str, Array], Any, Array], tuple[Array, Array]]:
+            step_params, step_state, next_key = carry
+            x = data_x_array[example][permutation]
+            y = data_y_array[example]
+            next_key, step_key = jr.split(next_key)
+            new_params, new_state, metrics = step_fn(
+                step_params, step_state, x, y, step_key
+            )
+            accuracy, _, plasticity = metrics
+            return (new_params, new_state, next_key), (accuracy, plasticity)
+
+        (new_params, new_state, new_key), (accuracies, plasticities) = jax.lax.scan(
+            one_step,
+            (phase_params, phase_state, learner_key),
+            examples,
+        )
+        return new_params, new_state, new_key, accuracies, plasticities
+
+    run_phase_jit = jax.jit(run_phase)
+    accuracy_trace: list[float] = []
+    plasticity_trace: list[float] = []
+    snapshots: list[SentinelProbeSnapshot] = []
+    permutation_by_id = {
+        permutation_ids[0]: resolved_permutations[0],
+        permutation_ids[1]: resolved_permutations[1],
+    }
+    sentinel_labels = resolved_y[indices]
+
+    for phase_index in range(3):
+        params, state, key_noise, accuracies, plasticities = run_phase_jit(
+            params,
+            state,
+            key_noise,
+            jnp.asarray(resolved_permutations[phase_index], dtype=jnp.int32),
+            jnp.asarray(online_indices[phase_index], dtype=jnp.int32),
+        )
+        accuracy_trace.extend(
+            float(value) for value in np.asarray(jax.device_get(accuracies)).reshape(-1)
+        )
+        plasticity_trace.extend(
+            float(value) for value in np.asarray(jax.device_get(plasticities)).reshape(-1)
+        )
+
+        requirements = tuple(
+            requirement
+            for requirement in protocol.required_probe_snapshots
+            if requirement.phase_index == phase_index
+        )
+        for requirement in requirements:
+            state_hash_before = _declared_learner_state_sha256(params, state, key_noise)
+            permutation = permutation_by_id[requirement.permutation_id]
+            sentinel_inputs = jnp.asarray(
+                resolved_x[indices][:, permutation], dtype=jnp.float32
+            )
+            model_inputs = spec.frozen_probe_input(
+                state, sentinel_inputs, spec.hyperparameters
+            )
+            if model_inputs.shape != sentinel_inputs.shape:
+                raise ValueError("frozen_probe_input must preserve sentinel input shape")
+            logits = np.asarray(jax.device_get(mlp_logits(params, model_inputs)))
+            if not np.all(np.isfinite(logits)):
+                raise ValueError("a frozen sentinel probe produced non-finite logits")
+            correctness = tuple(
+                bool(value)
+                for value in np.asarray(np.argmax(logits, axis=-1) == sentinel_labels)
+            )
+            state_hash_after = _declared_learner_state_sha256(params, state, key_noise)
+            snapshots.append(
+                SentinelProbeSnapshot.from_requirement(
+                    requirement,
+                    learner_state_sha256_before=state_hash_before,
+                    learner_state_sha256_after=state_hash_after,
+                    correctness=correctness,
+                )
+            )
+
+    trace = RecurringIPMNISTTrace(
+        pre_update_online_accuracy=tuple(accuracy_trace),
+        post_update_one_step_plasticity=tuple(plasticity_trace),
+    )
+    return build_recurring_ipmnist_retention_report(
+        protocol=protocol,
+        trace=trace,
+        sentinel_snapshots=tuple(snapshots),
+    )
 
 
 # =============================================================================
