@@ -748,3 +748,32 @@ class TestOptimizerComparison:
         assert jnp.any(idbd_result.weight_delta != 0)
         assert jnp.any(autostep_result.weight_delta != 0)
         assert jnp.any(obgd_result.weight_delta != 0)
+
+
+class TestSupportedForMLP:
+    """Construction-time capability check for the per-parameter MLP path."""
+
+    def test_lms_idbd_autostep_support_mlp(self):
+        assert LMS(step_size=0.01).supported_for_mlp()
+        assert IDBD().supported_for_mlp()
+        assert Autostep().supported_for_mlp()
+
+    def test_obgd_and_gtd_do_not_support_mlp(self):
+        assert not ObGD().supported_for_mlp()
+        assert not AutostepGTDLambda().supported_for_mlp()
+
+    def test_unsupported_optimizers_still_raise_not_implemented(self):
+        optimizer = ObGD()
+
+        with pytest.raises(NotImplementedError):
+            optimizer.init_for_shape((3, 2))
+        with pytest.raises(NotImplementedError):
+            optimizer.update_from_gradient(None, jnp.zeros(3))
+
+    def test_capability_matches_hook_availability(self):
+        """supported_for_mlp() is exactly 'both shape-generic hooks work'."""
+        for optimizer in (LMS(step_size=0.01), IDBD(), Autostep()):
+            state = optimizer.init_for_shape((2, 3))
+            step, _ = optimizer.update_from_gradient(state, jnp.ones((2, 3)))
+            assert optimizer.supported_for_mlp()
+            assert step.shape == (2, 3)

@@ -348,11 +348,32 @@ class Optimizer[
         """
         ...
 
+    def supported_for_mlp(self) -> bool:
+        """Whether this optimizer supports the per-parameter MLP path.
+
+        MLP, multi-head, and head-optimizer construction sites should call
+        this before accepting an optimizer, so an unsupported choice fails at
+        construction time instead of raising ``NotImplementedError`` deep
+        inside a jitted update.  The capability is detected structurally: an
+        optimizer supports the MLP path exactly when it overrides both
+        :meth:`init_for_shape` and :meth:`update_from_gradient`.
+
+        Returns:
+            True when both shape-generic hooks are overridden by the
+            subclass (currently LMS, IDBD, and Autostep).
+        """
+        cls = type(self)
+        return (
+            cls.init_for_shape is not Optimizer.init_for_shape
+            and cls.update_from_gradient is not Optimizer.update_from_gradient
+        )
+
     def init_for_shape(self, shape: tuple[int, ...]) -> Any:
         """Initialize optimizer state for parameters of arbitrary shape.
 
         Used by MLP learners where parameters are matrices/vectors of
-        varying shapes. Not all optimizers support this.
+        varying shapes. Not all optimizers support this; check
+        :meth:`supported_for_mlp` at construction time.
 
         The return type varies by subclass (e.g. ``LMSState`` for LMS,
         ``AutostepParamState`` for Autostep) so the base signature uses

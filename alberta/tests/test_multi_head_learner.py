@@ -6,16 +6,19 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import pytest
 
 from alberta_framework import (
     AGCBounding,
     Autostep,
+    AutostepGTDLambda,
     BatchedMultiHeadResult,
     EMANormalizer,
     MultiHeadLearningResult,
     MultiHeadMLPLearner,
     MultiHeadMLPState,
     MultiHeadMLPUpdateResult,
+    ObGD,
     ObGDBounding,
     WelfordNormalizer,
     multi_head_metrics_to_dicts,
@@ -30,6 +33,13 @@ from alberta_framework import (
 
 class TestMultiHeadInit:
     """Tests for MultiHeadMLPLearner.init."""
+
+    def test_rejects_optimizers_without_shape_generic_hooks_at_construction(self):
+        with pytest.raises(ValueError, match="optimizer.*MLP"):
+            MultiHeadMLPLearner(n_heads=2, optimizer=ObGD())
+
+        with pytest.raises(ValueError, match="head_optimizer.*MLP"):
+            MultiHeadMLPLearner(n_heads=2, head_optimizer=AutostepGTDLambda())
 
     def test_trunk_shapes_single_hidden(self):
         """Trunk with one hidden layer has correct shapes."""

@@ -13,10 +13,12 @@ from alberta_framework import (
     LMS,
     AGCBounding,
     Autostep,
+    AutostepGTDLambda,
     BatchedMLPResult,
     EMANormalizer,
     MLPLearner,
     NormalizerTrackingConfig,
+    ObGD,
     ObGDBounding,
     RandomWalkStream,
     WelfordNormalizer,
@@ -27,6 +29,13 @@ from alberta_framework import (
 
 class TestMLPLearner:
     """Tests for the MLPLearner class."""
+
+    def test_rejects_optimizer_without_shape_generic_hooks_at_construction(self):
+        with pytest.raises(ValueError, match="optimizer.*MLP"):
+            MLPLearner(optimizer=ObGD())
+
+        with pytest.raises(ValueError, match="head_optimizer.*MLP"):
+            MLPLearner(head_optimizer=AutostepGTDLambda())
 
     def test_correct_param_shapes_single_hidden(self):
         """MLP with one hidden layer should have correct param shapes."""

@@ -305,6 +305,16 @@ class MultiHeadMLPLearner:
         self._hidden_sizes = hidden_sizes
         self._optimizer: AnyOptimizer = optimizer or LMS(step_size=step_size)
         self._head_optimizer: AnyOptimizer | None = head_optimizer
+        if not self._optimizer.supported_for_mlp():
+            raise ValueError(
+                f"optimizer {type(self._optimizer).__name__} does not support the MLP "
+                "shape-generic update API"
+            )
+        if self._head_optimizer is not None and not self._head_optimizer.supported_for_mlp():
+            raise ValueError(
+                f"head_optimizer {type(self._head_optimizer).__name__} does not support the MLP "
+                "shape-generic update API"
+            )
         self._bounder = bounder
         self._gamma = gamma
         self._lamda = lamda
