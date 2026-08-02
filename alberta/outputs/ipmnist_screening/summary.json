@@ -1,13 +1,13 @@
 {
  "confirmation_threshold": 0.005,
  "control_name": "upgd_w_control",
- "created_unix": 1785656794.3266532,
+ "created_unix": 1785662512.5236602,
  "evidence_policy": {
   "development_only": true,
   "evidence_class": "development_screening_diagnostic",
   "scientific_promotion_allowed": false
  },
- "n_shards": 97,
+ "n_shards": 105,
  "noise_mode": "step",
  "protocol_config": {
   "hidden1": 300,
@@ -70,6 +70,57 @@
    "wall_clock_seconds_total": 8007.99
   },
   {
+   "average_online_accuracy_mean": 0.8519722013333334,
+   "average_online_accuracy_stderr": 8.402754877330571e-05,
+   "average_plasticity_mean": 0.32709838050000006,
+   "base_learner": "upgd_w",
+   "config_name": "upgd_ema_norm_sigma0",
+   "hyperparameters": {
+    "noise_std": 0.0,
+    "norm_decay": 0.999,
+    "norm_epsilon": 1e-08,
+    "step_size": 0.01,
+    "utility_decay": 0.9999,
+    "weight_decay": 0.01
+   },
+   "late_window_slope_mean": -0.00022404717857142813,
+   "n_seeds": 3,
+   "paired_vs_control": {
+    "all_seeds_improve": true,
+    "beats_control": true,
+    "confirmation_candidate": true,
+    "control": "upgd_w_control",
+    "mean_diff": 0.07421333411111097,
+    "per_seed_diff": [
+     0.07466,
+     0.07336,
+     0.07462
+    ],
+    "seeds": [
+     0,
+     1,
+     2
+    ],
+    "stderr_diff": 0.00042682323386305875
+   },
+   "per_seed_average_online_accuracy": [
+    0.852137,
+    0.85192,
+    0.85186
+   ],
+   "per_seed_late_window_slope": [
+    0.00031,
+    -0.000615,
+    -0.00036714
+   ],
+   "seeds": [
+    0,
+    1,
+    2
+   ],
+   "wall_clock_seconds_total": 9487.55
+  },
+  {
    "average_online_accuracy_mean": 0.8468710877777778,
    "average_online_accuracy_stderr": 7.397019254071422e-05,
    "average_plasticity_mean": 0.39587734249999995,
@@ -119,6 +170,57 @@
     2
    ],
    "wall_clock_seconds_total": 8804.62
+  },
+  {
+   "average_online_accuracy_mean": 0.842128869388889,
+   "average_online_accuracy_stderr": 0.0003142188703131245,
+   "average_plasticity_mean": 0.21502089561111107,
+   "base_learner": "upgd_w",
+   "config_name": "upgd_ema_norm_lr0003",
+   "hyperparameters": {
+    "noise_std": 0.1,
+    "norm_decay": 0.999,
+    "norm_epsilon": 1e-08,
+    "step_size": 0.003,
+    "utility_decay": 0.9999,
+    "weight_decay": 0.01
+   },
+   "late_window_slope_mean": -6.761820238095126e-05,
+   "n_seeds": 3,
+   "paired_vs_control": {
+    "all_seeds_improve": true,
+    "beats_control": true,
+    "confirmation_candidate": true,
+    "control": "upgd_w_control",
+    "mean_diff": 0.06437000216666659,
+    "per_seed_diff": [
+     0.064363,
+     0.06323,
+     0.065517
+    ],
+    "seeds": [
+     0,
+     1,
+     2
+    ],
+    "stderr_diff": 0.0006601121142203985
+   },
+   "per_seed_average_online_accuracy": [
+    0.84184,
+    0.84179,
+    0.842757
+   ],
+   "per_seed_late_window_slope": [
+    0.00016929,
+    -0.00029428,
+    -7.786e-05
+   ],
+   "seeds": [
+    0,
+    1,
+    2
+   ],
+   "wall_clock_seconds_total": 9201.12
   },
   {
    "average_online_accuracy_mean": 0.7994544242777777,
@@ -1025,9 +1127,9 @@
    "wall_clock_seconds_total": 4981.11
   },
   {
-   "average_online_accuracy_mean": 0.7753333133333334,
-   "average_online_accuracy_stderr": 0.0,
-   "average_plasticity_mean": 0.550189771,
+   "average_online_accuracy_mean": 0.7747288678333333,
+   "average_online_accuracy_stderr": 0.000768237492979684,
+   "average_plasticity_mean": 0.5501603747222222,
    "base_learner": "upgd_w",
    "config_name": "upgd_ema_norm_lr003",
    "hyperparameters": {
@@ -1038,32 +1140,42 @@
     "utility_decay": 0.9999,
     "weight_decay": 0.01
    },
-   "late_window_slope_mean": -0.0012271421071428598,
-   "n_seeds": 1,
+   "late_window_slope_mean": -0.0007773807500000019,
+   "n_seeds": 3,
    "paired_vs_control": {
     "all_seeds_improve": false,
     "beats_control": false,
     "confirmation_candidate": false,
     "control": "upgd_w_control",
-    "mean_diff": -0.0021433298333333184,
+    "mean_diff": -0.0030299993888890007,
     "per_seed_diff": [
-     -0.002143
+     -0.002143,
+     -0.00291,
+     -0.004037
     ],
     "seeds": [
-     0
+     0,
+     1,
+     2
     ],
-    "stderr_diff": 0.0
+    "stderr_diff": 0.0005498432342264604
    },
    "per_seed_average_online_accuracy": [
-    0.775333
+    0.775333,
+    0.77565,
+    0.773203
    ],
    "per_seed_late_window_slope": [
-    -0.00122714
+    -0.00122714,
+    -0.00102071,
+    -8.429e-05
    ],
    "seeds": [
-    0
+    0,
+    1,
+    2
    ],
-   "wall_clock_seconds_total": 2951.91
+   "wall_clock_seconds_total": 8966.83
   },
   {
    "average_online_accuracy_mean": 0.7722788681111111,

@@ -10,3 +10,5 @@ WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a 
 2026-08-02 01:03:55,864 INFO upgd_idbd seed=1 task 140/200 online_acc=0.7844 elapsed=9754.2s
 2026-08-02 01:30:20,561 INFO upgd_idbd seed=1 task 160/200 online_acc=0.7718 elapsed=11338.9s
 2026-08-02 01:56:38,522 INFO upgd_idbd seed=1 task 180/200 online_acc=0.7832 elapsed=12916.9s
+2026-08-02 02:20:53,795 INFO upgd_idbd seed=1 task 200/200 online_acc=0.7786 elapsed=14372.1s
+2026-08-02 02:20:55,499 INFO upgd_idbd seed=1 done: avg online acc 0.7787 (wall 14372.1s) -> outputs/ipmnist_screening/confirm_full/upgd_idbd_seed1.json
