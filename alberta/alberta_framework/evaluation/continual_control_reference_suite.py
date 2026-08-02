@@ -17,9 +17,11 @@ import dataclasses
 import hashlib
 import json
 import math
+import os
+import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Protocol, TypeGuard, cast, runtime_checkable
+from typing import Any, NoReturn, Protocol, TypeGuard, cast, runtime_checkable
 
 import numpy as np
 
@@ -44,13 +46,17 @@ REFERENCE_RUN_CONFIG_SCHEMA = "alberta.privileged_control_reference_run_config.v
 REFERENCE_EXTRA_BUDGET_SCHEMA = "alberta.privileged_control_reference_extra_budget.v1"
 STATIONARY_STREAM_SCHEMA = "alberta.stationary_control_reference_stream.v1"
 STATIONARY_EXAMPLE_SCHEMA = "alberta.stationary_control_reference_example.v1"
-ORACLE_SOURCE_SCHEMA = "alberta.frozen_control_oracle_action_scores.v1"
+ORACLE_SOURCE_SCHEMA = "alberta.frozen_exact_control_oracle_action_scores.v1"
 
-FRESH_PER_REGIME_ROLE = "fresh_per_regime"
+RETAINED_FRESH_PER_REGIME_ROLE = "retained_fresh_once_per_regime_identity"
 STATIONARY_MULTITASK_ROLE = "stationary_multitask"
-ORACLE_ACTION_DATA_ROLE = "oracle_action_data_upper"
+ORACLE_ACTION_DATA_ROLE = "exact_frozen_oracle_action_data_upper"
+EXACT_ORACLE_SCORE_SEMANTICS = "exact_frozen_counterfactual_outcome_by_action"
+EXACT_ORACLE_CALLBACK_TEMPORAL_CONTRACT = (
+    "exact frozen counterfactual outcome scores returned before outcome"
+)
 REFERENCE_ROLES = (
-    FRESH_PER_REGIME_ROLE,
+    RETAINED_FRESH_PER_REGIME_ROLE,
     STATIONARY_MULTITASK_ROLE,
     ORACLE_ACTION_DATA_ROLE,
 )
@@ -64,18 +70,23 @@ REPORT_INTERPRETATION = (
 REFERENCE_LIMITATIONS = (
     "development-only; the configured seed is consumed and is not a promotion seed",
     "all three references receive privileges unavailable to ordinary matched conditions",
-    "fresh-per-regime recurrence can be unavailable when a retained learner state cannot "
-    "own the recurrence observation without an undisclosed reset",
+    "the retained fresh-per-regime-identity reference initializes once per evaluator regime "
+    "identity and reuses that trained state on recurrence; it is not fresh per segment or reset "
+    "at each regime change",
+    "retained fresh-per-regime-identity recurrence can be unavailable when its learner state "
+    "cannot own the recurrence observation without an undisclosed reset",
     "stationary-multitask training consumes the frozen additional stream and budget reported",
-    "oracle counterfactual action scores are trusted from a frozen evaluator callback; only "
-    "the selected action score is checked against the realized outcome",
+    "the exact-oracle role accepts only a source declaring exact frozen counterfactual outcomes "
+    "for every action, not stochastic expected scores; only the selected score can be checked "
+    "against the realized outcome",
     "callback configuration cannot audit hidden external side effects",
     "held-out probes score one selected action rather than a frozen-policy rollout",
     "no thresholds, hypothesis tests, evidence promotion, or default-mechanism selection",
 )
 
 FRESH_UNAVAILABLE_REASON_PREFIX = (
-    "fresh-per-regime retained state cannot own recurrence observation for evaluator regime "
+    "retained fresh-per-regime-identity state cannot own recurrence observation for evaluator "
+    "regime "
 )
 STATIONARY_UNAVAILABLE_REASON = (
     "stationary-multitask pretrained state cannot own the common protocol initial observation"
@@ -337,9 +348,7 @@ class StationaryReferenceExample:
     @property
     def next_decision_observation(self) -> tuple[float, ...]:
         return (
-            self.bootstrap_observation
-            if self.reset_observation is None
-            else self.reset_observation
+            self.bootstrap_observation if self.reset_observation is None else self.reset_observation
         )
 
     def to_config(self) -> dict[str, object]:
@@ -422,9 +431,7 @@ class FrozenStationaryReferenceStream:
             raise ValueError("stationary stream requires at least two immutable examples")
         if any(not isinstance(example, StationaryReferenceExample) for example in self.examples):
             raise TypeError("stationary stream examples have an invalid type")
-        for index, (left, right) in enumerate(
-            zip(self.examples, self.examples[1:], strict=False)
-        ):
+        for index, (left, right) in enumerate(zip(self.examples, self.examples[1:], strict=False)):
             if left.reference_regime_id == right.reference_regime_id:
                 raise ValueError("stationary stream regime labels must be interleaved")
             if left.next_decision_observation != right.observation:
@@ -611,7 +618,7 @@ class ReferenceEnvironmentFactory(Protocol):
     def __call__(self, seed: int) -> ContinuingControlEnvironment: ...
 
 
-class FreshRegimeLearnerFactory(Protocol):
+class RetainedRegimeIdentityLearnerFactory(Protocol):
     def __call__(self, seed: int, evaluator_regime_id: str) -> ContinuingControlLearner: ...
 
 
@@ -620,7 +627,7 @@ class StationaryReferenceLearnerFactory(Protocol):
 
 
 @runtime_checkable
-class FrozenOracleActionScoreSource(Protocol):
+class FrozenExactOracleOutcomeSource(Protocol):
     def to_config(self) -> dict[str, object]: ...
 
     def action_scores(
@@ -632,8 +639,8 @@ class FrozenOracleActionScoreSource(Protocol):
     ) -> tuple[float, ...]: ...
 
 
-class OracleActionScoreSourceFactory(Protocol):
-    def __call__(self, seed: int) -> FrozenOracleActionScoreSource: ...
+class ExactOracleOutcomeSourceFactory(Protocol):
+    def __call__(self, seed: int) -> FrozenExactOracleOutcomeSource: ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -756,9 +763,7 @@ def _transition_to_config(transition: ControlTransition) -> dict[str, object]:
         "truncated": transition.truncated,
         "bootstrap_observation": list(transition.bootstrap_observation),
         "reset_observation": (
-            None
-            if transition.reset_observation is None
-            else list(transition.reset_observation)
+            None if transition.reset_observation is None else list(transition.reset_observation)
         ),
         "safety_violation": transition.safety_violation,
         "intervention": transition.intervention,
@@ -870,16 +875,19 @@ def _pending_from_config(value: object, *, name: str) -> _PendingLearningDecisio
 
 
 def _action_record_to_config(record: _ReferenceActionRecord) -> dict[str, object]:
+    inner_available = record.inner_decision_id is not None
     return {
         "evaluator_regime_id": record.evaluator_regime_id,
         "transition": _transition_to_config(record.transition),
         "inner_decision_id": (
             None if record.inner_decision_id is None else list(record.inner_decision_id)
         ),
+        "inner_decision_observation": (
+            list(record.transition.observation) if inner_available else None
+        ),
+        "inner_decision_action": record.transition.action if inner_available else None,
         "oracle_action_scores": (
-            None
-            if record.oracle_action_scores is None
-            else list(record.oracle_action_scores)
+            None if record.oracle_action_scores is None else list(record.oracle_action_scores)
         ),
         "decision_selected_before_outcome": True,
         "transition_ownership_verified": True,
@@ -898,6 +906,8 @@ def _action_record_from_config(
             "evaluator_regime_id",
             "transition",
             "inner_decision_id",
+            "inner_decision_observation",
+            "inner_decision_action",
             "oracle_action_scores",
             "decision_selected_before_outcome",
             "transition_ownership_verified",
@@ -915,7 +925,34 @@ def _action_record_from_config(
     ):
         raise ValueError(f"{name} must preserve transition ownership")
     inner_raw = mapping["inner_decision_id"]
+    inner_observation_raw = mapping["inner_decision_observation"]
+    inner_action_raw = mapping["inner_decision_action"]
     oracle_raw = mapping["oracle_action_scores"]
+    if inner_raw is None:
+        if inner_observation_raw is not None or inner_action_raw is not None:
+            raise ValueError(f"{name} inner decision ownership must be wholly unavailable")
+    else:
+        inner_observation = _observation_from_json(
+            inner_observation_raw,
+            name=f"{name}.inner_decision_observation",
+        )
+        inner_action = _nonnegative_int(
+            inner_action_raw,
+            name=f"{name}.inner_decision_action",
+        )
+        transition_mapping = _mapping(
+            mapping["transition"],
+            name=f"{name}.transition",
+        )
+        if (
+            inner_observation
+            != _observation_from_json(
+                transition_mapping["observation"],
+                name=f"{name}.transition.observation",
+            )
+            or inner_action != transition_mapping["action"]
+        ):
+            raise ValueError(f"{name} wrapper and inner decision ownership disagree")
     record = _ReferenceActionRecord(
         evaluator_regime_id=_string(
             mapping["evaluator_regime_id"],
@@ -1017,9 +1054,7 @@ def _trace_from_config(value: object, *, name: str) -> _ReferenceTrace:
         name=f"{name}.backward_call_counts",
     ):
         backward.append(
-            None
-            if item is None
-            else _nonnegative_int(item, name=f"{name}.backward_call_counts")
+            None if item is None else _nonnegative_int(item, name=f"{name}.backward_call_counts")
         )
     trace = _ReferenceTrace(
         actions=tuple(
@@ -1082,10 +1117,10 @@ class PrivilegedContinualControlReferenceSuite:
         common_evaluation_budget: ContinuingControlBudget,
         environment_factory: ReferenceEnvironmentFactory,
         probes: Mapping[str, Sequence[ControlProbe]],
-        fresh_learner_factory: FreshRegimeLearnerFactory,
+        fresh_learner_factory: RetainedRegimeIdentityLearnerFactory,
         stationary_learner_factory: StationaryReferenceLearnerFactory,
         stationary_stream: FrozenStationaryReferenceStream,
-        oracle_source_factory: OracleActionScoreSourceFactory,
+        oracle_source_factory: ExactOracleOutcomeSourceFactory,
     ):
         if not isinstance(config, PrivilegedReferenceRunConfig):
             raise TypeError("config must be a PrivilegedReferenceRunConfig")
@@ -1123,9 +1158,7 @@ class PrivilegedContinualControlReferenceSuite:
             if getattr(self._budget, field_name) < transition_count:
                 raise ValueError(f"common {field_name} is too small")
 
-        self._probes = {
-            regime_id: tuple(values) for regime_id, values in probes.items()
-        }
+        self._probes = {regime_id: tuple(values) for regime_id, values in probes.items()}
         if set(self._probes) != set(self._protocol.evaluator_regime_ids):
             raise ValueError("probe keys must exactly match evaluator_regime_ids")
         if any(not values for values in self._probes.values()):
@@ -1155,11 +1188,14 @@ class PrivilegedContinualControlReferenceSuite:
         )
         if len({_canonical_json(value) for value in environment_configs}) != 1:
             raise ValueError("all reference environment configs must be identical")
-        if _assert_explicit_seed_fields(
-            environment_configs[0],
-            seed=seed,
-            name="environment",
-        ) == 0:
+        if (
+            _assert_explicit_seed_fields(
+                environment_configs[0],
+                seed=seed,
+                name="environment",
+            )
+            == 0
+        ):
             raise ValueError("environment config must explicitly bind the suite seed")
         self._environment_config = environment_configs[0]
 
@@ -1242,14 +1278,12 @@ class PrivilegedContinualControlReferenceSuite:
         for example in self._stationary_stream.examples:
             if len(example.action_scores) != n_actions:
                 raise ValueError("stationary stream action-score width is invalid")
-        if len(self._stationary_stream.examples[0].observation) != len(
-            self._initial_observation
-        ):
+        if len(self._stationary_stream.examples[0].observation) != len(self._initial_observation):
             raise ValueError("stationary stream observation dimension is incompatible")
 
         oracle_source = oracle_source_factory(seed)
-        if not isinstance(oracle_source, FrozenOracleActionScoreSource):
-            raise TypeError("oracle_source_factory must return FrozenOracleActionScoreSource")
+        if not isinstance(oracle_source, FrozenExactOracleOutcomeSource):
+            raise TypeError("oracle_source_factory must return FrozenExactOracleOutcomeSource")
         if isinstance(oracle_source, ContinuingControlLearner):
             raise TypeError("oracle source must remain outside ContinuingControlLearner")
         self._oracle_source = oracle_source
@@ -1260,11 +1294,25 @@ class PrivilegedContinualControlReferenceSuite:
         _string(self._oracle_source_config.get("type"), name="oracle source.type")
         if self._oracle_source_config.get("schema_version") != ORACLE_SOURCE_SCHEMA:
             raise ValueError("oracle source schema_version is invalid")
-        if _assert_explicit_seed_fields(
-            self._oracle_source_config,
-            seed=seed,
-            name="oracle source",
-        ) == 0:
+        if (
+            _string(
+                self._oracle_source_config.get("score_semantics"),
+                name="oracle source.score_semantics",
+            )
+            != EXACT_ORACLE_SCORE_SEMANTICS
+        ):
+            raise ValueError(
+                "oracle source must declare exact frozen counterfactual outcome semantics; "
+                "stochastic expected scores are not accepted by this role"
+            )
+        if (
+            _assert_explicit_seed_fields(
+                self._oracle_source_config,
+                seed=seed,
+                name="oracle source",
+            )
+            == 0
+        ):
             raise ValueError("oracle source config must explicitly bind the suite seed")
 
         probe_examples = sum(len(values) for values in self._probes.values())
@@ -1273,9 +1321,7 @@ class PrivilegedContinualControlReferenceSuite:
             raise ValueError("common probe-call budget is too small")
         self._probe_examples_per_checkpoint = probe_examples
         self._probe_action_score_scalars_per_checkpoint = sum(
-            len(probe.action_scores)
-            for values in self._probes.values()
-            for probe in values
+            len(probe.action_scores) for values in self._probes.values() for probe in values
         )
         self._probe_config = {
             regime_id: [probe.to_config() for probe in self._probes[regime_id]]
@@ -1354,10 +1400,13 @@ class PrivilegedContinualControlReferenceSuite:
 
     def _assert_environment_configs_stable(self) -> None:
         for environment in self._environments:
-            if self._json_object(
-                environment.to_config(),
-                name="environment config",
-            ) != self._environment_config:
+            if (
+                self._json_object(
+                    environment.to_config(),
+                    name="environment config",
+                )
+                != self._environment_config
+            ):
                 raise ValueError("reference environment config changed during execution")
 
     def _assert_learner_config_stable(
@@ -1556,10 +1605,13 @@ class PrivilegedContinualControlReferenceSuite:
         evaluator_regime_id: str,
         step: int,
     ) -> tuple[float, ...]:
-        if self._json_object(
-            self._oracle_source.to_config(),
-            name="oracle source config",
-        ) != self._oracle_source_config:
+        if (
+            self._json_object(
+                self._oracle_source.to_config(),
+                name="oracle source config",
+            )
+            != self._oracle_source_config
+        ):
             raise ValueError("oracle source config changed during execution")
         raw = self._oracle_source.action_scores(
             observation,
@@ -1572,10 +1624,13 @@ class PrivilegedContinualControlReferenceSuite:
             _finite_float(value, name=f"oracle action_scores[{index}]")
             for index, value in enumerate(raw)
         )
-        if self._json_object(
-            self._oracle_source.to_config(),
-            name="oracle source config",
-        ) != self._oracle_source_config:
+        if (
+            self._json_object(
+                self._oracle_source.to_config(),
+                name="oracle source config",
+            )
+            != self._oracle_source_config
+        ):
             raise ValueError("oracle callback mutated its frozen config")
         return scores
 
@@ -1592,10 +1647,13 @@ class PrivilegedContinualControlReferenceSuite:
             self._stationary_learner,
             self._stationary_learner_config,
         )
-        if self._json_object(
-            self._oracle_source.to_config(),
-            name="oracle source config",
-        ) != self._oracle_source_config:
+        if (
+            self._json_object(
+                self._oracle_source.to_config(),
+                name="oracle source config",
+            )
+            != self._oracle_source_config
+        ):
             raise ValueError("oracle source config changed")
         return {
             "type": "PrivilegedContinualControlReferenceSuite",
@@ -1611,7 +1669,7 @@ class PrivilegedContinualControlReferenceSuite:
                 "config_sha256": _digest(self._environment_config),
                 "independent_copy_count": 3,
             },
-            "fresh_per_regime": {
+            RETAINED_FRESH_PER_REGIME_ROLE: {
                 "factory_seed": self._config.seed,
                 "lifecycle_id": list(self._config.fresh_lifecycle_id),
                 "learner_configs": [
@@ -1627,6 +1685,9 @@ class PrivilegedContinualControlReferenceSuite:
                     )
                 ],
                 "regime_selection_owner": "privileged suite wrapper only",
+                "initialization_scope": "once per evaluator regime identity",
+                "recurrence_policy": "retain and reuse that regime-identity learner state",
+                "fresh_per_segment_or_change": False,
             },
             "stationary_multitask": {
                 "factory_seed": self._config.seed,
@@ -1636,12 +1697,15 @@ class PrivilegedContinualControlReferenceSuite:
                 "stream": self._stationary_stream.to_config(),
                 "stream_sha256": _digest(self._stationary_stream.to_config()),
             },
-            "oracle_action_data_upper": {
+            ORACLE_ACTION_DATA_ROLE: {
                 "factory_seed": self._config.seed,
                 "lifecycle_id": list(self._config.oracle_lifecycle_id),
                 "source_config": _json_clone(self._oracle_source_config),
                 "source_config_sha256": _digest(self._oracle_source_config),
-                "callback_temporal_contract": "full action scores returned before outcome",
+                "score_semantics": EXACT_ORACLE_SCORE_SEMANTICS,
+                "callback_temporal_contract": EXACT_ORACLE_CALLBACK_TEMPORAL_CONTRACT,
+                "selected_score_realized_reward_equality_required": True,
+                "stochastic_expected_score_source_supported": False,
             },
             "probe_sha256": _digest(self._probe_config),
             "probe_examples_per_checkpoint": self._probe_examples_per_checkpoint,
@@ -1671,9 +1735,7 @@ class PrivilegedContinualControlReferenceSuite:
         used_ids: set[DecisionId] = set()
         for index, example in enumerate(self._stationary_stream.examples):
             if not self._learner_state_valid(learner, state, example.observation):
-                raise ValueError(
-                    f"stationary learner cannot own frozen stream example {index}"
-                )
+                raise ValueError(f"stationary learner cannot own frozen stream example {index}")
             decision = self._inner_decision(
                 learner,
                 expected,
@@ -1712,9 +1774,7 @@ class PrivilegedContinualControlReferenceSuite:
             for record in records
             if record.backward_call_count is not None
         ]
-        if sum(known_backward) > (
-            self._config.extra_data_budget.stationary_backward_call_limit
-        ):
+        if sum(known_backward) > (self._config.extra_data_budget.stationary_backward_call_limit):
             raise ValueError("stationary extra-stream backward-call budget exceeded")
         return state, tuple(records)
 
@@ -1737,9 +1797,7 @@ class PrivilegedContinualControlReferenceSuite:
                 )
                 ephemeral_initializations += 1
             scores = [
-                probe.action_scores[
-                    self._probe_action(learner, expected, live_state, probe)
-                ]
+                probe.action_scores[self._probe_action(learner, expected, live_state, probe)]
                 for probe in probes
             ]
             row.append(sum(scores) / len(scores))
@@ -1834,9 +1892,7 @@ class PrivilegedContinualControlReferenceSuite:
         )
         stationary = _StationaryReferenceState(
             available=stationary_available,
-            unavailable_reason=(
-                None if stationary_available else STATIONARY_UNAVAILABLE_REASON
-            ),
+            unavailable_reason=(None if stationary_available else STATIONARY_UNAVAILABLE_REASON),
             environment_state=stationary_environment_state,
             current_observation=self._initial_observation,
             learner_state=stationary_learner_state,
@@ -2053,7 +2109,9 @@ class PrivilegedContinualControlReferenceSuite:
             regime_id,
         )
         if transition.reward != scores[pending.action]:
-            raise ValueError("oracle selected-action score does not match realized outcome")
+            raise ValueError(
+                "exact oracle selected-action score does not match the realized outcome"
+            )
         record = _ReferenceActionRecord(
             evaluator_regime_id=regime_id,
             transition=transition,
@@ -2198,7 +2256,7 @@ class PrivilegedContinualControlReferenceSuite:
                 if transition.action != expected_action:
                     raise ValueError("oracle action is not the frozen score argmax")
                 if transition.reward != scores[transition.action]:
-                    raise ValueError("oracle selected score and realized reward disagree")
+                    raise ValueError("exact oracle selected score and realized reward disagree")
             else:
                 if record.inner_decision_id is None:
                     raise ValueError(f"{role} trace is missing inner decision ownership")
@@ -2245,8 +2303,7 @@ class PrivilegedContinualControlReferenceSuite:
             or pending.inner.observation != current_observation
             or pending.outer.action != pending.inner.action
             or pending.outer.action >= self._n_actions
-            or pending.outer.decision_id
-            != _generation_decision_id(lifecycle_id, suite_step)
+            or pending.outer.decision_id != _generation_decision_id(lifecycle_id, suite_step)
         ):
             raise ValueError(f"{role} pending wrapper/inner ownership is invalid")
 
@@ -2277,13 +2334,9 @@ class PrivilegedContinualControlReferenceSuite:
             if transition.action >= self._n_actions or not expected_static:
                 raise ValueError(f"stationary extra trace example {index} is invalid")
         known_backward = [
-            record.backward_call_count
-            for record in trace
-            if record.backward_call_count is not None
+            record.backward_call_count for record in trace if record.backward_call_count is not None
         ]
-        if sum(known_backward) > (
-            self._config.extra_data_budget.stationary_backward_call_limit
-        ):
+        if sum(known_backward) > (self._config.extra_data_budget.stationary_backward_call_limit):
             raise ValueError("stationary extra trace exceeds backward-call budget")
 
     def _validate_state(self, state: PrivilegedReferenceRunState) -> None:
@@ -2329,30 +2382,31 @@ class PrivilegedContinualControlReferenceSuite:
         if fresh.ephemeral_probe_initialization_count != expected_ephemeral:
             raise ValueError("fresh ephemeral probe initialization count is invalid")
         _observation(fresh.current_observation, name="fresh current_observation")
-        if self._environment_observation(
-            self._environments[0],
-            fresh.environment_state,
-        ) != fresh.current_observation:
+        if (
+            self._environment_observation(
+                self._environments[0],
+                fresh.environment_state,
+            )
+            != fresh.current_observation
+        ):
             raise ValueError("fresh environment observation cache is inconsistent")
         self._validate_trace(
             fresh.trace,
-            role=FRESH_PER_REGIME_ROLE,
+            role=RETAINED_FRESH_PER_REGIME_ROLE,
             lifecycle_id=self._config.fresh_lifecycle_id,
             suite_step=step,
             available=fresh.available,
         )
         self._validate_pending_learning(
             fresh.pending,
-            role=FRESH_PER_REGIME_ROLE,
+            role=RETAINED_FRESH_PER_REGIME_ROLE,
             lifecycle_id=self._config.fresh_lifecycle_id,
             suite_step=step,
             available=fresh.available,
             current_observation=fresh.current_observation,
         )
         if fresh.pending is not None:
-            index = self._protocol.evaluator_regime_ids.index(
-                fresh.pending.evaluator_regime_id
-            )
+            index = self._protocol.evaluator_regime_ids.index(fresh.pending.evaluator_regime_id)
             learner_state = fresh.learner_states[index]
             if learner_state is None or not self._learner_state_valid(
                 self._fresh_learners[index],
@@ -2375,10 +2429,13 @@ class PrivilegedContinualControlReferenceSuite:
             stationary.current_observation,
             name="stationary current_observation",
         )
-        if self._environment_observation(
-            self._environments[1],
-            stationary.environment_state,
-        ) != stationary.current_observation:
+        if (
+            self._environment_observation(
+                self._environments[1],
+                stationary.environment_state,
+            )
+            != stationary.current_observation
+        ):
             raise ValueError("stationary environment observation cache is inconsistent")
         self._learner_state_payload(
             self._stationary_learner,
@@ -2413,10 +2470,13 @@ class PrivilegedContinualControlReferenceSuite:
         if not oracle.available or oracle.unavailable_reason is not None:
             raise ValueError("oracle action-data reference must remain available")
         _observation(oracle.current_observation, name="oracle current_observation")
-        if self._environment_observation(
-            self._environments[2],
-            oracle.environment_state,
-        ) != oracle.current_observation:
+        if (
+            self._environment_observation(
+                self._environments[2],
+                oracle.environment_state,
+            )
+            != oracle.current_observation
+        ):
             raise ValueError("oracle environment observation cache is inconsistent")
         self._validate_trace(
             oracle.trace,
@@ -2453,7 +2513,7 @@ class PrivilegedContinualControlReferenceSuite:
         oracle = state.oracle_action_data_upper
         return {
             "step": state.step,
-            FRESH_PER_REGIME_ROLE: {
+            RETAINED_FRESH_PER_REGIME_ROLE: {
                 "available": fresh.available,
                 "unavailable_reason": fresh.unavailable_reason,
                 "environment_state": self._environment_state_payload(
@@ -2499,8 +2559,7 @@ class PrivilegedContinualControlReferenceSuite:
                 "pending": _pending_to_config(stationary.pending),
                 "trace": _trace_to_config(stationary.trace),
                 "extra_training_trace": [
-                    _extra_record_to_config(record)
-                    for record in stationary.extra_training_trace
+                    _extra_record_to_config(record) for record in stationary.extra_training_trace
                 ],
             },
             ORACLE_ACTION_DATA_ROLE: {
@@ -2512,9 +2571,7 @@ class PrivilegedContinualControlReferenceSuite:
                 ),
                 "current_observation": list(oracle.current_observation),
                 "pending": (
-                    None
-                    if oracle.pending is None
-                    else _decision_to_config(oracle.pending)
+                    None if oracle.pending is None else _decision_to_config(oracle.pending)
                 ),
                 "pending_action_scores": (
                     None
@@ -2527,12 +2584,15 @@ class PrivilegedContinualControlReferenceSuite:
 
     @staticmethod
     def _privilege_disclosure(role: str) -> dict[str, object]:
-        if role == FRESH_PER_REGIME_ROLE:
+        if role == RETAINED_FRESH_PER_REGIME_ROLE:
             return {
                 "evaluator_regime_id_visible_to_privileged_wrapper": True,
                 "evaluator_regime_id_visible_to_inner_learner": False,
                 "independent_persistent_learner_state_per_regime": True,
                 "initialization_policy": "lazy once at first evaluator-regime exposure",
+                "fresh_per_segment_or_regime_change": False,
+                "same_identity_state_retained_and_reused_on_recurrence": True,
+                "determinism_verification_init_per_logical_initialization": 1,
                 "recurrence_reset_allowed": False,
                 "ephemeral_untrained_probe_initialization": True,
                 "additional_training_transitions": 0,
@@ -2543,6 +2603,7 @@ class PrivilegedContinualControlReferenceSuite:
                 "reference_stream_regime_label_visible_to_evaluator_only": True,
                 "single_persistent_learner_state": True,
                 "pretraining_before_common_evaluation": True,
+                "learner_init_calls_include_one_determinism_verification": True,
                 "frozen_interleaved_extra_stream": True,
                 "additional_training_budget_reported_exactly": True,
             }
@@ -2550,8 +2611,11 @@ class PrivilegedContinualControlReferenceSuite:
             return {
                 "implements_continuing_control_learner": False,
                 "evaluator_regime_id_visible_to_frozen_callback": True,
-                "full_action_score_vector_visible_before_each_outcome": True,
-                "selected_action_score_checked_against_realized_outcome": True,
+                "score_semantics": EXACT_ORACLE_SCORE_SEMANTICS,
+                "exact_frozen_counterfactual_outcomes_visible_before_each_outcome": True,
+                "stochastic_expected_action_scores_accepted": False,
+                "selected_exact_score_checked_against_realized_outcome": True,
+                "unselected_exact_scores_trusted_not_outcome_audited": True,
                 "held_out_probe_scores_visible_for_action_selection": True,
                 "learner_update_or_training_state": False,
             }
@@ -2560,15 +2624,18 @@ class PrivilegedContinualControlReferenceSuite:
     @staticmethod
     def _comparability_disclosure(role: str) -> dict[str, object]:
         reasons = {
-            FRESH_PER_REGIME_ROLE: (
-                "multiple privileged regime-selected learner states exceed the ordinary "
-                "single-learner condition contract"
+            RETAINED_FRESH_PER_REGIME_ROLE: (
+                "multiple privileged regime-selected learner states, each initialized once and "
+                "retained across recurrences of its identity, exceed the ordinary single-learner "
+                "condition contract; this is not a reset-per-segment comparator"
             ),
             STATIONARY_MULTITASK_ROLE: (
                 "frozen additional training data is outside the common evaluation budget"
             ),
             ORACLE_ACTION_DATA_ROLE: (
-                "pre-outcome oracle action scores are unavailable to ordinary conditions"
+                "exact frozen pre-outcome counterfactual outcomes for every action are unavailable "
+                "to ordinary conditions; stochastic expected-score references are a distinct, "
+                "unsupported comparator"
             ),
         }
         return {
@@ -2590,9 +2657,7 @@ class PrivilegedContinualControlReferenceSuite:
             "decision_calls": processed,
             "environment_calls": processed,
             "update_calls": 0 if role == ORACLE_ACTION_DATA_ROLE else processed,
-            "probe_calls": (
-                len(trace.evaluator_matrix) * self._probe_examples_per_checkpoint
-            ),
+            "probe_calls": (len(trace.evaluator_matrix) * self._probe_examples_per_checkpoint),
             "backward_call_count_available": backward_available,
             "backward_calls": sum(known) if backward_available else None,
             "stored_wrapper_decision_ids": processed,
@@ -2609,9 +2674,7 @@ class PrivilegedContinualControlReferenceSuite:
             "interventions": sum(item.intervention for item in transitions),
             "near_misses": sum(item.near_miss for item in transitions),
             "cumulative_safety_cost": sum(item.safety_cost for item in transitions),
-            "cumulative_near_miss_cost": sum(
-                item.near_miss_cost for item in transitions
-            ),
+            "cumulative_near_miss_cost": sum(item.near_miss_cost for item in transitions),
             "maximum_step_safety_cost": max(
                 (item.safety_cost for item in transitions),
                 default=0.0,
@@ -2670,16 +2733,14 @@ class PrivilegedContinualControlReferenceSuite:
         role: str,
         state: PrivilegedReferenceRunState,
     ) -> dict[str, object]:
-        if role == FRESH_PER_REGIME_ROLE:
+        if role == RETAINED_FRESH_PER_REGIME_ROLE:
             fresh = state.fresh_per_regime
             return {
                 "training_transitions": 0,
-                "persistent_learner_initializations": (
-                    fresh.learner_initialization_count
-                ),
-                "ephemeral_probe_initializations": (
-                    fresh.ephemeral_probe_initialization_count
-                ),
+                "persistent_learner_initializations": (fresh.learner_initialization_count),
+                "persistent_learner_init_api_calls": (2 * fresh.learner_initialization_count),
+                "ephemeral_probe_initializations": (fresh.ephemeral_probe_initialization_count),
+                "ephemeral_probe_init_api_calls": (2 * fresh.ephemeral_probe_initialization_count),
                 "recurrence_resets": 0,
                 "regime_selector_calls": len(fresh.trace.actions),
             }
@@ -2693,14 +2754,14 @@ class PrivilegedContinualControlReferenceSuite:
             return {
                 "declared_exact_budget": self._config.extra_data_budget.to_config(),
                 "pretraining_completed": True,
+                "learner_init_api_calls": 2,
                 "training_transitions": len(trace),
                 "decision_calls": len(trace),
                 "update_calls": len(trace),
                 "backward_call_count_available": len(known) == len(trace),
                 "backward_calls": sum(known) if len(known) == len(trace) else None,
                 "reward_table_scalars_available_to_evaluator": sum(
-                    len(example.action_scores)
-                    for example in self._stationary_stream.examples
+                    len(example.action_scores) for example in self._stationary_stream.examples
                 ),
                 "selected_reward_scalars_revealed_to_learner": len(trace),
                 "evaluator_only_regime_labels": len(trace),
@@ -2710,9 +2771,7 @@ class PrivilegedContinualControlReferenceSuite:
             return {
                 "declared_exact_budget": self._config.extra_data_budget.to_config(),
                 "environment_action_score_callbacks": len(oracle.trace.actions),
-                "environment_action_score_scalars": (
-                    len(oracle.trace.actions) * self._n_actions
-                ),
+                "environment_action_score_scalars": (len(oracle.trace.actions) * self._n_actions),
                 "probe_action_score_scalars_used_for_selection": (
                     len(oracle.trace.evaluator_matrix)
                     * self._probe_action_score_scalars_per_checkpoint
@@ -2726,7 +2785,7 @@ class PrivilegedContinualControlReferenceSuite:
         role: str,
         state: PrivilegedReferenceRunState,
     ) -> dict[str, object]:
-        if role == FRESH_PER_REGIME_ROLE:
+        if role == RETAINED_FRESH_PER_REGIME_ROLE:
             fresh_state = state.fresh_per_regime
             trace = fresh_state.trace
             resource = self._fresh_resource_usage(fresh_state)
@@ -2738,8 +2797,7 @@ class PrivilegedContinualControlReferenceSuite:
             trace = stationary_state.trace
             resource = self._stationary_resource_usage(stationary_state)
             extra_trace = [
-                _extra_record_to_config(record)
-                for record in stationary_state.extra_training_trace
+                _extra_record_to_config(record) for record in stationary_state.extra_training_trace
             ]
             available = stationary_state.available
             reason = stationary_state.unavailable_reason
@@ -2849,7 +2907,7 @@ class PrivilegedContinualControlReferenceSuite:
             mapping,
             {
                 "step",
-                FRESH_PER_REGIME_ROLE,
+                RETAINED_FRESH_PER_REGIME_ROLE,
                 STATIONARY_MULTITASK_ROLE,
                 ORACLE_ACTION_DATA_ROLE,
             },
@@ -2857,7 +2915,7 @@ class PrivilegedContinualControlReferenceSuite:
         )
         step = _nonnegative_int(mapping["step"], name="reference state.step")
 
-        fresh_raw = _mapping(mapping[FRESH_PER_REGIME_ROLE], name="fresh state")
+        fresh_raw = _mapping(mapping[RETAINED_FRESH_PER_REGIME_ROLE], name="fresh state")
         _exact_keys(
             fresh_raw,
             {
@@ -3125,9 +3183,9 @@ def _parse_suite_config(
         "protocol",
         "common_evaluation_budget",
         "environment",
-        "fresh_per_regime",
+        RETAINED_FRESH_PER_REGIME_ROLE,
         "stationary_multitask",
-        "oracle_action_data_upper",
+        ORACLE_ACTION_DATA_ROLE,
         "probe_sha256",
         "probe_examples_per_checkpoint",
         "probe_action_score_scalars_per_checkpoint",
@@ -3148,9 +3206,7 @@ def _parse_suite_config(
         raise ValueError("reference checkpoint schema identity is invalid")
     run_config = PrivilegedReferenceRunConfig.from_config(mapping["run_config"])
     protocol, protocol_config = control_core._parse_protocol_config(mapping["protocol"])
-    budget, budget_config = control_core._parse_budget_config(
-        mapping["common_evaluation_budget"]
-    )
+    budget, budget_config = control_core._parse_budget_config(mapping["common_evaluation_budget"])
     if budget.transition_limit != len(protocol.regime_schedule):
         raise ValueError("reference common budget transition limit is invalid")
 
@@ -3160,9 +3216,7 @@ def _parse_suite_config(
         {"factory_seed", "config", "config_sha256", "independent_copy_count"},
         name="reference environment identity",
     )
-    if _uint32(environment["factory_seed"], name="environment.factory_seed") != (
-        run_config.seed
-    ):
+    if _uint32(environment["factory_seed"], name="environment.factory_seed") != (run_config.seed):
         raise ValueError("environment factory seed does not match suite seed")
     environment_config = _mapping(
         environment["config"],
@@ -3173,21 +3227,33 @@ def _parse_suite_config(
         environment_config.get("schema_version"),
         name="environment config.schema_version",
     )
-    if _assert_explicit_seed_fields(
-        environment_config,
-        seed=run_config.seed,
-        name="environment config",
-    ) == 0:
+    if (
+        _assert_explicit_seed_fields(
+            environment_config,
+            seed=run_config.seed,
+            name="environment config",
+        )
+        == 0
+    ):
         raise ValueError("environment config does not explicitly bind suite seed")
     if _sha256(
         environment["config_sha256"],
         name="environment.config_sha256",
     ) != _digest(environment_config):
         raise ValueError("environment config digest does not match")
-    if environment["independent_copy_count"] != 3:
+    if (
+        _positive_int(
+            environment["independent_copy_count"],
+            name="environment.independent_copy_count",
+        )
+        != 3
+    ):
         raise ValueError("reference suite must declare three independent environments")
 
-    fresh = _mapping(mapping["fresh_per_regime"], name="fresh reference identity")
+    fresh = _mapping(
+        mapping[RETAINED_FRESH_PER_REGIME_ROLE],
+        name="fresh reference identity",
+    )
     _exact_keys(
         fresh,
         {
@@ -3195,15 +3261,21 @@ def _parse_suite_config(
             "lifecycle_id",
             "learner_configs",
             "regime_selection_owner",
+            "initialization_scope",
+            "recurrence_policy",
+            "fresh_per_segment_or_change",
         },
         name="fresh reference identity",
     )
     if _uint32(fresh["factory_seed"], name="fresh.factory_seed") != run_config.seed:
         raise ValueError("fresh factory seed does not match suite seed")
-    if _decision_id_from_lifecycle_json(
-        fresh["lifecycle_id"],
-        name="fresh.lifecycle_id",
-    ) != run_config.fresh_lifecycle_id:
+    if (
+        _decision_id_from_lifecycle_json(
+            fresh["lifecycle_id"],
+            name="fresh.lifecycle_id",
+        )
+        != run_config.fresh_lifecycle_id
+    ):
         raise ValueError("fresh lifecycle identity does not match run config")
     raw_fresh_configs = _list(fresh["learner_configs"], name="fresh.learner_configs")
     if len(raw_fresh_configs) != len(protocol.evaluator_regime_ids):
@@ -3244,6 +3316,15 @@ def _parse_suite_config(
         parsed_fresh_configs.append(learner_config)
     if fresh["regime_selection_owner"] != "privileged suite wrapper only":
         raise ValueError("fresh regime selector ownership is invalid")
+    if fresh["initialization_scope"] != "once per evaluator regime identity":
+        raise ValueError("fresh initialization scope is invalid")
+    if fresh["recurrence_policy"] != "retain and reuse that regime-identity learner state":
+        raise ValueError("fresh recurrence policy is invalid")
+    if _boolean(
+        fresh["fresh_per_segment_or_change"],
+        name="fresh.fresh_per_segment_or_change",
+    ):
+        raise ValueError("retained fresh reference cannot claim reset-per-segment semantics")
 
     stationary = _mapping(
         mapping["stationary_multitask"],
@@ -3261,14 +3342,15 @@ def _parse_suite_config(
         },
         name="stationary reference identity",
     )
-    if _uint32(stationary["factory_seed"], name="stationary.factory_seed") != (
-        run_config.seed
-    ):
+    if _uint32(stationary["factory_seed"], name="stationary.factory_seed") != (run_config.seed):
         raise ValueError("stationary factory seed does not match suite seed")
-    if _decision_id_from_lifecycle_json(
-        stationary["lifecycle_id"],
-        name="stationary.lifecycle_id",
-    ) != run_config.stationary_lifecycle_id:
+    if (
+        _decision_id_from_lifecycle_json(
+            stationary["lifecycle_id"],
+            name="stationary.lifecycle_id",
+        )
+        != run_config.stationary_lifecycle_id
+    ):
         raise ValueError("stationary lifecycle identity does not match run config")
     stationary_learner_config = _mapping(
         stationary["learner_config"],
@@ -3304,7 +3386,7 @@ def _parse_suite_config(
         raise ValueError("stationary stream digest does not match")
 
     oracle = _mapping(
-        mapping["oracle_action_data_upper"],
+        mapping[ORACLE_ACTION_DATA_ROLE],
         name="oracle reference identity",
     )
     _exact_keys(
@@ -3314,36 +3396,63 @@ def _parse_suite_config(
             "lifecycle_id",
             "source_config",
             "source_config_sha256",
+            "score_semantics",
             "callback_temporal_contract",
+            "selected_score_realized_reward_equality_required",
+            "stochastic_expected_score_source_supported",
         },
         name="oracle reference identity",
     )
     if _uint32(oracle["factory_seed"], name="oracle.factory_seed") != run_config.seed:
         raise ValueError("oracle factory seed does not match suite seed")
-    if _decision_id_from_lifecycle_json(
-        oracle["lifecycle_id"],
-        name="oracle.lifecycle_id",
-    ) != run_config.oracle_lifecycle_id:
+    if (
+        _decision_id_from_lifecycle_json(
+            oracle["lifecycle_id"],
+            name="oracle.lifecycle_id",
+        )
+        != run_config.oracle_lifecycle_id
+    ):
         raise ValueError("oracle lifecycle identity does not match run config")
     oracle_config = _mapping(oracle["source_config"], name="oracle.source_config")
     _string(oracle_config.get("type"), name="oracle source.type")
     if oracle_config.get("schema_version") != ORACLE_SOURCE_SCHEMA:
         raise ValueError("oracle source schema_version is invalid")
-    if _assert_explicit_seed_fields(
-        oracle_config,
-        seed=run_config.seed,
-        name="oracle source",
-    ) == 0:
+    if (
+        _string(
+            oracle_config.get("score_semantics"),
+            name="oracle source.score_semantics",
+        )
+        != EXACT_ORACLE_SCORE_SEMANTICS
+    ):
+        raise ValueError("oracle source must declare exact frozen counterfactual outcome semantics")
+    if (
+        _assert_explicit_seed_fields(
+            oracle_config,
+            seed=run_config.seed,
+            name="oracle source",
+        )
+        == 0
+    ):
         raise ValueError("oracle source does not explicitly bind suite seed")
     if _sha256(
         oracle["source_config_sha256"],
         name="oracle.source_config_sha256",
     ) != _digest(oracle_config):
         raise ValueError("oracle source config digest does not match")
-    if oracle["callback_temporal_contract"] != (
-        "full action scores returned before outcome"
-    ):
+    if oracle["score_semantics"] != EXACT_ORACLE_SCORE_SEMANTICS:
+        raise ValueError("oracle suite score semantics are invalid")
+    if oracle["callback_temporal_contract"] != EXACT_ORACLE_CALLBACK_TEMPORAL_CONTRACT:
         raise ValueError("oracle callback temporal contract is invalid")
+    if not _boolean(
+        oracle["selected_score_realized_reward_equality_required"],
+        name="oracle.selected_score_realized_reward_equality_required",
+    ):
+        raise ValueError("exact oracle selected-score equality check must remain required")
+    if _boolean(
+        oracle["stochastic_expected_score_source_supported"],
+        name="oracle.stochastic_expected_score_source_supported",
+    ):
+        raise ValueError("stochastic expected scores cannot be relabeled as exact oracle data")
 
     _sha256(mapping["probe_sha256"], name="reference suite probe_sha256")
     probe_examples = _positive_int(
@@ -3377,9 +3486,7 @@ def _parse_suite_config(
         if getattr(extra, field_name) != expected:
             raise ValueError(f"suite config {field_name} is not exact")
 
-    if _list(mapping["reference_roles"], name="reference_roles") != list(
-        REFERENCE_ROLES
-    ):
+    if _list(mapping["reference_roles"], name="reference_roles") != list(REFERENCE_ROLES):
         raise ValueError("reference role identity or order is invalid")
     if _boolean(
         mapping["ordinary_conditions_included"],
@@ -3441,9 +3548,7 @@ def _validate_report_trace(
         raise ValueError(f"{role} available report trace is incomplete")
     if not available and processed >= total:
         raise ValueError(f"{role} unavailable report trace must be a strict prefix")
-    expected_rows = sum(
-        checkpoint <= processed for checkpoint in protocol.checkpoint_steps
-    )
+    expected_rows = sum(checkpoint <= processed for checkpoint in protocol.checkpoint_steps)
     if len(trace.evaluator_matrix) != expected_rows:
         raise ValueError(f"{role} report held-out row count is invalid")
     for row in trace.evaluator_matrix:
@@ -3524,7 +3629,7 @@ def _parse_resource_usage(value: object, *, role: str) -> dict[str, object]:
         name=f"{role}.resource_usage",
     )
     raw_parameters = mapping["trainable_parameter_count"]
-    result = {
+    result: dict[str, object] = {
         "persistent_state_bytes": _nonnegative_int(
             mapping["persistent_state_bytes"],
             name=f"{role}.resource_usage.persistent_state_bytes",
@@ -3609,9 +3714,7 @@ def _parse_stationary_extra_trace(
         for index, item in enumerate(raw)
     ]
     used_ids: set[DecisionId] = set()
-    for index, (record, example) in enumerate(
-        zip(records, stream.examples, strict=True)
-    ):
+    for index, (record, example) in enumerate(zip(records, stream.examples, strict=True)):
         transition = record.transition
         if record.reference_regime_id != example.reference_regime_id:
             raise ValueError("stationary additional-data regime order is invalid")
@@ -3630,9 +3733,7 @@ def _parse_stationary_extra_trace(
         ):
             raise ValueError(f"stationary additional-data transition {index} is invalid")
     known = [
-        record.backward_call_count
-        for record in records
-        if record.backward_call_count is not None
+        record.backward_call_count for record in records if record.backward_call_count is not None
     ]
     if sum(known) > backward_limit:
         raise ValueError("stationary additional-data backward-call limit is exceeded")
@@ -3650,22 +3751,21 @@ def _expected_additional_usage(
     probe_score_scalars: int,
     stationary_extra_trace: Sequence[Mapping[str, object]] | None,
 ) -> dict[str, object]:
-    if role == FRESH_PER_REGIME_ROLE:
+    if role == RETAINED_FRESH_PER_REGIME_ROLE:
         processed = len(trace.actions)
         initialized_prefix = min(processed + 1, len(protocol.regime_schedule))
         initialized = len(set(protocol.regime_schedule[:initialized_prefix]))
         ephemeral = sum(
-            len(
-                set(protocol.evaluator_regime_ids)
-                - set(protocol.regime_schedule[:checkpoint])
-            )
+            len(set(protocol.evaluator_regime_ids) - set(protocol.regime_schedule[:checkpoint]))
             for checkpoint in protocol.checkpoint_steps
             if checkpoint <= processed
         )
         return {
             "training_transitions": 0,
             "persistent_learner_initializations": initialized,
+            "persistent_learner_init_api_calls": 2 * initialized,
             "ephemeral_probe_initializations": ephemeral,
+            "ephemeral_probe_init_api_calls": 2 * ephemeral,
             "recurrence_resets": 0,
             "regime_selector_calls": processed,
         }
@@ -3678,6 +3778,7 @@ def _expected_additional_usage(
         return {
             "declared_exact_budget": run_config.extra_data_budget.to_config(),
             "pretraining_completed": True,
+            "learner_init_api_calls": 2,
             "training_transitions": len(stream.examples),
             "decision_calls": len(stream.examples),
             "update_calls": len(stream.examples),
@@ -3742,11 +3843,7 @@ def _reconstruct_role_report(
         raise ValueError(f"{role} seed does not match suite seed")
     available = _boolean(mapping["available"], name=f"{role}.available")
     reason_raw = mapping["unavailable_reason"]
-    reason = (
-        None
-        if reason_raw is None
-        else _string(reason_raw, name=f"{role}.unavailable_reason")
-    )
+    reason = None if reason_raw is None else _string(reason_raw, name=f"{role}.unavailable_reason")
     if available != (reason is None):
         raise ValueError(f"{role} availability and reason disagree")
     if role == ORACLE_ACTION_DATA_ROLE and not available:
@@ -3754,7 +3851,7 @@ def _reconstruct_role_report(
 
     trace = _trace_from_config(mapping["trace"], name=f"{role}.trace")
     lifecycle = {
-        FRESH_PER_REGIME_ROLE: run_config.fresh_lifecycle_id,
+        RETAINED_FRESH_PER_REGIME_ROLE: run_config.fresh_lifecycle_id,
         STATIONARY_MULTITASK_ROLE: run_config.stationary_lifecycle_id,
         ORACLE_ACTION_DATA_ROLE: run_config.oracle_lifecycle_id,
     }[role]
@@ -3770,7 +3867,7 @@ def _reconstruct_role_report(
     )
     if not available:
         processed = len(trace.actions)
-        if role == FRESH_PER_REGIME_ROLE:
+        if role == RETAINED_FRESH_PER_REGIME_ROLE:
             expected_reason = FRESH_UNAVAILABLE_REASON_PREFIX + repr(
                 protocol.regime_schedule[processed]
             )
@@ -3780,15 +3877,11 @@ def _reconstruct_role_report(
             if reason != STATIONARY_UNAVAILABLE_REASON or processed != 0:
                 raise ValueError("stationary reference unavailability is invalid")
 
-    expected_privileges = PrivilegedContinualControlReferenceSuite._privilege_disclosure(
-        role
-    )
-    if _canonical_json(mapping["privilege_disclosure"]) != _canonical_json(
-        expected_privileges
-    ):
+    expected_privileges = PrivilegedContinualControlReferenceSuite._privilege_disclosure(role)
+    if _canonical_json(mapping["privilege_disclosure"]) != _canonical_json(expected_privileges):
         raise ValueError(f"{role} privilege disclosure is invalid")
-    expected_comparability = (
-        PrivilegedContinualControlReferenceSuite._comparability_disclosure(role)
+    expected_comparability = PrivilegedContinualControlReferenceSuite._comparability_disclosure(
+        role
     )
     if _canonical_json(mapping["comparability_disclosure"]) != _canonical_json(
         expected_comparability
@@ -3812,9 +3905,7 @@ def _reconstruct_role_report(
         )
         if mapping["metrics"] is not None:
             raise ValueError(f"{role} unavailable metrics must remain unavailable")
-    if _canonical_json(mapping["metric_applicability"]) != _canonical_json(
-        applicability
-    ):
+    if _canonical_json(mapping["metric_applicability"]) != _canonical_json(applicability):
         raise ValueError(f"{role} metric applicability does not reconstruct")
 
     budget_config = _mapping(
@@ -3853,14 +3944,14 @@ def _reconstruct_role_report(
         probe_score_scalars=probe_score_scalars,
         stationary_extra_trace=parsed_extra_trace,
     )
-    if _canonical_json(mapping["additional_data_usage"]) != _canonical_json(
-        expected_additional
-    ):
+    if _canonical_json(mapping["additional_data_usage"]) != _canonical_json(expected_additional):
         raise ValueError(f"{role} additional-data usage does not reconstruct")
 
     resource = _parse_resource_usage(mapping["resource_usage"], role=role)
-    if role == FRESH_PER_REGIME_ROLE and resource["retained_learner_state_count"] != (
-        expected_additional["persistent_learner_initializations"]
+    if (
+        role == RETAINED_FRESH_PER_REGIME_ROLE
+        and resource["retained_learner_state_count"]
+        != (expected_additional["persistent_learner_initializations"])
     ):
         raise ValueError("fresh resource state count does not match initialization count")
     if role == STATIONARY_MULTITASK_ROLE and resource["retained_learner_state_count"] != 1:
@@ -3888,3 +3979,283 @@ def _reconstruct_role_report(
     if _canonical_json(reconstructed) != _canonical_json(mapping):
         raise ValueError(f"{role} report contains noncanonical numeric or structural data")
     return cast(dict[str, object], _json_clone(reconstructed))
+
+
+def _reconstruct_reference_report(
+    report: Mapping[str, object],
+    *,
+    verify_current_source: bool,
+) -> dict[str, object]:
+    _exact_keys(
+        report,
+        {
+            "schema_version",
+            "acceptance_status",
+            "development_only",
+            "scientific_promotion_allowed",
+            "accepted_scientific_evidence",
+            "interpretation",
+            "metric_definitions",
+            "suite_config",
+            "suite_config_sha256",
+            "source_core_sha256",
+            "reference_roles",
+            "reference_roles_sha256",
+            "ordinary_conditions_included",
+            "claim_thresholds_included",
+            "limitations",
+        },
+        name="privileged reference report",
+    )
+    if report["schema_version"] != REFERENCE_REPORT_SCHEMA:
+        raise ValueError("privileged reference report schema_version is invalid")
+    if report["acceptance_status"] != ACCEPTANCE_STATUS:
+        raise ValueError("privileged reference report must remain not-assessed")
+    if not _boolean(report["development_only"], name="report.development_only"):
+        raise ValueError("privileged reference report must remain development-only")
+    if _boolean(
+        report["scientific_promotion_allowed"],
+        name="report.scientific_promotion_allowed",
+    ) or _boolean(
+        report["accepted_scientific_evidence"],
+        name="report.accepted_scientific_evidence",
+    ):
+        raise ValueError("privileged reference report cannot claim promotion or evidence")
+    if report["interpretation"] != REPORT_INTERPRETATION:
+        raise ValueError("privileged reference report interpretation is invalid")
+    if _canonical_json(report["metric_definitions"]) != _canonical_json(
+        dict(control_core.CONTROL_METRIC_DEFINITIONS)
+    ):
+        raise ValueError("privileged reference metric definitions are invalid")
+
+    (
+        suite_config,
+        run_config,
+        protocol,
+        budget,
+        stream,
+        n_actions,
+        probe_examples,
+        probe_score_scalars,
+    ) = _parse_suite_config(report["suite_config"])
+    if _sha256(
+        report["suite_config_sha256"],
+        name="report.suite_config_sha256",
+    ) != _digest(suite_config):
+        raise ValueError("privileged reference suite config digest does not match")
+
+    raw_source_hashes = _mapping(
+        report["source_core_sha256"],
+        name="report.source_core_sha256",
+    )
+    source_hashes = {
+        path_name: _sha256(value, name=f"source_core_sha256.{path_name}")
+        for path_name, value in raw_source_hashes.items()
+    }
+    current_hashes = _source_core_hashes()
+    if set(source_hashes) != set(current_hashes):
+        raise ValueError("privileged reference source-core hash paths are invalid")
+    if verify_current_source and source_hashes != current_hashes:
+        raise ValueError("privileged reference source-core hashes do not match")
+
+    raw_roles = _list(report["reference_roles"], name="report.reference_roles")
+    if len(raw_roles) != len(REFERENCE_ROLES):
+        raise ValueError("privileged reference report role count is invalid")
+    roles = [
+        _reconstruct_role_report(
+            raw,
+            role=role,
+            suite_config=suite_config,
+            run_config=run_config,
+            protocol=protocol,
+            budget=budget,
+            stream=stream,
+            n_actions=n_actions,
+            probe_examples=probe_examples,
+            probe_score_scalars=probe_score_scalars,
+        )
+        for raw, role in zip(raw_roles, REFERENCE_ROLES, strict=True)
+    ]
+    if _sha256(
+        report["reference_roles_sha256"],
+        name="report.reference_roles_sha256",
+    ) != _digest(roles):
+        raise ValueError("privileged reference role digest does not match")
+    if _boolean(
+        report["ordinary_conditions_included"],
+        name="report.ordinary_conditions_included",
+    ):
+        raise ValueError("privileged references cannot enter ordinary conditions")
+    if _boolean(
+        report["claim_thresholds_included"],
+        name="report.claim_thresholds_included",
+    ):
+        raise ValueError("privileged reference report cannot include claim thresholds")
+    limitations = [
+        _string(value, name="report limitations")
+        for value in _list(report["limitations"], name="report.limitations")
+    ]
+    if limitations != list(REFERENCE_LIMITATIONS):
+        raise ValueError("privileged reference limitations are invalid or incomplete")
+
+    reconstructed = {
+        "schema_version": REFERENCE_REPORT_SCHEMA,
+        "acceptance_status": ACCEPTANCE_STATUS,
+        "development_only": True,
+        "scientific_promotion_allowed": False,
+        "accepted_scientific_evidence": False,
+        "interpretation": REPORT_INTERPRETATION,
+        "metric_definitions": dict(control_core.CONTROL_METRIC_DEFINITIONS),
+        "suite_config": suite_config,
+        "suite_config_sha256": _digest(suite_config),
+        "source_core_sha256": source_hashes,
+        "reference_roles": roles,
+        "reference_roles_sha256": _digest(roles),
+        "ordinary_conditions_included": False,
+        "claim_thresholds_included": False,
+        "limitations": limitations,
+    }
+    if _canonical_json(reconstructed) != _canonical_json(report):
+        raise ValueError("privileged reference report is noncanonical")
+    return cast(dict[str, object], _json_clone(reconstructed))
+
+
+def validate_privileged_control_reference_report(
+    report: Mapping[str, object],
+    *,
+    verify_current_source: bool = True,
+) -> PrivilegedReferenceValidation:
+    """Strictly reconstruct identities, traces, metrics, privileges, and budgets."""
+    try:
+        _reconstruct_reference_report(
+            report,
+            verify_current_source=verify_current_source,
+        )
+    except (KeyError, IndexError, TypeError, ValueError) as error:
+        return PrivilegedReferenceValidation(False, (str(error),))
+    return PrivilegedReferenceValidation(True, ())
+
+
+def privileged_control_reference_report_json(report: Mapping[str, object]) -> str:
+    validation = validate_privileged_control_reference_report(report)
+    if not validation.valid:
+        raise ValueError(
+            "invalid privileged continual-control reference report: " + "; ".join(validation.errors)
+        )
+    return (
+        json.dumps(
+            report,
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    )
+
+
+def _atomic_write_json(payload: Mapping[str, object], path: str | Path) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    payload,
+                    indent=2,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+                + "\n"
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def save_privileged_control_reference_report(
+    report: Mapping[str, object],
+    path: str | Path,
+) -> None:
+    """Atomically save only a strictly reconstructing reference report."""
+    validation = validate_privileged_control_reference_report(report)
+    if not validation.valid:
+        raise ValueError(
+            "invalid privileged continual-control reference report: " + "; ".join(validation.errors)
+        )
+    _atomic_write_json(report, path)
+
+
+def load_privileged_control_reference_report(
+    path: str | Path,
+    *,
+    verify_current_source: bool = True,
+) -> dict[str, object]:
+    """Load strict JSON and reconstruct the complete reference report."""
+    raw = json.loads(
+        Path(path).read_text(encoding="utf-8"),
+        parse_constant=_reject_nonstandard_json_constant,
+        object_pairs_hook=_reject_duplicate_keys,
+    )
+    return _reconstruct_reference_report(
+        _mapping(raw, name="privileged reference report"),
+        verify_current_source=verify_current_source,
+    )
+
+
+def _reject_nonstandard_json_constant(value: str) -> NoReturn:
+    raise ValueError(f"non-standard JSON numeric constant {value!r}")
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key {key!r}")
+        result[key] = value
+    return result
+
+
+__all__ = [
+    "ACCEPTANCE_STATUS",
+    "EXACT_ORACLE_CALLBACK_TEMPORAL_CONTRACT",
+    "EXACT_ORACLE_SCORE_SEMANTICS",
+    "RETAINED_FRESH_PER_REGIME_ROLE",
+    "ExactOracleOutcomeSourceFactory",
+    "FrozenExactOracleOutcomeSource",
+    "FrozenStationaryReferenceStream",
+    "ORACLE_ACTION_DATA_ROLE",
+    "ORACLE_SOURCE_SCHEMA",
+    "PrivilegedContinualControlReferenceSuite",
+    "PrivilegedReferenceExtraDataBudget",
+    "PrivilegedReferenceRunConfig",
+    "PrivilegedReferenceRunState",
+    "PrivilegedReferenceValidation",
+    "REFERENCE_CHECKPOINT_SCHEMA",
+    "REFERENCE_EXTRA_BUDGET_SCHEMA",
+    "REFERENCE_REPORT_SCHEMA",
+    "REFERENCE_ROLES",
+    "REFERENCE_RUN_CONFIG_SCHEMA",
+    "REFERENCE_SUITE_SCHEMA",
+    "ReferenceEnvironmentFactory",
+    "STATIONARY_EXAMPLE_SCHEMA",
+    "STATIONARY_MULTITASK_ROLE",
+    "STATIONARY_STREAM_SCHEMA",
+    "StationaryReferenceExample",
+    "StationaryReferenceLearnerFactory",
+    "RetainedRegimeIdentityLearnerFactory",
+    "load_privileged_control_reference_report",
+    "privileged_control_reference_report_json",
+    "save_privileged_control_reference_report",
+    "validate_privileged_control_reference_report",
+]
