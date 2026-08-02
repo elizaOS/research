@@ -7,11 +7,15 @@ Baseline: published-config UPGD-W, our 10-seed exact reproduction = 0.7791
 
 | arm | n | mean | stderr | vs SOTA | verdict |
 |---|---|---|---|---|---|
-| upgd_ema_norm | 6 | 0.85359 | 0.00010 | +0.0745 | BEATS-SOTA |
+| upgd_ema_norm | 9 | 0.85359 | 0.00008 | +0.0745 | BEATS-SOTA |
+| upgd_ema_norm_sigma0 | 3 | 0.85051 | 0.00025 | +0.0714 | BEATS-SOTA |
+| upgd_ema_norm_wd0005 | 3 | 0.84745 | 0.00008 | +0.0683 | BEATS-SOTA |
+| sgd_ema_norm | 3 | 0.83991 | 0.00007 | +0.0608 | BEATS-SOTA |
 | adamw_cbp | 10 | 0.79876 | 0.00009 | +0.0197 | BEATS-SOTA |
 | upgd_w_wd0005 | 10 | 0.78431 | 0.00014 | +0.0052 | BEATS-SOTA |
-| upgd_l2init | 3 | 0.78042 | 0.00030 | +0.0013 | BEATS-SOTA |
+| upgd_l2init | 3 | 0.78042 | 0.00030 | +0.0013 | TIES |
 | upgd_idbd | 3 | 0.77895 | 0.00020 | -0.0002 | TIES |
+| adamw_cbp_ema_norm | 1 | 0.76909 | 0.00000 | -0.0100 | BELOW |
 
 Pool64 paired controls (seeds 0-2): {1: 0.7787729776000001, 2: 0.77910898075, 0: 0.7786109820999999}; exact partials 0.77906/0.77903/0.77932;
 pool-vs-exact delta -0.00012. adamw_cbp + idbd arms ran exact/step mode.
@@ -55,6 +59,13 @@ pool-vs-exact delta -0.00012. adamw_cbp + idbd arms ran exact/step mode.
 | upgd_w_wclip_k1 | 0.7396 | -0.0381 | False |
 | upgd_autostep | 0.6863 | -0.0915 | False |
 | upgd_w_idbd_swift | 0.6029 | -0.1749 | False |
+
+## Mechanism decomposition (full-horizon confirmed)
+
+Stable across 60- and 200-task horizons: input conditioning +0.061 (dominant),
+utility gate +0.011 (real, orthogonal), perturbation +0.003 (marginal).
+Bare normalize+SGD+decay (0.83991) beats the published SOTA method (0.7791).
+Best form: normalized utility-gated SGD (sigma=0) = 0.85051 at ~1/7th compute.
 
 ## Mechanistic findings (see CONTINUAL_LEARNING_THEORY.md)
 

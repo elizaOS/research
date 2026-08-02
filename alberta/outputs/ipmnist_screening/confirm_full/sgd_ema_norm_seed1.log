@@ -1,3 +1,14 @@
 WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
 2026-08-02 02:33:17,906 INFO loading MNIST from data_home=/home/shaw/milady/alberta/outputs/step2_published_mnist_openml_cache
 2026-08-02 02:33:24,296 INFO running sgd_ema_norm seed=1 for 200 tasks x 5000 steps (noise_mode=step)
+2026-08-02 02:34:13,817 INFO sgd_ema_norm seed=1 task 20/200 online_acc=0.8406 elapsed=44.1s
+2026-08-02 02:34:51,452 INFO sgd_ema_norm seed=1 task 40/200 online_acc=0.8224 elapsed=81.7s
+2026-08-02 02:35:28,388 INFO sgd_ema_norm seed=1 task 60/200 online_acc=0.8316 elapsed=118.6s
+2026-08-02 02:36:05,617 INFO sgd_ema_norm seed=1 task 80/200 online_acc=0.8360 elapsed=155.9s
+2026-08-02 02:36:42,902 INFO sgd_ema_norm seed=1 task 100/200 online_acc=0.8492 elapsed=193.1s
+2026-08-02 02:37:20,470 INFO sgd_ema_norm seed=1 task 120/200 online_acc=0.8356 elapsed=230.7s
+2026-08-02 02:37:58,337 INFO sgd_ema_norm seed=1 task 140/200 online_acc=0.8452 elapsed=268.6s
+2026-08-02 02:38:36,153 INFO sgd_ema_norm seed=1 task 160/200 online_acc=0.8260 elapsed=306.4s
+2026-08-02 02:39:13,471 INFO sgd_ema_norm seed=1 task 180/200 online_acc=0.8284 elapsed=343.7s
+2026-08-02 02:39:51,218 INFO sgd_ema_norm seed=1 task 200/200 online_acc=0.8366 elapsed=381.5s
+2026-08-02 02:39:51,278 INFO sgd_ema_norm seed=1 done: avg online acc 0.8400 (wall 381.5s) -> outputs/ipmnist_screening/confirm_full/sgd_ema_norm_seed1.json

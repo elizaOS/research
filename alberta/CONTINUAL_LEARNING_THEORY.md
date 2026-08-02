@@ -31,6 +31,15 @@
 > under normalization (wd0005/lr shifts all hurt), so the wd0005 gain
 > does not compose — tuning wins and conditioning wins are alternatives,
 > not additive.
+>
+> **Full-horizon confirmation (200 tasks, 3 seeds each):** the
+> decomposition is stable across the 3.3× horizon extension —
+> `upgd_ema_norm_sigma0` 0.85051 and `sgd_ema_norm` 0.83991 (seed
+> spread ≤ 0.0008 on both), giving conditioning **+0.061**, gate
+> **+0.011**, noise **+0.003** against the full method's 0.85359 and
+> the published-config baseline's 0.7791.  Every rung of the cascade —
+> including bare normalize+SGD+decay — beats the published SOTA method
+> at full protocol length.
 
 Status: development analysis (never promotable evidence). Every number below
 is from our own protocol-exact runs — the ICLR-2024 online Input-permuted
