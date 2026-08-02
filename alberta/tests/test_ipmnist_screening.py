@@ -156,6 +156,7 @@ class TestRegistry:
             "muon_gate",
             "lion_gate",
             "rff_rls",
+            "lin_rls",
         }
         assert expected == set(SCREENING_REGISTRY)
 
@@ -2201,7 +2202,8 @@ class TestRFFRLS:
 
     EXPECTED_HP = {
         "rff_m": 1024.0,
-        "rff_gamma": 0.05,
+        "rff_gamma": 0.001,
+        "rff_clip": 3.0,
         "rls_lambda": 0.999,
         "rls_ridge_init": 1.0,
         "norm_decay": 0.99,
@@ -2226,6 +2228,30 @@ class TestRFFRLS:
         assert spec.factory is _make_rff_rls_learner
         assert spec.frozen_probe_input is _rff_frozen_probe_input
         assert spec.hyperparameters == self.EXPECTED_HP
+
+    def test_lin_rls_registry_and_smoke(self):
+        """Linear floor: d+1 features (scaled z-scores + bias), no projection;
+        smoke run above chance on a linearly separable stream."""
+        from alberta_framework.benchmarks.ipmnist_screening import _make_lin_rls_learner
+
+        spec = screening_spec("lin_rls")
+        assert spec.mechanism == "random_features"
+        assert spec.factory is _make_lin_rls_learner
+        assert spec.frozen_probe_input is _rff_frozen_probe_input
+        init_fn, step_fn = spec.factory(spec.hyperparameters)
+        params = init_mlp_params(jr.key(7), SMALL)
+        state = init_fn(params)
+        assert state.p.shape == (SMALL.input_dim + 1, SMALL.input_dim + 1)
+        assert state.wout.shape == (SMALL.input_dim + 1, SMALL.n_classes)
+        x, y = self._learnable_stream()
+        correct = 0
+        for i in range(len(x)):
+            _, state, (acc, loss, plas) = step_fn(
+                params, state, jnp.asarray(x[i]), jnp.asarray(y[i]), jr.key(i)
+            )
+            assert np.isfinite(float(loss))
+            correct += float(acc)
+        assert correct / len(x) > 0.2
 
     def test_state_shapes_init_and_symmetry(self):
         """Omega/phase/P/Wout shapes; P starts at (1/ridge)*I, Wout at zero;

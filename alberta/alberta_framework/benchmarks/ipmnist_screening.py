@@ -2454,8 +2454,17 @@ def _make_rff_rls_learner(
 
     1. ``x_norm = ema_normalize(x)`` with the champion's conditioning
        (``norm_decay`` 0.99, ``norm_epsilon`` 1e-8).
-    2. ``phi = sqrt(2/m) * cos(Omega @ x_norm + b)`` with frozen
+    2. ``z = clip(x_norm, -rff_clip, rff_clip)`` — near-zero-variance pixels
+       produce extreme z-scores under the 1e-8-epsilon normalizer, which
+       would randomize the cosine phases; clipping bounds the phase
+       contribution of any single pixel.
+    3. ``phi = sqrt(2/m) * cos(Omega @ z + b)`` with frozen
        ``Omega ~ N(0, rff_gamma * I)`` and ``b ~ Uniform[0, 2pi)``.
+       ``rff_gamma`` sets the RBF kernel bandwidth: pre-activation variance
+       is ``gamma * ||z||^2``; with 784-dim clipped z-scores the calibrated
+       value is ~1e-3 (the original 0.05 put pre-activation std at ~6
+       radians — pure phase noise — and scored 0.177, barely above chance;
+       the 2-task diagnostic sweep recovered 0.79→0.81 at 5e-3→2e-4).
     3. Pre-update prediction ``argmax(Wout.T @ phi)`` scores the protocol's
        online accuracy.
     4. Sherman-Morrison RLS with forgetting factor ``rls_lambda``:
@@ -2479,6 +2488,7 @@ def _make_rff_rls_learner(
     """
     m = int(hp["rff_m"])
     gamma = hp["rff_gamma"]
+    clip = hp["rff_clip"]
     rls_lambda = hp["rls_lambda"]
     ridge_init = hp["rls_ridge_init"]
     norm_decay = hp["norm_decay"]
@@ -2511,7 +2521,74 @@ def _make_rff_rls_learner(
     ) -> tuple[dict[str, Array], RFFRLSState, StepMetrics]:
         del key  # no randomness: the projection is frozen, RLS is closed-form
         x_norm, new_norm = ema_normalize(state.norm, x, norm_decay, norm_epsilon)
-        phi = feature_scale * jnp.cos(state.omega @ x_norm + state.phase)
+        z = jnp.clip(x_norm, -clip, clip)
+        phi = feature_scale * jnp.cos(state.omega @ z + state.phase)
+        logits = state.wout.T @ phi
+        accuracy = (jnp.argmax(logits) == y).astype(jnp.float32)
+        y_onehot = jax.nn.one_hot(y, state.wout.shape[1], dtype=jnp.float32)
+        err = y_onehot - logits
+        loss = 0.5 * jnp.sum(err * err)
+        pp = state.p @ phi
+        gain = pp / (rls_lambda + phi @ pp)
+        new_wout = state.wout + jnp.outer(gain, err)
+        new_p = (state.p - jnp.outer(gain, pp)) / rls_lambda
+        new_p = 0.5 * (new_p + new_p.T)
+        err_after = y_onehot - new_wout.T @ phi
+        loss_after = 0.5 * jnp.sum(err_after * err_after)
+        plasticity = jnp.clip(
+            1.0 - loss_after / jnp.maximum(loss, _PLASTICITY_LOSS_FLOOR), 0.0, 1.0
+        )
+        return params, RFFRLSState(  # type: ignore[call-arg]
+            omega=state.omega,
+            phase=state.phase,
+            p=new_p,
+            wout=new_wout,
+            norm=new_norm,
+        ), (accuracy, loss, plasticity)
+
+    return init_fn, full_step
+
+
+def _make_lin_rls_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Linear floor of the tracking control: RLS on clipped z-scores directly.
+
+    Identical pipeline to :func:`_make_rff_rls_learner` but with the feature
+    map replaced by the normalized input itself, scaled by ``1/sqrt(d)`` and
+    concatenated with a constant bias feature (``m = d + 1``). No random
+    projection, no nonlinearity, no backprop — the cheapest possible measure
+    of how far pure linear tracking goes on this protocol. In the 2-task
+    calibration diagnostic this floor already reached 0.78, i.e. the
+    published-SOTA neighborhood, with no representation at all.
+    """
+    clip = hp["rff_clip"]
+    rls_lambda = hp["rls_lambda"]
+    ridge_init = hp["rls_ridge_init"]
+    norm_decay = hp["norm_decay"]
+    norm_epsilon = hp["norm_epsilon"]
+
+    def init_fn(params: dict[str, Array]) -> RFFRLSState:
+        input_dim = params["w1"].shape[0]
+        n_classes = params["w3"].shape[1]
+        m = input_dim + 1
+        return RFFRLSState(  # type: ignore[call-arg]
+            omega=jnp.zeros((1, input_dim), dtype=jnp.float32),
+            phase=jnp.zeros((1,), dtype=jnp.float32),
+            p=jnp.eye(m, dtype=jnp.float32) / ridge_init,
+            wout=jnp.zeros((m, n_classes), dtype=jnp.float32),
+            norm=_init_input_norm_state(params),
+        )
+
+    def full_step(
+        params: dict[str, Array], state: RFFRLSState, x: Array, y: Array, key: Array
+    ) -> tuple[dict[str, Array], RFFRLSState, StepMetrics]:
+        del key
+        x_norm, new_norm = ema_normalize(state.norm, x, norm_decay, norm_epsilon)
+        z = jnp.clip(x_norm, -clip, clip)
+        phi = jnp.concatenate(
+            [z / jnp.sqrt(jnp.float32(z.shape[0])), jnp.ones((1,), jnp.float32)]
+        )
         logits = state.wout.T @ phi
         accuracy = (jnp.argmax(logits) == y).astype(jnp.float32)
         y_onehot = jax.nn.one_hot(y, state.wout.shape[1], dtype=jnp.float32)
@@ -3263,7 +3340,8 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             mechanism="random_features",
             hyperparameters={
                 "rff_m": 1024.0,
-                "rff_gamma": 0.05,
+                "rff_gamma": 0.001,
+                "rff_clip": 3.0,
                 "rls_lambda": 0.999,
                 "rls_ridge_init": 1.0,
                 "norm_decay": 0.99,
@@ -3274,11 +3352,38 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             frozen_probe_input=_rff_frozen_probe_input,
             description=(
                 "No-backprop tracking control: champion EMA input normalizer "
-                "(decay 0.99) into frozen random Fourier features (m=1024, "
-                "Omega ~ N(0, 0.05*I), phase ~ U[0, 2pi)) with a streaming "
-                "one-vs-all RLS readout (forgetting 0.999, ridge init 1.0). "
-                "If this matches the deep arms, the benchmark measures "
-                "tracking rather than learning."
+                "(decay 0.99), z-scores clipped to +/-3, frozen random "
+                "Fourier features (m=1024, Omega ~ N(0, 0.001*I) — bandwidth "
+                "calibrated after the 0.05 draft scored chance-level phase "
+                "noise), streaming one-vs-all RLS readout (forgetting 0.999, "
+                "ridge init 1.0). If this matches the deep arms, the "
+                "benchmark measures tracking rather than learning."
+            ),
+        )
+    )
+    specs.append(
+        ScreeningSpec(
+            name="lin_rls",
+            base_learner="upgd_w",
+            mechanism="random_features",
+            hyperparameters={
+                "rff_m": 785.0,
+                "rff_gamma": 0.0,
+                "rff_clip": 3.0,
+                "rls_lambda": 0.999,
+                "rls_ridge_init": 1.0,
+                "norm_decay": 0.99,
+                "norm_epsilon": 1e-8,
+                "noise_std": 0.0,
+            },
+            factory=_make_lin_rls_learner,
+            frozen_probe_input=_rff_frozen_probe_input,
+            description=(
+                "Linear floor of the tracking control: champion EMA input "
+                "normalizer, z-scores clipped to +/-3 and scaled by "
+                "1/sqrt(784) with a bias feature, streaming one-vs-all RLS "
+                "readout (forgetting 0.999). No features at all — measures "
+                "how far pure linear tracking goes on this protocol."
             ),
         )
     )
