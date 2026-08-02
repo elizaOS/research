@@ -3210,3 +3210,25 @@ class TestFixedBudgetInteractionLearner:
 
         chex.assert_shape(result.metrics, (10, 7))
         chex.assert_tree_all_finite(result.metrics)
+
+
+class TestReplaceFractionRemoval:
+    """The vestigial replace_fraction knob is gone but legacy configs load."""
+
+    def test_constructor_rejects_replace_fraction(self) -> None:
+        with pytest.raises(TypeError):
+            FixedBudgetFeatureLearner(n_features=4, n_tasks=1, replace_fraction=0.5)  # type: ignore[call-arg]
+
+    def test_to_config_omits_replace_fraction(self) -> None:
+        learner = FixedBudgetFeatureLearner(n_features=4, n_tasks=1)
+
+        assert "replace_fraction" not in learner.to_config()
+
+    def test_from_config_drops_legacy_replace_fraction(self) -> None:
+        learner = FixedBudgetFeatureLearner(n_features=4, n_tasks=2, candidate_count=1)
+        legacy = dict(learner.to_config())
+        legacy["replace_fraction"] = 0.25
+
+        restored = FixedBudgetFeatureLearner.from_config(legacy)
+
+        assert restored.to_config() == learner.to_config()

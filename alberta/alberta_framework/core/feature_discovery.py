@@ -131,7 +131,6 @@ class FixedBudgetFeatureLearner:
         step_size_feature: float = 0.003,
         utility_decay: float = 0.995,
         replacement_interval: int = 200,
-        replace_fraction: float = 1.0,
         min_feature_age: int = 100,
         candidate_count: int = 0,
         candidate_min_age: int = 50,
@@ -178,11 +177,11 @@ class FixedBudgetFeatureLearner:
             step_size_feature: LMS step-size for feature-constructor weights.
             utility_decay: EMA decay for feature utility estimates.
             replacement_interval: Steps between utility-based replacement
-                attempts.  Set to ``0`` to disable replacement.
-            replace_fraction: Accepted and serialized for sweep-configuration
-                compatibility but not read by the update path: exactly one
-                slot is replaced per replacement event regardless of this
-                value.
+                attempts.  Set to ``0`` to disable replacement.  Exactly one
+                slot is replaced (or one candidate promoted) per replacement
+                event; the removed ``replace_fraction`` knob was never read
+                by the update path and is silently dropped by
+                :meth:`from_config` for old serialized configurations.
             min_feature_age: Minimum active age before a feature can be
                 discarded.
             candidate_count: Number of shadow candidate features to train.
@@ -331,7 +330,6 @@ class FixedBudgetFeatureLearner:
         self._step_size_feature = step_size_feature
         self._utility_decay = utility_decay
         self._replacement_interval = replacement_interval
-        self._replace_fraction = replace_fraction
         self._min_feature_age = min_feature_age
         self._candidate_count = candidate_count
         self._candidate_min_age = candidate_min_age
@@ -383,7 +381,6 @@ class FixedBudgetFeatureLearner:
             "step_size_feature": self._step_size_feature,
             "utility_decay": self._utility_decay,
             "replacement_interval": self._replacement_interval,
-            "replace_fraction": self._replace_fraction,
             "min_feature_age": self._min_feature_age,
             "candidate_count": self._candidate_count,
             "candidate_min_age": self._candidate_min_age,
@@ -425,6 +422,9 @@ class FixedBudgetFeatureLearner:
         """Reconstruct learner from ``to_config`` output."""
         config = dict(config)
         config.pop("type", None)
+        # replace_fraction was serialized by older versions but never read by
+        # the update path; drop it so old configs keep loading.
+        config.pop("replace_fraction", None)
         generator_mix = config.pop("generator_mix", (1.0, 0.0, 0.0))
         replacement_multipliers = config.pop(
             "plasticity_replacement_multipliers",

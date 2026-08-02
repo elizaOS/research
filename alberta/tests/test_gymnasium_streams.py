@@ -11,6 +11,7 @@ from alberta_framework.streams.gymnasium import (  # noqa: E402
     GymnasiumStream,
     PredictionMode,
     TDStream,
+    collect_trajectory,
     make_epsilon_greedy_policy,
     make_gymnasium_stream,
     make_random_policy,
@@ -442,3 +443,93 @@ class TestStreamIterator:
         env = gymnasium.make("CartPole-v1")
         stream = GymnasiumStream(env, mode=PredictionMode.REWARD)
         assert iter(stream) is stream
+
+
+class TestCollectTrajectoryValueMode:
+    """collect_trajectory VALUE targets with and without a value estimator."""
+
+    def test_without_estimator_matches_reward_targets(self):
+        """Documented zero bootstrap: VALUE targets equal immediate reward."""
+        env_a = gymnasium.make("CartPole-v1")
+        env_b = gymnasium.make("CartPole-v1")
+
+        _, reward_targets = collect_trajectory(
+            env_a, None, num_steps=40, mode=PredictionMode.REWARD, seed=3
+        )
+        _, value_targets = collect_trajectory(
+            env_b, None, num_steps=40, mode=PredictionMode.VALUE, seed=3
+        )
+
+        assert jnp.allclose(value_targets, reward_targets)
+
+    def test_with_estimator_bootstraps_td_target(self):
+        """With V(s)=1 the non-terminal targets shift by exactly gamma."""
+        gamma = 0.5
+        env_a = gymnasium.make("CartPole-v1")
+        env_b = gymnasium.make("CartPole-v1")
+
+        _, reward_targets = collect_trajectory(
+            env_a, None, num_steps=60, mode=PredictionMode.REWARD, seed=7
+        )
+        _, value_targets = collect_trajectory(
+            env_b,
+            None,
+            num_steps=60,
+            mode=PredictionMode.VALUE,
+            seed=7,
+            value_estimator=lambda _obs: 1.0,
+            gamma=gamma,
+        )
+
+        diffs = value_targets - reward_targets
+        # Every step is either bootstrapped (+gamma * 1.0) or terminal (+0).
+        bootstrapped = jnp.isclose(diffs, gamma)
+        terminal = jnp.isclose(diffs, 0.0)
+        assert bool(jnp.all(bootstrapped | terminal))
+        # Random CartPole rollouts of 60 steps contain non-terminal steps.
+        assert bool(jnp.any(bootstrapped))
+
+    def test_estimator_receives_next_observation(self):
+        """The bootstrap value is computed from the next observation."""
+        env = gymnasium.make("CartPole-v1")
+        seen: list[tuple[float, ...]] = []
+
+        def estimator(obs) -> float:
+            seen.append(tuple(float(v) for v in obs))
+            return 0.0
+
+        observations, _ = collect_trajectory(
+            env,
+            None,
+            num_steps=10,
+            mode=PredictionMode.VALUE,
+            include_action_in_features=False,
+            seed=11,
+            value_estimator=estimator,
+        )
+
+        assert seen
+        # Each recorded estimator input is a full 4-dim CartPole observation.
+        assert all(len(obs) == 4 for obs in seen)
+        # Non-terminal steps: estimator input equals the following feature row.
+        first_input = jnp.asarray(seen[0], dtype=jnp.float32)
+        assert jnp.allclose(first_input, observations[1], atol=1e-6)
+
+    def test_estimator_ignored_by_reward_mode(self):
+        """value_estimator only affects VALUE mode."""
+        env_a = gymnasium.make("CartPole-v1")
+        env_b = gymnasium.make("CartPole-v1")
+
+        _, plain = collect_trajectory(
+            env_a, None, num_steps=20, mode=PredictionMode.REWARD, seed=5
+        )
+        _, with_estimator = collect_trajectory(
+            env_b,
+            None,
+            num_steps=20,
+            mode=PredictionMode.REWARD,
+            seed=5,
+            value_estimator=lambda _obs: 100.0,
+        )
+
+        assert jnp.allclose(plain, with_estimator)

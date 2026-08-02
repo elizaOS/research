@@ -158,9 +158,9 @@ class OptionModelsState:
 
     Checkpoint schema note:
         These fields are part of the JAX PyTree. Generic Orbax restores require
-        an exact template match; the repository does not currently provide a
-        versioned STOMP-state migration loader for checkpoints written before
-        the environment-return, duration, and baseline-mass fields were added.
+        an exact template match; use :func:`load_stomp_state_with_migration`
+        to load checkpoints written before the environment-return, duration,
+        and baseline-mass fields were added.
 
     Attributes:
         cumreward_ema: Shape ``(n_options,)``.  EMA of observed cumulative
@@ -2043,6 +2043,174 @@ def subtasks_from_feature_scores(
     ]
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint payloads and STOMP-state migration
+# ---------------------------------------------------------------------------
+
+#: Option-model fields added by the environment-return/duration/baseline-mass
+#: expansion.  Pre-expansion checkpoints lack exactly these keys.
+STOMP_OPTION_MODEL_EXPANSION_FIELDS = (
+    "env_return_ema",
+    "duration_ema",
+    "baseline_mass_ema",
+)
+
+#: Top-level ``STOMPState`` accumulators added by the same expansion.
+STOMP_STATE_EXPANSION_FIELDS = (
+    "option_env_cumreward",
+    "option_baseline_mass",
+)
+
+
+def stomp_state_to_checkpoint_payload(state: STOMPState) -> dict[str, Any]:
+    """Flatten a :class:`STOMPState` into a field-keyed checkpoint payload.
+
+    The payload maps every ``STOMPState`` field name to its value, with
+    ``option_models`` and ``option_policies`` expanded into nested field-keyed
+    dictionaries.  ``load_stomp_state_with_migration`` accepts exactly this
+    layout, so ``load(to_payload(state))`` round-trips losslessly.
+
+    Args:
+        state: The STOMP agent state to flatten.
+
+    Returns:
+        Nested plain-dict payload suitable for generic checkpointers.
+    """
+    payload: dict[str, Any] = {
+        field.name: getattr(state, field.name)
+        for field in dataclasses.fields(STOMPState)  # type: ignore[arg-type]
+    }
+    payload["option_models"] = {
+        field.name: getattr(state.option_models, field.name)
+        for field in dataclasses.fields(OptionModelsState)  # type: ignore[arg-type]
+    }
+    payload["option_policies"] = {
+        field.name: getattr(state.option_policies, field.name)
+        for field in dataclasses.fields(IntraOptionPoliciesState)  # type: ignore[arg-type]
+    }
+    return payload
+
+
+def _sub_payload_as_dict(value: Any, name: str, cls: type) -> dict[str, Any]:
+    """Normalize a nested payload entry to a plain field-keyed dict."""
+    if isinstance(value, cls):
+        return {
+            field.name: getattr(value, field.name)
+            for field in dataclasses.fields(cls)
+        }
+    if isinstance(value, dict):
+        return dict(value)
+    raise ValueError(
+        f"'{name}' must be a field-keyed dict or {cls.__name__}, "
+        f"got {type(value).__name__}"
+    )
+
+
+def load_stomp_state_with_migration(payload: dict[str, Any]) -> STOMPState:
+    """Load a STOMP checkpoint payload, migrating pre-expansion templates.
+
+    Pre-expansion checkpoints were written before the option models tracked
+    the discounted environment return, primitive-step duration, and discounted
+    baseline mass, and before ``STOMPState`` carried the matching in-flight
+    accumulators.  This loader detects that old template by the missing keys
+    and fills principled defaults:
+
+    * ``option_models.env_return_ema``, ``option_models.duration_ema``, and
+      ``option_models.baseline_mass_ema`` become zeros of shape
+      ``(n_options,)`` — the same "no completed option executions observed"
+      prior that :meth:`STOMPAgent.init` uses, so the EMAs warm-start exactly
+      as on a fresh agent.
+    * ``option_env_cumreward`` and ``option_baseline_mass`` become scalar
+      zeros — any option mid-flight at checkpoint time restarts its
+      environment-return and baseline-mass accumulation, since the old
+      format never recorded those quantities.
+
+    Everything present in the payload is required: missing pre-expansion
+    fields or unknown keys raise ``ValueError`` (fail-closed) rather than
+    being silently defaulted or dropped.
+
+    Args:
+        payload: Field-keyed payload as produced by
+            :func:`stomp_state_to_checkpoint_payload` (new format) or its
+            pre-expansion equivalent (old format).
+
+    Returns:
+        A fully populated :class:`STOMPState`.
+
+    Raises:
+        ValueError: If any non-expansion field is missing or the payload
+            contains keys that are not ``STOMPState`` fields.
+    """
+    data = dict(payload)
+    state_field_names = {
+        field.name
+        for field in dataclasses.fields(STOMPState)  # type: ignore[arg-type]
+    }
+    unknown = sorted(set(data) - state_field_names)
+    if unknown:
+        raise ValueError(f"Unknown STOMPState checkpoint fields: {unknown}")
+    missing_required = sorted(
+        state_field_names - set(data) - set(STOMP_STATE_EXPANSION_FIELDS)
+    )
+    if missing_required:
+        raise ValueError(
+            f"STOMP checkpoint payload is missing required fields: {missing_required}"
+        )
+
+    models = _sub_payload_as_dict(
+        data.pop("option_models"), "option_models", OptionModelsState
+    )
+    model_field_names = {
+        field.name
+        for field in dataclasses.fields(OptionModelsState)  # type: ignore[arg-type]
+    }
+    unknown_models = sorted(set(models) - model_field_names)
+    if unknown_models:
+        raise ValueError(
+            f"Unknown OptionModelsState checkpoint fields: {unknown_models}"
+        )
+    missing_models = sorted(
+        model_field_names - set(models) - set(STOMP_OPTION_MODEL_EXPANSION_FIELDS)
+    )
+    if missing_models:
+        raise ValueError(
+            f"STOMP option-model payload is missing required fields: {missing_models}"
+        )
+    cumreward_ema = jnp.asarray(models["cumreward_ema"], dtype=jnp.float32)
+    for name in STOMP_OPTION_MODEL_EXPANSION_FIELDS:
+        if name in models:
+            models[name] = jnp.asarray(models[name], dtype=jnp.float32)
+        else:
+            models[name] = jnp.zeros_like(cumreward_ema)
+    option_models = OptionModelsState(**models)
+
+    policies = _sub_payload_as_dict(
+        data.pop("option_policies"), "option_policies", IntraOptionPoliciesState
+    )
+    policy_field_names = {
+        field.name
+        for field in dataclasses.fields(IntraOptionPoliciesState)  # type: ignore[arg-type]
+    }
+    if set(policies) != policy_field_names:
+        raise ValueError(
+            "STOMP option-policy payload fields "
+            f"{sorted(policies)} != {sorted(policy_field_names)}"
+        )
+    option_policies = IntraOptionPoliciesState(**policies)
+
+    for name in STOMP_STATE_EXPANSION_FIELDS:
+        if name in data:
+            data[name] = jnp.asarray(data[name], dtype=jnp.float32)
+        else:
+            data[name] = jnp.array(0.0, dtype=jnp.float32)
+
+    return STOMPState(
+        option_models=option_models,
+        option_policies=option_policies,
+        **data,
+    )
+
+
 __all__ = [
     "DISPATCH_OWNER_BASE_PRIMITIVE",
     "DISPATCH_OWNER_INVALID",
@@ -2058,9 +2226,13 @@ __all__ = [
     "STOMPStartResult",
     "STOMPState",
     "STOMPUpdateResult",
+    "STOMP_OPTION_MODEL_EXPANSION_FIELDS",
+    "STOMP_STATE_EXPANSION_FIELDS",
     "SubtaskSpec",
     "check_option_terminated",
     "compute_pseudo_reward",
+    "load_stomp_state_with_migration",
     "replace_dispatched_primitive_action",
+    "stomp_state_to_checkpoint_payload",
     "subtasks_from_feature_scores",
 ]

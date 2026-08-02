@@ -12,10 +12,11 @@ Supports multiple prediction modes:
 - NEXT_STATE: Predict next state from (state, action)
 - VALUE: TD-style value target ``reward + gamma * V(next)``.  How much
   genuine bootstrapping happens depends on the collector:
-  :func:`collect_trajectory` always uses a zero bootstrap (targets reduce
-  to immediate reward), :class:`GymnasiumStream` bootstraps only after
-  ``set_value_estimator`` is called, and :class:`TDStream` bootstraps from
-  a caller-updated value function.
+  :func:`collect_trajectory` bootstraps only when a ``value_estimator`` is
+  passed (zero bootstrap otherwise, so targets reduce to immediate reward),
+  :class:`GymnasiumStream` bootstraps only after ``set_value_estimator`` is
+  called, and :class:`TDStream` bootstraps from a caller-updated value
+  function.
 """
 
 from __future__ import annotations
@@ -196,6 +197,8 @@ def collect_trajectory(
     mode: PredictionMode = PredictionMode.REWARD,
     include_action_in_features: bool = True,
     seed: int = 0,
+    value_estimator: Callable[[Array], float] | None = None,
+    gamma: float = 0.99,
 ) -> tuple[Array, Array]:
     """Collect a trajectory from a Gymnasium environment.
 
@@ -207,11 +210,17 @@ def collect_trajectory(
         env: Gymnasium environment instance
         policy: Action selection function. If None, uses random policy
         num_steps: Number of steps to collect
-        mode: What to predict (REWARD, NEXT_STATE, VALUE). VALUE uses a
-            zero bootstrap here, so its targets equal immediate reward;
-            use :class:`TDStream` for genuine bootstrapped TD targets.
+        mode: What to predict (REWARD, NEXT_STATE, VALUE). VALUE targets
+            are ``reward + gamma * value_estimator(next_obs)`` when a
+            ``value_estimator`` is supplied (``reward`` alone on
+            termination); without one the documented zero bootstrap makes
+            targets equal immediate reward. Use :class:`TDStream` for
+            targets that bootstrap from a learner updated during collection.
         include_action_in_features: If True, features = concat(obs, action)
         seed: Random seed for environment resets and random policy
+        value_estimator: Optional fixed state-value function ``V(next_obs)``
+            used only by VALUE mode for the TD bootstrap
+        gamma: Discount factor used only by VALUE mode
 
     Returns:
         Tuple of (observations, targets) as JAX arrays with shape
@@ -247,8 +256,16 @@ def collect_trajectory(
         elif mode == PredictionMode.NEXT_STATE:
             target = next_obs
         else:  # VALUE mode
-            # TD target with 0 bootstrap (simple version)
-            target = jnp.atleast_1d(jnp.array(reward, dtype=jnp.float32))
+            # TD target reward + gamma * V(next); zero bootstrap without an
+            # estimator (documented on PredictionMode.VALUE) and on
+            # termination, where the post-terminal value is defined as zero.
+            if value_estimator is not None and not terminated:
+                bootstrap = gamma * float(value_estimator(next_obs))
+            else:
+                bootstrap = 0.0
+            target = jnp.atleast_1d(
+                jnp.array(float(reward) + bootstrap, dtype=jnp.float32)
+            )
 
         observations.append(features)
         targets.append(target)
