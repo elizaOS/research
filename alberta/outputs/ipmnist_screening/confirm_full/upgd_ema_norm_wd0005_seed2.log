@@ -6,3 +6,4 @@ WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a 
 2026-08-02 01:40:05,937 INFO upgd_ema_norm_wd0005 seed=2 task 60/200 online_acc=0.8536 elapsed=3181.3s
 2026-08-02 01:57:31,251 INFO upgd_ema_norm_wd0005 seed=2 task 80/200 online_acc=0.8462 elapsed=4226.6s
 2026-08-02 02:15:18,448 INFO upgd_ema_norm_wd0005 seed=2 task 100/200 online_acc=0.8428 elapsed=5293.8s
+2026-08-02 02:26:41,818 INFO upgd_ema_norm_wd0005 seed=2 task 120/200 online_acc=0.8512 elapsed=5977.2s

@@ -172,3 +172,29 @@ different control).
 - Interesting paired contrasts once merged: vs `upgd_w_control` (standard),
   and vs `adamw_cbp` / `upgd_ema_norm` on the adamw-family/normalized side
   (separate summary files as above; never overwrite `summary.json`).
+
+## Wave 6 (`jobs6.txt`, 2026-08-02): `sgd_ema_norm` — the gate ablation
+
+- Motivation: `upgd_ema_norm` leads the screen (0.8529; 0.85357 confirmed at
+  200 tasks) and `upgd_ema_norm_sigma0` TIES it (0.8520), so under input
+  conditioning the method is normalize + utility-GATED SGD + decay. This arm
+  closes the dissection: does the gate itself matter?
+- `sgd_ema_norm` — plain SGD with decoupled weight decay
+  (`w <- w*(1 - lr*wd) - lr*grad`) behind the EXACT `upgd_ema_norm` EMA input
+  normalizer (norm_decay 0.999, norm_epsilon 1e-8, same state threading;
+  normalizer states pinned bitwise against `upgd_ema_norm`'s on a shared
+  stream). lr 0.01, wd 0.01 (the leader's non-noise values). NO utility, NO
+  gate, NO noise — the per-step RNG key is unused; hand-computed-trajectory
+  reduction pinned in `tests/test_ipmnist_screening.py`.
+- Ops: seeds 0-2 in `jobs6.txt`, launched detached 2026-08-02 via
+  `setsid xargs -P 3 -n 2 bash worker.sh < jobs6.txt` (idempotent; shards
+  land in `shards/`, launch log `wave6_launch.log`). Cost ~ `upgd_w_sigma0`
+  (no noise draw) minus the utility bookkeeping — the cheapest UPGD-family
+  arm yet.
+- Interpretation once merged (paired vs `upgd_ema_norm` /
+  `upgd_ema_norm_sigma0` on shared seeds; separate summary file, never
+  overwrite `summary.json`): a tie at ~0.85 means the gate is NOT
+  load-bearing on this no-recurrence protocol and the SOTA here reduces to
+  normalize + SGD + decay; a drop toward the raw-input UPGD/AdamW band
+  (~0.75-0.78) means the utility gate IS the mechanism and
+  normalized-gated-SGD stands as the method.

@@ -7,3 +7,4 @@ WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a 
 2026-08-02 01:47:35,308 INFO adamw_cbp_ema_norm seed=0 task 80/200 online_acc=0.7782 elapsed=3624.3s
 2026-08-02 02:02:22,402 INFO adamw_cbp_ema_norm seed=0 task 100/200 online_acc=0.7734 elapsed=4511.4s
 2026-08-02 02:17:18,788 INFO adamw_cbp_ema_norm seed=0 task 120/200 online_acc=0.7578 elapsed=5407.8s
+2026-08-02 02:27:42,231 INFO adamw_cbp_ema_norm seed=0 task 140/200 online_acc=0.7580 elapsed=6031.2s

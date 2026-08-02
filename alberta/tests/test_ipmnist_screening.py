@@ -8,6 +8,7 @@ test shard/merge/validation plumbing. Benchmark executions never run here.
 import json
 import math
 
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -26,6 +27,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     _make_adamw_cbp_learner,
     _make_adamw_cbp_noreset_learner,
     _make_guarded_cbp_adam_learner,
+    _make_sgd_ema_norm_learner,
     _make_upgd_alpha_utility_learner,
     _make_upgd_idbd_learner,
     _make_upgd_w_fade_head_learner,
@@ -53,6 +55,7 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     UPGD_W_PROTOCOL_HYPERPARAMETERS,
     IPMNISTConfig,
     LeanUPGDState,
+    cross_entropy_loss,
     init_mlp_params,
     lean_upgd_w_update,
     run_ipmnist,
@@ -112,6 +115,7 @@ class TestRegistry:
             "upgd_ema_norm_lr003",
             "upgd_ema_norm_lr0003",
             "upgd_ema_norm_sigma0",
+            "sgd_ema_norm",
         }
         assert expected == set(SCREENING_REGISTRY)
 
@@ -663,6 +667,7 @@ class TestSmokeRuns:
         "upgd_w_localgate", "upgd_w_fade_head", "upgd_w_idbd_swift",
         "guarded_cbp_adam", "adamw_cbp_noreset", "adamw_cbp_ema_norm",
         "upgd_w_sigma0", "upgd_alpha_utility", "adamw_cbp_r3e4",
+        "sgd_ema_norm",
     ])
     def test_combo_runs_and_is_finite(self, small_data, name):
         x, y = small_data
@@ -1101,6 +1106,118 @@ class TestUPGDSigma0:
             x, y, screening_spec("upgd_w_control"), seed=5, config=SMALL
         )
         assert not np.array_equal(ours.per_task_loss, control.per_task_loss)
+
+
+class TestSGDEMANorm:
+    """Gate ablation: plain SGD + decoupled decay behind the exact
+    upgd_ema_norm EMA input normalizer — no utility, no gate, no noise."""
+
+    def test_registry_config(self):
+        spec = screening_spec("sgd_ema_norm")
+        norm = screening_spec("upgd_ema_norm")
+        assert spec.mechanism == "input_normalization"
+        assert spec.noise_update is None
+        assert spec.factory is _make_sgd_ema_norm_learner
+        # exact upgd_ema_norm non-noise optimizer + normalizer values
+        assert spec.hyperparameters == {
+            "step_size": norm.hyperparameters["step_size"],
+            "weight_decay": norm.hyperparameters["weight_decay"],
+            "norm_decay": norm.hyperparameters["norm_decay"],
+            "norm_epsilon": norm.hyperparameters["norm_epsilon"],
+        }
+        assert spec.hyperparameters["step_size"] == 0.01
+        assert spec.hyperparameters["weight_decay"] == 0.01
+        # no utility, no gate, no noise — not even as inert hyperparameters
+        assert "utility_decay" not in spec.hyperparameters
+        assert "noise_std" not in spec.hyperparameters
+
+    def test_reduction_pin_hand_computed_sgd_decay(self):
+        """The full step equals a hand-computed normalize -> grad ->
+        ``w * (1 - lr*wd) - lr*grad`` trajectory, bit-for-bit."""
+        hp = screening_spec("sgd_ema_norm").hyperparameters
+        init_fn, step_fn = _make_sgd_ema_norm_learner(hp)
+        params = init_mlp_params(jr.key(3), SMALL)
+        state = init_fn(params)
+        ref_params = params
+        norm_state = EMANormState(
+            mean=jnp.zeros(SMALL.input_dim),
+            var=jnp.ones(SMALL.input_dim),
+            count=jnp.array(0.0),
+        )
+        decay = 1.0 - hp["step_size"] * hp["weight_decay"]
+        key = jr.key(21)
+        for i in range(4):
+            x = jr.normal(jr.fold_in(key, i), (SMALL.input_dim,)) * 2.0 + 0.5
+            y = jnp.array(i % SMALL.n_classes, jnp.int32)
+            params, state, _ = step_fn(params, state, x, y, jr.key(1000 + i))
+            x_norm, norm_state = ema_normalize(
+                norm_state, x, hp["norm_decay"], hp["norm_epsilon"]
+            )
+            _, grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+                ref_params, x_norm, y
+            )
+            ref_params = {
+                n: ref_params[n] * decay - hp["step_size"] * grads[n]
+                for n in ref_params
+            }
+            for n in ref_params:
+                np.testing.assert_array_equal(
+                    np.asarray(params[n]), np.asarray(ref_params[n])
+                )
+
+    def test_key_is_unused(self):
+        """No noise: stepping with different RNG keys is bit-identical."""
+        hp = screening_spec("sgd_ema_norm").hyperparameters
+        init_fn, step_fn = _make_sgd_ema_norm_learner(hp)
+        params = init_mlp_params(jr.key(7), SMALL)
+        state = init_fn(params)
+        x = jr.normal(jr.key(40), (SMALL.input_dim,))
+        y = jnp.array(2, jnp.int32)
+        p_a, s_a, _ = step_fn(params, state, x, y, jr.key(0))
+        p_b, s_b, _ = step_fn(params, state, x, y, jr.key(123456))
+        for n in params:
+            np.testing.assert_array_equal(np.asarray(p_a[n]), np.asarray(p_b[n]))
+        for field in ("mean", "var", "count"):
+            np.testing.assert_array_equal(
+                np.asarray(getattr(s_a.norm, field)),
+                np.asarray(getattr(s_b.norm, field)),
+            )
+
+    def test_full_step_threads_identical_normalizer_state(self, small_data):
+        """Both arms' full steps on the same (x, y) stream keep the threaded
+        normalizer states bit-identical even as their params diverge."""
+        x, y = small_data
+        params = init_mlp_params(jr.key(0), SMALL)
+        spec_ours = screening_spec("sgd_ema_norm")
+        spec_ref = screening_spec("upgd_ema_norm")
+        init_ours, step_ours = spec_ours.factory(spec_ours.hyperparameters)
+        init_ref, step_ref = spec_ref.factory(spec_ref.hyperparameters)
+        s_ours = init_ours(params)
+        s_ref = init_ref(params)
+        p_ours = p_ref = params
+        for i in range(5):
+            xi = jnp.asarray(x[i], jnp.float32)
+            yi = jnp.asarray(y[i], jnp.int32)
+            p_ours, s_ours, _ = step_ours(p_ours, s_ours, xi, yi, jr.key(100 + i))
+            p_ref, s_ref, _ = step_ref(p_ref, s_ref, xi, yi, jr.key(100 + i))
+            for field in ("mean", "var", "count"):
+                np.testing.assert_array_equal(
+                    np.asarray(getattr(s_ours.norm, field)),
+                    np.asarray(getattr(s_ref.norm, field)),
+                )
+        assert float(s_ours.norm.count) == 5.0
+
+    def test_gate_removal_changes_trajectory(self, small_data):
+        """Sanity: dropping the utility gate separates the trajectory from
+        upgd_ema_norm_sigma0 (same normalizer, same lr/wd, no noise)."""
+        x, y = small_data
+        ours = run_screening_config(
+            x, y, screening_spec("sgd_ema_norm"), seed=11, config=SMALL
+        )
+        ref = run_screening_config(
+            x, y, screening_spec("upgd_ema_norm_sigma0"), seed=11, config=SMALL
+        )
+        assert not np.array_equal(ours.per_task_loss, ref.per_task_loss)
 
 
 class TestAlphaUtility:

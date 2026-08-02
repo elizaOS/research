@@ -75,6 +75,12 @@ identical seeds):
   composition of the screening's two orthogonal wins (input conditioning +
   capacity regeneration). ``norm_enabled=0`` skips the normalizer entirely
   and reduces bit-exactly to ``adamw_cbp`` (pinned).
+- ``sgd_ema_norm``: the gate ablation closing the ``upgd_ema_norm`` /
+  ``upgd_ema_norm_sigma0`` dissection — plain SGD with decoupled weight decay
+  (``w <- w * (1 - lr*wd) - lr * grad``) behind the exact ``upgd_ema_norm``
+  EMA input normalizer (same decay/eps/state threading); no utility, no gate,
+  no noise. Pinned against a hand-computed trajectory, and the normalizer
+  states are pinned bitwise against ``upgd_ema_norm``'s on a shared stream.
 
 Everything here is a development screening diagnostic — never promotable
 scientific evidence. Benchmark executions happen through the CLI
@@ -845,6 +851,61 @@ def _make_upgd_ema_norm_learner(
         return new_params, UPGDNormState(  # type: ignore[call-arg]
             utility=new_lean.utility, step=new_lean.step, norm=new_norm
         ), metrics
+
+    return init_fn, full_step
+
+
+@chex.dataclass(frozen=True)
+class SGDNormState:
+    """Just the EMA input-normalizer state (the gate-ablation arm is stateless
+    beyond the normalizer: no utility EMA, no step clock)."""
+
+    norm: EMANormState
+
+
+def _make_sgd_ema_norm_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Plain SGD + decoupled weight decay behind the exact ``upgd_ema_norm``
+    EMA input normalizer (same decay/eps/state threading).
+
+    The final dissection of the normalized-UPGD result: ``upgd_ema_norm_sigma0``
+    showed the perturbation is not load-bearing under input conditioning, so
+    the method there is normalize + utility-GATED SGD + decay. This arm drops
+    the gate too — ``w <- w * (1 - lr*wd) - lr * grad`` — no utility, no gate,
+    no noise (the RNG key is deliberately unused). Pinned by a hand-computed
+    trajectory test; the normalizer path is pinned bitwise against
+    ``upgd_ema_norm``'s on a shared stream.
+    """
+    step_size = hp["step_size"]
+    decay_factor = 1.0 - step_size * hp["weight_decay"]
+    norm_decay = hp["norm_decay"]
+    epsilon = hp["norm_epsilon"]
+
+    def init_fn(params: dict[str, Array]) -> SGDNormState:
+        input_dim = params["w1"].shape[0]
+        return SGDNormState(  # type: ignore[call-arg]
+            norm=EMANormState(  # type: ignore[call-arg]
+                mean=jnp.zeros(input_dim, dtype=jnp.float32),
+                var=jnp.ones(input_dim, dtype=jnp.float32),
+                count=jnp.array(0.0, dtype=jnp.float32),
+            ),
+        )
+
+    def full_step(
+        params: dict[str, Array], state: SGDNormState, x: Array, y: Array, key: Array
+    ) -> tuple[dict[str, Array], SGDNormState, StepMetrics]:
+        del key  # no perturbation: the per-step noise key is unused
+        x_norm, new_norm = ema_normalize(state.norm, x, norm_decay, epsilon)
+        (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+            params, x_norm, y
+        )
+        new_params = {
+            name: params[name] * decay_factor - step_size * grads[name]
+            for name in params
+        }
+        metrics = _step_metrics(new_params, x_norm, y, loss, logits)
+        return new_params, SGDNormState(norm=new_norm), metrics  # type: ignore[call-arg]
 
     return init_fn, full_step
 
@@ -1847,6 +1908,26 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             description=(
                 "upgd_ema_norm without the perturbation: is the noise "
                 "load-bearing once inputs are conditioned?"
+            ),
+        ),
+        # --- Wave 6: the final dissection of the normalized arm.  With
+        # upgd_ema_norm_sigma0 tying upgd_ema_norm, the method reduces to
+        # normalize + utility-gated SGD + decay; this arm drops the gate too.
+        ScreeningSpec(
+            name="sgd_ema_norm",
+            base_learner="upgd_w",
+            mechanism="input_normalization",
+            hyperparameters={
+                "step_size": 0.01,
+                "weight_decay": 0.01,
+                "norm_decay": 0.999,
+                "norm_epsilon": 1e-8,
+            },
+            factory=_make_sgd_ema_norm_learner,
+            description=(
+                "Gate ablation of upgd_ema_norm_sigma0: plain SGD + decoupled "
+                "decay behind the exact EMA input normalizer — no utility, no "
+                "gate, no noise."
             ),
         ),
         ScreeningSpec(

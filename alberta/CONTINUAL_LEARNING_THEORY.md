@@ -1,5 +1,37 @@
 # Continual learning on streaming supervision: a mechanistic theory from the IPMNIST campaign
 
+> **2026-08-02 addendum — the completed dissection cascade.**  The
+> follow-up ablations fully decomposed the top result (`upgd_ema_norm`,
+> 0.85359 at 200 tasks) into mechanism contributions (60-task proxy):
+>
+> | component removed | arm | mean | contribution |
+> |---|---|---|---|
+> | (full method) | `upgd_ema_norm` | 0.8529 | — |
+> | − perturbation | `upgd_ema_norm_sigma0` | 0.8520 | noise ≈ **+0.001** (not load-bearing) |
+> | − utility gate | `sgd_ema_norm` | 0.8406 | gate ≈ **+0.012** (real, modest) |
+> | − normalization (raw UPGD-W) | `upgd_w_control` | 0.7778 | conditioning ≈ **+0.062** (dominant) |
+>
+> Three conclusions.  (1) **Input conditioning dominates**: bare
+> normalize+SGD+decay (0.8406) beats the published SOTA method run as
+> published (0.7791) by +0.06 — much of what the plasticity-method
+> literature fights on this benchmark dissolves under the Alberta Plan's
+> Step-1 normalization tenet, which the published setup omitted.
+> (2) The **utility gate survives dissection** as a genuine, orthogonal
+> +0.012 protection effect — the UPGD idea is real, but an order of
+> magnitude smaller than its enabling condition.  (3) The
+> **perturbation contributes nothing** here (no-recurrence protocol) —
+> the best form, *normalized utility-gated SGD (σ=0)*, delivers the
+> full 0.85-class result at ~1/7th UPGD-W's compute.  The composition
+> result (`adamw_cbp_ema_norm` 0.7995 ≈ `adamw_cbp`) closes the loop:
+> Adam's second-moment denominator IS input conditioning, so
+> normalization is redundant there — and normalized gated-SGD beats
+> conditioned Adam+CBP outright.  Full-horizon confirmations of both
+> ablation arms run under `outputs/ipmnist_screening/confirm_full/`.
+> The hyperparameter star found published UPGD-W values locally optimal
+> under normalization (wd0005/lr shifts all hurt), so the wd0005 gain
+> does not compose — tuning wins and conditioning wins are alternatives,
+> not additive.
+
 Status: development analysis (never promotable evidence). Every number below
 is from our own protocol-exact runs — the ICLR-2024 online Input-permuted
 MNIST protocol (`alberta_framework/benchmarks/upgd_ipmnist.py`), its 60-task

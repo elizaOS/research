@@ -160,3 +160,7 @@ retrying upgd_l2init seed 0 with --noise-mode step (noise-free arm)
 retrying upgd_idbd seed 0 with --noise-mode step (noise-free arm)
 retrying upgd_idbd seed 1 with --noise-mode step (noise-free arm)
 retrying upgd_idbd seed 2 with --noise-mode step (noise-free arm)
+Traceback (most recent call last):
+  File "<stdin>", line 27, in <module>
+TypeError: unhashable type: 'dict'
+=== endgame done 2026-08-02T02:21:06-07:00
