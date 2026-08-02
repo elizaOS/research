@@ -1,5 +1,20 @@
 # mypy: disable-error-code="call-arg"
-"""Production-facing Step 6 average-reward control facade."""
+"""Production-facing Step 6 average-reward control facade (Control II).
+
+Step 6 of the Alberta Plan is continuing control: the agent maximizes the
+long-run reward *rate* rather than a discounted or episodic return.  The
+agent behind this facade is the linear differential SARSA learner in
+:mod:`alberta_framework.core.average_reward` — epsilon-greedy over
+action-values learned relative to an online reward-rate estimate
+(``td_error = reward - average_reward + q(s', a') - q(s, a)``).  As in Step 5
+prediction, the reward-rate estimate is updated from the same TD error with a
+smaller step-size than the action-values, since it enters every TD target.
+
+References:
+    Wan, Naik, & Sutton (2021). "Learning and Planning in Average-Reward
+        Markov Decision Processes."
+    Sutton & Barto (2018). "Reinforcement Learning: An Introduction," §10.3.
+"""
 
 from __future__ import annotations
 

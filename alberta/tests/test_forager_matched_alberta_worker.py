@@ -1,3 +1,20 @@
+"""Contract tests for
+:mod:`alberta_framework.benchmarks._forager_matched_alberta_worker`.
+
+The worker is the single-seed Alberta workload that the matched-current
+executor snapshots and runs inside the qualified networkless OCI image; it
+must emit exactly one deterministic reward-trace NPZ per seed for the frozen
+in-container scorer and never compute a score itself.  Tests cover the
+strict configuration loader (duplicate keys, non-finite JSON, and partially
+specified configs are rejected — every field must be explicit), the atomic
+reward-trace sink (single ``rewards.npy`` member with a zeroed timestamp for
+byte-reproducible archives; incomplete or non-float32 chunks fail closed and
+abort leaves nothing behind), dispatch across the three Alberta families
+(causal-map, Horde actor-critic, RTU/RTRL), and seed-domain validation
+before any output is created.  All family runners are monkeypatched — no
+environment steps execute.
+"""
+
 from __future__ import annotations
 
 import json

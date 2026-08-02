@@ -3,7 +3,8 @@
 This module evaluates whether a learned transition model is useful for choosing
 among a fixed menu of open-loop action sequences.  It is inspired by the
 decision-fidelity protocol in WorldModelGym and by the known-reward planning
-setup in Liu et al. (2025):
+setup in Liu et al. (2025), *Continual Reinforcement Learning by Planning with
+Online World Models*:
 
 * true menu returns are precomputed with a separate deterministic environment;
 * every imagined sequence branches from the same immutable model state;
@@ -67,7 +68,33 @@ EVIDENCE_SEEDS = tuple(range(30, 60))
 
 @dataclass(frozen=True)
 class DecisionFidelityConfig:
-    """Scientific configuration for the deterministic decision probe."""
+    """Scientific configuration for the deterministic decision probe.
+
+    Args:
+        phase_steps: Online transitions in each visitation phase (A1, B, A2).
+        horizon: Length of every open-loop menu sequence; imagined rollouts
+            are scored over exactly this many steps.
+        probes_per_domain: Held-out decision probes drawn per domain; the
+            probe set holds twice this many decisions.
+        menu_amplitudes: Peak amplitude of each half-sine action profile, one
+            menu entry per amplitude.  Every profile starts at zero, so the
+            menus share their first action and diverge only later.
+        projection_dim: Random projections in the sparse model's feature map
+            (forwarded to :class:`SparseFTLWorldModelConfig`).
+        bins: Soft bins per projection in the sparse feature map.
+        ridge: Ridge coefficient shared by the sparse model and the raw
+            linear baseline.
+        prediction_clip: Absolute bound on each model's predicted state delta
+            during imagined rollouts.
+        state_bound: The true environment clips states to this magnitude;
+            probe goals stay within ``0.89 * state_bound``.
+        action_cost: Quadratic control penalty in the known reward
+            ``-(s' - g)^2 - action_cost * u^2``.
+        bootstrap_resamples: Frozen resample count for percentile intervals.
+        confidence_level: Two-sided confidence level of those intervals.
+        bootstrap_seed: Base seed of the bootstrap RNG, offset once per
+            condition-metric pair.
+    """
 
     phase_steps: int = 180
     horizon: int = 6
@@ -241,7 +268,15 @@ def _true_next_observation(
     action: NDArray[np.float64],
     config: DecisionFidelityConfig,
 ) -> NDArray[np.float64]:
-    """Deterministic nonlinear one-dimensional evaluation environment."""
+    """Deterministic nonlinear one-dimensional evaluation environment.
+
+    The state delta mixes a linear control gain with ``sin`` and cubic state
+    terms that lie outside the raw-linear baseline's feature span
+    ``(1, s, u, s*u)``, so that baseline is deliberately misspecified.  Both
+    nonlinear terms are odd in the state, so local dynamics differ between
+    the negative (A) and positive (B) probe domains.  The next state is
+    clipped to ``±state_bound``.
+    """
 
     state = float(observation[0])
     control = float(action[0])
@@ -375,7 +410,16 @@ def _phase_transitions(
     domain: int,
     phase_index: int,
 ) -> tuple[Array, Array, Array]:
-    """Generate one deterministic online visitation phase."""
+    """Generate one deterministic online visitation phase.
+
+    Observations sweep ``center ± 0.55`` (domain A centers at -0.78, B at
+    +0.78), covering the disjoint state ranges the held-out probes are drawn
+    from.  The observation and action sinusoids use incommensurate
+    frequencies (0.137 vs 0.193 rad/step), so the visited (state, action)
+    pairs fill a two-dimensional region rather than retracing one curve; the
+    seed and phase-index offsets decorrelate the sweep across seeds and
+    across repeat visits to the same domain.
+    """
 
     time = np.arange(config.phase_steps, dtype=np.float64)
     center = -0.78 if domain == 0 else 0.78

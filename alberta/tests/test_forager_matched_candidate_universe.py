@@ -1,3 +1,18 @@
+"""Contract tests for
+:mod:`alberta_framework.benchmarks.forager_matched_candidate_universe`.
+
+The candidate universe is the frozen provenance record explaining how the
+matched-current panel was assembled from historical development screens —
+screens that used consumed seeds and nonmatched horizons and therefore can
+never be scientific evidence themselves.  Tests pin the descriptor's exact
+content digest, require every screened arm's inclusion or exclusion to be
+accounted for, keep every screen classified nonpromoting (no superiority or
+SOTA claims), require the registered panel to match the open-protocol
+builder, and exercise the bound-JSON source verifier fail-closed (tampered
+bytes, symlinks, ambiguous or non-finite JSON, duplicate rank rows, hash
+drift).
+"""
+
 from __future__ import annotations
 
 import copy
@@ -13,6 +28,8 @@ from alberta_framework.benchmarks import forager_matched_candidate_universe as u
 from alberta_framework.benchmarks import forager_matched_open_protocol as open_protocol
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+# Frozen content digest of the canonical universe descriptor bytes; any
+# change to the descriptor is deliberate and must re-pin this constant.
 _EXPECTED_DIGEST = "2c3b214cf29e013e3f8d88b2558bd94f75e92330bf0ddcc6afd7514279a1ee77"
 
 

@@ -46,11 +46,19 @@ ROLE_HELPER: Literal["helper"] = "helper"
 ROLE_BENEFICIARY: Literal["beneficiary"] = "beneficiary"
 INPUT_PRIVATE_CUE: Literal["private_cue"] = "private_cue"
 INPUT_DELIVERED_MESSAGE: Literal["delivered_message"] = "delivered_message"
+# Policy literals are intentionally re-declared here rather than imported from
+# :mod:`~alberta_framework.core.slot_signaling_agent`: the oracle re-expresses
+# the learner independently, so a producer-side literal change must disagree
+# with recorded traces instead of silently teaching the oracle the same change.
 DURABLE_WRITE_SELECTIVE = "selective"
 DURABLE_WRITE_WRITABLE = "writable"
 REPLACEMENT_TARGET_EVIDENCE = "evidence"
 REPLACEMENT_TARGET_LRU = "lru"
 
+# 2**24 — the largest float32 integer count for which ``x + 1.0`` is still
+# exact.  The agent saturates its relevance-mass counter at this value (one
+# step further, adding 1.0 would be a float32 rounding no-op), so the oracle
+# enforces the same cap when validating and reconstructing masses.
 _FLOAT32_MASS_LIMIT = np.float32(16_777_216.0)
 _INT32_MAX = int(np.iinfo(np.int32).max)
 

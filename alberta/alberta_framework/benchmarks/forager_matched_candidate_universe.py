@@ -226,6 +226,10 @@ class CandidateUniverseVerification:
 
 
 _SCREEN_BINDINGS: Final = (
+    # Screened 11 official-repo DQN variants under one common-control config
+    # (vanilla plus LN, CReLU, L2, L2_Init, reward-trace, Reset_Head,
+    # causal-history with and without reward-trace, Shrink_and_Perturb, SWR)
+    # at 100k steps per seed.
     ScreeningArtifactBinding(
         screen_id="dqn_common_control_v3",
         family="common_control_dqn",
@@ -246,6 +250,9 @@ _SCREEN_BINDINGS: Final = (
         horizon_per_seed=100_000,
         candidate_count=11,
     ),
+    # Screened 8 stateful/continual baselines (PPO, PPO-RTU with LN, two DRQN
+    # variants, DQN+ReDo, PT_DQN, and their DQN architecture controls) at
+    # 102,400 steps per seed.
     ScreeningArtifactBinding(
         screen_id="stateful_corrected_v4",
         family="stateful_and_continual_baselines",
@@ -271,6 +278,8 @@ _SCREEN_BINDINGS: Final = (
 )
 
 _LOCAL_CANDIDATE_GENERATION_BINDINGS: Final = (
+    # Tuned 4 Alberta Horde actor-critic variants (default, step3e3, eps05,
+    # recurrent64) on the FOV task at 10k steps across five seeds.
     LocalCandidateGenerationBinding(
         screen_id="horde_fov_tuning_v2",
         family="alberta_horde_actor_critic",
@@ -310,6 +319,8 @@ _LOCAL_CANDIDATE_GENERATION_BINDINGS: Final = (
             ),
         ),
     ),
+    # Screened 6 Alberta RTU-RTRL variants (hidden size 8/16/32, each with and
+    # without the Taylor correction) at 500k steps across four seeds.
     LocalCandidateGenerationBinding(
         screen_id="rtu_schema23_screening_v1",
         family="alberta_rtu_rtrl",

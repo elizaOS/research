@@ -86,6 +86,13 @@ FROZEN_CONDITION_ORDER: tuple[str, ...] = (
     SHUFFLED_CHANNEL,
 )
 
+# The frozen schedule is the development schedule expanded by the 16-step slot
+# lease (64/72/56 -> 1024/1152/896): regimes 0 (A) and 1 (B) recur throughout
+# to probe retention under interleaving, regime 2 (C-old) is permanently
+# superseded by the incompatible regime 3 (C-new) to probe stale-convention
+# replacement, and regime 4 (D-transient) appears exactly once and stays at 16
+# steps -- one lease -- as a distraction that must not evict a durable
+# convention.  See ``streams/hidden_regime_signaling.py`` for the base tables.
 FROZEN_SEGMENT_LENGTHS: tuple[int, ...] = (
     1024,
     1152,

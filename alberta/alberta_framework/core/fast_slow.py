@@ -1,15 +1,17 @@
 # mypy: disable-error-code="call-arg,name-defined"
-"""Fast/slow additive learner implementation for Step 2 productionization.
+"""Fast/slow additive learner: two readout timescales over one shared encoder.
 
-This module is the small production-oriented bridge from the D18 research
-runner toward a JAX-native core learner.  It intentionally avoids the D18
-portfolio machinery: there are no kernel banks, Fourier features, polynomial
-caps, or hand-routed experts.  The learner has one trainable feature encoder,
-one slow readout, one fast decayed readout, and a learned gate between them.
-
-The design goal is not to claim parity with D18 yet.  It is a compact,
-scan-compatible API that lets the Step 2 fast/slow hypothesis move into the
-core stack without destabilizing existing learners.
+The prediction decomposes as
+``slow(phi(x)) + sigmoid(g(phi(x))) * fast(phi(x))``: a slow readout carries
+durable structure while a per-step-decayed fast readout absorbs transients,
+in the spirit of fast-weight memory (Hinton & Plaut 1987, "Using Fast Weights
+to Deblur Old Memories").  The module distills the exploratory Step 2 runner
+(``d18_simple_universal_resource_basis.py`` under ``examples/The Alberta
+Plan/Step2/new_directions/``) down to this core hypothesis, deliberately
+omitting that runner's portfolio machinery — kernel banks, Fourier features,
+polynomial caps, hand-routed experts.  What remains is one trainable tanh
+encoder, one slow readout, one fast decayed readout, and a learned gate, in a
+compact scan-compatible API.
 """
 
 from __future__ import annotations
@@ -193,6 +195,9 @@ def init_fast_slow_params(key: Array, config: FastSlowConfig) -> FastSlowParams:
             dtype=jnp.float32,
         ),
         fast_bias=jnp.zeros(config.output_dim, dtype=jnp.float32),
+        # Scale 0.01 keeps initial gate logits near zero: the gate starts
+        # nearly input-independent at ~0.5, so gating structure is learned
+        # rather than imposed by the random init.
         gate_kernel=_linear_init(gate_key, config.hidden_dim, config.output_dim, 0.01),
         gate_bias=jnp.zeros(config.output_dim, dtype=jnp.float32),
     )

@@ -18,19 +18,28 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     PROXY_N_TASKS,
     SCREENING_REGISTRY,
     SHARD_SCHEMA,
+    AdamCBPState,
+    CBPState,
     EMANormState,
     ScreeningSpec,
+    _make_adamw_cbp_learner,
+    _make_adamw_cbp_noreset_learner,
+    _make_guarded_cbp_adam_learner,
+    _make_upgd_alpha_utility_learner,
     _make_upgd_idbd_learner,
     _make_upgd_w_fade_head_learner,
     _make_upgd_w_wclip_learner,
+    adam_elem_step,
     adam_elem_update,
     cbp_maybe_replace_layer,
     ema_normalize,
+    guarded_adam_update,
     load_shard,
     merge_shards,
     run_screening_config,
     screening_spec,
     shard_payload,
+    upgd_alpha_utility_update,
     upgd_idbd_swift_update,
     upgd_idbd_update,
     upgd_l2init_update,
@@ -89,6 +98,14 @@ class TestRegistry:
             "upgd_w_localgate",
             "upgd_w_fade_head",
             "upgd_w_idbd_swift",
+            "guarded_cbp_adam",
+            "adamw_cbp_noreset",
+            "upgd_w_sigma0",
+            "upgd_alpha_utility",
+            "adamw_cbp_r3e5",
+            "adamw_cbp_r3e4",
+            "adamw_cbp_m50",
+            "adamw_cbp_m200",
         }
         assert expected == set(SCREENING_REGISTRY)
 
@@ -638,6 +655,8 @@ class TestSmokeRuns:
         "upgd_idbd", "upgd_autostep", "upgd_l2init", "upgd_ema_norm",
         "upgd_cbp", "adamw_cbp", "upgd_w_wclip_k1", "upgd_w_wclip_k2_wd0",
         "upgd_w_localgate", "upgd_w_fade_head", "upgd_w_idbd_swift",
+        "guarded_cbp_adam", "adamw_cbp_noreset", "upgd_w_sigma0",
+        "upgd_alpha_utility", "adamw_cbp_r3e4",
     ])
     def test_combo_runs_and_is_finite(self, small_data, name):
         x, y = small_data
@@ -791,6 +810,314 @@ class TestPoolConfirmation:
         path.write_text(json.dumps(shard_payload(pool)), encoding="utf-8")
         with pytest.raises(ValueError, match="noise_mode"):
             validate_proxy([path], tmp_path)
+
+
+class TestGuardedCBPAdam:
+    """AdamW+CBP with UPGD-style utility protection scaling Adam's delta."""
+
+    def test_registry_config(self):
+        spec = screening_spec("guarded_cbp_adam")
+        assert spec.base_learner == "adamw"
+        assert spec.hyperparameters["guard_scale"] == 1.0
+        assert spec.hyperparameters["utility_decay"] == 0.9999
+        assert spec.hyperparameters["cbp_replacement_rate"] == 1e-4
+        assert spec.hyperparameters["cbp_maturity_threshold"] == 100.0
+        # protection only — the arm must have no perturbation channel
+        assert "noise_std" not in spec.hyperparameters
+        assert spec.noise_update is None
+
+    def test_guard_zero_reduces_to_adamw_cbp_bitwise(self, small_data):
+        """guard_scale=0: the whole trajectory equals adamw_cbp bit-for-bit."""
+        x, y = small_data
+        hp = dict(screening_spec("guarded_cbp_adam").hyperparameters)
+        hp["guard_scale"] = 0.0
+        spec = ScreeningSpec(
+            name="adamw_cbp",  # reuse registry identity for shard plumbing
+            base_learner="adamw",
+            mechanism="utility_guarded_recycling",
+            hyperparameters=hp,
+            factory=_make_guarded_cbp_adam_learner,
+        )
+        ours = run_screening_config(x, y, spec, seed=11, config=SMALL)
+        ref = run_screening_config(
+            x, y, screening_spec("adamw_cbp"), seed=11, config=SMALL
+        )
+        np.testing.assert_array_equal(ours.per_task_accuracy, ref.per_task_accuracy)
+        np.testing.assert_array_equal(ours.per_task_loss, ref.per_task_loss)
+        np.testing.assert_array_equal(
+            ours.per_task_plasticity, ref.per_task_plasticity
+        )
+
+    def test_high_gate_weight_takes_smaller_step_moments_untouched(self):
+        """The gate scales only the applied delta; Adam moments see raw grads."""
+        hp = {"step_size": 1e-4, "beta1": 0.0, "beta2": 0.99, "eps": 1e-8,
+              "weight_decay": 0.0, "guard_scale": 1.0}
+        params = {"w": jnp.array([1.0, 1.0], jnp.float32)}
+        zeros = {"w": jnp.zeros(2, jnp.float32)}
+        grads = {"w": jnp.array([0.5, 0.5], jnp.float32)}
+        gate = {"w": jnp.array([0.9, 0.1], jnp.float32)}
+        new_params, new_m, new_v, _ = guarded_adam_update(
+            params, dict(zeros), dict(zeros), dict(zeros), grads, gate, hp
+        )
+        delta = np.asarray(params["w"] - new_params["w"])
+        assert abs(delta[0]) < abs(delta[1])  # protected weight moves less
+        # equal grads => identical moments regardless of gate
+        assert float(new_m["w"][0]) == float(new_m["w"][1])
+        assert float(new_v["w"][0]) == float(new_v["w"][1])
+        # unprotected delta scales by (1 - gate)
+        np.testing.assert_allclose(
+            delta[0] / delta[1], (1.0 - 0.9) / (1.0 - 0.1), rtol=1e-2
+        )
+
+
+class TestAdamCBPNoReset:
+    """adamw_cbp without per-unit optimizer-state reset at replacement."""
+
+    @pytest.mark.parametrize("name", ["adamw_cbp", "adamw_cbp_noreset"])
+    def test_replacement_rate_zero_reduces_to_adamw_control(self, small_data, name):
+        x, y = small_data
+        hp = dict(screening_spec(name).hyperparameters)
+        hp["cbp_replacement_rate"] = 0.0
+        spec = ScreeningSpec(
+            name="adamw_control",
+            base_learner="adamw",
+            mechanism="dormant_unit_recycling",
+            hyperparameters=hp,
+            factory=screening_spec(name).factory,
+        )
+        ours = run_screening_config(x, y, spec, seed=3, config=SMALL)
+        ref = run_screening_config(
+            x, y, screening_spec("adamw_control"), seed=3, config=SMALL
+        )
+        np.testing.assert_allclose(
+            ours.per_task_accuracy, ref.per_task_accuracy, atol=1e-7
+        )
+        np.testing.assert_allclose(ours.per_task_loss, ref.per_task_loss, rtol=1e-5)
+
+    def test_stale_moments_kept_on_replacement(self, small_data):
+        """When a layer-1 replacement fires, the reset arm zeroes the recycled
+        unit's m/v/count slices while the noreset arm keeps them."""
+        x, y = small_data
+        params = init_mlp_params(jr.key(0), SMALL)
+        hp = dict(screening_spec("adamw_cbp").hyperparameters)
+        h1, h2 = SMALL.hidden1, SMALL.hidden2
+        fired = AdamCBPState(
+            m={n: jnp.full_like(v, 0.25) for n, v in params.items()},
+            v={n: jnp.full_like(v, 0.5) for n, v in params.items()},
+            count={n: jnp.full_like(v, 7.0) for n, v in params.items()},
+            cbp=CBPState(
+                util1=jnp.arange(1, h1 + 1, dtype=jnp.float32),  # unit 0 lowest
+                util2=jnp.arange(1, h2 + 1, dtype=jnp.float32),
+                age1=jnp.full((h1,), 200, dtype=jnp.int32),
+                age2=jnp.zeros((h2,), dtype=jnp.int32),  # immature: never fires
+                accumulator=jnp.array([1.0, 0.0], jnp.float32),
+            ),
+        )
+        x0 = jnp.asarray(x[0], jnp.float32)
+        y0 = jnp.asarray(y[0], jnp.int32)
+        _, step_reset = _make_adamw_cbp_learner(hp)
+        _, step_nores = _make_adamw_cbp_noreset_learner(hp)
+        _, s_reset, _ = step_reset(params, fired, x0, y0, jr.key(42))
+        _, s_nores, _ = step_nores(params, fired, x0, y0, jr.key(42))
+        # the fire consumed the layer-1 budget in both arms
+        assert float(s_reset.cbp.accumulator[0]) < 1.0
+        assert float(s_nores.cbp.accumulator[0]) < 1.0
+        # reset arm: recycled unit-0 slices zeroed (count restarts bias correction)
+        np.testing.assert_allclose(np.asarray(s_reset.count["w1"][:, 0]), 0.0)
+        np.testing.assert_allclose(np.asarray(s_reset.m["w1"][:, 0]), 0.0)
+        np.testing.assert_allclose(np.asarray(s_reset.v["w1"][:, 0]), 0.0)
+        # noreset arm: stale moments/counts carried through the replacement
+        np.testing.assert_allclose(np.asarray(s_nores.count["w1"][:, 0]), 8.0)
+        assert np.all(np.asarray(s_nores.v["w1"][:, 0]) > 0.0)
+        # untouched units identical across the two arms
+        np.testing.assert_array_equal(
+            np.asarray(s_reset.m["w1"][:, 1]), np.asarray(s_nores.m["w1"][:, 1])
+        )
+
+    def test_differs_from_adamw_cbp_when_recycling(self, small_data):
+        """With recycling active the reset/noreset trajectories separate."""
+        x, y = small_data
+        overrides = {"cbp_replacement_rate": 0.2, "cbp_maturity_threshold": 5.0}
+        specs = {}
+        for name, factory in (
+            ("adamw_cbp", _make_adamw_cbp_learner),
+            ("adamw_cbp_noreset", _make_adamw_cbp_noreset_learner),
+        ):
+            hp = dict(screening_spec(name).hyperparameters)
+            hp.update(overrides)
+            specs[name] = ScreeningSpec(
+                name=name, base_learner="adamw", mechanism="dormant_unit_recycling",
+                hyperparameters=hp, factory=factory,
+            )
+        reset = run_screening_config(x, y, specs["adamw_cbp"], seed=2, config=SMALL)
+        nores = run_screening_config(
+            x, y, specs["adamw_cbp_noreset"], seed=2, config=SMALL
+        )
+        assert not np.array_equal(reset.per_task_loss, nores.per_task_loss)
+
+
+class TestUPGDSigma0:
+    """Perturbation dissection: lean UPGD-W with sigma=0."""
+
+    def test_registry_sigma_zero(self):
+        spec = screening_spec("upgd_w_sigma0")
+        assert spec.hyperparameters["noise_std"] == 0.0
+        assert spec.base_learner == "upgd_w"
+        # everything else stays at the published UPGD-W configuration
+        for k in ("step_size", "utility_decay", "weight_decay"):
+            assert spec.hyperparameters[k] == UPGD_W_PROTOCOL_HYPERPARAMETERS[k]
+
+    def test_matches_control_factory_at_sigma_zero_bitwise(self, small_data):
+        """Skipping the noise draw == drawing and scaling by zero, bit-for-bit."""
+        x, y = small_data
+        hp = dict(UPGD_W_PROTOCOL_HYPERPARAMETERS)
+        hp["noise_std"] = 0.0
+        ref_spec = ScreeningSpec(
+            name="upgd_w_control",
+            base_learner="upgd_w",
+            mechanism="control",
+            hyperparameters=hp,
+            factory=screening_spec("upgd_w_control").factory,
+        )
+        ours = run_screening_config(
+            x, y, screening_spec("upgd_w_sigma0"), seed=5, config=SMALL
+        )
+        ref = run_screening_config(x, y, ref_spec, seed=5, config=SMALL)
+        np.testing.assert_array_equal(ours.per_task_accuracy, ref.per_task_accuracy)
+        np.testing.assert_array_equal(ours.per_task_loss, ref.per_task_loss)
+
+    def test_sigma0_differs_from_published_control(self, small_data):
+        """Sanity: removing the perturbation changes the trajectory."""
+        x, y = small_data
+        ours = run_screening_config(
+            x, y, screening_spec("upgd_w_sigma0"), seed=5, config=SMALL
+        )
+        control = run_screening_config(
+            x, y, screening_spec("upgd_w_control"), seed=5, config=SMALL
+        )
+        assert not np.array_equal(ours.per_task_loss, control.per_task_loss)
+
+
+class TestAlphaUtility:
+    """UPGD-W protection gate driven by passive IDBD step-size drift."""
+
+    def _hp(self, **overrides):
+        hp = dict(UPGD_W_PROTOCOL_HYPERPARAMETERS)
+        hp.update({"meta_step_size": 1e-2, "initial_step_size": 0.01})
+        hp.update(overrides)
+        return hp
+
+    def test_registry_config(self):
+        spec = screening_spec("upgd_alpha_utility")
+        assert spec.hyperparameters["meta_step_size"] == 1e-2
+        assert spec.hyperparameters["initial_step_size"] == 0.01
+        assert spec.hyperparameters["step_size"] == 0.01
+
+    def test_meta_zero_reduces_to_half_gated_step(self):
+        """meta=0: log-alphas never leave init, so the gate is exactly 0.5 and
+        the update is the closed-form half-gated UPGD-W step, bit-for-bit."""
+        hp = self._hp(meta_step_size=0.0)
+        params = init_mlp_params(jr.key(3), SMALL)
+        init_fn, _ = _make_upgd_alpha_utility_learner(hp)
+        state = init_fn(params)
+        decay = 1.0 - hp["step_size"] * hp["weight_decay"]
+        for step in range(3):
+            kg, kn = jr.split(jr.key(70 + step))
+            grads = {n: jr.normal(jr.fold_in(kg, i), v.shape) * 0.1
+                     for i, (n, v) in enumerate(sorted(params.items()))}
+            noise = {n: jr.normal(jr.fold_in(kn, i), v.shape) * hp["noise_std"]
+                     for i, (n, v) in enumerate(sorted(params.items()))}
+            new_params, state = upgd_alpha_utility_update(
+                params, state, grads, noise, hp
+            )
+            for n in params:
+                expected = params[n] * decay - hp["step_size"] * (
+                    (grads[n] + noise[n]) * 0.5
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(new_params[n]), np.asarray(expected)
+                )
+            params = new_params
+
+    def test_consistent_gradient_earns_more_protection(self):
+        """A weight with a persistent-sign gradient must end with higher
+        log-alpha (more protection => smaller applied delta) than a weight
+        whose gradient alternates sign every step."""
+        hp = self._hp(weight_decay=0.0, noise_std=0.0)
+        params = {"w": jnp.array([0.5, 0.5], jnp.float32)}
+        init_fn, _ = _make_upgd_alpha_utility_learner(hp)
+        state = init_fn(params)
+        zeros = {"w": jnp.zeros(2, jnp.float32)}
+        for step in range(60):
+            sign = 1.0 if step % 2 == 0 else -1.0
+            grads = {"w": jnp.array([0.2, 0.2 * sign], jnp.float32)}
+            params, state = upgd_alpha_utility_update(
+                params, state, grads, zeros, hp
+            )
+        la = np.asarray(state.log_alpha["w"])
+        la0 = math.log(hp["initial_step_size"])
+        assert la[0] > la0 > la[1]
+        # the protected weight takes the smaller applied step
+        grads = {"w": jnp.array([0.2, 0.2], jnp.float32)}
+        new_params, _ = upgd_alpha_utility_update(params, state, grads, zeros, hp)
+        delta = np.abs(np.asarray(new_params["w"] - params["w"]))
+        assert delta[0] < delta[1]
+
+    def test_bounds_and_finiteness(self):
+        hp = self._hp(meta_step_size=10.0)
+        params = init_mlp_params(jr.key(6), SMALL)
+        init_fn, _ = _make_upgd_alpha_utility_learner(hp)
+        state = init_fn(params)
+        zeros = {n: jnp.zeros_like(v) for n, v in params.items()}
+        for step in range(50):
+            kg = jr.fold_in(jr.key(8), step)
+            grads = {n: jr.normal(jr.fold_in(kg, i), v.shape)
+                     for i, (n, v) in enumerate(sorted(params.items()))}
+            params, state = upgd_alpha_utility_update(params, state, grads, zeros, hp)
+        for n in params:
+            assert bool(jnp.all(state.log_alpha[n] >= -10.0)), n
+            assert bool(jnp.all(state.log_alpha[n] <= 0.0)), n
+            assert bool(jnp.all(jnp.isfinite(params[n]))), n
+            assert bool(jnp.all(jnp.isfinite(state.trace[n]))), n
+
+
+class TestAdamCBPTunedStar:
+    """Axis-aligned mini-star around the untuned adamw_cbp leader."""
+
+    def test_star_hyperparameters(self):
+        base = screening_spec("adamw_cbp").hyperparameters
+        star = {
+            "adamw_cbp_r3e5": {"cbp_replacement_rate": 3e-5},
+            "adamw_cbp_r3e4": {"cbp_replacement_rate": 3e-4},
+            "adamw_cbp_m50": {"cbp_maturity_threshold": 50.0},
+            "adamw_cbp_m200": {"cbp_maturity_threshold": 200.0},
+        }
+        for name, overrides in star.items():
+            hp = screening_spec(name).hyperparameters
+            assert screening_spec(name).base_learner == "adamw"
+            for key, value in overrides.items():
+                assert hp[key] == value, (name, key)
+            for key, value in base.items():
+                if key not in overrides:
+                    assert hp[key] == value, (name, key)
+
+
+class TestAdamElemStep:
+    def test_update_composes_step(self):
+        """adam_elem_update == param - adam_elem_step delta, same moments."""
+        hp = {"step_size": 1e-4, "beta1": 0.0, "beta2": 0.99, "eps": 1e-8,
+              "weight_decay": 0.01}
+        key = jr.key(12)
+        param = jr.normal(jr.fold_in(key, 0), (4, 3))
+        grad = jr.normal(jr.fold_in(key, 1), (4, 3))
+        m = v = jnp.zeros((4, 3))
+        count = jnp.zeros((4, 3))
+        delta, m1, v1, c1 = adam_elem_step(param, m, v, count, grad, hp)
+        p2, m2, v2, c2 = adam_elem_update(param, m, v, count, grad, hp)
+        np.testing.assert_array_equal(np.asarray(param - delta), np.asarray(p2))
+        np.testing.assert_array_equal(np.asarray(m1), np.asarray(m2))
+        np.testing.assert_array_equal(np.asarray(v1), np.asarray(v2))
+        np.testing.assert_array_equal(np.asarray(c1), np.asarray(c2))
 
 
 class TestSpecShape:

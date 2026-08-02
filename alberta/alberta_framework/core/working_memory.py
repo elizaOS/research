@@ -25,6 +25,12 @@ from jaxtyping import Float
 class WorkingMemoryConfig:
     """Configuration for :class:`WorkingMemoryFeaturizer`.
 
+    A decay rate ``beta`` yields an EMA with effective timescale
+    ``1 / (1 - beta)``, so the default observation rates ``(0.5, 0.9, 0.99)``
+    span memory horizons of roughly 2, 10, and 100 steps — a multi-timescale
+    view of recent history, the same construction motivated in
+    :mod:`alberta_framework.core.history_features`.
+
     Args:
         observation_dim: Observation vector dimensionality.
         action_dim: Action-feature dimensionality, usually one-hot actions.

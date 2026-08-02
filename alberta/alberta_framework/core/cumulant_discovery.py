@@ -18,9 +18,13 @@ lowest-utility candidates with new random projections.
 Why squared TD error? A TD error of zero means the demon has accurately
 predicted its cumulant; the cumulant is therefore *not informative*
 about future dynamics. Demons with persistent positive squared TD error
-are predicting a signal that is hard to know -- they capture genuine
-structure rather than noise. (Cf. White, Modayil & Sutton 2014, "Surprise
-as an intrinsic motivation for hierarchical RL.")
+are predicting a signal that is hard to know. (Cf. White, Modayil &
+Sutton 2014, "Surprise as an intrinsic motivation for hierarchical RL.")
+Caveat: the converse selection also happens -- a cumulant that is
+irreducible noise sustains high squared TD error forever, so this
+utility cannot separate hard-but-learnable structure from unpredictable
+noise. Distinguishing the two needs a learning-progress signal (error
+*decrease* over time) rather than error magnitude.
 
 Limitations
 ===========

@@ -7,9 +7,9 @@ This module wraps the Step 1 research implementation in a narrow, stable API:
 * online normalizers used in the canonical ablations;
 * a small smoke run suitable for integration tests and deployment probes.
 
-For paper-scale evidence, use the scripts under
-``examples/The Alberta Plan/Step1/`` and the committed artifacts under
-``outputs/step1_canonical/``.
+This kernel runs a single configuration and is not an evidence generator:
+paper-scale Step 1 claims require multi-seed optimizer/normalizer grid sweeps
+(see :mod:`alberta_framework.utils.experiments` for the multi-seed machinery).
 """
 
 from __future__ import annotations
@@ -60,8 +60,8 @@ class Step1KernelConfig:
 
     The default is deliberately conservative for daemon/integration use:
     Autostep plus EMA normalization on the canonical drifting Alberta stream.
-    Canonical paper claims should still be regenerated with the Step 1
-    experiment scripts, because those run the full optimizer/normalizer grids.
+    A single kernel configuration is never a canonical paper claim — those
+    require the full optimizer/normalizer grid across multiple seeds.
     """
 
     feature_dim: int = 20

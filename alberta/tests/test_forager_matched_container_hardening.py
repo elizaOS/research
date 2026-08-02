@@ -1,3 +1,17 @@
+"""Hardening tests for :mod:`alberta_framework.benchmarks._forager_matched_container`.
+
+The in-container helper walks workload output trees and launches the
+workload under a hard ``RLIMIT_FSIZE`` cap.  These tests pin its resource
+hygiene: descriptor-leak regressions (count ``/proc/self/fd`` before and
+after an injected failure — equality proves every opened descriptor was
+closed on the error path), directory/depth/entry bounds enforced *before*
+eager materialization, and the runpy wrapper setting a non-raiseable file
+limit in the real child without ``preexec_fn``.
+
+The same fd-count pattern guards the executor/qualification tree walkers in
+``test_forager_matched_fd_cleanup``.
+"""
+
 from __future__ import annotations
 
 import os

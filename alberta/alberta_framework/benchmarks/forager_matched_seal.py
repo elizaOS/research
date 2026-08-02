@@ -36,7 +36,7 @@ from alberta_framework.benchmarks import forager_matched_evidence as evidence
 from alberta_framework.benchmarks import forager_matched_executor as executor
 from alberta_framework.benchmarks import forager_matched_protocol as protocol
 
-MATCHED_SEAL_BUNDLE_SCHEMA_VERSION: Final = "alberta.forager_matched_seal_bundle.v1"
+MATCHED_SEAL_BUNDLE_SCHEMA_VERSION: Final = "alberta.forager_matched_seal_bundle.v2"
 MATCHED_SEALED_TRANSITION_SCHEMA_VERSION: Final = (
     evaluation.MATCHED_SEALED_TRANSITION_SCHEMA_VERSION
 )
@@ -469,6 +469,7 @@ def _parse_recorded_bindings(
             "score_evidence_sha256",
             "source_manifest_sha256",
             "executor_manifest_sha256",
+            "qualification_manifest_sha256",
             "execution_closure_sha256",
             "trust_anchor_identity",
             "verification_subject_sha256",
@@ -494,6 +495,10 @@ def _parse_recorded_bindings(
             ),
             executor_manifest_sha256=_require_sha256(
                 payload["executor_manifest_sha256"], "bindings executor manifest"
+            ),
+            qualification_manifest_sha256=_require_sha256(
+                payload["qualification_manifest_sha256"],
+                "bindings qualification manifest",
             ),
             execution_closure_sha256=_require_sha256(
                 payload["execution_closure_sha256"], "bindings execution closure"
@@ -523,6 +528,7 @@ def _validate_request_content(
         "score_evidence_sha256": scores.payload_sha256,
         "source_manifest_sha256": scores.source_evidence_sha256,
         "executor_manifest_sha256": scores.executor_evidence_sha256,
+        "qualification_manifest_sha256": scores.qualification_manifest_sha256,
         "execution_closure_sha256": evidence.matched_execution_closure_sha256(
             open_protocol, scores
         ),
@@ -555,6 +561,7 @@ def _validate_execution_plan_snapshot(
             "external_verification_required",
             "stage",
             "protocol_sha256",
+            "qualification_manifest_sha256",
             "active_seeds",
             "horizon",
             "candidate_order",
@@ -593,8 +600,12 @@ def _validate_execution_plan_snapshot(
     executor_digest = _require_sha256(
         value["executor_manifest_sha256"], "plan executor manifest"
     )
+    qualification_digest = _require_sha256(
+        value["qualification_manifest_sha256"], "plan qualification manifest"
+    )
     if (
         value["protocol_sha256"] != open_protocol.protocol_sha256
+        or qualification_digest != scores.qualification_manifest_sha256
         or active_seeds != open_protocol.active_seeds
         or value["horizon"] != open_protocol.horizon
         or candidate_order
@@ -603,6 +614,11 @@ def _validate_execution_plan_snapshot(
         or source_digest != scores.source_evidence_sha256
         or _canonical_sha256(executor_manifest) != executor_digest
         or executor_digest != scores.executor_evidence_sha256
+        or executor_manifest.get("schema_version")
+        != executor.MATCHED_EXECUTOR_MANIFEST_SCHEMA_VERSION
+        or executor_manifest.get("protocol_sha256") != open_protocol.protocol_sha256
+        or executor_manifest.get("qualification_manifest_sha256")
+        != qualification_digest
     ):
         raise ForagerMatchedSealError("open execution plan closure drifted")
     _require_array(
@@ -651,6 +667,16 @@ def _validate_receipt_index(
     expected_plan_sha256: str,
     expected_live_runtime_identity_sha256: str,
 ) -> None:
+    """Replay the open execution receipt index against the score evidence.
+
+    Checks, in order: the fail-closed header (schema, nonpromoting authority
+    flags, ``open_tuning`` stage), the index's self-declared payload digest, the
+    campaign closure (protocol/plan/source/executor/live-runtime digests, seed
+    block, candidate order), and finally every per-candidate receipt preimage —
+    each must hash to the receipt digest recorded in the score evidence and equal
+    the expected field set exactly, including per-seed artifact digests.  Any
+    drift raises :class:`ForagerMatchedSealError`.
+    """
     value = dict(payload)
     _require_exact_keys(
         value,
@@ -801,6 +827,7 @@ def _validate_completion_summary(
         "status",
         "stage",
         "protocol_sha256",
+        "qualification_manifest_sha256",
         "execution_plan_sha256",
         "source_manifest_sha256",
         "executor_manifest_sha256",
@@ -840,6 +867,7 @@ def _validate_completion_summary(
         raise ForagerMatchedSealError("open completion summary schema/state drifted")
     expected = {
         "protocol_sha256": scores.protocol_sha256,
+        "qualification_manifest_sha256": scores.qualification_manifest_sha256,
         "execution_plan_sha256": receipt_index["plan_sha256"],
         "source_manifest_sha256": scores.source_evidence_sha256,
         "executor_manifest_sha256": scores.executor_evidence_sha256,
@@ -880,6 +908,20 @@ def _build_manifest(
     transition: Mapping[str, Any],
     transition_sha256: str,
 ) -> dict[str, Any]:
+    """Assemble the self-digested seal manifest.
+
+    Fields: frozen schema/classification/stage plus the authority-boundary flags
+    (persisted bindings are cache-only, resolver revalidation required,
+    self-authentication forbidden); ``artifacts`` maps each bundled role to its
+    path, file digest, and canonical payload digest where one exists;
+    ``open_campaign`` records the completed open-tuning closure (protocol, plan,
+    source/executor manifests, live runtime, receipt index, score evidence,
+    verification subject, candidate order, active seeds, cell count);
+    ``selection`` binds the plan/result/report digests and the recorded resolver
+    cache; ``sealed_transition`` carries the transition descriptor, its digest,
+    and the sealed protocol digest.  The unsigned body is closed with
+    ``payload_sha256``, which :func:`_validate_manifest_shape` re-derives on load.
+    """
     payload_digests: dict[str, str | None] = {
         "open_protocol": None,
         "open_execution_plan": cast(
@@ -923,6 +965,7 @@ def _build_manifest(
         "artifacts": artifacts,
         "open_campaign": {
             "protocol_sha256": open_protocol.protocol_sha256,
+            "qualification_manifest_sha256": scores.qualification_manifest_sha256,
             "execution_plan_sha256": completion_summary["execution_plan_sha256"],
             "source_manifest_sha256": scores.source_evidence_sha256,
             "executor_manifest_sha256": scores.executor_evidence_sha256,
@@ -1013,6 +1056,15 @@ def _freeze_json(value: Any) -> Any:
 def _validate_selection_replay_budget(
     open_protocol: protocol.ForagerMatchedProtocol,
 ) -> None:
+    """Bound replay work before the loader recomputes the frozen selection.
+
+    Loading a seal bundle replays the open-tuning ranking (a bootstrap over
+    candidates x seeds x resamples), so an oversized artifact could otherwise buy
+    unbounded compute from every verifier.  Each ``_MAX_MATCHED_*`` cap equals the
+    frozen matched-current campaign dimension (23 registered candidates, 10 tuning
+    and 30 evaluation seeds, 2 selection groups of at most 14 candidates, 10_000
+    bootstrap resamples); a protocol claiming more is rejected before any replay.
+    """
     groups = open_protocol.selection_plan.groups
     if (
         len(open_protocol.candidates) > _MAX_MATCHED_CANDIDATES

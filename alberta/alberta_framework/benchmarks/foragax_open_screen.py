@@ -30,6 +30,11 @@ from typing import Any, BinaryIO, Final, cast
 import numpy as np
 import numpy.typing as npt
 
+# Schema lattice.  Two protocol families (baseline and stateful baseline) exist in three
+# generations: v1 (the GPU-era originals), CPU v2 (the first CPU overlays), and CPU v3.
+# All six stay in SUPPORTED_SCHEMAS so their pinned artifacts can be re-validated
+# byte-for-byte, but v1 and CPU v2 are immutable history — only the two CPU-v3
+# protocols (EXECUTABLE_CPU_SCHEMAS) may actually be executed by this harness.
 BASELINE_SCHEMA: Final = "alberta.forager_fov_baseline_screening.v1"
 STATEFUL_SCHEMA: Final = "alberta.forager_fov_stateful_baseline_screening.v1"
 BASELINE_CPU_SCHEMA: Final = "alberta.forager_fov_baseline_screening_cpu.v2"
@@ -45,6 +50,11 @@ EXECUTABLE_CPU_SCHEMAS: Final = CPU_V3_SCHEMAS
 SUPPORTED_SCHEMAS: Final = frozenset(
     {BASELINE_SCHEMA, STATEFUL_SCHEMA, *CPU_SCHEMAS}
 )
+# SHA-256 of each frozen PROTOCOL.json under its _KNOWN_PROTOCOL_ROOTS directory in
+# outputs/forager.  load_frozen_protocol() rejects any protocol whose bytes do not hash
+# to the registered value, so these pins ARE the freeze: they are never regenerated.
+# Editing a protocol changes its digest and correctly invalidates it; a genuinely new
+# protocol gets a new schema version, a new root, and a new row here.
 _FROZEN_PROTOCOL_SHA256: Final[dict[str, str]] = {
     BASELINE_SCHEMA: "b94c906f9d3c1f2abf226d7049bd9305700d7f5a81012b07b36cc10d458d3174",
     STATEFUL_SCHEMA: "df80dfafbd3bfc8eca7f1e6eccadc0ba93da4a3ec8f12ebe2befd430a21915e8",
@@ -92,6 +102,10 @@ _MAX_NPZ_BYTES: Final = 64 * 1024**2
 _MAX_ZIP_MEMBERS: Final = 512
 _MAX_UNCOMPRESSED_BYTES: Final = 64 * 1024**2
 _MAX_REWARD_MEMBER_BYTES: Final = 4 * 1024**2
+# Container environment pinned for determinism: force JAX/XLA onto CPU and hide every
+# GPU path (empty CUDA_VISIBLE_DEVICES, NVIDIA_VISIBLE_DEVICES=void), disable XLA client
+# preallocation, and fix PYTHONHASHSEED so hash-order-dependent iteration in candidate
+# code cannot vary between runs.
 _CPU_V2_ENVIRONMENT: Final[dict[str, str]] = {
     "CUDA_VISIBLE_DEVICES": "",
     "JAX_PLATFORM_NAME": "cpu",
@@ -100,6 +114,9 @@ _CPU_V2_ENVIRONMENT: Final[dict[str, str]] = {
     "PYTHONHASHSEED": "0",
     "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
 }
+# v3 additionally pins the matplotlib and numba cache directories inside the writable
+# tmpfs, so library caches land in the ephemeral mount instead of attempting writes to
+# the read-only root; the preflight contract below requires both directories to exist.
 _CPU_V3_ENVIRONMENT: Final[dict[str, str]] = {
     **_CPU_V2_ENVIRONMENT,
     "MPLCONFIGDIR": "/tmp/alberta-matplotlib-cache",
@@ -115,6 +132,10 @@ _CPU_V3_PREFLIGHT_CONTRACT: Final[dict[str, Any]] = {
         "NUMBA_CACHE_DIR": "/tmp/alberta-numba-cache",
     },
 }
+# Sandbox contract recorded in every plan and receipt: no network, read-only root,
+# all capabilities dropped, no-new-privileges, non-root uid/gid 65532 (the conventional
+# distroless "nonroot" user), a pids limit as a fork-bomb guard, and one
+# noexec/nosuid/nodev tmpfs as the only writable path.
 _CPU_PROTOCOL_SANDBOX: Final[dict[str, Any]] = {
     "capabilities": "all_dropped",
     "container_user": "65532:65532",
@@ -1921,7 +1942,18 @@ def _metric_contract(protocol: FrozenProtocol) -> dict[str, Any]:
 
 
 def score_raw_rewards(rewards: npt.NDArray[np.generic], horizon: int) -> dict[str, Any]:
-    """Validate and compute the exact frozen unadjusted FOV tail-EMA statistic."""
+    """Validate and compute the exact frozen unadjusted FOV tail-EMA statistic.
+
+    This is the Forager paper's field-of-view metric (arXiv:2605.01131; see
+    ``FORAGER_BENCHMARK.md``): the mean over the final 10% of the unadjusted
+    reward-EMA curve — decay 0.999, zero initial value, no bias correction —
+    sampled every 100 steps starting at step 0, matching the upstream
+    stored-EMA convention (frames 0, 100, ...).  The constants are frozen
+    protocol values (see ``_metric_contract``/``_validate_metric``), not
+    tunables.  Returns the score together with the reward-trace digest,
+    dtype/shape, and tail-boundary bookkeeping used for drift checks against
+    the in-image scorer.
+    """
 
     if rewards.shape != (horizon,):
         raise ScreenError(f"raw rewards must have exact shape ({horizon},), got {rewards.shape}")
@@ -2131,6 +2163,19 @@ def _tagged_sqlite_value(value: Any) -> dict[str, Any]:
 
 
 def _canonical_results_database(contents: bytes) -> dict[str, Any]:
+    """Reduce a candidate ``results.db`` to a canonical, comparison-safe JSON form.
+
+    The bytes are deserialized into a fresh in-memory connection with
+    ``trusted_schema`` off and ``query_only`` on, must pass
+    ``integrity_check``, and may contain only plain tables and indexes —
+    views, triggers, and virtual tables are rejected, since those can run
+    attacker-chosen SQL when the database is queried.  Exactly one
+    ``_metadata_`` table is required; its schema row, column list, and rows
+    (ordered by id then seed) are returned with every value tagged by SQLite
+    storage class, floats and blobs rendered as hex, so the later equality
+    check against the preflight contract is exact rather than subject to
+    float formatting or column affinity.
+    """
     if not contents or len(contents) > 64 * 1024**2:
         raise ScreenError("results.db is empty or exceeds its byte bound")
     connection = sqlite3.connect(":memory:")

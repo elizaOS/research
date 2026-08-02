@@ -1,4 +1,10 @@
-"""Development-only v5 lifecycle metrics and frozen confirmation plan.
+"""Development-only lifecycle diagnostics and frozen v5 confirmation plan.
+
+Two critical feature pairs on the frozen A->B->A->D->A->C->A->B->C partner
+schedule carry the diagnostic: the C-critical pair must be learned, retained
+across a long absence, and reused at recurrence, while the D-critical pair
+must be learned and then stably retired after its only exposure.  Joint
+success on both is the memory-management property under test.
 
 This module closes the endpoint loopholes in the original hidden-partner
 diagnostic.  Feature presence is indexed by the representation available for
@@ -8,6 +14,12 @@ therefore first changes presence at decision ``t + 1``.
 The exhaustive 66-pair archive is reported separately from the scarce
 deployed bank.  Retirement means release of deployed capacity and reset of the
 candidate's learned head; it does not erase the enumerated descriptor.
+
+Naming: the module name (``_v2``) tracks the diagnostic generation — this is
+the second-generation lifecycle diagnostic — while artifact schema versions
+advance independently.  The tuning grid emits ``lifecycle.v4`` /
+``critical-run-primitives.v3``; the later target-only-probe revision ("v5" in
+prose here) emits ``lifecycle.v5`` / ``critical-run-primitives.v4``.
 """
 
 from __future__ import annotations
@@ -42,18 +54,18 @@ HIDDEN_PARTNER_LIFECYCLE_V5_SCHEMA = "alberta.hidden-partner-development.lifecyc
 CRITICAL_RUN_PRIMITIVES_V5_SCHEMA = (
     "alberta.hidden-partner-development.critical-run-primitives.v4"
 )
-# Earlier v3 development seeds were inspected while diagnosing downstream
-# consumer interference.  This fresh namespace is reserved for the frozen
-# evidence-gated grid and must not be reused for adaptive debugging.
+# Fresh namespace: the earlier v3 development seeds are consumed (inspected
+# during debugging) and can never back the frozen evidence-gated grid, and
+# this namespace in turn must never be spent on adaptive debugging.
 LEASE_TUNING_NAMESPACE = "hidden-partner-v0-dev-v4-evidence-gated-lease-grid-a-v1"
 LEASE_TUNING_NAMESPACE_STATUS = "FORBIDDEN/UNEXECUTED"
 LEASE_TUNING_SEED_COUNT = 8
 CONFIRMATION_NAMESPACE = (
     "hidden-partner-v0-dev-v5-retired-reacquisition-confirmation-a-v1"
 )
-# The namespace was reserved but never executed.  A concurrent core change to
-# conditional leave-one-out probes no longer satisfies this v5 protocol's
-# target-only probe contract, so fail closed and forbid future execution.
+# Reserved but never executed, and permanently forbidden: the core's
+# conditional leave-one-out probes no longer satisfy this v5 protocol's
+# target-only probe contract, so execution fails closed.
 CONFIRMATION_NAMESPACE_STATUS = "FORBIDDEN/UNEXECUTED"
 
 
@@ -72,6 +84,12 @@ def require_lease_tuning_execution_allowed() -> None:
         )
 
 
+# Frozen cell-selection rule, recorded verbatim in the grid artifact.  Keys
+# are maximized lexicographically, so the negated keys minimize D repromotions
+# and D retirement latency.  The property under test (joint C-retain/D-retire
+# success) dominates, worst-seed reward outranks mean reward, and the final
+# negated cell index makes the selection deterministic — the grid can never
+# report a tie.
 TUNING_SELECTION_RULE: dict[str, object] = {
     "feasibility": (
         "all finite/contracts; mean reward >=0.85; minimum reward "
@@ -88,10 +106,24 @@ TUNING_SELECTION_RULE: dict[str, object] = {
     "no_feasible_cell_result": None,
 }
 
+# Measurement windows, in decision steps: task learning is scored over the
+# last 128 steps of a critical regime's segment, C's retention over the first
+# 128 steps of its recurrence, retirement over the 128 steps following a
+# retirement event, and D's final absence over the last 256 steps of the run.
 FEATURE_LEARNING_WINDOW = 128
 RETIREMENT_CONFIRMATION_WINDOW = 128
 FINAL_ABSENCE_WINDOW = 256
 RECURRENT_ENTRY_WINDOW = 128
+# Frozen development-only verdict gates feeding the composite lifecycle
+# booleans (``c_task_learned``, ``c_retained_and_used``,
+# ``d_learned_then_stably_retired``); they promote nothing.  Per-decision
+# reward is binary ({0, 1}, chance 0.5), so the 0.75 reward gates sit well
+# above chance, and the retention ratio compares excess-over-chance reward at
+# C's recurrence against its first exposure.  The masked-NLL gates require the
+# critical column to be load-bearing for prediction: masking it must raise NLL
+# by >= 0.005 nats on average and on >= 55% of window steps.
+# ``MINIMUM_JOINT_SUCCESS_FRACTION`` is instead the per-cell grid-feasibility
+# floor: joint success on >= 75% of the tuning seeds.
 CRITICAL_LATE_PREDICTION_ACCURACY_THRESHOLD = 0.80
 CRITICAL_COLUMN_LEARNING_NLL_GAIN_THRESHOLD = 0.05
 CRITICAL_COLUMN_LEARNING_POSITIVE_FRACTION_THRESHOLD = 0.55
@@ -198,6 +230,13 @@ class EvidenceLeaseTuningCell:
         }
 
 
+# Grace axis against the frozen schedule geometry: C's two exposures are
+# separated by an A+B gap of 3,328 base steps (jitter +/-63 per segment),
+# while ~8.4k steps remain after D's single exposure.  The swept grace values
+# bracket C's absence gap from below (2_048, 3_072) and above (4_096), and
+# every value is short enough to retire an evidence-idle D long before the
+# final-absence window.  The second axis sweeps the utility-evidence
+# threshold over 0.075-0.40.
 LEASE_TUNING_GRID: tuple[EvidenceLeaseTuningCell, ...] = tuple(
     EvidenceLeaseTuningCell(index=index, grace_steps=grace, evidence_threshold=threshold)
     for index, (grace, threshold) in enumerate(

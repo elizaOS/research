@@ -1,15 +1,28 @@
 """UPGD (Utility-based Perturbed Gradient Descent) learner.
 
-Implements UPGD (Dohare et al. 2023, "Maintaining Plasticity in Deep
-Continual Learning"), which augments standard SGD with utility-scaled
-perturbations of low-utility weights instead of the hard slot replacement
-used by generate-and-test methods.
+Implements a multi-head UPGD learner after Elsayed & Mahmood (ICLR 2024,
+"Addressing Loss of Plasticity and Catastrophic Forgetting in Continual
+Learning"): standard SGD augmented with utility-scaled perturbations of
+low-utility weights, instead of the hard slot replacement used by
+generate-and-test methods (the Dohare et al. loss-of-plasticity /
+continual-backprop line).
 
 The intuition: weights with low utility (small product of weight magnitude
 and gradient magnitude) are not contributing to the prediction and are
-"dead". UPGD adds Gaussian noise to such weights, scaled by ``(1 - u_norm)^beta``,
+"dead". UPGD adds noise to such weights, scaled by ``(1 - u_norm)^beta``,
 which lets them drift back into a useful regime without destroying any
 structure that the network has already learned.
+
+This learner deliberately extends the paper algorithm. Its utility trace is
+the absolute product ``|w * grad|`` with a power gate, where the paper uses
+the signed first-order estimate ``-grad * w``, and it layers several
+optional mechanisms on top of the paper update: ObGD-style step bounding
+with an online-adapted kappa, gradient-alignment meta-plasticity for
+trunk/head step multipliers, hidden-unit recycling, and a family of simplex
+readouts (softmax/CE, factorized label-map adapters, two-timescale
+fast+slow heads). For a source-profiled implementation faithful to the
+published paper and its released code, use
+:mod:`alberta_framework.core.canonical_upgd`.
 
 Architecture mirrors :class:`MultiHeadMLPLearner`: a shared MLP trunk
 (``Input -> [Dense -> LayerNorm -> LeakyReLU] x N``) with ``n_heads``
@@ -17,8 +30,8 @@ linear output heads. Utility tracking and perturbation are applied only
 to the trunk hidden weight matrices -- biases and output (head) weights
 and biases are updated with plain SGD with no perturbation.
 
-Reference: Dohare et al. 2023, "Maintaining Plasticity in Deep Continual
-Learning"
+Reference: Elsayed & Mahmood (2024). "Addressing Loss of Plasticity and
+Catastrophic Forgetting in Continual Learning." ICLR 2024.
 """
 
 import functools
@@ -175,7 +188,7 @@ class UPGDLearningResult:
 
 
 class UPGDLearner:
-    """Utility-based Perturbed Gradient Descent learner (Dohare et al. 2023).
+    """Utility-based Perturbed Gradient Descent learner (Elsayed & Mahmood, ICLR 2024).
 
     Architecture mirrors :class:`MultiHeadMLPLearner`:
 
@@ -1162,22 +1175,22 @@ class UPGDLearner:
         readout_slow_simplex_gradient_multiplier: float = 1.0,
         step_size: float = 0.03,
     ) -> "UPGDLearner":
-        """Create the current resource-efficient Step 2 UPGD candidate.
+        """Create the resource-efficient Step 2 UPGD configuration.
 
         This factory is intentionally explicit rather than changing the
-        constructor default.  It captures the no-portfolio Step 2 candidate
-        used for the compute-efficiency promotion experiments: target-structure
-        vector loss, conservative ObGD bounding, low-noise utility perturbation,
-        sparse Rademacher mutation every 16 steps, and lean bookkeeping when
-        unit recycling and gradient-alignment meta-control are disabled.
+        constructor default.  It bundles the lean single-learner Step 2
+        configuration: target-structure vector loss, conservative ObGD
+        bounding, low-noise utility perturbation, sparse Rademacher mutation
+        every 16 steps, and minimal bookkeeping (unit recycling and
+        gradient-alignment meta-control disabled, so no per-unit or
+        previous-gradient buffers are carried).
 
         Args:
             n_heads: Number of vector-output prediction heads.
             hidden_sizes: Shared hidden-layer sizes.
             loss_normalization: Target normalizer to test.  The preferred
-                default is ``"target_structure"``; pass ``"target_density"``
-                only to reproduce historical one-hot density-equivalent
-                ablations.
+                default is ``"target_structure"``; ``"target_density"`` is
+                kept only for one-hot density-equivalent ablations.
             readout_mode: Output loss/readout mode.  ``"linear_mse"`` is the
                 supervised Step 2 default; ``"softmax_ce"`` keeps the same
                 resource-efficient UPGD branch for one-hot classification or
@@ -1266,19 +1279,25 @@ class UPGDLearner:
         *,
         step_size: float = 0.018,
     ) -> "UPGDLearner":
-        """Create the strict Step 2 digit/readout consistency candidate.
+        """Create the strict Step 2 digit/readout configuration.
 
-        This factory captures the 2026-05-07 branch that closes the
-        one-branch digit readout conflict against same-run fair MLP baselines.
-        It is intentionally separate from :meth:`step2_default`: this branch
-        is a heavier simplex/readout default for sklearn-digits-style online
-        classification streams, while ``step2_default`` remains the
-        resource-efficient broad target-structure default.
+        A heavier simplex/readout configuration for sklearn-digits-style
+        online classification streams, intentionally separate from
+        :meth:`step2_default` (which stays the resource-efficient broad
+        target-structure default).  It enables the two-timescale simplex
+        readout with a separately bounded fast head (2x fast-head step-size
+        and trunk-gradient multipliers, slow simplex gradients gated off),
+        loss-ratio adaptive kappa clamped to ``[0.35, 0.65]`` around the
+        ``0.5`` base so bounding never drifts far from the fixed-kappa
+        default, and gradient-alignment meta-plasticity restricted to the
+        output heads (trunk multiplier frozen).  The specific constants
+        (warmup steps, multiplier bounds, ``step_size=0.018``) are frozen
+        empirical calibrations for this stream family, not derived values.
 
         Args:
             n_heads: Number of simplex output heads.
             hidden_sizes: Shared hidden-layer sizes.
-            step_size: Base UPGD step-size.  The promoted row uses ``0.018``.
+            step_size: Base UPGD step-size.
 
         Returns:
             Configured :class:`UPGDLearner`.

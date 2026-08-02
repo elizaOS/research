@@ -1,0 +1,15 @@
+upgd_ema_norm 0
+upgd_ema_norm 1
+upgd_ema_norm 2
+adamw_cbp 0
+adamw_cbp 1
+adamw_cbp 2
+upgd_w_wd0005 0
+upgd_w_wd0005 1
+upgd_w_wd0005 2
+upgd_l2init 0
+upgd_l2init 1
+upgd_l2init 2
+upgd_idbd 0
+upgd_idbd 1
+upgd_idbd 2

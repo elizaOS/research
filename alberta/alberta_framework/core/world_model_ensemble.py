@@ -7,6 +7,14 @@ states.  Every event first evaluates every member and emits causal typed
 learning signals.  Only after that observation has been recorded are
 bootstrap-masked member updates and residual-variance statistics formed.
 
+Bootstrap masking follows the bootstrapped-ensemble recipe (Osband et al.
+2016): each member commits a given event's update only with probability
+``bootstrap_probability``, so the members train on different subsamples of
+the same stream and stay decorrelated.  The variance across member
+predictions (``epistemic_disagreement``) then serves as an inexpensive
+epistemic-uncertainty proxy — members agree where data has constrained them
+all and disagree where it has not (Lakshminarayanan et al. 2017).
+
 The residual variance is a per-member, per-head EMA of earlier squared
 residuals.  It is only a development residual-variance proxy, not a learned or
 calibrated aleatoric-uncertainty estimate.  Uncertainty channels remain
@@ -17,6 +25,12 @@ The subsystem is transactional.  Invalid runtime input, corrupt dynamic
 state, a non-finite prediction, or a non-finite candidate update leaves the
 complete state (including RNG, masks, counters, models, and signal estimator)
 unchanged.  Static shape and dtype mismatches raise before compiled execution.
+
+References:
+    Osband, Blundell, Pritzel, & Van Roy (2016). "Deep Exploration via
+        Bootstrapped DQN."
+    Lakshminarayanan, Pritzel, & Blundell (2017). "Simple and Scalable
+        Predictive Uncertainty Estimation Using Deep Ensembles."
 """
 
 from __future__ import annotations
@@ -89,7 +103,16 @@ class WorldModelEnsembleConfig:
 
     ``bootstrap_probability`` must be strictly between zero and one so the
     persisted mask stream can expose members to genuinely different subsets.
-    A particular event may still draw an all-true or all-false mask.
+    A particular event may still draw an all-true or all-false mask.  Each
+    member commits, in expectation, ``bootstrap_probability`` of all valid
+    events.
+
+    ``residual_variance_decay`` is the EMA decay of the squared-residual
+    proxy; the default 0.99 averages over an effective window of roughly
+    ``1 / (1 - decay)`` = 100 events.  ``residual_variance_warmup_steps``
+    gates the uncertainty channels; the default of 1 requires only that one
+    real residual has been observed, so the floor-initialized prior variance
+    is never reported as if it were measured.
 
     ``signal_estimator.ensemble_size`` and ``target_dim`` must exactly match
     this ensemble and the normalized raw world-model head vector.

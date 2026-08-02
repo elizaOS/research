@@ -4,8 +4,13 @@
 This module is a mechanism-only replay substrate.  It does not train a model,
 critic, or actor and it carries no scientific-evidence claim.  A configured
 total slot budget is split between a short-term FIFO and a long-term memory.
-The long-term policy is static: either exact reservoir sampling or a calibrated
-combination of epistemic surprise, observation coverage, and learning progress.
+The long-term policy is static: either exact reservoir sampling (Algorithm R,
+Vitter 1985) or a ``"calibrated"`` priority policy — a weight-normalized convex
+combination of scale-normalized epistemic surprise, observation-coverage
+novelty (distance to the nearest retained observation), and learning progress.
+The calibration itself lives with the caller: scales, weights, and the
+admission threshold are per-protocol inputs, and the defaults (unit scales,
+equal weights, midpoint threshold) are neutral placeholders, not tuned values.
 
 The write boundary is deliberately causal.  :meth:`DualReplayMemory.record`
 accepts a :class:`ReplayPrediction` that must have been produced before the
@@ -19,6 +24,10 @@ are compatible with eager execution, ``jax.jit``, and ``jax.lax.scan``.  Invalid
 dynamic state and exhausted counters fail closed without changing persistent
 state.  Invalid transitions only advance the bounded attempt/rejection counters;
 neither replay stratum nor the PRNG is partially updated.
+
+Reference:
+    Vitter, J. S. (1985). "Random Sampling with a Reservoir."
+    ACM Transactions on Mathematical Software 11(1), 37-57.
 """
 
 from __future__ import annotations
@@ -61,6 +70,17 @@ class DualReplayConfig:
     strata must contain at least one slot.  Calibrated retention uses all three
     positive-weight components and requires explicit epistemic, learning-
     progress, and aleatoric availability.
+
+    Calibrated-retention fields: each ``*_scale`` divides its raw signal before
+    clipping to ``[0, 1]``, so it encodes the magnitude at which that signal
+    saturates; the ``*_weight`` values form a convex combination, so the
+    resulting priority also lies in ``[0, 1]``.
+    ``calibrated_priority_threshold`` is the admission floor on that priority
+    (default ``0.5`` — the midpoint of the attainable range), and
+    ``calibrated_replacement_margin`` is the extra priority a candidate must
+    carry over the lowest-priority resident once the stratum is full.  The
+    defaults are neutral placeholders; protocols supply their own calibrated
+    values.
     """
 
     total_capacity: int
@@ -273,7 +293,7 @@ class DualReplayState:
 
 @chex.dataclass(frozen=True)
 class ReservoirSelection:
-    """Exact Algorithm-R selection calculation for one one-based candidate."""
+    """Exact Algorithm-R (Vitter 1985) selection calculation for one one-based candidate."""
 
     selected: Array
     slot: Array
@@ -492,7 +512,7 @@ def reservoir_selection(
     candidate_number: Array,
     capacity: int,
 ) -> ReservoirSelection:
-    """Apply the exact one-based Algorithm-R selection contract.
+    """Apply the exact one-based Algorithm-R (Vitter 1985) selection contract.
 
     Candidates ``1..capacity`` deterministically fill slots ``0..capacity-1``.
     For candidate ``n > capacity``, one integer is drawn uniformly from

@@ -1,4 +1,29 @@
-"""Fail-closed contracts for the managed hidden-regime execution boundary."""
+"""Fail-closed contracts for the managed hidden-regime execution boundary.
+
+:mod:`alberta_framework.evaluation.hidden_regime_execution_governance` gates
+who may execute the exact calibration worlds.  Vocabulary used throughout
+this suite:
+
+* **genesis** — the deterministic, zero-entry initial ledger tree binding
+  the source-archive, runtime, and readiness-receipt digests;
+* **ledger** — the on-disk record of execution attempts (started, completed,
+  replay, and finalization records), only ever published via atomic
+  whole-tree or single-record installs;
+* **authorization** — a process-sealed capability bound to one readiness
+  receipt, genesis, and case, consumed before the first learner transition,
+  so each calibration case executes at most once (a crash permits an exact
+  replay only);
+* **zip provenance capability** — attestation that the worker executed from
+  the content-addressed source ZIP with bytecode/``__pycache__`` isolation.
+
+The tests drive real (tiny) hidden-regime learner executions through the
+boundary and then attack it: forked children inheriting process-local
+capabilities, fresh processes replaying seals, forged issuers, ledger
+tampering and symlinks, fault injection at every atomic-install checkpoint,
+and concurrent initializers/executors must fail closed with exactly one
+winner.  The ``development`` marker keeps this suite in the same lane as the
+calibration machinery it governs: passing here is never promoted evidence.
+"""
 
 from __future__ import annotations
 

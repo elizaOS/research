@@ -3,8 +3,8 @@
 
 This module evaluates the paper-specific actor-sample gate, never the separate
 Prototype ``sparks_joy`` candidate-update audit.  It implements neither Kondo
-selection nor a promotion path.  Ordinary and delightful policy gradients use
-matched categorical actor-critic configurations that differ only in gate mode,
+selection nor a promotion path.  Ordinary and paper-specific DG policy gradients
+use matched categorical actor-critic configurations that differ only in gate mode,
 the same initialization and sampler, paired action/environment random-number
 schedules, and the same logical resource budget.  Their realized actions and
 transitions may diverge once their policies diverge.
@@ -14,11 +14,16 @@ heteroskedastic gambling stream first, then a six-state switching RiverSwim
 control.  Both are uninterrupted A/B/A lives.  Every trace is prequential: the
 logged policy and action exist before the corresponding outcome and update.
 
+The paper-specific DG delight/gate equations are those of
+:func:`alberta_framework.core.delight.discrete_delightful_policy_gradient`,
+implementing the bounded discrete-action experiment specified in WP5 of
+``CONTINUAL_AGENT_IMPLEMENTATION_PLAN.md``.
+
 Reports are deterministic, versioned, JSON-compatible development records.
 Their strict validator checks schema, digest, common-random-number pairing,
-environment reconstruction, action sampling, literal delight/gate equations,
-metrics, strata, and logical accounting.  No result or threshold in this file
-can promote a scientific claim.
+environment reconstruction, action sampling, exact paper-specific DG
+delight/gate equations, metrics, strata, and logical accounting.  No result
+or threshold in this file can promote a scientific claim.
 """
 
 from __future__ import annotations
@@ -108,6 +113,11 @@ _CONTEXT_MEANS = (
 )
 _CONTEXT_STANDARD_DEVIATIONS = (0.1, 2.0)
 
+# RiverSwim-style stochastic chain (Strehl & Littman 2008); values match the
+# :class:`RiverSwimConfig` defaults documented in
+# ``alberta_framework.streams.closed_loop``.  The regime tables below only swap
+# which boundary pays the large reward, so regime B reverses the optimal policy
+# without changing the transition kernel.
 _RIVER_CONFIG = RiverSwimConfig(
     n_states=6,
     p_right_up=0.35,
@@ -119,6 +129,9 @@ _RIVER_CONFIG = RiverSwimConfig(
 _RIVER_LEFT_REWARD_BY_REGIME = (0.005, 1.0)
 _RIVER_RIGHT_REWARD_BY_REGIME = (1.0, 0.005)
 
+# Arbitrary-but-frozen fold-in tags (see ``_scenario_keys``) that split each
+# seed's root key into independent agent and environment streams per benchmark.
+# The values carry no meaning, but changing any of them changes every trace.
 _CONTEXT_AGENT_SEED_TAG = 1_001
 _CONTEXT_ENVIRONMENT_SEED_TAG = 1_002
 _RIVER_AGENT_SEED_TAG = 2_001
@@ -1401,7 +1414,9 @@ def _validate_policy_and_dg_semantics(
     if not np.allclose(
         arrays["delight"], np.asarray(expected_pg.delight), atol=1.0e-6, rtol=1.0e-6
     ):
-        errors.append("trace delight does not match advantage times action surprisal")
+        errors.append(
+            "trace paper-specific DG delight does not match advantage times action surprisal"
+        )
     if not np.allclose(
         arrays["gate_weight"],
         np.asarray(expected_pg.sample_weights),

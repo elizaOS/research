@@ -1,8 +1,8 @@
 # mypy: disable-error-code="call-arg,name-defined,unused-ignore"
 """Fixed-budget online associative memory for Step 2 sequence features.
 
-This module packages the strongest sparse key/value mechanism probe into a
-small JAX-compatible learner.  It is deliberately narrower than a transformer:
+This module implements a sparse key/value associative memory as a small
+JAX-compatible online learner.  It is deliberately narrower than a transformer:
 contexts are integer token windows, features are causal token/local-conjunction
 keys, and a fixed-size table maps those keys to value logits.  Feature utility
 is learned online from feature-level loss advantage and the table budget is
@@ -43,8 +43,8 @@ class AssociativeMemoryConfig:
         vocab_size: Number of discrete labels/tokens.
         block_size: Context length.
         suffix_length: Number of recent tokens used for local pair features.
-        feature_family: Active feature family. ``"token_suffix_pair"`` is the
-            promoted hybrid from the sparse-KV probe.
+        feature_family: Active feature family. ``"token_suffix_pair"``
+            enables both the position-token and suffix-pair families.
         max_features: Fixed row budget for the associative table.
         write_lr: Additive write rate for the observed label.
         retention: Multiplicative decay applied to prior and row values.
@@ -382,6 +382,9 @@ class AssociativeMemoryLearner:
         return found, indices.astype(jnp.int32)
 
     def _feature_weights(self, utility: Array) -> Array:
+        # Mirror of the stored-trace clip in ``update``; keeps ``exp`` finite
+        # for arbitrary restored states.  The [min_weight, max_weight] clamp
+        # below is what actually bounds a feature's influence.
         clipped = jnp.clip(utility, -8.0, 8.0)
         return jnp.clip(jnp.exp(clipped), self._config.min_weight, self._config.max_weight)
 
@@ -463,6 +466,10 @@ class AssociativeMemoryLearner:
         scope_weights = family_scope * window_scope * mask.astype(jnp.float32)
         weights = base_weights * scope_weights
         evidence = jnp.sum(weights[:, None] * row_values, axis=0)
+        # The decayed label-frequency prior enters with a small fixed weight:
+        # it dominates only when no feature rows match (evidence is zero, so
+        # the prediction falls back to base rates) and is otherwise a weak
+        # tiebreak against feature evidence scaled by ``logit_scale``.
         logits = 0.05 * state.prior + self._config.logit_scale * evidence
         total_weight = jnp.sum(weights)
         if self._config.normalize_by_weight:
@@ -594,6 +601,8 @@ class AssociativeMemoryLearner:
         loss_pressure = jnp.clip((loss / uniform_loss) - 1.0, -1.0, 1.0)
         grow = replacement_rate * (1.0 + jnp.maximum(loss_pressure, 0.0))
         shrink = (1.0 - replacement_rate) * jnp.maximum(-loss_pressure, 0.0)
+        # Asymmetric controller: shrink pressure is discounted 4x relative to
+        # growth, so the exposed budget contracts more slowly than it expands.
         budget_delta = self._config.budget_lr * (grow - 0.25 * shrink)
         budget_logit = jnp.clip(
             state.budget_logit + budget_delta,
@@ -646,6 +655,11 @@ class AssociativeMemoryLearner:
                 self._config.utility_decay * old_utility
                 + self._config.utility_lr * (loss - feature_loss)
             )
+            # Clip the stored trace, not just the derived weight: ±8 is far
+            # outside the range that moves the clamped weight (ln of the
+            # default weight clamps is about [-3.9, +2.1]), so this bound
+            # caps how deeply a row can saturate and keeps the number of
+            # opposing-sign updates needed to recover bounded.
             new_utility = jnp.clip(new_utility, -8.0, 8.0)
             new_row = old_row * self._config.retention
             new_row = new_row.at[label].add(self._config.write_lr)

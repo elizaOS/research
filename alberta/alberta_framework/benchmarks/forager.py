@@ -193,6 +193,11 @@ _PRESET_OBSERVATIONS: dict[ForagerPreset, ObservationType] = {
     "field_of_view": "color",
     "unending": "rgb",
 }
+# Arbitrary fixed domain-separation tags.  Each agent family folds its tag
+# into ``jax.random.key(seed)``, making its key stream disjoint from the
+# untagged environment chain and from every other family at the same seed.
+# The exact values are frozen: :func:`forager_rng_contract` publishes them and
+# the matrix runner pins a digest of that contract.
 _AGENT_RNG_NAMESPACE = 0x0A1BE47A
 _RECURRENT_RNG_NAMESPACE = 0x6EC0A11E
 _RTU_RTRL_RNG_NAMESPACE = 0x527455AC
@@ -687,7 +692,14 @@ def _unadjusted_ema_chunk(
     decay: float,
     filter_state: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Apply the historical Collector ``MovingAverage`` transformation."""
+    """Apply the paper pipeline's Collector ``MovingAverage`` transform.
+
+    Zero-initialized, bias-uncorrected EMA (``z = decay*z + (1-decay)*r``),
+    reproducing the ``ml-instrumentation`` Collector stack used by the
+    authors' experiment repositories (``FORAGER_FOV_AGENTS_URL``); the FOV
+    statistic is defined on this curve.  Contrast :func:`_adjusted_ewm_chunk`,
+    which divides out the zero-initialization bias.
+    """
     return cast(
         tuple[np.ndarray, np.ndarray],
         lfilter(
@@ -864,6 +876,14 @@ class AlbertaForagerConfig:
     and critic use Autostep with ObGD bounds.  ``recurrent_hidden_size > 0``
     adds a seed-fixed echo-state GRU whose causal hidden state is appended to
     the ordinary features; only the downstream actor and critic are trained.
+
+    ``autostep_tau`` keeps the Autostep normalizer time constant at the
+    Mahmood et al. (2012) default of 10^4 samples.  For the reservoir,
+    ``recurrent_scale < 1`` gives the Gaussian recurrent kernel an expected
+    spectral radius below one (fading memory), and the negative
+    ``recurrent_update_bias`` starts the GRU update gate mostly closed
+    (``sigmoid(-1)`` is about 0.27) so reservoir state persists across many
+    steps by default.
     """
 
     actor_hidden_sizes: tuple[int, ...] = (64, 64)

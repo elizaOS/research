@@ -1,3 +1,15 @@
+"""Contract tests for
+:mod:`alberta_framework.benchmarks.forager_matched_evaluation_campaign`.
+
+The module under test is pure, reward-free scheduling for the sealed
+evaluation block: given a sealed protocol and a validated open-to-sealed
+transition, it builds the seed-major 6-candidate x 30-seed schedule (the
+four tuning-selected arms followed by the two fixed descriptive arms) and
+the canonical transition descriptor.  Tests pin the exact cell layout and
+digest bindings and require self-consistent tampering, bad self-hashes,
+non-canonical bytes, wrong stages, and drifted transitions to fail closed.
+"""
+
 from __future__ import annotations
 
 import copy
@@ -42,6 +54,10 @@ def sealed_context() -> tuple[
         "ranked_groups": [
             {
                 "selection_group": group.selection_group,
+                # Rank each group in *reverse* declaration order so the
+                # synthetic winners differ from the panel's declared order —
+                # any code that confuses declaration order with the selection
+                # ranking fails the schedule/transition assertions below.
                 "ranked_candidate_ids": list(reversed(group.candidate_ids)),
                 "ranking_evidence_sha256": hashlib.sha256(
                     f"sealed-ranking:{group.selection_group}".encode("ascii")

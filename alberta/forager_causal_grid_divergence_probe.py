@@ -1745,8 +1745,14 @@ def _run_child_with_qualification_mount(
             ) from exc
         raise
     if completed.returncode != 0 or completed.stderr:
+        if not _cleanup_named_container(runtime_path, container_name, environment):
+            raise CausalGridDivergenceProbeError(
+                "isolated probe completed unsuccessfully and named-container cleanup "
+                "was not confirmed"
+            )
         raise CausalGridDivergenceProbeError(
-            f"isolated frozen-source probe failed with status {completed.returncode}"
+            "isolated frozen-source probe failed with status "
+            f"{completed.returncode}; named-container cleanup completed"
         )
     probe_raw_after = _read_stable_regular_file(
         probe_path,
@@ -2669,7 +2675,7 @@ def load_receipt(output_root: Path) -> dict[str, Any]:
         raise CausalGridDivergenceProbeError(
             "published development receipt omits required schema fields"
         ) from exc
-    if reconstructed != payload:
+    if reconstructed != payload or _canonical_json_bytes(reconstructed) != raw:
         raise CausalGridDivergenceProbeError(
             "published development receipt fails exact schema replay"
         )

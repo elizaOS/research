@@ -1,5 +1,12 @@
 """Strict active execution contract for the UPGD IPMNIST development lane.
 
+The benchmark science lives in :mod:`alberta_framework.benchmarks.upgd_ipmnist`
+(the Input-permuted MNIST replication of Elsayed & Mahmood, ICLR 2024,
+including its documented deviations); this module governs only *how* that
+protocol may be executed.  Operator procedure — prerequisites, the external
+seed-reservation ledger, and the exact per-stage commands — is specified in
+``UPGD_IPMNIST_V3_RUNBOOK.md`` at the alberta tree root.
+
 The v3 lifecycle is deliberately split into three commands: issue an immutable
 pre-run plan, execute exactly one learner/seed shard, and merge the exact
 planned Cartesian product.  Every file is published atomically at a new path.
@@ -56,6 +63,9 @@ DATA_SCHEMA = "alberta.upgd_ipmnist.data.v1"
 BENCHMARK = "upgd_input_permuted_mnist"
 
 LEARNER_IDS = ("upgd_w", "adamw")
+# Seed IDs 0-9 were consumed by the completed v1 diagnostic run of this
+# benchmark; plan validation rejects them so no v3 plan can reuse a seed
+# whose results have already been observed.
 KNOWN_CONSUMED_SEED_IDS = tuple(range(10))
 MNIST_ARCHIVE_RELATIVE_PATH = Path("openml/openml.org/data/v1/download/52667/mnist_784.arff.gz")
 MNIST_ARCHIVE_BYTE_SIZE = 15_469_256

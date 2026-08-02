@@ -803,6 +803,11 @@ def _parse_condition(
         if not 0 <= nominal_accepted <= nominal_decisions:
             errors.append(f"{location} nominal accepted count is out of range")
         executed_accepted = int(np.count_nonzero(accepted))
+        # The primitive trace records each acceptance one step after the
+        # decision: a decision at step t selects the action executed at step
+        # t + 1, so the run's final decision never appears as an executed
+        # transition.  The nominal counter may therefore lead the executed
+        # count by exactly one; any other discrepancy is a protocol violation.
         if nominal_accepted not in {
             executed_accepted,
             executed_accepted + 1,

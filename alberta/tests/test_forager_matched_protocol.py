@@ -1,3 +1,21 @@
+"""Contract tests for :mod:`alberta_framework.benchmarks.forager_matched_protocol`.
+
+The module under test is the strict, reward-agnostic parser for the
+matched-current Forager comparison protocol: it validates scientific intent
+and execution identity (candidate strata, seed contracts, runtime bindings,
+the frozen statistics plan) without executing agents or reading results.
+This suite exercises that contract fail-closed: mutations of a valid payload
+— digest tampering, stage confusion, seed-set overlap, relabelled strata,
+non-canonical or hostile JSON — must be rejected, while the one legal
+transition (``open_tuning`` -> ``sealed_evaluation`` via a bound selection
+result) must replay deterministically.
+
+The synthetic-payload builders here (``_candidate``, ``_payload``,
+``_sealed_payload``) double as a fixture library: sibling suites import this
+module as ``protocol_fixtures`` (``test_forager_matched_evidence``,
+``test_forager_matched_executor``).
+"""
+
 from __future__ import annotations
 
 import copy
@@ -11,11 +29,19 @@ import pytest
 
 from alberta_framework.benchmarks import forager_matched_protocol as matched
 
+# Mirrors the executor's MATCHED_HORIZON: a ~500k-step horizon that power-of-two
+# rollout lengths divide exactly (499_712 = 244 * 2_048 = 122 * 4_096); the
+# parser requires ``rollout_steps`` to divide the horizon with no remainder.
 HORIZON = 499_712
+# Placeholder 64-hex digests — the parser validates digest format and
+# cross-references between sections, never the referenced content.
 IMAGE_SHA = "1" * 64
 PROFILE_SHA = "2" * 64
 TASK_SHA = "3" * 64
 SCHEDULE_SHA = "4" * 64
+# Qualification trust-anchor identity: names the authority that issued each
+# candidate's capability receipt.  The parser requires every candidate's
+# runtime binding to cite the same anchor as the protocol's runtime block.
 TRUST_ANCHOR = "alberta_protocol_qualification_anchor_v1"
 
 

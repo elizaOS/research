@@ -19,7 +19,13 @@ from jax import Array
 
 
 class GeometricFeatureState(NamedTuple):
-    """State for ``BudgetedGeometricFeatureLearner``."""
+    """State for ``BudgetedGeometricFeatureLearner``.
+
+    ``birth_timestamp`` (seconds since the epoch, set at ``init``) and
+    ``uptime_s`` (cumulative wall-clock seconds spent in scan runs) are
+    lifetime-accounting metadata only; they never enter the learning
+    computation.
+    """
 
     centers: Array
     active: Array
@@ -79,6 +85,34 @@ class BudgetedGeometricFeatureLearner:
         use_obgd: bool = True,
         obgd_kappa: float = 2.0,
     ) -> None:
+        """Configure the budgeted geometric feature learner.
+
+        Args:
+            n_centers: Fixed dictionary budget (number of center slots).
+            n_tasks: Number of linear output heads.
+            step_size_output: LMS step-size for the output layer.
+            energy_decay: EMA decay for the feature/input/target energy
+                normalizers.
+            utility_decay: EMA decay for per-center utility, the replacement
+                score for occupied slots.
+            rbf_bandwidth: Gaussian bump width, in units of per-dimension
+                RMS-normalized input distance.
+            hinge_radius: Support radius of the linear hinge feature
+                ``max(1 - dist / radius, 0)``, in the same normalized units.
+            novelty_threshold: Minimum normalized distance to the nearest
+                active center before the current observation may be admitted.
+            residual_threshold: Minimum pre-update residual energy, relative
+                to the target-energy EMA, before admission.
+            min_center_age: Updates an active center must survive before it
+                becomes eligible for utility-based replacement.
+            imprint_scale: Fraction of the current per-head error written into
+                a newly admitted center's RBF output weight, so insertion
+                immediately absorbs part of the residual.
+            feature_clip: Symmetric clip applied to normalized features.
+            use_obgd: Whether to bound the output-layer update with ObGD-style
+                global scaling (Elsayed et al. 2024).
+            obgd_kappa: ObGD sensitivity; higher is more conservative.
+        """
         if n_centers < 1:
             raise ValueError("n_centers must be positive")
         if n_tasks < 1:
@@ -301,6 +335,10 @@ class BudgetedGeometricFeatureLearner:
         weight_delta = step_scale * errors[:, None] * feats[None, :] / active_count
         bias_delta = step_scale * errors / active_count
         bounding_scale = jnp.array(1.0, dtype=jnp.float32)
+        # ObGD-style global update bound (Elsayed, Lan, Lyle & Mahmood 2024,
+        # "Streaming Deep Reinforcement Learning Finally Works"): rescale the
+        # whole step so kappa * max(||error||, 1) * |step|_1 cannot exceed 1,
+        # preventing any single surprising sample from blowing up the readout.
         if self._use_obgd:
             total_step = jnp.sum(jnp.abs(weight_delta)) + jnp.sum(jnp.abs(bias_delta))
             err_norm = jnp.linalg.norm(errors)

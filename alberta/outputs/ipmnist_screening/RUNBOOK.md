@@ -105,3 +105,50 @@ update. Run once the main sweep frees cores, with the same worker pattern:
 `cd outputs/ipmnist_screening && xargs -P 6 -n 2 bash worker.sh < jobs3.txt`
 (idempotent; shards land in `shards/` and merge with the existing control
 shards through the standard `merge` command).
+
+## Wave 4 (`jobs4.txt`) — theory-driven novel arms (QUEUED, not launched)
+
+Eight arms x seeds 0-2 (24 jobs in `jobs4.txt`; earlier jobs files untouched).
+Derivations, falsifiable predictions, and refutation criteria for every arm
+live in `CONTINUAL_LEARNING_THEORY.md` (repo root). All arms are exact-noise
+(`noise_mode="step"`) with no pool-mode update; all reductions below are
+pinned by unit tests in `tests/test_ipmnist_screening.py`.
+
+- `guarded_cbp_adam` — the `adamw_cbp` leader plus UPGD-style utility
+  *protection only*: Adam's applied per-weight delta is scaled by
+  `1 - guard_scale * gate`, gate = UPGD's sigmoid/global-max squashing of the
+  bias-corrected `-w*g` utility EMA (utility_decay 0.9999). No perturbation
+  (CBP supplies regeneration); moments see raw gradients; recycled units also
+  reset their guard utility (fresh units restart at the neutral 0.5 gate).
+  `guard_scale=0` reduces bit-exactly to `adamw_cbp` (pinned).
+- `adamw_cbp_noreset` — `adamw_cbp` WITHOUT the per-unit Adam m/v/count reset
+  at CBP replacement. NOTE: the reset ("vreset") is already the `adamw_cbp`
+  default, so the moment-freshness mechanism is dissected by ablation.
+  `cbp_replacement_rate=0` reduces to `adamw_control` (pinned for both arms).
+- `upgd_w_sigma0` — lean UPGD-W at sigma=0 (pure gated SGD + decoupled
+  decay); the per-step noise draw (~85-90% of UPGD step cost) is skipped
+  entirely, bit-exact vs the control factory at noise_std=0 (pinned). Runs at
+  near-AdamW cost (~5-9s/task vs ~30s single-thread).
+- `upgd_alpha_utility` — UPGD-W whose protection gate reads passive IDBD
+  step-size drift (log_alpha kept as a statistic on the raw gradient, never
+  applied as a rate; gate = sigmoid(drift / global max |drift|), 0.5 at zero
+  drift). meta 1e-2, initial_step_size 0.01. `meta=0` reduces bit-exactly to
+  the closed-form half-gated step (pinned). Cost ~ `upgd_idbd` (~34s/task).
+- `adamw_cbp_{r3e5,r3e4,m50,m200}` — axis-aligned mini-star on the untuned
+  leader: replacement_rate {3e-5, 3e-4} and maturity {50, 200}, one axis at a
+  time (defaults 1e-4 / 100 held elsewhere). Cost ~ `adamw_cbp`.
+
+Run (only when the confirmation runs + sweep free cores — the box is
+contended; do NOT start these alongside the 200-task lanes):
+
+```bash
+cd outputs/ipmnist_screening
+xargs -P 8 -n 2 bash worker.sh < jobs4.txt   # idempotent; skips done shards
+```
+
+Then re-merge with the standard `merge` command (all shards, control
+`upgd_w_control`); for the adamw-family arms the interesting paired contrast
+is additionally vs `adamw_cbp` (`merge --control-name adamw_cbp` on the
+adamw-family shards into a SEPARATE summary file, e.g.
+`summary_wave4_adamcbp.json` — never overwrite `summary.json` with a
+different control).

@@ -1,5 +1,25 @@
 # mypy: disable-error-code="call-arg"
-"""Production-facing Step 5 average-reward prediction facade."""
+"""Production-facing Step 5 average-reward prediction facade (Predict II).
+
+Step 5 of the Alberta Plan moves prediction to the continuing, average-reward
+setting: no discounting, no episodes.  The learner behind this facade is the
+linear differential TD predictor in
+:mod:`alberta_framework.core.average_reward`, which learns values relative to
+an online reward-rate estimate via
+``td_error = reward - average_reward + v(s') - v(s)`` and updates the rate
+estimate from the same TD error.
+
+The default step-sizes separate two timescales: values at ``step_size=0.05``,
+the reward-rate estimate at ``average_reward_step_size=0.01``.  The rate
+estimate enters every differential TD target, so it is moved more slowly than
+the value weights — a fast-moving estimate would make every value target
+non-stationary.
+
+References:
+    Wan, Naik, & Sutton (2021). "Learning and Planning in Average-Reward
+        Markov Decision Processes."
+    Sutton & Barto (2018). "Reinforcement Learning: An Introduction," §10.3-4.
+"""
 
 from __future__ import annotations
 

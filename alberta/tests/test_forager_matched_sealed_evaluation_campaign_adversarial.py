@@ -1,3 +1,18 @@
+"""Adversarial tests for
+:mod:`alberta_framework.benchmarks.forager_matched_sealed_evaluation_campaign`.
+
+Twin of ``test_forager_matched_sealed_evaluation_campaign`` (which covers the
+engine lifecycle on a synthetic context): this suite attacks the
+authentication and closure boundaries around a *real* seal bundle built once
+per session (``real_seal_bundle``).  Threat model: a same-UID local adversary
+who can rewrite bytes on disk but cannot forge the external resolver.  Every
+mutating entry point must resolve authority last and write nothing on
+failure; qualification digests must bind across all three closures (open,
+sealed plan, evaluation); v1/nonexact manifests, false-authority completion
+summaries, partial final artifacts, and root/dynamic-root inode substitution
+must all fail closed; read-only entry points must never invoke the resolver.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -40,6 +55,15 @@ def _sha(label: str) -> str:
 
 def _canonical_sha(value: dict[str, Any]) -> str:
     return hashlib.sha256(campaign.canonical_json_bytes(value)).hexdigest()
+
+
+def _qualification_material() -> tuple[dict[str, Any], bytes, str]:
+    manifest = {
+        "schema_version": "test.qualification.v2",
+        "label": "café-sealed-adversarial",
+    }
+    raw = qualification._canonical_json_bytes(manifest)
+    return manifest, raw, hashlib.sha256(raw).hexdigest()
 
 
 @cache
@@ -114,19 +138,25 @@ def _six_by_thirty_protocol() -> tuple[
     return opened, sealed, selection, transition, schedule
 
 
-def _fake_plan(sealed: protocol.ForagerMatchedProtocol, candidate_ids: tuple[str, ...]) -> Any:
+def _fake_plan(
+    sealed: protocol.ForagerMatchedProtocol,
+    candidate_ids: tuple[str, ...],
+    qualification_manifest_sha256: str,
+) -> Any:
     source_manifest = {
         "schema_version": "test.sealed.source-manifest.v1",
         "candidate_order": list(candidate_ids),
     }
     executor_manifest = {
-        "schema_version": "test.sealed.executor-manifest.v1",
+        "schema_version": "test.sealed.executor-manifest.v2",
         "candidate_order": list(candidate_ids),
+        "qualification_manifest_sha256": qualification_manifest_sha256,
     }
     payload = {
-        "schema_version": "test.sealed.execution-plan.v1",
+        "schema_version": "test.sealed.execution-plan.v2",
         "stage": "sealed_evaluation",
         "protocol_sha256": sealed.protocol_sha256,
+        "qualification_manifest_sha256": qualification_manifest_sha256,
         "candidate_order": list(candidate_ids),
         "active_seeds": list(sealed.active_seeds),
         "source_manifest_sha256": _canonical_sha(source_manifest),
@@ -142,6 +172,8 @@ def _fake_plan(sealed: protocol.ForagerMatchedProtocol, candidate_ids: tuple[str
         source_manifest_sha256=_canonical_sha(source_manifest),
         executor_manifest=executor_manifest,
         executor_manifest_sha256=_canonical_sha(executor_manifest),
+        qualification_manifest_sha256=qualification_manifest_sha256,
+        payload=payload,
         plan_sha256=_canonical_sha(payload),
         to_dict=lambda: payload,
     )
@@ -162,10 +194,15 @@ def _synthetic_inputs(
 ) -> sealed_campaign._SealedInputs:
     opened, sealed, selection, transition, schedule = _six_by_thirty_protocol()
     candidate_ids = transition.evaluation_candidate_ids
-    plan = _fake_plan(sealed, candidate_ids)
+    qualification_manifest, qualification_bytes, qualification_digest = (
+        _qualification_material()
+    )
+    plan = _fake_plan(sealed, candidate_ids, qualification_digest)
     bundle = SimpleNamespace(
         output_root=tmp_path / "synthetic-qualification",
-        manifest={"schema_version": "test.qualification.v1"},
+        manifest=qualification_manifest,
+        manifest_bytes=qualification_bytes,
+        manifest_sha256=qualification_digest,
         cpu_qualification_root=tmp_path / "cpu-qualification",
         rng_parity_qualification_root=tmp_path / "rng-qualification",
     )
@@ -177,16 +214,33 @@ def _synthetic_inputs(
         )
         seal_content = SimpleNamespace(
             output_root=tmp_path / "synthetic-seal",
-            manifest={"payload_sha256": _sha("synthetic-seal-manifest")},
+            manifest={
+                "payload_sha256": _sha("synthetic-seal-manifest"),
+                "open_campaign": {
+                    "qualification_manifest_sha256": qualification_digest,
+                },
+            },
             open_protocol=opened,
-            open_verification_request=SimpleNamespace(
-                verification_subject_sha256=_sha("synthetic-open-subject")
+            open_score_evidence=SimpleNamespace(
+                qualification_manifest_sha256=qualification_digest,
             ),
+            open_verification_request=SimpleNamespace(
+                verification_subject_sha256=_sha("synthetic-open-subject"),
+                qualification_manifest_sha256=qualification_digest,
+            ),
+            recorded_bindings_cache={
+                "qualification_manifest_sha256": qualification_digest,
+            },
             selection_result=selection,
             sealed_protocol=sealed,
             sealed_transition=descriptor,
             sealed_transition_sha256=descriptor_sha,
         )
+    elif (
+        seal_content.open_verification_request.qualification_manifest_sha256
+        != qualification_digest
+    ):
+        raise AssertionError("real seal fixture qualification digest drifted")
     rebuilt = campaign._RebuiltInputs(
         bundle=cast(Any, bundle),
         protocol=sealed,
@@ -225,6 +279,7 @@ def _status(root: Path, inputs: sealed_campaign._SealedInputs) -> campaign.Campa
         next_candidate_id=inputs.rebuilt.candidate_ids[0],
         next_seed=inputs.rebuilt.protocol.active_seeds[0],
         protocol_sha256=inputs.rebuilt.protocol.protocol_sha256,
+        qualification_manifest_sha256=inputs.rebuilt.bundle.manifest_sha256,
         plan_sha256=inputs.rebuilt.plan.plan_sha256,
         live_runtime_identity_sha256=_fake_live().identity_sha256,
         score_evidence_sha256=None,
@@ -260,13 +315,19 @@ def _tree_snapshot(root: Path) -> tuple[tuple[str, str, str], ...]:
 @pytest.fixture(scope="module")
 def real_seal_bundle(tmp_path_factory: pytest.TempPathFactory) -> Any:
     root = tmp_path_factory.mktemp("sealed-campaign-real-auth")
+    _manifest, _raw, qualification_digest = _qualification_material()
+    patcher = pytest.MonkeyPatch()
+    patcher.setattr(
+        seal_fixtures,
+        "_QUALIFICATION_MANIFEST_SHA256",
+        qualification_digest,
+    )
     completed, bindings = seal_fixtures._completed_campaign(root)
     qualification_root = root / "qualification"
     campaign_root = root / "open-campaign"
     qualification_root.mkdir()
     campaign_root.mkdir()
     output_root = root / "seal"
-    patcher = pytest.MonkeyPatch()
     seal_fixtures._install_completed_loader(patcher, completed)
     try:
         content = seal.create_forager_matched_seal_bundle(
@@ -310,6 +371,9 @@ def test_exact_six_by_thirty_rebuild_and_seed_major_schedule(
         candidate_id: SimpleNamespace(candidate_id=candidate_id)
         for candidate_id in candidate_universe_ids
     }
+    qualification_manifest, qualification_bytes, qualification_digest = (
+        _qualification_material()
+    )
     bundle = SimpleNamespace(
         output_root=qualification_root,
         runtime_qualification=SimpleNamespace(),
@@ -317,7 +381,9 @@ def test_exact_six_by_thirty_rebuild_and_seed_major_schedule(
         candidate_assets=assets,
         cpu_qualification_root=tmp_path / "cpu",
         rng_parity_qualification_root=tmp_path / "rng",
-        manifest={"schema_version": "test.qualification.v1"},
+        manifest=qualification_manifest,
+        manifest_bytes=qualification_bytes,
+        manifest_sha256=qualification_digest,
     )
     descriptor = evaluation.build_sealed_transition_descriptor(sealed, transition)
     descriptor_sha = evaluation.canonical_sealed_transition_descriptor_sha256(
@@ -326,23 +392,40 @@ def test_exact_six_by_thirty_rebuild_and_seed_major_schedule(
     )
     content = SimpleNamespace(
         output_root=seal_root,
-        manifest={"payload_sha256": _sha("seal-manifest")},
+        manifest={
+            "payload_sha256": _sha("seal-manifest"),
+            "open_campaign": {
+                "qualification_manifest_sha256": qualification_digest,
+            },
+        },
         open_protocol=opened,
-        open_verification_request=SimpleNamespace(
-            verification_subject_sha256=_sha("open-subject")
+        open_score_evidence=SimpleNamespace(
+            qualification_manifest_sha256=qualification_digest,
         ),
+        open_verification_request=SimpleNamespace(
+            verification_subject_sha256=_sha("open-subject"),
+            qualification_manifest_sha256=qualification_digest,
+        ),
+        recorded_bindings_cache={
+            "qualification_manifest_sha256": qualification_digest,
+        },
         selection_result=selection,
         sealed_protocol=sealed,
         sealed_transition=descriptor,
         sealed_transition_sha256=descriptor_sha,
     )
-    plan = _fake_plan(sealed, transition.evaluation_candidate_ids)
+    plan = _fake_plan(
+        sealed,
+        transition.evaluation_candidate_ids,
+        qualification_digest,
+    )
     observed: dict[str, Any] = {}
 
     def build_plan(
         frozen: protocol.ForagerMatchedProtocol,
         selected_assets: dict[str, Any],
         *,
+        qualification_manifest_sha256: str,
         candidate_ids: tuple[str, ...],
         cpu_qualification_root: Path,
         rng_parity_qualification_root: Path,
@@ -350,6 +433,7 @@ def test_exact_six_by_thirty_rebuild_and_seed_major_schedule(
         observed.update(
             frozen=frozen,
             assets=selected_assets,
+            qualification_manifest_sha256=qualification_manifest_sha256,
             candidate_ids=candidate_ids,
             cpu=cpu_qualification_root,
             rng=rng_parity_qualification_root,
@@ -394,6 +478,7 @@ def test_exact_six_by_thirty_rebuild_and_seed_major_schedule(
     assert rebuilt.rebuilt.candidate_ids == expected_ids
     assert tuple(observed["assets"]) == expected_ids
     assert observed["candidate_ids"] == expected_ids
+    assert observed["qualification_manifest_sha256"] == qualification_digest
     assert len(rebuilt.rebuilt.protocol.active_seeds) == 30
     assert len(schedule["cells"]) == 180
     assert [cell["candidate_id"] for cell in schedule["cells"][:6]] == list(
@@ -432,7 +517,204 @@ def test_initial_publication_has_exact_immutable_inventory(tmp_path: Path) -> No
         assert (published / f"{name}.sha256").read_bytes() == (
             f"{digest}\n".encode("ascii")
         )
+    assert (published / "qualification-manifest.json").read_bytes() == (
+        inputs.rebuilt.bundle.manifest_bytes
+    )
+    assert (published / "qualification-manifest.json.sha256").read_bytes() == (
+        f"{inputs.rebuilt.bundle.manifest_sha256}\n".encode("ascii")
+    )
     sealed_campaign._validate_root_shape(published)
+
+
+def test_publication_rejects_changed_qualification_bytes_before_writing(
+    tmp_path: Path,
+) -> None:
+    inputs = _synthetic_inputs(tmp_path)
+    bad_bundle = SimpleNamespace(
+        **{
+            **vars(inputs.rebuilt.bundle),
+            "manifest_bytes": inputs.rebuilt.bundle.manifest_bytes + b"\n",
+        }
+    )
+    bad_inputs = replace(
+        inputs,
+        rebuilt=replace(inputs.rebuilt, bundle=cast(Any, bad_bundle)),
+    )
+    output_root = tmp_path / "unwritten" / "evaluation"
+    prospective = sealed_campaign._prospective_output(bad_inputs, output_root)
+
+    with pytest.raises(ValueError, match="manifest bytes"):
+        sealed_campaign._publish_initial_root(
+            bad_inputs,
+            _fake_live(),
+            output_root,
+            prospective,
+        )
+
+    assert not output_root.parent.exists()
+
+
+def test_v1_campaign_manifest_is_rejected_as_nonexact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = _synthetic_inputs(tmp_path)
+    live = _fake_live()
+    output_root = tmp_path / "legacy-campaign"
+    sealed_campaign._publish_initial_root(
+        inputs,
+        live,
+        output_root,
+        sealed_campaign._prospective_output(inputs, output_root),
+    )
+    legacy = sealed_campaign._campaign_manifest(inputs, live)
+    legacy["schema_version"] = (
+        "alberta.forager_matched_sealed_evaluation_campaign.v1"
+    )
+    raw = campaign.canonical_json_bytes(legacy)
+    (output_root / "campaign.json").write_bytes(raw)
+    (output_root / "campaign.json.sha256").write_bytes(
+        f"{hashlib.sha256(raw).hexdigest()}\n".encode("ascii")
+    )
+    monkeypatch.setattr(
+        sealed_campaign,
+        "_rebuild_sealed_inputs",
+        lambda *_args: inputs,
+    )
+    monkeypatch.setattr(campaign, "_qualify_live", lambda *_args, **_kwargs: live)
+    monkeypatch.setattr(
+        executor,
+        "parse_execution_plan",
+        lambda *_args, **_kwargs: inputs.rebuilt.plan,
+    )
+
+    with pytest.raises(
+        campaign.ForagerMatchedCampaignError,
+        match="persisted campaign.json differs",
+    ):
+        sealed_campaign._load_context(
+            tmp_path / "qualification",
+            tmp_path / "seal",
+            output_root,
+            runtime="docker",
+            runner=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "source",
+    ("bundle", "seal_manifest", "score", "request", "bindings"),
+)
+def test_open_qualification_closure_rejects_each_digest_tamper(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    inputs = _synthetic_inputs(tmp_path)
+    rebuilt = inputs.rebuilt
+    content = inputs.seal_content
+    changed_bundle = SimpleNamespace(**vars(rebuilt.bundle))
+    changed_content = SimpleNamespace(**vars(content))
+    wrong = _sha(f"wrong-open-{source}")
+
+    if source == "bundle":
+        changed_bundle.manifest_sha256 = wrong
+    elif source == "seal_manifest":
+        changed_content.manifest = {
+            **content.manifest,
+            "open_campaign": {
+                **content.manifest["open_campaign"],
+                "qualification_manifest_sha256": wrong,
+            },
+        }
+    elif source == "score":
+        changed_content.open_score_evidence = SimpleNamespace(
+            qualification_manifest_sha256=wrong,
+        )
+    elif source == "request":
+        changed_content.open_verification_request = SimpleNamespace(
+            **{
+                **vars(content.open_verification_request),
+                "qualification_manifest_sha256": wrong,
+            }
+        )
+    else:
+        changed_content.recorded_bindings_cache = {
+            **content.recorded_bindings_cache,
+            "qualification_manifest_sha256": wrong,
+        }
+    changed = replace(
+        inputs,
+        rebuilt=replace(rebuilt, bundle=cast(Any, changed_bundle)),
+        seal_content=cast(Any, changed_content),
+    )
+
+    with pytest.raises(ValueError, match="qualification.*manifest|manifest.*digest"):
+        sealed_campaign._sealed_input_qualification_manifest_sha256(changed)
+
+
+@pytest.mark.parametrize("source", ("plan", "payload", "executor_manifest"))
+def test_sealed_plan_rejects_each_qualification_digest_tamper(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    inputs = _synthetic_inputs(tmp_path)
+    plan = inputs.rebuilt.plan
+    changed_plan = SimpleNamespace(**vars(plan))
+    wrong = _sha(f"wrong-plan-{source}")
+    if source == "plan":
+        changed_plan.qualification_manifest_sha256 = wrong
+    elif source == "payload":
+        changed_plan.payload = {
+            **plan.payload,
+            "qualification_manifest_sha256": wrong,
+        }
+    else:
+        changed_plan.executor_manifest = {
+            **plan.executor_manifest,
+            "qualification_manifest_sha256": wrong,
+        }
+    changed = replace(
+        inputs,
+        rebuilt=replace(inputs.rebuilt, plan=cast(Any, changed_plan)),
+    )
+
+    with pytest.raises(ValueError, match="execution plan qualification-manifest"):
+        sealed_campaign._sealed_input_qualification_manifest_sha256(changed)
+
+
+@pytest.mark.parametrize("source", ("score", "request"))
+def test_evaluation_closure_rejects_qualification_digest_tamper(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    inputs = _synthetic_inputs(tmp_path)
+    context = _context(tmp_path / "evaluation", inputs).engine
+    digest = inputs.rebuilt.bundle.manifest_sha256
+    score_digest = _sha("wrong-evaluation-score") if source == "score" else digest
+    request_digest = _sha("wrong-evaluation-request") if source == "request" else digest
+    scores = cast(
+        Any,
+        SimpleNamespace(
+            payload_sha256=_sha("evaluation-scores"),
+            qualification_manifest_sha256=score_digest,
+        ),
+    )
+    request = cast(
+        Any,
+        SimpleNamespace(
+            verification_subject_sha256=_sha("evaluation-subject"),
+            qualification_manifest_sha256=request_digest,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="score/request qualification-manifest"):
+        sealed_campaign._completion_summary(
+            inputs,
+            context,
+            cast(Any, SimpleNamespace(payload_sha256=_sha("receipt-index"))),
+            scores,
+            request,
+        )
 
 
 def test_mandatory_pins_and_resolver_failure_are_zero_write(
@@ -661,10 +943,20 @@ def test_completion_summary_rejects_false_authority_and_closure(tmp_path: Path) 
     inputs = _synthetic_inputs(tmp_path)
     context = _context(tmp_path / "evaluation", inputs).engine
     receipt = cast(Any, SimpleNamespace(payload_sha256=_sha("receipt-index")))
-    scores = cast(Any, SimpleNamespace(payload_sha256=_sha("scores")))
+    qualification_digest = inputs.rebuilt.bundle.manifest_sha256
+    scores = cast(
+        Any,
+        SimpleNamespace(
+            payload_sha256=_sha("scores"),
+            qualification_manifest_sha256=qualification_digest,
+        ),
+    )
     request = cast(
         Any,
-        SimpleNamespace(verification_subject_sha256=_sha("evaluation-subject")),
+        SimpleNamespace(
+            verification_subject_sha256=_sha("evaluation-subject"),
+            qualification_manifest_sha256=qualification_digest,
+        ),
     )
     builder = sealed_campaign._summary_builder(inputs)
     validator = sealed_campaign._summary_validator(inputs)
@@ -678,13 +970,14 @@ def test_completion_summary_rejects_false_authority_and_closure(tmp_path: Path) 
         ("external_verification_required", False),
         ("cached_bindings_accepted_as_authority", True),
         ("score_evidence_sha256", _sha("other-scores")),
+        ("qualification_manifest_sha256", _sha("other-qualification")),
         ("seal_manifest_payload_sha256", _sha("other-seal")),
     ):
         changed = dict(valid)
         changed[key] = value
         tampered.append(changed)
     for changed in tampered:
-        with pytest.raises(ValueError, match="closure|exact v1 schema"):
+        with pytest.raises(ValueError, match="closure|exact v2 schema"):
             validator(context, receipt, scores, request, changed)
 
 

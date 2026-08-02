@@ -1,0 +1,14 @@
+WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-08-01 17:10:29,754 INFO loading MNIST from data_home=/home/shaw/milady/alberta/outputs/step2_published_mnist_openml_cache
+2026-08-01 17:10:34,790 INFO running upgd_w_wd0005 seed=3 for 200 tasks x 5000 steps (noise_mode=pool)
+2026-08-01 17:11:51,227 INFO upgd_w_wd0005 seed=3 task 20/200 online_acc=0.7846 elapsed=73.2s
+2026-08-01 17:12:58,659 INFO upgd_w_wd0005 seed=3 task 40/200 online_acc=0.7870 elapsed=140.6s
+2026-08-01 17:14:07,695 INFO upgd_w_wd0005 seed=3 task 60/200 online_acc=0.7768 elapsed=209.7s
+2026-08-01 17:15:15,364 INFO upgd_w_wd0005 seed=3 task 80/200 online_acc=0.7780 elapsed=277.3s
+2026-08-01 17:16:21,508 INFO upgd_w_wd0005 seed=3 task 100/200 online_acc=0.7868 elapsed=343.5s
+2026-08-01 17:17:50,317 INFO upgd_w_wd0005 seed=3 task 120/200 online_acc=0.7916 elapsed=432.3s
+2026-08-01 17:19:04,183 INFO upgd_w_wd0005 seed=3 task 140/200 online_acc=0.7840 elapsed=506.2s
+2026-08-01 17:20:46,068 INFO upgd_w_wd0005 seed=3 task 160/200 online_acc=0.7912 elapsed=608.0s
+2026-08-01 17:22:41,090 INFO upgd_w_wd0005 seed=3 task 180/200 online_acc=0.7930 elapsed=723.1s
+2026-08-01 17:24:26,340 INFO upgd_w_wd0005 seed=3 task 200/200 online_acc=0.7852 elapsed=828.3s
+2026-08-01 17:24:27,232 INFO upgd_w_wd0005 seed=3 done: avg online acc 0.7839 (wall 828.3s) -> outputs/ipmnist_screening/confirm_full/upgd_w_wd0005_seed3.json

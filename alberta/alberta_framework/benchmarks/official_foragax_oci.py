@@ -1,5 +1,32 @@
 """Audited build, launch, inspection, and qualification tooling for OCI v4.
 
+"v4" names the launcher contract ``oci-read-only-stdout-tar-v4`` defined in
+:mod:`alberta_framework.benchmarks.official_foragax` — run results leave the
+container only as a tar stream on stdout — together with the matching
+``alberta.official_foragax.oci_build.v4`` build-spec schema.  The lifecycle
+maps onto the CLI subcommands, in file order:
+
+1. **prepare** — :func:`prepare_build_context` checks every input against
+   the audited pins below (source commit and Git tree, digest-pinned CUDA
+   base image, uv binary, dependency lock) and atomically materializes a
+   path-neutral Docker build context whose Dockerfile runs every stage with
+   ``--network=none`` and carries its own canonical build attestation.
+2. **archive-cache** — :func:`create_regular_cache_archive` rewrites the uv
+   cache into one canonical USTAR archive so the cache identity is
+   byte-stable across hosts.
+3. **build** — :func:`build_image` runs the digest-pinned BuildKit frontend
+   over a prepared context.
+4. **inspect** — :func:`inspect_image` regenerates and verifies the image
+   config, rootfs inventory, native-runtime inventory, and SBOM against the
+   expected build spec.
+5. **cpu-probe / emit-launch** — read-only, networkless, cap-dropped
+   ``docker run`` command lines addressed by config digest only; GPU
+   launches bind the host driver explicitly via
+   :class:`DriverLaunchContract` (the image itself sets
+   ``NVIDIA_VISIBLE_DEVICES=void`` to refuse implicit runtime injection).
+6. **qualify** — :func:`qualify_v4_runs` seals two independent runs of the
+   same workload into one determinism-evidence envelope.
+
 The production trust and endorsement descriptors are intentionally outside
 this utility.  It emits candidate attestations that a later human-reviewed
 descriptor update may consume; it never grants official status itself.
@@ -56,6 +83,9 @@ QUALIFICATION_ENVELOPE_SCHEMA = (
 )
 QUALIFICATION_WORKLOAD_SCHEMA = OFFICIAL_FORAGAX_QUALIFICATION_WORKLOAD_SCHEMA
 TREE_HASH_SCHEME = "canonical-entry-json+mode+size+bytes-v1"
+# SHA-256 of the audited uv 0.9.24 release binary; ``prepare_build_context``
+# refuses any other uv, pinning dependency resolution to one audited
+# resolver build.
 UV_BINARY_SHA256 = (
     "5c021e58e83d7fab046137a02e5f459df30955756afda74e86e38150fdc781c1"
 )
@@ -68,6 +98,13 @@ RUNTIME_ROOT = PurePosixPath("/opt/alberta-runtime")
 ATTESTATION_ROOT = PurePosixPath("/opt/alberta-attestations")
 LAUNCHER_PATH = PurePosixPath("/opt/alberta/launcher")
 PYTHON_EXECUTABLE = RUNTIME_ROOT / "bin/python"
+# Audited identity pins enforced by ``prepare_build_context``: the
+# digest-pinned CUDA base image, the Git tree SHA-1 reconstructed from the
+# supplied source archive bytes, and the gitlink commit expected at each
+# empty submodule placeholder.  Refreshing a pin is a source edit here that
+# re-opens the audit — never a CLI option (``--base-image`` and
+# ``--uv-binary-sha256`` merely default to the audited values; any other
+# value is rejected).
 _AUDITED_BASE_IMAGE = (
     "nvidia/cuda:12.8.1-base-ubuntu24.04@"
     "sha256:133c78a0575303be34164d0b90137a042172bdf60696af01a3c424ab402d86e2"
@@ -85,6 +122,14 @@ _OCI_REFERENCE_PATTERN = re.compile(
 )
 _COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _DEBIAN_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9+.-]*$")
+# Substrings that only exist in build-time locations: ``/input/`` is the
+# read-only bind-mount target for every build input in the generated
+# Dockerfile, ``/build/`` and ``/root/.cache`` are conventional builder
+# workspace and cache homes, and ``file://`` marks content addressed by
+# local path rather than by digest.  Finding any of these in the build
+# attestation or in the image environment means a builder-local location
+# leaked into the artifact — its identity would then depend on where it was
+# built — so both checks fail closed.
 _FORBIDDEN_ATTESTATION_TEXT = (
     "/build/",
     "/input/",

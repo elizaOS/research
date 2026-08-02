@@ -17,6 +17,7 @@ from typing import Literal, NoReturn, cast
 
 import jax
 import jax.numpy as jnp
+import jax.random as jr
 import numpy as np
 from jax import Array
 
@@ -24,9 +25,15 @@ from alberta_framework.evaluation.hidden_partner_lifecycle_world_v6 import (
     PRIMARY_CONDITION_ORDER,
 )
 from alberta_framework.evaluation.hidden_partner_lifecycle_world_v6_controls import (
+    HIDDEN_PARTNER_LIFECYCLE_WORLD_V6_CONTROL_SCHEMA,
     V6_DIAGNOSTIC_ORDER,
+    HiddenPartnerLifecycleWorldV6ControlBinding,
+    build_v6_control_bindings,
     build_v6_diagnostic_controls,
     build_v6_primary_controls,
+    canonical_v6_control_matrix_sha256,
+    validate_v6_control,
+    validate_v6_control_binding,
 )
 from alberta_framework.streams.hidden_partner_world_feedback import (
     HIDDEN_PARTNER_WORLD_FEEDBACK_CONTRACT_VERSION,
@@ -36,6 +43,9 @@ from alberta_framework.streams.hidden_partner_world_feedback import (
 
 HIDDEN_PARTNER_LIFECYCLE_WORLD_V6_SCAN_PLAN_SCHEMA = (
     "alberta.hidden-partner-lifecycle-world.scan-plan-development.v1"
+)
+HIDDEN_PARTNER_LIFECYCLE_WORLD_V6_CONTROL_READINESS_SCHEMA = (
+    "alberta.hidden-partner-lifecycle-world.control-suite-readiness-development.v2"
 )
 SCAN_PLAN_STATUS = "NONEXECUTING_DEVELOPMENT_SCAN_PLAN"
 DEVELOPMENT_ONLY = True
@@ -81,7 +91,7 @@ class HiddenPartnerLifecycleWorldV6Window:
     end_exclusive: int
     steps: int
 
-    def to_config(self) -> dict[str, object]:
+    def _to_config_unchecked(self) -> dict[str, object]:
         return {
             "kind": self.kind,
             "start": self.start,
@@ -104,7 +114,7 @@ class HiddenPartnerLifecycleWorldV6SegmentOccurrence:
     entry_window: HiddenPartnerLifecycleWorldV6Window
     tail_window: HiddenPartnerLifecycleWorldV6Window
 
-    def to_config(self) -> dict[str, object]:
+    def _to_config_unchecked(self) -> dict[str, object]:
         return {
             "occurrence_index": self.occurrence_index,
             "cycle_index": self.cycle_index,
@@ -113,8 +123,8 @@ class HiddenPartnerLifecycleWorldV6SegmentOccurrence:
             "start": self.start,
             "end_exclusive": self.end_exclusive,
             "length": self.length,
-            "entry_window": self.entry_window.to_config(),
-            "tail_window": self.tail_window.to_config(),
+            "entry_window": self.entry_window._to_config_unchecked(),
+            "tail_window": self.tail_window._to_config_unchecked(),
             "window_proofs": {
                 "entry_within_one_segment": True,
                 "tail_within_one_segment": True,
@@ -139,11 +149,18 @@ class HiddenPartnerLifecycleWorldV6ScanPlan:
     def scheduled_active(self) -> Array:
         """Return the exact bool[30318] active-prefix mask for this plan."""
 
-        return v6_scheduled_active_mask(jnp.asarray(self.run_steps, dtype=jnp.int32))
+        validated = validate_hidden_partner_lifecycle_world_v6_scan_plan(self)
+        return v6_scheduled_active_mask(
+            jnp.asarray(validated.run_steps, dtype=jnp.int32)
+        )
 
     def to_config(self) -> dict[str, object]:
         """Return the exact authority-free, JSON-compatible development payload."""
 
+        validated = validate_hidden_partner_lifecycle_world_v6_scan_plan(self)
+        return validated._to_config_unchecked()
+
+    def _to_config_unchecked(self) -> dict[str, object]:
         return {
             "schema": HIDDEN_PARTNER_LIFECYCLE_WORLD_V6_SCAN_PLAN_SCHEMA,
             "status": SCAN_PLAN_STATUS,
@@ -184,10 +201,11 @@ class HiddenPartnerLifecycleWorldV6ScanPlan:
                 "final_window_steps": FINAL_WINDOW_STEPS,
                 "segment_occurrence_count": CYCLE_COUNT * N_SEGMENTS,
                 "segment_occurrences": [
-                    occurrence.to_config() for occurrence in self.segment_occurrences
+                    occurrence._to_config_unchecked()
+                    for occurrence in self.segment_occurrences
                 ],
                 "final_window": {
-                    **self.final_window.to_config(),
+                    **self.final_window._to_config_unchecked(),
                     "within_one_segment": True,
                     "within_active_prefix": True,
                 },
@@ -220,6 +238,10 @@ class HiddenPartnerLifecycleWorldV6BlockedControl:
     reason: str
 
     def to_config(self) -> dict[str, object]:
+        _validate_blocked_control_types(self, name="blocked_control")
+        return self._to_config_unchecked()
+
+    def _to_config_unchecked(self) -> dict[str, object]:
         return {"family": self.family, "name": self.name, "reason": self.reason}
 
 
@@ -232,6 +254,9 @@ class HiddenPartnerLifecycleWorldV6ControlSuiteReadiness:
     diagnostic_ready_count: int
     diagnostic_required_count: int
     blocked_controls: tuple[HiddenPartnerLifecycleWorldV6BlockedControl, ...]
+    control_matrix_schema: str
+    control_matrix_sha256: str
+    bindings: tuple[HiddenPartnerLifecycleWorldV6ControlBinding, ...]
 
     @property
     def all_controls_ready(self) -> bool:
@@ -239,11 +264,17 @@ class HiddenPartnerLifecycleWorldV6ControlSuiteReadiness:
             self.primary_ready_count == self.primary_required_count
             and self.diagnostic_ready_count == self.diagnostic_required_count
             and not self.blocked_controls
+            and len(self.bindings)
+            == self.primary_required_count + self.diagnostic_required_count
         )
 
     def to_config(self) -> dict[str, object]:
+        validated = validate_v6_control_suite_readiness(self)
+        return validated._to_config_unchecked()
+
+    def _to_config_unchecked(self) -> dict[str, object]:
         return {
-            "schema": HIDDEN_PARTNER_LIFECYCLE_WORLD_V6_SCAN_PLAN_SCHEMA,
+            "schema": HIDDEN_PARTNER_LIFECYCLE_WORLD_V6_CONTROL_READINESS_SCHEMA,
             "status": (
                 "DEVELOPMENT_CONTROL_SUITE_READY"
                 if self.all_controls_ready
@@ -258,12 +289,195 @@ class HiddenPartnerLifecycleWorldV6ControlSuiteReadiness:
             "diagnostic_ready_count": self.diagnostic_ready_count,
             "diagnostic_required_count": self.diagnostic_required_count,
             "all_controls_ready": self.all_controls_ready,
-            "blocked_controls": [control.to_config() for control in self.blocked_controls],
+            "control_matrix_schema": self.control_matrix_schema,
+            "control_matrix_sha256": self.control_matrix_sha256,
+            "blocked_controls": [
+                control._to_config_unchecked() for control in self.blocked_controls
+            ],
+            "bindings": [binding.to_config() for binding in self.bindings],
         }
 
 
 class HiddenPartnerLifecycleWorldV6ControlSuiteNotReadyError(RuntimeError):
     """Raised when runner work is requested while a required control is blocked."""
+
+
+def _require_exact_builtin_int(value: object, *, name: str) -> None:
+    if type(value) is not int:
+        raise TypeError(f"{name} must be an exact built-in int")
+
+
+def _validate_window_types(
+    window: object,
+    *,
+    name: str,
+    expected_kind: WindowKind,
+) -> None:
+    if type(window) is not HiddenPartnerLifecycleWorldV6Window:
+        raise TypeError(f"{name} must be an exact HiddenPartnerLifecycleWorldV6Window")
+    exact_window = window
+    if type(exact_window.kind) is not str:
+        raise TypeError(f"{name}.kind must be an exact built-in str")
+    if exact_window.kind != expected_kind:
+        raise ValueError(f"{name}.kind must be exactly {expected_kind!r}")
+    _require_exact_builtin_int(exact_window.start, name=f"{name}.start")
+    _require_exact_builtin_int(
+        exact_window.end_exclusive,
+        name=f"{name}.end_exclusive",
+    )
+    _require_exact_builtin_int(exact_window.steps, name=f"{name}.steps")
+
+
+def _validate_occurrence_types(
+    occurrence: object,
+    *,
+    name: str,
+) -> None:
+    if type(occurrence) is not HiddenPartnerLifecycleWorldV6SegmentOccurrence:
+        raise TypeError(
+            f"{name} must be an exact HiddenPartnerLifecycleWorldV6SegmentOccurrence"
+        )
+    exact_occurrence = occurrence
+    for field in (
+        "occurrence_index",
+        "cycle_index",
+        "segment_index",
+        "regime_id",
+        "start",
+        "end_exclusive",
+        "length",
+    ):
+        _require_exact_builtin_int(
+            getattr(exact_occurrence, field),
+            name=f"{name}.{field}",
+        )
+    _validate_window_types(
+        exact_occurrence.entry_window,
+        name=f"{name}.entry_window",
+        expected_kind="entry",
+    )
+    _validate_window_types(
+        exact_occurrence.tail_window,
+        name=f"{name}.tail_window",
+        expected_kind="tail",
+    )
+
+
+def _validate_scan_plan_types(plan: object) -> None:
+    if type(plan) is not HiddenPartnerLifecycleWorldV6ScanPlan:
+        raise TypeError("plan must be an exact HiddenPartnerLifecycleWorldV6ScanPlan")
+    exact_plan = plan
+    for field in ("segment_lengths", "segment_ends"):
+        values = getattr(exact_plan, field)
+        if type(values) is not tuple:
+            raise TypeError(f"plan.{field} must be an exact built-in tuple")
+        if len(values) != N_SEGMENTS:
+            raise ValueError(f"plan.{field} must contain exactly {N_SEGMENTS} values")
+        for index, value in enumerate(values):
+            _require_exact_builtin_int(value, name=f"plan.{field}[{index}]")
+    _require_exact_builtin_int(exact_plan.cycle_length, name="plan.cycle_length")
+    _require_exact_builtin_int(exact_plan.run_steps, name="plan.run_steps")
+    if type(exact_plan.segment_occurrences) is not tuple:
+        raise TypeError("plan.segment_occurrences must be an exact built-in tuple")
+    if len(exact_plan.segment_occurrences) != CYCLE_COUNT * N_SEGMENTS:
+        raise ValueError("plan.segment_occurrences must contain exactly eighteen values")
+    for index, occurrence in enumerate(exact_plan.segment_occurrences):
+        _validate_occurrence_types(
+            occurrence,
+            name=f"plan.segment_occurrences[{index}]",
+        )
+    _validate_window_types(
+        exact_plan.final_window,
+        name="plan.final_window",
+        expected_kind="final",
+    )
+
+
+def _validate_blocked_control_types(
+    blocked: object,
+    *,
+    name: str,
+) -> None:
+    if type(blocked) is not HiddenPartnerLifecycleWorldV6BlockedControl:
+        raise TypeError(
+            f"{name} must be an exact HiddenPartnerLifecycleWorldV6BlockedControl"
+        )
+    exact_blocked = blocked
+    if type(exact_blocked.family) is not str:
+        raise TypeError(f"{name}.family must be an exact built-in str")
+    if exact_blocked.family not in ("primary", "diagnostic"):
+        raise ValueError(f"{name}.family must be primary or diagnostic")
+    if type(exact_blocked.name) is not str:
+        raise TypeError(f"{name}.name must be an exact built-in str")
+    allowed = (
+        PRIMARY_CONDITION_ORDER
+        if exact_blocked.family == "primary"
+        else V6_DIAGNOSTIC_ORDER
+    )
+    if exact_blocked.name not in allowed:
+        raise ValueError(f"{name}.name must belong to its exact control family")
+    if type(exact_blocked.reason) is not str:
+        raise TypeError(f"{name}.reason must be an exact built-in str")
+    if not exact_blocked.reason:
+        raise ValueError(f"{name}.reason must be non-empty")
+
+
+def _validate_control_readiness_types(readiness: object) -> None:
+    if type(readiness) is not HiddenPartnerLifecycleWorldV6ControlSuiteReadiness:
+        raise TypeError(
+            "readiness must be an exact "
+            "HiddenPartnerLifecycleWorldV6ControlSuiteReadiness"
+        )
+    exact_readiness = readiness
+    for field in (
+        "primary_ready_count",
+        "primary_required_count",
+        "diagnostic_ready_count",
+        "diagnostic_required_count",
+    ):
+        value = getattr(exact_readiness, field)
+        _require_exact_builtin_int(value, name=f"readiness.{field}")
+        if value < 0:
+            raise ValueError(f"readiness.{field} must be non-negative")
+    if type(exact_readiness.blocked_controls) is not tuple:
+        raise TypeError("readiness.blocked_controls must be an exact built-in tuple")
+    for index, blocked in enumerate(exact_readiness.blocked_controls):
+        _validate_blocked_control_types(
+            blocked,
+            name=f"readiness.blocked_controls[{index}]",
+        )
+    if type(exact_readiness.control_matrix_schema) is not str:
+        raise TypeError("readiness.control_matrix_schema must be an exact built-in str")
+    if exact_readiness.control_matrix_schema != HIDDEN_PARTNER_LIFECYCLE_WORLD_V6_CONTROL_SCHEMA:
+        raise ValueError("readiness control matrix schema differs from the current schema")
+    if type(exact_readiness.control_matrix_sha256) is not str:
+        raise TypeError("readiness.control_matrix_sha256 must be an exact built-in str")
+    digest = exact_readiness.control_matrix_sha256
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError("readiness.control_matrix_sha256 must be lowercase SHA-256 hex")
+    if type(exact_readiness.bindings) is not tuple:
+        raise TypeError("readiness.bindings must be an exact built-in tuple")
+    for index, binding in enumerate(exact_readiness.bindings):
+        try:
+            validate_v6_control_binding(binding)
+        except (TypeError, ValueError) as exc:
+            raise type(exc)(f"readiness.bindings[{index}]: {exc}") from exc
+
+    full_order = (
+        *(("primary", name) for name in PRIMARY_CONDITION_ORDER),
+        *(("diagnostic", name) for name in V6_DIAGNOSTIC_ORDER),
+    )
+    blocked_order = {
+        (blocked.family, blocked.name) for blocked in exact_readiness.blocked_controls
+    }
+    expected_binding_order = tuple(
+        item for item in full_order if item not in blocked_order
+    )
+    actual_binding_order = tuple(
+        (binding.family, binding.name) for binding in exact_readiness.bindings
+    )
+    if actual_binding_order != expected_binding_order:
+        raise ValueError("readiness bindings must have the exact unblocked control order")
 
 
 def v6_scheduled_active_mask(run_steps: Array) -> Array:
@@ -306,11 +520,173 @@ def _exact_initialized_step_count(value: object) -> None:
     if dtype is None or np.dtype(dtype) != np.dtype(np.int32):
         raise TypeError("world state step_count must have exact int32 dtype")
     try:
-        step_count = int(np.asarray(jax.device_get(value)).item())
+        concrete = np.asarray(jax.device_get(value))
     except (TypeError, ValueError) as exc:
         raise TypeError("world state step_count must be a concrete int32 scalar") from exc
+    if concrete.shape != () or concrete.dtype != np.dtype(np.int32):
+        raise TypeError("world state step_count must be a concrete exact int32 scalar")
+    step_count = int(concrete.item())
     if step_count != 0:
         raise ValueError("scan plans must be derived from an initialized step-zero world state")
+
+
+def _exact_concrete_array(
+    value: object,
+    *,
+    name: str,
+    shape: tuple[int, ...],
+    dtype_name: str,
+) -> np.ndarray:
+    actual_shape = getattr(value, "shape", None)
+    actual_dtype = getattr(value, "dtype", None)
+    if actual_shape != shape:
+        raise ValueError(f"{name} must have exact shape {shape}")
+    try:
+        dtype = np.dtype(actual_dtype)
+    except TypeError as exc:
+        raise TypeError(f"{name} must have exact {dtype_name} dtype") from exc
+    expected_dtype = np.dtype(dtype_name)
+    if dtype != expected_dtype:
+        raise TypeError(f"{name} must have exact {dtype_name} dtype")
+    try:
+        result = np.asarray(jax.device_get(value))
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{name} must be a concrete {dtype_name} array") from exc
+    if result.shape != shape or result.dtype != expected_dtype:
+        raise TypeError(
+            f"{name} must be a concrete exact {dtype_name} array with shape {shape}"
+        )
+    return result
+
+
+def _validate_scalar_prng_key(
+    value: object,
+    *,
+    name: str,
+) -> tuple[str, str, tuple[int, ...]]:
+    """Validate one concrete scalar typed key or legacy uint32[2] key.
+
+    This establishes only the local representation accepted by JAX.  Key
+    contents cannot prove which root seed or derivation path produced them.
+    """
+
+    shape = getattr(value, "shape", None)
+    dtype = getattr(value, "dtype", None)
+    try:
+        typed_key = dtype is not None and bool(
+            jnp.issubdtype(dtype, jax.dtypes.prng_key)
+        )
+    except TypeError as exc:
+        raise TypeError(f"{name} must have a valid JAX PRNG-key dtype") from exc
+    if typed_key:
+        if shape != ():
+            raise ValueError(f"{name} must be one scalar typed JAX PRNG key")
+    else:
+        try:
+            legacy_dtype = np.dtype(dtype)
+        except TypeError as exc:
+            raise TypeError(
+                f"{name} must be a scalar typed key or legacy uint32[2] key"
+            ) from exc
+        if legacy_dtype != np.dtype(np.uint32):
+            raise TypeError(
+                f"{name} must be a scalar typed key or legacy uint32[2] key"
+            )
+        if shape != (2,):
+            raise ValueError(f"{name} legacy key must have exact shape (2,)")
+    try:
+        key = cast(Array, value)
+        implementation = str(jr.key_impl(key))
+        key_data = np.asarray(jax.device_get(jr.key_data(key)))
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{name} must be one concrete valid JAX PRNG key") from exc
+    if key_data.dtype != np.dtype(np.uint32) or key_data.ndim != 1:
+        raise TypeError(f"{name} must expose one exact uint32 PRNG-key data vector")
+    if not typed_key and key_data.shape != (2,):
+        raise ValueError(f"{name} legacy key data must have exact shape (2,)")
+    return (
+        "typed" if typed_key else "legacy",
+        implementation,
+        tuple(int(dimension) for dimension in key_data.shape),
+    )
+
+
+def _validate_exact_sign_array(
+    value: object,
+    *,
+    name: str,
+    shape: tuple[int, ...],
+) -> None:
+    array = _exact_concrete_array(
+        value,
+        name=name,
+        shape=shape,
+        dtype_name="float32",
+    )
+    if not bool(np.all(np.isfinite(array))):
+        raise ValueError(f"{name} must contain only finite signs")
+    if not bool(np.all((array == np.float32(-1.0)) | (array == np.float32(1.0)))):
+        raise ValueError(f"{name} must contain only exact -1 or +1 signs")
+
+
+def _validate_initialized_world_state(state: object) -> HiddenPartnerWorldFeedbackState:
+    if type(state) is not HiddenPartnerWorldFeedbackState:
+        raise TypeError("state must be an exact HiddenPartnerWorldFeedbackState")
+    exact_state = state
+    key_signatures = tuple(
+        _validate_scalar_prng_key(
+            getattr(exact_state, field),
+            name=f"world state {field}",
+        )
+        for field in ("signal_key", "partner_key", "world_key", "cue_key", "outcome_key")
+    )
+    if any(signature != key_signatures[0] for signature in key_signatures[1:]):
+        raise ValueError(
+            "all world state PRNG keys must use one representation and implementation"
+        )
+    _exact_initialized_step_count(exact_state.step_count)
+    _validate_exact_sign_array(
+        exact_state.current_signals,
+        name="world state current_signals",
+        shape=(3,),
+    )
+    _validate_exact_sign_array(
+        exact_state.current_cues,
+        name="world state current_cues",
+        shape=(2,),
+    )
+    _validate_exact_sign_array(
+        exact_state.world_sign,
+        name="world state world_sign",
+        shape=(),
+    )
+    previous_outcome = _exact_concrete_array(
+        exact_state.previous_outcome,
+        name="world state previous_outcome",
+        shape=(),
+        dtype_name="float32",
+    )
+    if not bool(np.isfinite(previous_outcome)):
+        raise ValueError("world state previous_outcome must be finite")
+    if int(previous_outcome.view(np.uint32).item()) != 0:
+        raise ValueError("world state previous_outcome must be exact positive float32 zero")
+    previous_partner_action = _exact_concrete_array(
+        exact_state.previous_partner_action,
+        name="world state previous_partner_action",
+        shape=(),
+        dtype_name="int32",
+    )
+    if int(previous_partner_action.item()) != 0:
+        raise ValueError("world state previous_partner_action must be the step-zero sentinel 0")
+    has_partner_history = _exact_concrete_array(
+        exact_state.has_partner_history,
+        name="world state has_partner_history",
+        shape=(),
+        dtype_name="bool",
+    )
+    if bool(has_partner_history.item()):
+        raise ValueError("world state has_partner_history must be false at step zero")
+    return exact_state
 
 
 def _validate_segment_geometry(
@@ -436,14 +812,19 @@ def build_hidden_partner_lifecycle_world_v6_scan_plan(
 def build_hidden_partner_lifecycle_world_v6_scan_plan_from_state(
     state: HiddenPartnerWorldFeedbackState,
 ) -> HiddenPartnerLifecycleWorldV6ScanPlan:
-    """Build geometry from an exact initialized, step-zero world state."""
+    """Build geometry from a locally valid initialized, step-zero world state.
 
-    if not isinstance(state, HiddenPartnerWorldFeedbackState):
-        raise TypeError("state must be a HiddenPartnerWorldFeedbackState")
-    _exact_initialized_step_count(state.step_count)
+    Validation covers the exact state class and every persistent leaf's
+    concrete shape, dtype, and initialized value domain.  It cannot
+    authenticate the root seed or prove the derivation history of otherwise
+    structurally valid PRNG keys; protocols requiring that provenance must
+    bind it separately.
+    """
+
+    validated = _validate_initialized_world_state(state)
     return build_hidden_partner_lifecycle_world_v6_scan_plan(
-        state.segment_lengths,
-        segment_ends=state.segment_ends,
+        validated.segment_lengths,
+        segment_ends=validated.segment_ends,
     )
 
 
@@ -452,8 +833,7 @@ def validate_hidden_partner_lifecycle_world_v6_scan_plan(
 ) -> HiddenPartnerLifecycleWorldV6ScanPlan:
     """Reconstruct and accept only the exact canonical scan plan."""
 
-    if type(plan) is not HiddenPartnerLifecycleWorldV6ScanPlan:
-        raise TypeError("plan must be an exact HiddenPartnerLifecycleWorldV6ScanPlan")
+    _validate_scan_plan_types(plan)
     rebuilt = build_hidden_partner_lifecycle_world_v6_scan_plan(
         np.asarray(plan.segment_lengths, dtype=np.int32),
         segment_ends=np.asarray(plan.segment_ends, dtype=np.int32),
@@ -482,7 +862,7 @@ def canonical_hidden_partner_lifecycle_world_v6_scan_plan_bytes(
     """Return canonical ASCII JSON bytes after exact plan reconstruction."""
 
     validated = validate_hidden_partner_lifecycle_world_v6_scan_plan(plan)
-    return _canonical_json_bytes(validated.to_config())
+    return _canonical_json_bytes(validated._to_config_unchecked())
 
 
 def _duplicate_rejecting_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -536,7 +916,9 @@ def _plan_from_payload(payload: Mapping[str, object]) -> HiddenPartnerLifecycleW
         lengths.astype(np.int32),
         segment_ends=ends.astype(np.int32),
     )
-    if _canonical_json_bytes(supplied) != _canonical_json_bytes(rebuilt.to_config()):
+    if _canonical_json_bytes(supplied) != _canonical_json_bytes(
+        rebuilt._to_config_unchecked()
+    ):
         raise ValueError("serialized scan plan differs from exact reconstructed geometry")
     return rebuilt
 
@@ -592,6 +974,8 @@ def build_v6_control_suite_readiness() -> HiddenPartnerLifecycleWorldV6ControlSu
         raise RuntimeError("every v6 primary binding must be marked primary")
     if any(control.primary for control in diagnostics):
         raise RuntimeError("v6 diagnostic bindings must not be marked primary")
+    for control in (*primary, *diagnostics):
+        validate_v6_control(control)
 
     blocked: list[HiddenPartnerLifecycleWorldV6BlockedControl] = []
     for family, controls in (("primary", primary), ("diagnostic", diagnostics)):
@@ -599,7 +983,7 @@ def build_v6_control_suite_readiness() -> HiddenPartnerLifecycleWorldV6ControlSu
             if control.execution_ready:
                 continue
             reason = control.execution_blocker
-            if not isinstance(reason, str) or not reason:
+            if type(reason) is not str or not reason:
                 raise RuntimeError(f"blocked v6 control {control.name!r} has no exact reason")
             blocked.append(
                 HiddenPartnerLifecycleWorldV6BlockedControl(
@@ -608,13 +992,37 @@ def build_v6_control_suite_readiness() -> HiddenPartnerLifecycleWorldV6ControlSu
                     reason=reason,
                 )
             )
+    bindings = build_v6_control_bindings()
+    expected_ready_order = tuple(
+        (family, control.name)
+        for family, controls in (("primary", primary), ("diagnostic", diagnostics))
+        for control in controls
+        if control.execution_ready
+    )
+    if tuple((binding.family, binding.name) for binding in bindings) != expected_ready_order:
+        raise RuntimeError("v6 bridge bindings differ from the exact ready control order")
     return HiddenPartnerLifecycleWorldV6ControlSuiteReadiness(
         primary_ready_count=sum(control.execution_ready for control in primary),
         primary_required_count=len(PRIMARY_CONDITION_ORDER),
         diagnostic_ready_count=sum(control.execution_ready for control in diagnostics),
         diagnostic_required_count=len(V6_DIAGNOSTIC_ORDER),
         blocked_controls=tuple(blocked),
+        control_matrix_schema=HIDDEN_PARTNER_LIFECYCLE_WORLD_V6_CONTROL_SCHEMA,
+        control_matrix_sha256=canonical_v6_control_matrix_sha256(),
+        bindings=bindings,
     )
+
+
+def validate_v6_control_suite_readiness(
+    readiness: HiddenPartnerLifecycleWorldV6ControlSuiteReadiness,
+) -> HiddenPartnerLifecycleWorldV6ControlSuiteReadiness:
+    """Accept only an exact, type-strict snapshot of the current live bindings."""
+
+    _validate_control_readiness_types(readiness)
+    expected = build_v6_control_suite_readiness()
+    if readiness != expected:
+        raise ValueError("v6 control readiness differs from the current live bindings")
+    return expected
 
 
 def require_v6_control_suite_ready() -> HiddenPartnerLifecycleWorldV6ControlSuiteReadiness:
@@ -640,8 +1048,10 @@ __all__ = [
     "EVIDENCE_AUTHORIZED",
     "EXECUTION_AUTHORIZED",
     "FINAL_WINDOW_STEPS",
+    "HIDDEN_PARTNER_LIFECYCLE_WORLD_V6_CONTROL_READINESS_SCHEMA",
     "HIDDEN_PARTNER_LIFECYCLE_WORLD_V6_SCAN_PLAN_SCHEMA",
     "HiddenPartnerLifecycleWorldV6BlockedControl",
+    "HiddenPartnerLifecycleWorldV6ControlBinding",
     "HiddenPartnerLifecycleWorldV6ControlSuiteNotReadyError",
     "HiddenPartnerLifecycleWorldV6ControlSuiteReadiness",
     "HiddenPartnerLifecycleWorldV6ScanPlan",
@@ -663,5 +1073,6 @@ __all__ = [
     "load_hidden_partner_lifecycle_world_v6_scan_plan",
     "require_v6_control_suite_ready",
     "v6_scheduled_active_mask",
+    "validate_v6_control_suite_readiness",
     "validate_hidden_partner_lifecycle_world_v6_scan_plan",
 ]

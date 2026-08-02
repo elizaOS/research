@@ -1,10 +1,27 @@
 # mypy: disable-error-code="call-arg"
 """Latent action-conditioned world model with surprise diagnostics.
 
-This module is a low-dimensional, online analogue of JEPA/LeWM-style latent
-prediction. It intentionally starts with a fixed random encoder so the first
-research question is about predictive latent dynamics, surprise, and dream
-selection rather than unstable joint representation learning.
+This module is a low-dimensional, online analogue of latent-prediction world
+models in the JEPA family (LeCun 2022, "A Path Towards Autonomous Machine
+Intelligence") such as LeWorldModel (LeWM; arXiv:2603.19312): dynamics are
+predicted in an embedding space, ``(z_t, a_t) -> (z_{t+1}, r, gamma)``, rather
+than in observation space.
+
+Two deliberate simplifications keep the first research question about
+predictive latent dynamics, surprise, and dream selection rather than
+unstable joint representation learning:
+
+1. **Fixed random encoder** — observations are embedded by an untrained
+   ``tanh`` random projection, i.e. a random-features map (cf. Rahimi &
+   Recht 2007; the sparse FTL world model in
+   :mod:`alberta_framework.core.ftl_world_model` makes the same trade for
+   the same reason).  Because the encoder receives no gradient,
+   representation collapse cannot be caused by training here.
+2. **Collapse tracking as diagnostic, not loss** — an EMA of per-dimension
+   target-latent variance is maintained, and ``collapse_score`` reports the
+   fraction of latent dimensions whose std falls below ``min_latent_std``.
+   With a learned encoder this diagnostic would become an anti-collapse
+   gate; with the fixed encoder it flags degenerate inputs or encoders.
 """
 
 from __future__ import annotations

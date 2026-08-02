@@ -1,3 +1,21 @@
+"""Contract tests for :mod:`alberta_framework.benchmarks.forager_matched_open_protocol`.
+
+The builder under test freezes the matched-current open-tuning design — task,
+horizon, seed sets, candidate panel, selection rule, analysis plan — while
+requiring callers to supply externally qualified, content-addressed
+source/configuration/runtime bindings.  The tests check both directions: the
+frozen design constants are exact (candidate ids, seeds, implementation
+digests), and incomplete, placeholder, or tampered qualification inputs fail
+closed.
+
+This module doubles as the shared open-protocol fixture library: five sibling
+suites (campaign, executor, evaluation-campaign, sealed-evaluation-campaign,
+final-analysis) import it as ``protocol_fixtures``/``open_protocol_fixtures``
+and treat :func:`_build` as the canonical parsed open-stage protocol.  Changes
+to the ``_runtime``/``_source``/``_configuration``/``_qualifications`` helpers
+ripple into those suites.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -31,6 +49,8 @@ from alberta_framework.benchmarks.forager_matched_statistics import (
     SECONDARY_SIGN_FLIP_HOLM_IMPLEMENTATION_SHA256,
 )
 
+# candidate_id -> (upstream config path, sha256 of the pinned original bytes,
+# sha256 after the allowed byte-preserving literal replacements, transform items).
 _UPSTREAM_CONFIGS: Final = {
     "external_dqn_ln": (
         "fov_baseline_screening_v1/configs/DQN_LN-common-control.json",
@@ -109,6 +129,14 @@ _PLAIN_DQN_FIXTURE: Final = (
 
 def _sha(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+def test_rng_isolated_source_family_is_named_by_its_actual_relationship() -> None:
+    assert builder.MATCHED_CURRENT_RNG_ISOLATED_SOURCE_CANDIDATE_IDS == (
+        "isolated_ppo",
+        "isolated_rtu",
+    )
+    assert not hasattr(builder, "MATCHED_CURRENT_RECURRENT_CANDIDATE_IDS")
 
 
 @pytest.mark.parametrize(
@@ -291,6 +319,13 @@ def _qualifications() -> dict[str, builder.MatchedCurrentCandidateQualification]
 
 
 def _build() -> ForagerMatchedProtocol:
+    """Return the canonical parsed open-stage protocol fixture.
+
+    Built from synthetic-but-well-formed qualification inputs; stage is
+    ``open_tuning`` with the exact frozen design (horizon 499_712, tuning
+    seeds 2_300_001..2_300_010, evaluation seeds 2_200_001..2_200_030).
+    Sibling suites import this as their starting protocol.
+    """
     return builder.build_forager_matched_open_protocol(
         runtime=_runtime(),
         candidate_qualifications=_qualifications(),

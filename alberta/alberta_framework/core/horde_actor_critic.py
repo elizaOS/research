@@ -1,9 +1,32 @@
-"""Horde-backed actor-critic control.
+"""Horde-backed actor-critic control (Alberta Plan Step 4 on the Step 3 critic).
 
-This module connects the Step 4 softmax policy-gradient actor to the Step 3
-``HordeLearner`` critic. The first GVF head is the scalar value critic used for
-the actor advantage. Remaining heads are optional auxiliary prediction demons
-that update on the same transition.
+This module connects Step 4 softmax policy-gradient actors to the Step 3
+:class:`~alberta_framework.core.horde.HordeLearner` critic. Four agents cover
+the critic-form x actor-form design space:
+
+* :class:`HordeActorCriticAgent` — linear actor, state-value critic. The
+  configured GVF head is the scalar critic ``V(s)`` whose TD error drives the
+  actor; remaining heads are auxiliary prediction demons updated on the same
+  transition.
+* :class:`QHordeActorCriticAgent` — linear actor, action-value critic: one
+  control-demon head per action learning an (expected) SARSA target; only the
+  taken action's head updates each transition.
+* :class:`NonlinearHordeActorCriticAgent` — MLP actor with the state-value
+  critic; the canonical nonlinear Step 4 agent. The policy gradient is taken
+  by ``jax.grad`` through the full softmax forward pass.
+* :class:`NonlinearQHordeActorCriticAgent` — MLP actor with the action-value
+  critic, plus an optional expected-advantage actor objective.
+
+All actors implement AC(lambda), ``theta += alpha * delta * e``, with an
+eligibility trace over log-policy gradients (Sutton & Barto 2018, Ch. 13).
+The critic update is always delegated unchanged to ``HordeLearner.update()``,
+preserving per-head trace decay and auxiliary demons.
+
+References:
+    Sutton & Barto (2018). "Reinforcement Learning: An Introduction,"
+        2nd ed., Ch. 13 (actor-critic policy-gradient methods).
+    Sutton et al. (2011). "Horde: A Scalable Real-time Architecture for
+        Learning Knowledge from Unsupervised Sensorimotor Interaction."
 """
 
 from __future__ import annotations
@@ -38,7 +61,9 @@ class HordeActorCriticConfig:
     Attributes:
         n_actions: Number of discrete actions.
         actor_step_size: Step-size for policy parameters.
-        actor_lamda: Eligibility trace decay for the actor.
+        actor_lamda: Eligibility trace decay ``lambda`` for the actor's
+            AC(lambda) trace. ``0`` gives one-step policy-gradient credit;
+            values near ``1`` spread credit over longer action histories.
         temperature: Softmax temperature.
         value_head_index: Horde head used as the scalar critic.
         actor_td_error_clip: Optional absolute clip applied only to the actor's

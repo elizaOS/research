@@ -1,4 +1,20 @@
-"""Tests for the observation-causal Forager cognitive-map variant."""
+"""Tests for the observation-causal Forager cognitive-map variant.
+
+The agent under test (:mod:`alberta_framework.benchmarks.causal_map_forager`)
+learns a compact world model online from egocentric field-of-view
+observations only — a relative toroidal map, per-channel reward statistics,
+and respawn-schedule estimates — with no privileged environment state.  The
+suite covers the map/estimator mechanisms (observation integration, interval
+and sample merging, saturating counters), the cost-aware routing and safety
+grids, action selection and retry/respawn timing, RNG contracts, state
+schema round-trips and validation, and exact-parity runs against the shared
+Forager host runner on tiny fake environments.
+
+Tests are deliberately white-box: they import ~15 private ``_helpers`` from
+the module under test to pin numeric behavior at the mechanism level (the
+public API alone cannot distinguish, e.g., interval-merge edge cases), so
+renaming module internals is expected to require touching this file.
+"""
 
 from __future__ import annotations
 

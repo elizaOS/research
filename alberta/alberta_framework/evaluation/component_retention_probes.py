@@ -220,7 +220,7 @@ class ComponentProbeInput:
 
 @dataclasses.dataclass(frozen=True)
 class ComponentProbeTargets:
-    """Evaluator-only targets for all WP4.5 component channels.
+    """Evaluator-only targets, one per probed component channel.
 
     ``actor_margin`` contains one integer-valued preferred action encoded as a
     float.  ``actor_return`` contains one held-out return for every discrete

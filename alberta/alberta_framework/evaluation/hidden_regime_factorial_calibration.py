@@ -12,6 +12,29 @@ an immutable aggregate has been exactly recomputed, this module can ask the
 same certified ZIP to run the separately pure threshold engine and publish its
 one development-only freeze-or-valid-rejection receipt.  No path here accepts
 a claim or supports scientific promotion.
+
+Stage map (this module is the coordinator; sibling modules own the pieces):
+
+1. Design — ``hidden_regime_factorial_protocol`` freezes the factorial design:
+   30 frozen seed pairs x 8 conditions = 240 matched cases, with seed pairs
+   assigned round-robin over three calibration-only manifests (A/B/C).
+2. Readiness — ``hidden_regime_calibration_readiness`` validates the published
+   content-addressed ZIP; its certified runtime is the only execution path.
+3. Ledger — ``hidden_regime_execution_governance`` owns the append-only case
+   ledger; :func:`initialize_calibration_ledger_from_readiness` writes genesis.
+4. Shards — :func:`run_calibration_case_subprocess` (or the bounded batch
+   variant) runs one case per ZIP subprocess and publishes one immutable
+   per-case shard; the raw primitive trace is audited in-process, then dropped.
+5. Aggregate — :func:`aggregate_and_publish_completed_calibration` recomputes
+   the 240-shard aggregate exactly and installs it content-addressed.
+6. Threshold freeze —
+   :func:`freeze_and_publish_completed_calibration_thresholds` runs the pure
+   engine from ``hidden_regime_factorial_thresholds`` inside the same certified
+   ZIP; the receipt is a freeze or a valid rejection, never a retune.
+7. Protected plan —
+   :func:`derive_and_publish_completed_calibration_protected_plan` derives the
+   strictly nonauthorizing protected-evaluation plan
+   (``hidden_regime_factorial_protected_plan``) from the frozen receipt.
 """
 
 from __future__ import annotations
@@ -187,6 +210,12 @@ AGGREGATE_RESULT_PREFIX = b"ALBERTA_HIDDEN_REGIME_CALIBRATION_AGGREGATE_V1:"
 THRESHOLD_FREEZE_RESULT_PREFIX = b"ALBERTA_HIDDEN_REGIME_THRESHOLD_FREEZE_V1:"
 PROTECTED_PLAN_RESULT_PREFIX = b"ALBERTA_HIDDEN_REGIME_PROTECTED_PLAN_V1:"
 
+# Frozen design totals, re-checked against the protocol module whenever the
+# design is materialized:
+# each case is one 16,528-step schedule, and 30 seed pairs x 8 conditions = 240
+# matched cases.  Seed pairs follow the frozen A/B/C round-robin over the three
+# calibration-only manifests, so each manifest stratum carries exactly
+# 240 / 3 = 80 cases from 30 / 3 = 10 seed pairs.
 EXPECTED_STEPS = 16_528
 EXPECTED_CONDITIONS = 8
 EXPECTED_SEED_PAIRS = 30
@@ -199,12 +228,18 @@ READINESS_EQUIVALENCE_CERTIFICATION_ID = (
 )
 
 _SHA256_LENGTH = 64
+# Fail-closed read ceilings: every on-disk artifact and every worker stdout is
+# length-checked against its per-class ceiling before any decoding, so a
+# truncated, corrupt, or oversized payload fails loudly instead of being
+# partially parsed.  These are generous sanity bounds, not tuned parameters.
 _MAX_RECEIPT_BYTES = 4 * 1024 * 1024
 _MAX_SOURCE_ZIP_BYTES = 32 * 1024 * 1024
 _MAX_WORKER_OUTPUT_BYTES = 8 * 1024 * 1024
 _MAX_SHARD_BYTES = 8 * 1024 * 1024
 _MAX_AGGREGATE_BYTES = 64 * 1024 * 1024
 _MAX_PROTECTED_PLAN_BYTES = 32 * 1024 * 1024
+# Hard cap on caller-requested subprocess fan-out in the batch executor, so a
+# mistyped ``max_workers`` cannot spawn an unbounded number of ZIP workers.
 _MAX_CALIBRATION_WORKERS = 16
 
 type RecurrenceIdentity = tuple[int, int, int, int]

@@ -4,16 +4,28 @@
 
 This module supports a small DiffEML logic-circuit classifier on image datasets.
 It is intended for research demos, not as a claim of competitive image
-performance.
+performance.  EML (exp-minus-log) is the two-input operator
+``exp(x) - log(y)`` implemented in :mod:`alberta_framework.core.diffeml`; a
+DiffEML circuit is a differentiable-logic-style network whose Boolean gates
+are realised by EML-threshold expressions instead of truth tables.
+
 The default mode executes depth-2 EML-threshold gate templates from
-``core.diffeml`` and learns a DiffLogic-style selector at every circuit node.
-The ``eml_threshold`` ablation compresses each node to one EML operation, one
-learned threshold, and one learned direction. Evaluation reports both the
-relaxed circuit and the hardened EML circuit.
+``core.diffeml`` and learns a DiffLogic-style soft gate selector at every
+circuit node (Petersen et al. 2022).  The ``eml_threshold`` ablation
+compresses each node to one EML operation, one learned threshold, and one
+learned direction. Evaluation reports both the relaxed circuit and the
+hardened EML circuit.
 
 For image-scale runs, ``threshold_pixels`` creates DiffLogic-style binary
 threshold features and ``local_hierarchy`` wires EML gates as local tree
-convolutions with progressively coarser spatial grids.
+convolutions with progressively coarser spatial grids, in the spirit of
+convolutional differentiable logic-gate networks (C-DLGN).
+
+References:
+    Petersen et al. (2022). "Deep Differentiable Logic Gate Networks."
+        NeurIPS 2022.
+    Petersen et al. (2024). "Convolutional Differentiable Logic Gate
+        Networks." NeurIPS 2024.
 """
 
 from __future__ import annotations
@@ -120,7 +132,41 @@ class DatasetSplit:
 
 @dataclass(frozen=True)
 class DemoConfig:
-    """Configuration for the DiffEML image demo."""
+    """Configuration for the DiffEML image demo.
+
+    Fields map one-to-one onto the demo runner's CLI flags (built by
+    :func:`build_config`, range-checked before construction) and fall into
+    seven groups:
+
+    * **Data** — ``datasets``, ``seed``, ``train_fraction``, ``max_train``,
+      ``max_test``: dataset selection plus deterministic stratified
+      splitting and capping.
+    * **Binarization** — ``feature_mode`` (``"variance_pixels"``,
+      ``"threshold_pixels"``, or ``"detector_thresholds"``), ``input_bits``,
+      ``pixel_thresholds``: how real-valued pixels become the Boolean
+      circuit inputs.
+    * **Topology** — ``layers``, ``width``, ``wiring_mode``,
+      ``local_patch_size``, ``tree_stage_depths``: circuit shape and the
+      fixed source wiring between layers.
+    * **Gate relaxation** — ``gate_mode`` (selector over EML templates or
+      truth tables vs. the ``"eml_threshold"`` one-op-per-node ablation),
+      ``eml_template_depth``, ``eml_eps``, ``eml_threshold_temperature``,
+      ``threshold_init_scale``, ``direction_init_scale``,
+      ``hard_loss_weight``: how the discrete gates are made differentiable.
+    * **Optimization** — ``epochs``, ``batch_size``, ``step_size``,
+      ``initial_temperature``/``min_temperature`` (selector-softmax
+      annealing), ``entropy_weight``, ``head_l2``, ``gate_init_scale``,
+      ``head_init_scale``, ``max_grad_norm``, ``input_drop_rate``,
+      ``feature_drop_rate``, ``residual_gate``, ``residual_gate_bias``.
+    * **Readout** — ``head_mode`` (``"linear"`` or the Boolean-count modes
+      ``"group_sum"``/``"class_vote"``/``"signed_class_vote"``),
+      ``group_sum_tau``, ``readout_entropy_weight``,
+      ``readout_balance_weight``; ``packed_eval`` additionally checks the
+      hardened circuit with bit-packed Boolean execution.
+    * **MLP baseline** — ``compare_mlp`` and the ``mlp_*`` fields configure
+      an optional MLP comparison run on the same split (its parameter count
+      is reported alongside the circuit's).
+    """
 
     datasets: tuple[str, ...]
     seed: int
@@ -1008,7 +1054,13 @@ def make_local_tree_hierarchy_wiring(
     stage_depths: tuple[int, ...],
     or_gate_index: int,
 ) -> CircuitWiring:
-    """Create C-DLGN-style local EML tree convolutions with fixed OR pooling."""
+    """Create C-DLGN-style local EML tree convolutions with fixed OR pooling.
+
+    Follows the convolutional differentiable logic-gate network recipe
+    (Petersen et al. 2024): each stage wires gates to small local patches on
+    a spatial grid, deepens within the patch for ``stage_depths[i]`` layers,
+    then pools with a fixed OR gate onto a coarser grid.
+    """
     if feature_layout.image_shape is None:
         raise ValueError("local tree wiring requires an image-shaped dataset")
     height, image_width, _channels = feature_layout.image_shape

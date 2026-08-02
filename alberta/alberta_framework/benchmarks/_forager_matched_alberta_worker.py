@@ -41,6 +41,11 @@ from alberta_framework.core.recurrent_trace_actor_critic import (
     RecurrentTraceActorCriticConfig,
 )
 
+# Mirrors ``forager_matched_open_protocol.MATCHED_CURRENT_HORIZON``.  The
+# value is the largest multiple of the external PPO comparators' 2,048-step
+# rollout under the 500k paper horizon (244 * 2,048 = 3,904 * 128 = 499,712);
+# the matched protocol requires rollout length to divide the horizon exactly,
+# so rollout-counted and step-counted candidates stop at the same step.
 MATCHED_CURRENT_HORIZON: Final = 499_712
 MATCHED_ALBERTA_WORKER_CONFIGURATION_SCHEMA_VERSION: Final = (
     "alberta.forager_matched_worker_configuration.v1"
@@ -415,6 +420,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise MatchedAlbertaWorkerError("runner requested an unexpected trace lane")
         return _MatchedRewardTraceSink(data_root, seed, steps)
 
+    # Environment (paper field-of-view task, aperture 9) and horizon mirror
+    # the frozen matched-current task in ``forager_matched_open_protocol``.
+    # The metric settings (EMA decay 0.999, subsample 100) follow the
+    # paper-era FOV convention (see ``_foragax_open_screen_scorer`` and
+    # ``HISTORICAL_FORAGER_EMA_DECAY``) but shape only host-side diagnostics:
+    # the scored artifact is the raw per-step reward NPZ written by the sink,
+    # read exclusively by the frozen in-container scorer.
     benchmark = ForagerBenchmarkConfig(
         environment=ForagerEnvConfig.paper_field_of_view(aperture_size=9),
         steps=MATCHED_CURRENT_HORIZON,

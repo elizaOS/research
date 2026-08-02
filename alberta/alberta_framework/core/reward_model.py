@@ -1,5 +1,15 @@
 # mypy: disable-error-code="call-arg"
-"""Online reward models for selective model-based updates."""
+"""Online reward models for selective model-based updates.
+
+Implements a linear recursive-least-squares (RLS) scalar reward predictor
+with exponential forgetting (standard exponentially weighted RLS; see e.g.
+Haykin, *Adaptive Filter Theory*).  Its role in the model-based lane is to
+supply calibrated reward targets for imagined (dream) transitions when the
+shared multi-head dynamics model's reward head is too biased or too slow to
+calibrate.  The ``abs_error_ema`` diagnostic gives callers an online
+reliability estimate for deciding whether imagined rewards are currently
+trustworthy — the "selective" part of selective model-based updates.
+"""
 
 from __future__ import annotations
 
@@ -21,7 +31,8 @@ class RLSRewardModelConfig:
     Args:
         feature_dim: Number of scalar input features.
         forgetting: Exponential forgetting factor. Values near one favor stable
-            estimates; lower values adapt faster to nonstationarity.
+            estimates; lower values adapt faster to nonstationarity but risk
+            covariance windup (see :meth:`RLSRewardModel.update`).
         ridge: Initial precision regularizer. Larger values make the initial
             covariance smaller and therefore more conservative.
         error_decay: EMA decay for absolute reward-prediction error diagnostics.
@@ -129,7 +140,23 @@ class RLSRewardModel:
         features: Array,
         reward: Array,
     ) -> RLSRewardModelUpdateResult:
-        """Update from one real reward observation."""
+        """Update from one real reward observation.
+
+        Standard exponentially weighted RLS (Haykin, *Adaptive Filter
+        Theory*):
+
+        1. ``gain = P x / (forgetting + x^T P x)``
+        2. ``w <- w + gain * error``
+        3. ``P <- (P - gain (P x)^T) / forgetting``
+
+        Caveat (covariance windup): with ``forgetting < 1``, any direction
+        of feature space that receives no excitation has its covariance
+        grown by ``1 / forgetting`` every step, so under persistently
+        poorly excited features the covariance — and hence the gain when
+        excitation returns — can grow without bound. Keep ``forgetting=1``
+        unless the reward function is genuinely nonstationary and the
+        feature stream stays exciting.
+        """
         x = jnp.asarray(features, dtype=jnp.float32).reshape((self._config.feature_dim,))
         target = jnp.asarray(reward, dtype=jnp.float32)
         prediction = jnp.dot(state.weights, x)

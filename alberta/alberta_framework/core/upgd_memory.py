@@ -1,11 +1,13 @@
 # mypy: disable-error-code="call-arg,name-defined"
 """Single Step 2 learner combining UPGD with fixed-budget prototype memory.
 
-The learner keeps the two mechanisms that survived the Step 2 pressure tests:
-target-structure UPGD for differentiable plastic features and a D20-style
-multi-prototype memory for retained one-hot class views.  Both components
-update on every step.  Their predictions are blended by one learned scalar plus
-causal confidence/reliability signals, so the deployed object is one learner
+Two complementary mechanisms form one learner: target-structure UPGD
+(:class:`~alberta_framework.core.upgd.UPGDLearner`) provides differentiable
+plastic features, and a fixed-budget multi-prototype memory
+(:class:`~alberta_framework.core.prototype_memory.PrototypeMemoryLearner`)
+retains one-hot class views.  Both components update on every step.  Their
+predictions are blended by one learned scalar logit plus causal
+confidence/reliability signals, so the deployed object is one learner
 rather than a route-selecting portfolio.
 """
 
@@ -76,10 +78,10 @@ class UPGDMemoryConfig:
         reliability_logit_scale: Fixed coefficient for UPGD loss EMA minus
             memory loss EMA.
         reliability_decay: EMA decay for component losses and allocation rate.
-        target_trace_blend_scale: Optional update-time blend toward the
-            previous target vector under repeated-target pressure.  This is a
-            causal temporal prior for prequential streams with persistent
-            targets.  It defaults to zero, and ordinary ``predict`` calls stay
+        target_trace_blend_scale: Update-time blend toward the previous
+            target vector under repeated-target pressure.  This is a causal
+            temporal prior for prequential streams with persistent targets.
+            Only ``update`` applies it; ordinary ``predict`` calls stay
             observation-based so held-out batch evaluation is not biased toward
             the last observed target.
         target_trace_pressure_threshold: Repetition EMA level below which the
@@ -254,6 +256,12 @@ class UPGDMemoryLearner:
     def __init__(self, config: UPGDMemoryConfig):
         _validate_config(config)
         self._config = config
+        # The UPGD sub-configuration is frozen here; UPGDMemoryConfig exposes
+        # only step-size and head-plasticity knobs.  Relative to UPGDLearner
+        # defaults this variant perturbs far more gently (sigma 1e-4 every 16
+        # steps vs 1e-3 every step), keeps more weights at init (sparsity 0.5
+        # vs 0.9), bounds updates more loosely (ObGD kappa 0.5 vs 2.0), and
+        # uses target-structure loss normalization for one-hot targets.
         self._upgd = UPGDLearner(
             n_heads=config.n_heads,
             hidden_sizes=config.hidden_sizes,
@@ -439,6 +447,10 @@ class UPGDMemoryLearner:
         next_memory_logit = state.memory_logit - (
             jnp.asarray(self._config.memory_logit_step_size, dtype=jnp.float32) * dloss_dlogit
         )
+        # Bound the learned base logit: sigmoid(+/-8) is already ~0.9997, so
+        # the clip costs nothing in gate range but stops unbounded drift during
+        # long one-sided regimes, keeping the additive confidence/reliability
+        # terms able to reverse the gate after a regime change.
         next_memory_logit = jnp.clip(next_memory_logit, -8.0, 8.0)
 
         threshold = jnp.exp(state.novelty_log_threshold)

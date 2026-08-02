@@ -1,13 +1,18 @@
-"""Causal prototype features for supervised Step 2 classification streams.
+"""Causal prototype features for supervised classification streams (Step 2).
 
-This module implements the small mechanism that repaired the class-blocked
-digits tracking/retention conflict in the Step 2 probes: maintain a bounded set
-of normalized class prototypes and expose cosine-similarity probabilities as
-constructed features.
+Maintains one bounded, unit-norm prototype per class -- an EMA of normalized
+observations of that class -- and exposes softmax-of-cosine-similarity
+probabilities as constructed features.  The mechanism targets class-blocked
+streams (long single-class blocks), where a learner must track the current
+class without overwriting what it learned about earlier classes; the
+prototype probabilities give downstream weights an explicit "which class
+regime is this" signal that the raw observation does not carry.
 
-The constructor is intentionally narrow.  It updates only on non-negative
-unit-mass simplex targets, so dense regression and non-simplex vector targets
-are skipped by default.
+The constructor is causal (prototypes are built only from past labelled
+observations) and intentionally narrow: :meth:`~PrototypeFeatureConstructor.update`
+fires only on non-negative unit-mass simplex targets (one-hot or soft
+labels), so dense regression and non-simplex vector targets leave the
+prototypes untouched.
 """
 
 import functools
@@ -33,8 +38,13 @@ class PrototypeFeatureConstructor:
 
     Args:
         n_classes: Number of simplex target classes/tasks.
-        alpha: EMA rate for the observed class prototype.
+        alpha: EMA rate for the observed class prototype; effective memory is
+            roughly the last ``1 / alpha`` observations of that class
+            (~20 at the 0.05 default).
         temperature: Softmax temperature for cosine-similarity features.
+            Cosine similarity lies in ``[-1, 1]``, so logits span
+            ``[-1/temperature, 1/temperature]``; the 0.05 default makes the
+            output nearly one-hot toward the closest seen prototype.
     """
 
     def __init__(
@@ -80,6 +90,10 @@ class PrototypeFeatureConstructor:
         normalized_prototypes = state.prototypes / (prototype_norms[:, None] + 1e-8)
         cosine = normalized_prototypes @ obs
         seen = state.counts > 0.0
+        # Unseen classes get a finite sentinel logit rather than -inf: on a
+        # fresh state (all classes unseen) softmax over all-(-inf) logits is
+        # NaN, whereas all -20.0 yields the uniform distribution.  Once any
+        # class has been seen, exp(-20) ~ 2e-9 makes unseen classes negligible.
         scores = jnp.where(
             seen,
             cosine / jnp.asarray(self._temperature, dtype=jnp.float32),
@@ -99,7 +113,14 @@ class PrototypeFeatureConstructor:
         observation: Array,
         target: Array,
     ) -> PrototypeFeatureState:
-        """Update the observed class prototype when the target is simplex-like."""
+        """Update the observed class prototype when the target is simplex-like.
+
+        The gate accepts targets that are non-negative and sum to one within
+        tolerance (one-hot or soft labels); NaN entries mark inactive target
+        dimensions and are ignored.  Any other target (dense regression,
+        general vectors) leaves prototypes and counts unchanged, though
+        ``step_count`` still advances.
+        """
         active = ~jnp.isnan(target)
         safe_target = jnp.where(active, target, 0.0)
         target_mass = jnp.sum(jnp.where(active, safe_target, 0.0))

@@ -887,8 +887,8 @@ def _estimated_respawn_delay(
     quantile can only increase the conservative interval endpoint.
 
     This distribution-free bound may be late when the policy returns late, but
-    unlike the previous mixed Welford population it cannot mistake visibility
-    duration (a lower censoring bound) for a respawn draw.
+    it cannot mistake visibility duration (only a lower censoring bound) for a
+    respawn draw.
     """
     safe_channel = jnp.maximum(channel, 0)
     interval_count = state.respawn_interval_count[safe_channel]
@@ -1509,8 +1509,8 @@ def _safe_distance_grid(
     # after iteration k, all paths of at most k edges have been considered.
     # A shortest simple path visits at most V cells, so V - 1 iterations reach
     # every reachable cell and one final iteration detects the fixed point.
-    # The V-iteration cap is also the former unconditional loop bound, making
-    # this fail-safe result identical even if early convergence does not occur.
+    # The V-iteration cap therefore yields the exact result even if the
+    # early-convergence exit never fires.
     maximum_iterations = config.height * config.width
 
     def not_fixed(carry: tuple[Array, Array, Array]) -> Array:

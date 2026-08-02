@@ -1,18 +1,41 @@
+"""Contract tests for :mod:`alberta_framework.benchmarks.forager_matched_executor`.
+
+The executor is the strict CPU boundary between a parsed matched-current
+protocol and live OCI execution: plan construction is nonexecuting and
+content-addressed, live runs go through small injected-runner primitives, and
+the host hashes the opaque result archive without ever opening reward bytes
+(only the frozen scorer inside the qualified image does).  The suite is
+adversarial throughout: manifest/receipt/digest drift, rename swaps, raw
+archive mutation mid-scoring, symlink and FIFO source trees, hostile USTAR
+members, and self-attested receipts must all fail closed, while the
+plan -> execute -> score -> receipt-index path replays deterministically.
+
+No real container runtime is used: ``_runtime`` fabricates a qualified
+runtime identity from stub binaries and canned inspection payloads.  The
+helpers here (``_fixture``, ``_plan``, ``_runtime``,
+``_runtime_reinspection_result``, ``_scoring_output``) are imported by the
+campaign, sealed-evaluation-campaign, and final-analysis suites as
+``executor_fixtures``.
+"""
+
 from __future__ import annotations
 
 import copy
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Any, NoReturn, cast
 
 import pytest
@@ -32,6 +55,9 @@ def _sha(label: str) -> str:
     return hashlib.sha256(label.encode("ascii")).hexdigest()
 
 
+_QUALIFICATION_MANIFEST_SHA256 = _sha("matched-current-qualification-manifest")
+
+
 def _canonical_sha(value: dict[str, Any]) -> str:
     return hashlib.sha256(executor.canonical_json_bytes(value)).hexdigest()
 
@@ -40,6 +66,7 @@ def _receipt(
     candidate: dict[str, Any],
     *,
     entrypoint: str,
+    python_import_root: str = "src",
     invocation_style: str,
     result_root: str,
     patch_sha256: str | None,
@@ -63,7 +90,7 @@ def _receipt(
         "rng_parity_contract_sha256": executor.RNG_PARITY_CONTRACT_SHA256,
         "entrypoint_family": candidate["entrypoint_family"],
         "entrypoint_path": entrypoint,
-        "python_import_root": "src",
+        "python_import_root": python_import_root,
         "invocation_style": invocation_style,
         "result_root": result_root,
         "agent_rng_identity": candidate["agent_rng"]["identity"],
@@ -81,6 +108,14 @@ def _fixture(
     protocol.ForagerMatchedProtocol,
     dict[str, executor.CandidateExecutionAssets],
 ]:
+    """Build a plan-ready single-candidate fixture on real temporary files.
+
+    Rebinds the generic protocol payload to the executor's qualified
+    constants (image/profile/scorer/task digests), materializes a minimal
+    on-disk source tree whose entrypoint raises if ever executed, and
+    returns ``(payload, parsed protocol, execution assets)`` for
+    ``candidate_id``.  Shared with sibling suites via ``executor_fixtures``.
+    """
     payload = protocol_fixtures._payload()
     if candidate_id == "isolated_ppo":
         def replace_isolated_rtu(value: Any) -> Any:
@@ -147,6 +182,7 @@ def _fixture(
     entrypoint = source_root / source_entrypoint
     entrypoint.parent.mkdir()
     entrypoint.write_text("raise SystemExit('not executed by tests')\n", encoding="utf-8")
+    entrypoint.chmod(0o644)
     inventory = executor.source_inventory(source_root)
     source_archive = tmp_path / f"{candidate_id}.tar"
     source_archive.write_bytes(f"archive:{candidate_id}".encode("ascii"))
@@ -222,6 +258,7 @@ def _plan(
     return executor.build_execution_plan(
         frozen,
         assets,
+        qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
         candidate_ids=(candidate_id,),
     )
 
@@ -266,6 +303,9 @@ def _runtime(
     tmp_path: Path,
     plan: executor.MatchedExecutionPlan,
 ) -> executor.LiveRuntimeIdentity:
+    """Qualify a fake live runtime: a stub ``docker`` binary (which exits 99
+    if actually invoked) plus canned version/inspection payloads routed
+    through the injected runner.  No container runtime is touched."""
     tmp_path.mkdir(parents=True, exist_ok=True)
     runtime = tmp_path / "docker"
     runtime.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
@@ -415,6 +455,7 @@ def _two_candidate_plan(tmp_path: Path) -> executor.MatchedExecutionPlan:
     return executor.build_execution_plan(
         frozen,
         assets,
+        qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
         candidate_ids=tuple(assets),
     )
 
@@ -425,11 +466,35 @@ def _refresh_receipt_index_digest(payload: dict[str, Any]) -> None:
     payload["payload_sha256"] = _canonical_sha(unsigned)
 
 
+def _direct_plan(
+    template: executor.MatchedExecutionPlan,
+    *,
+    source_manifest: Mapping[str, Any],
+    executor_manifest: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    candidate_index: Mapping[str, executor.PreparedCandidate],
+    candidates: tuple[executor.PreparedCandidate, ...] | None = None,
+    protocol_value: protocol.ForagerMatchedProtocol | None = None,
+) -> executor.MatchedExecutionPlan:
+    return executor.MatchedExecutionPlan(
+        protocol=template.protocol if protocol_value is None else protocol_value,
+        qualification_manifest_sha256=template.qualification_manifest_sha256,
+        candidates=template.candidates if candidates is None else candidates,
+        source_manifest=source_manifest,
+        executor_manifest=executor_manifest,
+        payload=payload,
+        candidate_index=candidate_index,
+        cpu_qualification_root=template.cpu_qualification_root,
+        rng_parity_qualification_root=template.rng_parity_qualification_root,
+    )
+
+
 def test_plan_is_content_addressed_nonexecuting_and_replayable(tmp_path: Path) -> None:
     _payload, frozen, assets = _fixture(tmp_path)
     plan = executor.build_execution_plan(
         frozen,
         assets,
+        qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
         candidate_ids=("alberta_causal",),
     )
 
@@ -456,14 +521,475 @@ def test_plan_is_content_addressed_nonexecuting_and_replayable(tmp_path: Path) -
     assert qualification["rng_parity_qualification"]["promotion_authorized"] is False
     assert b"<ACTIVE_SEED>" in plan.canonical_bytes
     assert str(tmp_path).encode() not in plan.canonical_bytes
+    for mapping, key in (
+        (plan.payload, "stage"),
+        (plan.source_manifest, "stage"),
+        (plan.executor_manifest, "protocol_sha256"),
+        (plan.candidate_index, "replacement"),
+    ):
+        with pytest.raises(TypeError):
+            cast(Any, mapping)[key] = "mutated"
+    with pytest.raises(TypeError):
+        cast(Any, plan.executor_manifest["qualified_lock"])["image_sha256"] = "0" * 64
 
     replayed = executor.parse_execution_plan(
         plan.canonical_bytes,
         protocol=frozen,
         assets=assets,
         expected_plan_sha256=plan.plan_sha256,
+        expected_qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
     )
     assert replayed.to_dict() == plan.to_dict()
+
+
+def test_direct_plan_rejects_legacy_plan_schema_despite_exact_manifest_closure(
+    tmp_path: Path,
+) -> None:
+    template = _plan(tmp_path)
+    payload = template.to_dict()
+    source_manifest = cast(dict[str, Any], payload["source_manifest"])
+    executor_manifest = cast(dict[str, Any], payload["executor_manifest"])
+    payload["schema_version"] = "alberta.forager_matched_execution_plan.v1"
+
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="object schema_version is unsupported",
+    ):
+        _direct_plan(
+            template,
+            source_manifest=source_manifest,
+            executor_manifest=executor_manifest,
+            payload=payload,
+            candidate_index=dict(template.candidate_index),
+        )
+
+
+def test_direct_plan_rejects_legacy_executor_schema_despite_rehashed_closure(
+    tmp_path: Path,
+) -> None:
+    template = _plan(tmp_path)
+    payload = template.to_dict()
+    source_manifest = cast(dict[str, Any], payload["source_manifest"])
+    executor_manifest = cast(dict[str, Any], payload["executor_manifest"])
+    executor_manifest["schema_version"] = "alberta.forager_matched_executor_manifest.v1"
+    payload["executor_manifest_sha256"] = _canonical_sha(executor_manifest)
+
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="executor-manifest schema_version is unsupported",
+    ):
+        _direct_plan(
+            template,
+            source_manifest=source_manifest,
+            executor_manifest=executor_manifest,
+            payload=payload,
+            candidate_index=dict(template.candidate_index),
+        )
+
+
+def test_direct_plan_rejects_protocol_outside_qualified_lock(
+    tmp_path: Path,
+) -> None:
+    template = _plan(tmp_path)
+    changed_protocol = replace(
+        template.protocol,
+        runtime=replace(
+            template.protocol.runtime,
+            executor_qualification_receipt_sha256=_sha("unqualified-executor"),
+        ),
+    )
+    source_manifest = cast(dict[str, Any], template.to_dict()["source_manifest"])
+    source_manifest["protocol_sha256"] = changed_protocol.protocol_sha256
+    executor_manifest = cast(dict[str, Any], template.to_dict()["executor_manifest"])
+    executor_manifest["protocol_sha256"] = changed_protocol.protocol_sha256
+    executor_manifest["runtime"] = changed_protocol.runtime.to_dict()
+    payload = template.to_dict()
+    payload.update(
+        {
+            "protocol_sha256": changed_protocol.protocol_sha256,
+            "source_manifest": source_manifest,
+            "source_manifest_sha256": _canonical_sha(source_manifest),
+            "executor_manifest": executor_manifest,
+            "executor_manifest_sha256": _canonical_sha(executor_manifest),
+        }
+    )
+
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="qualified matched-current lock",
+    ):
+        _direct_plan(
+            template,
+            protocol_value=changed_protocol,
+            source_manifest=source_manifest,
+            executor_manifest=executor_manifest,
+            payload=payload,
+            candidate_index=dict(template.candidate_index),
+        )
+
+
+def test_direct_plan_rejects_rehashed_executor_manifest_semantic_forgery(
+    tmp_path: Path,
+) -> None:
+    template = _plan(tmp_path)
+    payload = template.to_dict()
+    executor_manifest = cast(dict[str, Any], payload["executor_manifest"])
+    resource_limits = cast(dict[str, Any], executor_manifest["resource_limits"])
+    resource_limits["pids"] = 999
+    payload["executor_manifest_sha256"] = _canonical_sha(executor_manifest)
+
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="exact qualified reconstruction",
+    ):
+        _direct_plan(
+            template,
+            source_manifest=template.source_manifest,
+            executor_manifest=executor_manifest,
+            payload=payload,
+            candidate_index=dict(template.candidate_index),
+        )
+
+
+def test_direct_plan_rejects_protocol_candidate_index_outside_hashed_tuple(
+    tmp_path: Path,
+) -> None:
+    template = _plan(tmp_path)
+    original = template.candidates[0]
+    forged_candidate = replace(
+        original.candidate,
+        resources=replace(
+            original.candidate.resources,
+            parameter_count=original.candidate.resources.parameter_count + 1,
+        ),
+    )
+    forged = replace(original, candidate=forged_candidate)
+    changed_protocol = replace(
+        template.protocol,
+        candidate_index=MappingProxyType(
+            {forged_candidate.candidate_id: forged_candidate}
+        ),
+    )
+    source_manifest = executor._source_manifest_for_prepared(  # noqa: SLF001
+        changed_protocol,
+        (forged,),
+    )
+    payload = template.to_dict()
+    payload["source_manifest"] = source_manifest
+    payload["source_manifest_sha256"] = _canonical_sha(source_manifest)
+
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="candidate index differs from its canonical candidate tuple",
+    ):
+        _direct_plan(
+            template,
+            protocol_value=changed_protocol,
+            source_manifest=source_manifest,
+            executor_manifest=template.executor_manifest,
+            payload=payload,
+            candidate_index={forged_candidate.candidate_id: forged},
+            candidates=(forged,),
+        )
+
+
+def test_direct_plan_rejects_noncanonical_outer_semantics_and_source_schema(
+    tmp_path: Path,
+) -> None:
+    template = _plan(tmp_path)
+    semantic_cases: tuple[tuple[str, Any], ...] = (
+        ("classification", "promoting"),
+        ("promotion_authorized", True),
+        ("external_verification_required", False),
+        ("stage", "sealed_evaluation"),
+        ("active_seeds", [float(template.protocol.active_seeds[0])]),
+        ("horizon", float(template.protocol.horizon)),
+        ("candidate_command_templates", []),
+        ("scoring_boundary", {}),
+    )
+    for field, changed_value in semantic_cases:
+        payload = template.to_dict()
+        source_manifest = cast(dict[str, Any], payload["source_manifest"])
+        executor_manifest = cast(dict[str, Any], payload["executor_manifest"])
+        payload[field] = changed_value
+        with pytest.raises(executor.ForagerMatchedExecutorError):
+            _direct_plan(
+                template,
+                source_manifest=source_manifest,
+                executor_manifest=executor_manifest,
+                payload=payload,
+                candidate_index=dict(template.candidate_index),
+            )
+
+    payload = template.to_dict()
+    payload.pop("candidate_order")
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="execution plan payload keys differ",
+    ):
+        _direct_plan(
+            template,
+            source_manifest=template.source_manifest,
+            executor_manifest=template.executor_manifest,
+            payload=payload,
+            candidate_index=dict(template.candidate_index),
+        )
+
+    payload = template.to_dict()
+    source_manifest = cast(dict[str, Any], payload["source_manifest"])
+    executor_manifest = cast(dict[str, Any], payload["executor_manifest"])
+    source_manifest["schema_version"] = "alberta.forager_matched_source_manifest.v0"
+    payload["source_manifest_sha256"] = _canonical_sha(source_manifest)
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="exact manifest closure",
+    ):
+        _direct_plan(
+            template,
+            source_manifest=source_manifest,
+            executor_manifest=executor_manifest,
+            payload=payload,
+            candidate_index=dict(template.candidate_index),
+        )
+
+    payload = template.to_dict()
+    source_manifest = cast(dict[str, Any], payload["source_manifest"])
+    executor_manifest = cast(dict[str, Any], payload["executor_manifest"])
+    source_manifest["candidates"] = []
+    payload["source_manifest_sha256"] = _canonical_sha(source_manifest)
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="typed protocol/candidate closure",
+    ):
+        _direct_plan(
+            template,
+            source_manifest=source_manifest,
+            executor_manifest=executor_manifest,
+            payload=payload,
+            candidate_index=dict(template.candidate_index),
+        )
+
+
+def test_direct_plan_rejects_unparsed_prepared_candidate_receipt(
+    tmp_path: Path,
+) -> None:
+    template = _plan(tmp_path)
+    receipt = cast(
+        dict[str, Any],
+        json.loads(executor.canonical_json_bytes(template.candidates[0].capability_receipt)),
+    )
+    receipt["status"] = "forged"
+    forged = replace(template.candidates[0], capability_receipt=receipt)
+
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="capability receipt",
+    ):
+        _direct_plan(
+            template,
+            source_manifest=template.source_manifest,
+            executor_manifest=template.executor_manifest,
+            payload=template.payload,
+            candidate_index={forged.candidate.candidate_id: forged},
+            candidates=(forged,),
+        )
+
+
+def test_direct_plan_rejects_prepared_candidate_source_changed_after_preparation(
+    tmp_path: Path,
+) -> None:
+    template = _plan(tmp_path)
+    prepared = template.candidates[0]
+    prepared.source_root.joinpath(*PurePosixPath(prepared.entrypoint_path).parts).write_bytes(
+        b"changed after preparation\n"
+    )
+
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="source root bytes differ",
+    ):
+        _direct_plan(
+            template,
+            source_manifest=template.source_manifest,
+            executor_manifest=template.executor_manifest,
+            payload=template.payload,
+            candidate_index=dict(template.candidate_index),
+        )
+
+
+def test_direct_plan_rejects_candidate_with_same_id_but_outside_protocol(
+    tmp_path: Path,
+) -> None:
+    template = _plan(tmp_path)
+    original = template.candidates[0]
+    changed_candidate = replace(
+        original.candidate,
+        resources=replace(
+            original.candidate.resources,
+            parameter_count=original.candidate.resources.parameter_count + 1,
+        ),
+    )
+    forged = replace(original, candidate=changed_candidate)
+    source_manifest = executor._source_manifest_for_prepared(  # noqa: SLF001
+        template.protocol,
+        (forged,),
+    )
+    payload = template.to_dict()
+    payload["source_manifest"] = source_manifest
+    payload["source_manifest_sha256"] = _canonical_sha(source_manifest)
+
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="typed protocol/candidate closure",
+    ):
+        _direct_plan(
+            template,
+            source_manifest=source_manifest,
+            executor_manifest=template.executor_manifest,
+            payload=payload,
+            candidate_index={forged.candidate.candidate_id: forged},
+            candidates=(forged,),
+        )
+
+
+def test_direct_plan_normalizes_cyclic_outer_mapping_error(tmp_path: Path) -> None:
+    template = _plan(tmp_path)
+    payload = template.to_dict()
+    payload["source_manifest"] = payload
+
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="canonical JSON",
+    ):
+        _direct_plan(
+            template,
+            source_manifest=template.source_manifest,
+            executor_manifest=template.executor_manifest,
+            payload=payload,
+            candidate_index=dict(template.candidate_index),
+        )
+
+
+def test_direct_plan_snapshots_all_retained_caller_mappings(tmp_path: Path) -> None:
+    template = _plan(tmp_path)
+    serialized = template.to_dict()
+    source_manifest = copy.deepcopy(
+        cast(dict[str, Any], serialized["source_manifest"])
+    )
+    executor_manifest = copy.deepcopy(
+        cast(dict[str, Any], serialized["executor_manifest"])
+    )
+    payload = copy.deepcopy(serialized)
+    capability_receipt = cast(
+        dict[str, Any],
+        json.loads(executor.canonical_json_bytes(template.candidates[0].capability_receipt)),
+    )
+    source_inventory = cast(
+        dict[str, Any],
+        json.loads(executor.canonical_json_bytes(template.candidates[0].source_inventory)),
+    )
+    caller_candidate = replace(
+        template.candidates[0],
+        capability_receipt=capability_receipt,
+        source_inventory=source_inventory,
+    )
+    caller_candidates = (caller_candidate,)
+    candidate_index = {caller_candidate.candidate.candidate_id: caller_candidate}
+    expected_payload = copy.deepcopy(payload)
+    expected_source_sha256 = _canonical_sha(source_manifest)
+    expected_executor_sha256 = _canonical_sha(executor_manifest)
+    expected_candidate_ids = tuple(candidate_index)
+
+    direct = _direct_plan(
+        template,
+        source_manifest=source_manifest,
+        executor_manifest=executor_manifest,
+        payload=payload,
+        candidate_index=candidate_index,
+        candidates=caller_candidates,
+    )
+
+    source_manifest["stage"] = "mutated_source"
+    cast(list[dict[str, Any]], source_manifest["candidates"])[0][
+        "candidate_id"
+    ] = "mutated_source_candidate"
+    executor_manifest["authentication_state"] = "mutated_executor"
+    cast(dict[str, Any], executor_manifest["qualified_lock"])["image_sha256"] = "0" * 64
+    payload["classification"] = "mutated_payload"
+    cast(dict[str, Any], payload["source_manifest"])["stage"] = "mutated_payload_source"
+    cast(dict[str, Any], payload["executor_manifest"])[
+        "authentication_state"
+    ] = "mutated_payload_executor"
+    candidate_index.clear()
+    candidate_index["replacement"] = template.candidates[0]
+    capability_receipt["status"] = "mutated_receipt"
+    cast(list[dict[str, Any]], source_inventory["files"])[0]["sha256"] = "0" * 64
+
+    assert direct.to_dict() == expected_payload
+    assert direct.source_manifest_sha256 == expected_source_sha256
+    assert direct.executor_manifest_sha256 == expected_executor_sha256
+    assert tuple(direct.candidate_index) == expected_candidate_ids
+    assert direct.candidates[0].capability_receipt["status"] == "qualified"
+    assert direct.candidates[0].source_inventory["files"][0]["sha256"] != "0" * 64
+
+
+def test_plan_qualification_manifest_binding_is_hard_v2_and_hash_sensitive(
+    tmp_path: Path,
+) -> None:
+    _payload, frozen, assets = _fixture(tmp_path)
+    changed_qualification_sha256 = _sha("changed-qualification-manifest")
+    first = executor.build_execution_plan(
+        frozen,
+        assets,
+        qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
+        candidate_ids=("alberta_causal",),
+    )
+    changed = executor.build_execution_plan(
+        frozen,
+        assets,
+        qualification_manifest_sha256=changed_qualification_sha256,
+        candidate_ids=("alberta_causal",),
+    )
+
+    assert first.payload["schema_version"] == "alberta.forager_matched_execution_plan.v2"
+    assert first.executor_manifest["schema_version"] == (
+        "alberta.forager_matched_executor_manifest.v2"
+    )
+    assert first.qualification_manifest_sha256 == _QUALIFICATION_MANIFEST_SHA256
+    assert first.payload["qualification_manifest_sha256"] == _QUALIFICATION_MANIFEST_SHA256
+    assert first.executor_manifest["qualification_manifest_sha256"] == (
+        _QUALIFICATION_MANIFEST_SHA256
+    )
+    assert first.source_manifest_sha256 == changed.source_manifest_sha256
+    assert first.executor_manifest_sha256 != changed.executor_manifest_sha256
+    assert first.plan_sha256 != changed.plan_sha256
+
+    with pytest.raises(executor.ForagerMatchedExecutorError, match="lowercase SHA-256"):
+        executor.build_execution_plan(
+            frozen,
+            assets,
+            qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256.upper(),
+            candidate_ids=("alberta_causal",),
+        )
+    with pytest.raises(executor.ForagerMatchedExecutorError, match="classification/schema"):
+        executor.parse_execution_plan(
+            first.canonical_bytes,
+            protocol=frozen,
+            assets=assets,
+            expected_plan_sha256=first.plan_sha256,
+            expected_qualification_manifest_sha256=changed_qualification_sha256,
+        )
+
+    legacy = first.to_dict()
+    legacy["schema_version"] = "alberta.forager_matched_execution_plan.v1"
+    with pytest.raises(executor.ForagerMatchedExecutorError, match="classification/schema"):
+        executor.parse_execution_plan(
+            legacy,
+            protocol=frozen,
+            assets=assets,
+            expected_plan_sha256=first.plan_sha256,
+            expected_qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
+        )
 
 
 @pytest.mark.parametrize(
@@ -540,6 +1066,7 @@ def test_plan_rejects_unqualified_runtime_lock(
         executor.build_execution_plan(
             protocol.parse_forager_matched_protocol(payload),
             assets,
+            qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
             candidate_ids=("alberta_causal",),
         )
 
@@ -569,14 +1096,16 @@ def test_plan_rejects_horizon_task_scorer_and_source_drift(tmp_path: Path) -> No
                 executor.build_execution_plan(
                     changed,
                     assets,
-                candidate_ids=("alberta_causal",),
-            )
+                    qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
+                    candidate_ids=("alberta_causal",),
+                )
 
     assets["alberta_causal"].source_archive.write_bytes(b"drift")
     with pytest.raises(executor.ForagerMatchedExecutorError, match="source archive"):
         executor.build_execution_plan(
             frozen,
             assets,
+            qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
             candidate_ids=("alberta_causal",),
         )
 
@@ -602,6 +1131,7 @@ def test_receipt_is_exact_canonical_and_not_a_self_attested_boolean(tmp_path: Pa
         executor.build_execution_plan(
             frozen,
             changed_assets,
+            qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
             candidate_ids=("alberta_causal",),
         )
 
@@ -611,6 +1141,7 @@ def test_rtu_requires_separately_bound_isolated_rng_patch(tmp_path: Path) -> Non
     plan = executor.build_execution_plan(
         frozen,
         assets,
+        qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
         candidate_ids=("isolated_rtu",),
     )
     assert plan.candidates[0].rng_isolation_patch_sha256 == (
@@ -633,7 +1164,12 @@ def test_rtu_requires_separately_bound_isolated_rng_patch(tmp_path: Path) -> Non
         )
     }
     with pytest.raises(executor.ForagerMatchedExecutorError, match="source-bound RNG patch"):
-        executor.build_execution_plan(frozen, changed, candidate_ids=("isolated_rtu",))
+        executor.build_execution_plan(
+            frozen,
+            changed,
+            qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
+            candidate_ids=("isolated_rtu",),
+        )
 
 
 def test_isolated_ppo_rejects_any_unreviewed_rng_patch(tmp_path: Path) -> None:
@@ -667,6 +1203,7 @@ def test_isolated_ppo_rejects_any_unreviewed_rng_patch(tmp_path: Path) -> None:
         executor.build_execution_plan(
             frozen_payload,
             changed_assets,
+            qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
             candidate_ids=("isolated_ppo",),
         )
 
@@ -684,6 +1221,7 @@ def test_fixed_descriptive_shared_rng_ppo_remains_labeled_noninferential(
     plan = executor.build_execution_plan(
         frozen,
         assets,
+        qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
         candidate_ids=("exact_ppo",),
     )
     candidate = plan.candidates[0].candidate
@@ -725,21 +1263,25 @@ def test_default_runner_cidfile_force_removes_interrupted_container(
     container_id = "a" * 64
     calls: list[tuple[str, ...]] = []
 
+    def fail_bounded_run(command: Sequence[str], **_kwargs: Any) -> NoReturn:
+        materialized = tuple(command)
+        calls.append(materialized)
+        cid_argument = next(item for item in materialized if item.startswith("--cidfile="))
+        Path(cid_argument.split("=", 1)[1]).write_text(
+            container_id + "\n",
+            encoding="ascii",
+        )
+        if failure_kind == "timeout":
+            raise subprocess.TimeoutExpired(materialized, timeout=1)
+        raise OSError("synthetic runner failure")
+
     def fake_run(command: Sequence[str], **_kwargs: Any) -> Any:
         materialized = tuple(command)
         calls.append(materialized)
-        if len(materialized) >= 2 and materialized[1] == "run":
-            cid_argument = next(item for item in materialized if item.startswith("--cidfile="))
-            Path(cid_argument.split("=", 1)[1]).write_text(
-                container_id + "\n",
-                encoding="ascii",
-            )
-            if failure_kind == "timeout":
-                raise subprocess.TimeoutExpired(materialized, timeout=1)
-            raise OSError("synthetic runner failure")
         assert materialized == ("/usr/bin/docker", "rm", "--force", container_id)
         return subprocess.CompletedProcess(materialized, 0)
 
+    monkeypatch.setattr(executor, "_run_bounded_process", fail_bounded_run)
     monkeypatch.setattr(subprocess, "run", fake_run)
     with pytest.raises(
         executor.ForagerMatchedExecutorError,
@@ -748,6 +1290,375 @@ def test_default_runner_cidfile_force_removes_interrupted_container(
         executor._default_runner(("/usr/bin/docker", "run", "qualified-image"))
 
     assert len(calls) == 2
+
+
+def test_default_runner_force_removes_named_container_before_cidfile_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    observed_name = ""
+
+    def fail_bounded_run(command: Sequence[str], **_kwargs: Any) -> NoReturn:
+        nonlocal observed_name
+        materialized = tuple(command)
+        calls.append(materialized)
+        name_argument = next(item for item in materialized if item.startswith("--name="))
+        observed_name = name_argument.split("=", 1)[1]
+        assert re.fullmatch(r"alberta-matched-executor-[0-9a-f]{32}", observed_name)
+        raise subprocess.TimeoutExpired(materialized, timeout=1)
+
+    def fake_run(command: Sequence[str], **_kwargs: Any) -> Any:
+        materialized = tuple(command)
+        calls.append(materialized)
+        assert materialized == ("/usr/bin/docker", "rm", "--force", observed_name)
+        return subprocess.CompletedProcess(materialized, 0)
+
+    monkeypatch.setattr(executor, "_run_bounded_process", fail_bounded_run)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="cleanup=force_removed_by_name",
+    ):
+        executor._default_runner(("/usr/bin/docker", "run", "qualified-image"))
+
+    assert len(calls) == 2
+
+
+def test_executor_cleanup_uses_exact_name_for_a_partial_cidfile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cidfile = tmp_path / "container.cid"
+    cidfile.write_bytes(b"partial")
+    container_name = "alberta-matched-executor-" + "b" * 32
+    observed: list[tuple[str, ...]] = []
+
+    def fake_run(command: Sequence[str], **_kwargs: Any) -> Any:
+        materialized = tuple(command)
+        observed.append(materialized)
+        assert materialized == ("/usr/bin/docker", "rm", "--force", container_name)
+        return subprocess.CompletedProcess(materialized, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="cidfile contract failed after cleanup=force_removed_by_name",
+    ):
+        executor._cleanup_interrupted_container(  # noqa: SLF001
+            ("/usr/bin/docker", "run"),
+            cidfile,
+            container_name,
+        )
+    assert len(observed) == 1
+
+
+def test_default_runner_cleans_a_completed_nonzero_container_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    observed_name = ""
+
+    def completed(command: Sequence[str], **_kwargs: Any) -> Any:
+        nonlocal observed_name
+        materialized = tuple(command)
+        calls.append(materialized)
+        observed_name = next(
+            item.split("=", 1)[1]
+            for item in materialized
+            if item.startswith("--name=")
+        )
+        return executor.ProcessResult(125, b"", b"failed")
+
+    def cleanup(command: Sequence[str], **_kwargs: Any) -> Any:
+        materialized = tuple(command)
+        calls.append(materialized)
+        assert materialized == ("/usr/bin/docker", "rm", "--force", observed_name)
+        return subprocess.CompletedProcess(materialized, 0)
+
+    monkeypatch.setattr(executor, "_run_bounded_process", completed)
+    monkeypatch.setattr(subprocess, "run", cleanup)
+    result = executor._default_runner(
+        ("/usr/bin/docker", "run", "qualified-image")
+    )
+    assert result.returncode == 125
+    assert len(calls) == 2
+
+
+def test_executor_cleanup_accepts_bounded_proof_that_name_is_already_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_name = "alberta-matched-executor-" + "d" * 32
+    commands: list[tuple[str, ...]] = []
+
+    def missing(command: Sequence[str], **_kwargs: Any) -> Any:
+        materialized = tuple(command)
+        commands.append(materialized)
+        return subprocess.CompletedProcess(materialized, 1)
+
+    def inspect(command: Sequence[str], **_kwargs: Any) -> Any:
+        materialized = tuple(command)
+        commands.append(materialized)
+        return executor.ProcessResult(0, b"", b"")
+
+    monkeypatch.setattr(subprocess, "run", missing)
+    monkeypatch.setattr(executor, "_run_bounded_process", inspect)
+    state = executor._cleanup_interrupted_container(  # noqa: SLF001
+        ("/usr/bin/docker", "run"),
+        tmp_path / "missing.cid",
+        container_name,
+    )
+    assert state == "already_absent_by_name"
+    assert commands == [
+        ("/usr/bin/docker", "rm", "--force", container_name),
+        (
+            "/usr/bin/docker",
+            "container",
+            "ls",
+            "--all",
+            "--quiet",
+            "--no-trunc",
+            f"--filter=name=^/{container_name}$",
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "caller_option",
+    ("--name=caller-owned", "--cidfile=/tmp/caller-owned.cid"),
+)
+def test_default_runner_rejects_caller_owned_cleanup_identifiers(
+    caller_option: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def run(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal called
+        called = True
+        raise AssertionError("rejected commands must not run")
+
+    monkeypatch.setattr(executor, "_run_bounded_process", run)
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="already contains a name or cidfile",
+    ):
+        executor._default_runner(
+            ("/usr/bin/docker", "run", caller_option, "qualified-image")
+        )
+    assert called is False
+
+
+def test_executor_cleanup_fails_if_the_exact_name_still_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_name = "alberta-matched-executor-" + "e" * 32
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 1),
+    )
+    monkeypatch.setattr(
+        executor,
+        "_run_bounded_process",
+        lambda *_args, **_kwargs: executor.ProcessResult(
+            0,
+            b"f" * 64 + b"\n",
+            b"",
+        ),
+    )
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="did not remove or prove absent",
+    ):
+        executor._cleanup_interrupted_container(  # noqa: SLF001
+            ("/usr/bin/docker", "run"),
+            tmp_path / "missing.cid",
+            container_name,
+        )
+
+
+@pytest.mark.parametrize(
+    ("stream_name", "overflow"),
+    (
+        ("stdout", False),
+        ("stdout", True),
+        ("stderr", False),
+        ("stderr", True),
+    ),
+    ids=("stdout-exact", "stdout-plus-one", "stderr-exact", "stderr-plus-one"),
+)
+def test_default_runner_enforces_active_per_stream_byte_limits(
+    monkeypatch: pytest.MonkeyPatch,
+    stream_name: str,
+    overflow: bool,
+) -> None:
+    stdout_limit = 37
+    stderr_limit = 19
+    monkeypatch.setattr(executor, "_MAX_RAW_ARCHIVE_BYTES", stdout_limit)
+    monkeypatch.setattr(executor, "_MAX_PROCESS_STDERR_BYTES", stderr_limit)
+    real_temporary_file = tempfile.TemporaryFile
+    closed_sizes: dict[int, int] = {}
+    created = 0
+
+    class TrackingTemporaryFile:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            nonlocal created
+            self.index = created
+            created += 1
+            self.handle = real_temporary_file(*args, **kwargs)
+
+        def __enter__(self) -> TrackingTemporaryFile:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            self.close()
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.handle, name)
+
+        def close(self) -> None:
+            if not self.handle.closed:
+                self.handle.flush()
+                closed_sizes[self.index] = os.fstat(self.handle.fileno()).st_size
+                self.handle.close()
+
+    monkeypatch.setattr(tempfile, "TemporaryFile", TrackingTemporaryFile)
+    selected_limit = stdout_limit if stream_name == "stdout" else stderr_limit
+    descriptor = 1 if stream_name == "stdout" else 2
+    output_size = selected_limit + int(overflow)
+    command = (
+        sys.executable,
+        "-c",
+        f"import os; os.write({descriptor}, b'x' * {output_size})",
+    )
+
+    if overflow:
+        with pytest.raises(
+            executor.ForagerMatchedExecutorError,
+            match="output exceeded its byte bound",
+        ):
+            executor._default_runner(command)
+    else:
+        result = executor._default_runner(command)
+        assert result.returncode == 0
+        assert len(result.stdout if stream_name == "stdout" else result.stderr) == selected_limit
+
+    selected_sink = 0 if stream_name == "stdout" else 1
+    other_sink = 1 - selected_sink
+    assert closed_sizes[selected_sink] == selected_limit
+    assert closed_sizes[other_sink] == 0
+
+
+def test_default_runner_drains_stdout_and_stderr_without_deadlock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdout_size = 256 * 1024 + 17
+    stderr_size = 192 * 1024 + 11
+    monkeypatch.setattr(executor, "_MAX_RAW_ARCHIVE_BYTES", stdout_size)
+    monkeypatch.setattr(executor, "_MAX_PROCESS_STDERR_BYTES", stderr_size)
+    script = f"""
+import os
+import threading
+
+def emit(descriptor, value, total):
+    chunk = value * 8192
+    while total:
+        current = chunk[:total]
+        os.write(descriptor, current)
+        total -= len(current)
+
+threads = (
+    threading.Thread(target=emit, args=(1, b'o', {stdout_size})),
+    threading.Thread(target=emit, args=(2, b'e', {stderr_size})),
+)
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join()
+"""
+
+    result = executor._default_runner((sys.executable, "-c", script))
+
+    assert result.returncode == 0
+    assert result.stdout == b"o" * stdout_size
+    assert result.stderr == b"e" * stderr_size
+
+
+def test_default_runner_output_overflow_force_removes_cidfile_container(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_id = "b" * 64
+    cidfile_payload = container_id + "\n"
+    cleanup_log = tmp_path / "cleanup.log"
+    runtime = tmp_path / "fake-runtime"
+    runtime.write_text(
+        "\n".join(
+            (
+                f"#!{sys.executable}",
+                "import os",
+                "import sys",
+                "import time",
+                "from pathlib import Path",
+                f"cleanup_log = Path({cleanup_log.as_posix()!r})",
+                "if sys.argv[1] == 'run':",
+                "    cidfile = next(",
+                "        item.split('=', 1)[1]",
+                "        for item in sys.argv",
+                "        if item.startswith('--cidfile=')",
+                "    )",
+                f"    Path(cidfile).write_text({cidfile_payload!r}, encoding='ascii')",
+                "    os.write(1, b'x' * 9)",
+                "    time.sleep(60)",
+                "elif sys.argv[1:3] == ['rm', '--force']:",
+                "    cleanup_log.write_text(' '.join(sys.argv[1:]), encoding='ascii')",
+                "else:",
+                "    raise SystemExit(2)",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    runtime.chmod(0o755)
+    monkeypatch.setattr(executor, "_MAX_RAW_ARCHIVE_BYTES", 8)
+    monkeypatch.setattr(executor, "_MAX_PROCESS_STDERR_BYTES", 8)
+
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="cleanup=force_removed",
+    ):
+        executor._default_runner((runtime.as_posix(), "run", "qualified-image"))
+
+    assert cleanup_log.read_text(encoding="ascii") == f"rm --force {container_id}"
+
+
+def test_bounded_process_timeout_kills_and_reaps_child(tmp_path: Path) -> None:
+    pid_path = tmp_path / "child.pid"
+    script = (
+        "import os,time; "
+        f"open({pid_path.as_posix()!r}, 'w', encoding='ascii').write(str(os.getpid())); "
+        "time.sleep(60)"
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        executor._run_bounded_process(  # noqa: SLF001
+            (sys.executable, "-c", script),
+            timeout=1.0,
+            maximum_stdout_bytes=16,
+            maximum_stderr_bytes=16,
+        )
+
+    child_pid = int(pid_path.read_text(encoding="ascii"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+
+
+def test_default_runner_preserves_asymmetric_stream_limits() -> None:
+    assert executor._MAX_RAW_ARCHIVE_BYTES == 512 * 1024 * 1024  # noqa: SLF001
+    assert executor._MAX_PROCESS_STDERR_BYTES == 16 * 1024 * 1024  # noqa: SLF001
 
 
 def test_execute_seed_rebinds_daemon_and_image_before_launch(tmp_path: Path) -> None:
@@ -1085,6 +1996,7 @@ def test_build_score_evidence_is_bridge_compatible_and_requires_external_resolve
             score_evidence_sha256=subject.score_evidence_sha256,
             source_manifest_sha256=subject.source_manifest_sha256,
             executor_manifest_sha256=subject.executor_manifest_sha256,
+            qualification_manifest_sha256=subject.qualification_manifest_sha256,
             execution_closure_sha256=subject.execution_closure_sha256,
             trust_anchor_identity=subject.trust_anchor_identity,
             verification_subject_sha256=subject.verification_subject_sha256,
@@ -1142,11 +2054,70 @@ def test_verification_request_round_trip_loader_and_digest_domains(
         )
 
 
+def test_score_and_verification_request_bind_exact_qualification_manifest_v2(
+    tmp_path: Path,
+) -> None:
+    _payload, frozen, assets = _fixture(tmp_path)
+    changed_qualification_sha256 = _sha("changed-request-qualification-manifest")
+    plan = executor.build_execution_plan(
+        frozen,
+        assets,
+        qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
+        candidate_ids=("alberta_causal",),
+    )
+    changed_plan = executor.build_execution_plan(
+        frozen,
+        assets,
+        qualification_manifest_sha256=changed_qualification_sha256,
+        candidate_ids=("alberta_causal",),
+    )
+    scores = executor.build_score_evidence(
+        plan,
+        _complete_execution_artifacts(
+            plan,
+            _runtime(tmp_path / "original-runtime", plan),
+        ),
+    )
+    changed_scores = executor.build_score_evidence(
+        changed_plan,
+        _complete_execution_artifacts(
+            changed_plan,
+            _runtime(tmp_path / "changed-runtime", changed_plan),
+        ),
+    )
+    request = executor.build_verification_request(plan, scores)
+    changed_request = executor.build_verification_request(changed_plan, changed_scores)
+
+    assert scores.schema_version == "alberta.forager_matched_score_evidence.v2"
+    assert scores.qualification_manifest_sha256 == _QUALIFICATION_MANIFEST_SHA256
+    assert request.to_dict()["schema_version"] == (
+        "alberta.forager_matched_verification_request.v2"
+    )
+    assert request.qualification_manifest_sha256 == _QUALIFICATION_MANIFEST_SHA256
+    assert request.execution_closure_sha256 != changed_request.execution_closure_sha256
+    assert request.verification_subject_sha256 != changed_request.verification_subject_sha256
+    assert request.request_sha256 != changed_request.request_sha256
+
+    mismatched_score_payload = scores.to_dict()
+    mismatched_score_payload["qualification_manifest_sha256"] = changed_qualification_sha256
+    unsigned_score_payload = copy.deepcopy(mismatched_score_payload)
+    del unsigned_score_payload["payload_sha256"]
+    mismatched_score_payload["payload_sha256"] = _canonical_sha(unsigned_score_payload)
+    with pytest.raises(executor.ForagerMatchedExecutorError, match="execution plan manifests"):
+        executor.build_verification_request(plan, mismatched_score_payload)
+
+    legacy_request = request.to_dict()
+    legacy_request["schema_version"] = "alberta.forager_matched_verification_request.v1"
+    with pytest.raises(executor.ForagerMatchedExecutorError, match="schema/authentication"):
+        executor.parse_verification_request(legacy_request)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "error"),
     [
         ("authentication_state", "authenticated", "authentication boundary"),
         ("qualification_promotion_authorized", True, "authentication boundary"),
+        ("qualification_manifest_sha256", "0" * 64, "subject"),
         ("score_evidence_sha256", "0" * 64, "subject"),
         (
             "rng_parity_qualification_status",
@@ -1405,6 +2376,7 @@ def test_plan_and_artifact_loaders_require_external_digests(tmp_path: Path) -> N
     plan = executor.build_execution_plan(
         frozen,
         assets,
+        qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
         candidate_ids=("alberta_causal",),
     )
     plan_path = tmp_path / "plan.json"
@@ -1414,6 +2386,7 @@ def test_plan_and_artifact_loaders_require_external_digests(tmp_path: Path) -> N
         protocol=frozen,
         assets=assets,
         expected_plan_sha256=plan.plan_sha256,
+        expected_qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
     ).plan_sha256 == plan.plan_sha256
     with pytest.raises(executor.ForagerMatchedExecutorError, match="external expected"):
         executor.load_execution_plan(
@@ -1421,6 +2394,7 @@ def test_plan_and_artifact_loaders_require_external_digests(tmp_path: Path) -> N
             protocol=frozen,
             assets=assets,
             expected_plan_sha256="0" * 64,
+            expected_qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
         )
 
 

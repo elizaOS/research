@@ -1,11 +1,15 @@
 # mypy: disable-error-code="call-arg"
 """Action-conditioned one-step world models.
 
-The first promoted environment-prediction surface is intentionally small:
-predict the next observation delta, reward, and discount from the current
-observation and action. This is enough to support GVF-style environment
-prediction and guarded Dyna-style dream updates without committing the core API
-to a large latent dynamics architecture too early.
+The prediction surface is intentionally small: predict the next observation
+(or its delta), reward, and discount from the current observation and action.
+This is enough to support GVF-style environment prediction and guarded
+Dyna-style dream updates without committing the core API to a large latent
+dynamics architecture too early.
+
+References:
+    Sutton (1991). "Dyna, an Integrated Architecture for Learning,
+        Planning, and Reacting." SIGART Bulletin 2(4).
 """
 
 from __future__ import annotations
@@ -47,6 +51,11 @@ class ActionConditionedWorldModelConfig:
         observation_scale: Per-observation-dimension scale for normalized delta
             targets. When ``None``, all dimensions use scale ``1``.
         reward_scale: Scalar reward target scale.
+        predict_delta: When ``True`` (default), the observation heads are
+            trained on the normalized change ``next_obs - obs`` and decoded
+            by adding the predicted change back to the current observation;
+            when ``False`` they predict the normalized next observation
+            directly.
         hidden_sizes: Shared MLP trunk sizes. Use ``()`` for a linear model.
         step_size: Base learner step-size when ``optimizer`` is omitted.
         sparsity: Sparse initialization fraction for MLP weights.

@@ -36,6 +36,15 @@ NATIVE_RUNTIME_INVENTORY_HASH_SCHEME = (
 DETERMINISM_QUALIFICATION_SCHEMA_VERSION = (
     "alberta.oci_determinism_qualification.v2"
 )
+# The two environment-key derivations a run may declare.
+# ``dedicated_environment_split_chain_v1``: environment keys come from their
+# own split chain, isolated from agent RNG -- the matched-protocol default and
+# a precondition for cross-candidate seed pairing (same seed => same
+# environment stream regardless of how many draws the agent makes).
+# ``shared_agent_environment_rng_v1``: one chain feeds both agent and
+# environment (the upstream PPO convention), so the environment stream depends
+# on agent draw counts; such runs are descriptive-only in the matched
+# campaign (see ``exact_ppo`` in :mod:`forager_matched_open_protocol`).
 EnvironmentRngSchedule = Literal[
     "dedicated_environment_split_chain_v1",
     "shared_agent_environment_rng_v1",
@@ -49,6 +58,14 @@ SUPPORTED_ENVIRONMENT_RNG_SCHEDULES = frozenset(
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _OCI_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
+# Mirror of the canonical "matched_current_foragax_0_55_cuda12" dependency
+# lock: the same pins are enforced at image build (:mod:`official_foragax_oci`)
+# and on execution manifests (:mod:`official_foragax`).  The lock bytes are
+# separately bound by ``dependency_contract.dependency_lock_sha256``; these
+# literals are the per-profile recheck so a drifted lock fails closed here as
+# well.  pyexputils/pyfixedreps/replaytables are upstream
+# continual-foragax-agents harness dependencies whose installed RECORDs are
+# hashed alongside the scientific stack.
 _REQUIRED_DISTRIBUTION_VERSIONS = {
     "continual-foragax": "0.55.0",
     "imageio-ffmpeg": "0.6.0",
@@ -183,7 +200,41 @@ def environment_rng_schedule_sha256(
 def validate_environment_runtime_profile(
     value: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Return a detached, strictly validated immutable OCI runtime profile."""
+    """Return a detached, strictly validated immutable OCI runtime profile.
+
+    The profile is a fail-closed, exact-key contract over everything that can
+    change a Foragax trajectory or its bytes.  What each section pins:
+
+    - ``python``: exact CPython 3.12 ABI with ``PYTHONHASHSEED=0`` and the
+      interpreter binary hash.
+    - ``scientific_packages`` / ``scientific_package_records``: the canonical
+      matched-current lock (see ``_REQUIRED_DISTRIBUTION_VERSIONS``) plus
+      per-distribution RECORD hashes, so an installed tree cannot diverge
+      silently from its declared version.
+    - ``bundled_executables``: the imageio-ffmpeg binary identity (content
+      hash, 0o555 mode, wheel-relative path).
+    - ``foragax``: continual-foragax 0.55.0 with an install-tree content hash.
+    - ``jax``: GPU backend at 0.9.0.1 under the frozen determinism-relevant
+      config (threefry2x32, partitionable keys, x64 off, compilation cache
+      off) and one entry per visible device.
+    - ``dependency_contract``: image digests, dependency-lock digest, native
+      library inventories, and the sealed two-run bit-exactness
+      qualification.  Digests over embedded sub-objects (determinism
+      qualification, CUDA wheel path profile, GPU library bundle) are
+      recomputed here, never trusted as reported.
+    - ``import_shadow_contract``: the interpreter ran isolated (``-I``,
+      ``safe_path``, empty ``PYTHONPATH``/``PYTHONHOME``) with the trusted
+      read-only source mount first on ``sys.path`` and only the
+      ``/run/alberta`` scratch mounts writable.
+    - ``gpu_host_runtime`` / ``container_environment``: host driver and
+      device identities, and the exact sorted environment lock (CUDA caches
+      disabled, deterministic XLA flags, ``CUDA_VISIBLE_DEVICES`` consistent
+      with the JAX device list).
+
+    Validation is structural: it proves the payload is shaped and internally
+    consistent like a qualified runtime, not that any process actually ran
+    under it (see the module docstring).
+    """
     profile = _object(
         _json_copy(value, label="environment runtime profile"),
         label="environment runtime profile",

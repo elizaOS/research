@@ -773,6 +773,45 @@ def test_oci_timeout_forcibly_cleans_up_the_exact_named_container(
     assert cleanup_calls == [(runtime.resolve(), container_name)]
 
 
+def test_completed_oci_failure_confirms_named_container_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    qualification_root = tmp_path / "qualification"
+    runtime = tmp_path / "docker"
+    qualification_root.mkdir()
+    runtime.write_bytes(b"fake docker executable")
+    runtime.chmod(0o755)
+    probe_mount = _private_probe_mount(tmp_path)
+    cleanup_names: list[str] = []
+
+    def fail(command: tuple[str, ...], **_kwargs: Any) -> Any:
+        return subprocess.CompletedProcess(command, 17, b"", b"child failed")
+
+    def clean(
+        _runtime_path: Path,
+        container_name: str,
+        _environment: Any,
+    ) -> bool:
+        cleanup_names.append(container_name)
+        return True
+
+    monkeypatch.setattr(secrets, "token_hex", lambda _count: "completed-failure")
+    monkeypatch.setattr(probe, "_run_bounded_command", fail)
+    monkeypatch.setattr(probe, "_cleanup_named_container", clean)
+
+    with pytest.raises(probe.CausalGridDivergenceProbeError, match="cleanup completed"):
+        probe._run_child_with_qualification_mount(
+            qualification_root,
+            probe_mount,
+            oci_runtime=runtime,
+            expected_probe_source_sha256=hashlib.sha256(
+                Path(probe.__file__).read_bytes()
+            ).hexdigest(),
+        )
+    assert cleanup_names == ["alberta-causal-q-probe-completed-failure"]
+
+
 def test_probe_source_mutation_across_oci_execution_is_rejected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1042,6 +1081,37 @@ def test_strict_receipt_loader_rejects_sidecar_canonical_and_schema_tampering(
     schema_sidecar.write_bytes(hashlib.sha256(changed_raw).hexdigest().encode() + b"\n")
     with pytest.raises(probe.CausalGridDivergenceProbeError, match="schema replay"):
         probe.load_receipt(schema_root)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda value: value.__setitem__("seed", False),
+        lambda value: value.__setitem__("promotion_authorized", 0),
+        lambda value: value["action_boundary"]["scalar_domain"].__setitem__(0, False),
+        lambda value: value.__setitem__("divergent_pair_count", False),
+    ),
+)
+def test_strict_receipt_loader_rejects_boolean_integer_aliases(
+    tmp_path: Path,
+    mutate: Any,
+) -> None:
+    receipt, _passed = probe._assemble_receipt(
+        _child_payload(divergent=False),
+        probe_source_sha256="a" * 64,
+        execution_envelope=_execution_envelope(),
+    )
+    mutate(receipt)
+    raw = probe._canonical_json_bytes(receipt)
+    output_root = tmp_path / "boolean-alias"
+    output_root.mkdir()
+    (output_root / "receipt.json").write_bytes(raw)
+    (output_root / "receipt.json.sha256").write_bytes(
+        hashlib.sha256(raw).hexdigest().encode() + b"\n"
+    )
+
+    with pytest.raises(probe.CausalGridDivergenceProbeError, match="schema replay"):
+        probe.load_receipt(output_root)
 
 
 def test_strict_json_rejects_duplicate_keys_and_nonfinite_numbers() -> None:

@@ -14,6 +14,18 @@ Replay never calls the learning-signal estimator.  It cannot advance real
 event counts, residual/aleatoric calibration, change evidence, real bootstrap
 keys, or real member-update counts.  This module has no actor, critic, state
 builder, control update, effectiveness claim, or accepted scientific evidence.
+
+Rehearsal on stored experience follows Lin (1992).  Replay is restricted to
+the world model because one-step model targets
+``(observation, action) -> (next_observation, reward, discount)`` are
+policy-independent: stored transitions remain valid supervised examples no
+matter how far the current policy has drifted.  Replaying into a critic or
+actor would instead re-serve returns generated under stale behavior, so
+control-side replay is deliberately out of scope here.
+
+References:
+    Lin (1992). "Self-Improving Reactive Agents Based on Reinforcement
+        Learning, Planning and Teaching."
 """
 
 from __future__ import annotations

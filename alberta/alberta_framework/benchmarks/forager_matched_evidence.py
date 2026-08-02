@@ -59,18 +59,18 @@ from alberta_framework.benchmarks.forager_matched_statistics import (
     PermutationSpec,
 )
 
-MATCHED_SCORE_EVIDENCE_SCHEMA_VERSION: Final = "alberta.forager_matched_score_evidence.v1"
+MATCHED_SCORE_EVIDENCE_SCHEMA_VERSION: Final = "alberta.forager_matched_score_evidence.v2"
 MATCHED_SELECTION_REPORT_SCHEMA_VERSION: Final = "alberta.forager_matched_selection_report.v1"
 MATCHED_SELECTION_GROUP_EVIDENCE_SCHEMA_VERSION: Final = (
     "alberta.forager_matched_selection_group_evidence.v1"
 )
 MATCHED_METRIC_BINDING_SCHEMA_VERSION: Final = "alberta.forager_matched_metric_binding.v1"
-MATCHED_EXECUTION_CLOSURE_SCHEMA_VERSION: Final = "alberta.forager_matched_execution_closure.v1"
+MATCHED_EXECUTION_CLOSURE_SCHEMA_VERSION: Final = "alberta.forager_matched_execution_closure.v2"
 MATCHED_VERIFICATION_SUBJECT_SCHEMA_VERSION: Final = (
-    "alberta.forager_matched_verification_subject.v1"
+    "alberta.forager_matched_verification_subject.v2"
 )
 AUTHENTICATED_EVIDENCE_BINDINGS_SCHEMA_VERSION: Final = (
-    "alberta.forager_authenticated_evidence_bindings.v1"
+    "alberta.forager_authenticated_evidence_bindings.v2"
 )
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -145,12 +145,22 @@ MATCHED_SELECTION_STATISTIC_IMPLEMENTATION_SHA256: Final = _canonical_sha256(
 
 
 def matched_selection_bootstrap_rng_implementation_descriptor() -> dict[str, Any]:
-    """Return the canonical semantics behind the frozen RNG digest."""
+    """Return the canonical semantics behind the frozen RNG digest.
+
+    The digest is embedded in every open protocol's selection plan.
+    :func:`compute_open_selection` verifies it twice per replay: the descriptor is
+    re-hashed against the module constant (drift fails closed), and the plan's
+    recorded digest must name exactly this implementation.
+    """
     return dict(_SELECTION_BOOTSTRAP_RNG_IMPLEMENTATION_DESCRIPTOR)
 
 
 def matched_selection_statistic_implementation_descriptor() -> dict[str, Any]:
-    """Return the canonical semantics behind the frozen statistic digest."""
+    """Return the canonical semantics behind the frozen statistic digest.
+
+    Verified exactly like the RNG descriptor: re-hashed on every selection replay
+    and matched against the digest frozen into the protocol's selection plan.
+    """
     return dict(_SELECTION_STATISTIC_IMPLEMENTATION_DESCRIPTOR)
 
 
@@ -386,6 +396,12 @@ def _integer(
 
 
 def _score_from_hex(value: Any, path: str) -> float:
+    """Parse a score transported as ``float.hex()`` text.
+
+    Hex transport round-trips IEEE-754 doubles exactly and, with the enforced
+    ``score.hex() == text`` identity, gives each value one canonical spelling —
+    score digests cannot be perturbed by decimal formatting.
+    """
     text = _string(value, path, maximum=32)
     try:
         score = float.fromhex(text)
@@ -531,7 +547,7 @@ class CandidateScoreEvidence:
 class MatchedScoreEvidence:
     """Canonical score bundle shared by selection and sealed analysis."""
 
-    schema_version: Literal["alberta.forager_matched_score_evidence.v1"]
+    schema_version: Literal["alberta.forager_matched_score_evidence.v2"]
     stage: Stage
     protocol_sha256: str
     active_seeds: tuple[int, ...]
@@ -543,6 +559,7 @@ class MatchedScoreEvidence:
     runtime_profile_sha256: str
     source_evidence_sha256: str
     executor_evidence_sha256: str
+    qualification_manifest_sha256: str
     candidate_scores: tuple[CandidateScoreEvidence, ...]
     payload_sha256: str
 
@@ -598,6 +615,10 @@ class MatchedScoreEvidence:
             self.executor_evidence_sha256,
             "score evidence executor_evidence_sha256",
         )
+        _sha256(
+            self.qualification_manifest_sha256,
+            "score evidence qualification_manifest_sha256",
+        )
         if (
             type(self.candidate_scores) is not tuple
             or not 1 <= len(self.candidate_scores) <= _MAX_CANDIDATES
@@ -639,6 +660,7 @@ class MatchedScoreEvidence:
             "runtime_profile_sha256": self.runtime_profile_sha256,
             "source_evidence_sha256": self.source_evidence_sha256,
             "executor_evidence_sha256": self.executor_evidence_sha256,
+            "qualification_manifest_sha256": self.qualification_manifest_sha256,
             "candidate_scores": [candidate.to_dict() for candidate in self.candidate_scores],
         }
 
@@ -657,6 +679,7 @@ def _verification_subject_sha256(
     score_evidence_sha256: str,
     source_manifest_sha256: str,
     executor_manifest_sha256: str,
+    qualification_manifest_sha256: str,
     execution_closure_sha256: str,
     trust_anchor_identity: str,
 ) -> str:
@@ -668,6 +691,7 @@ def _verification_subject_sha256(
             "score_evidence_sha256": score_evidence_sha256,
             "source_manifest_sha256": source_manifest_sha256,
             "executor_manifest_sha256": executor_manifest_sha256,
+            "qualification_manifest_sha256": qualification_manifest_sha256,
             "execution_closure_sha256": execution_closure_sha256,
             "trust_anchor_identity": trust_anchor_identity,
         }
@@ -691,6 +715,7 @@ class AuthenticatedEvidenceBindings:
     score_evidence_sha256: str
     source_manifest_sha256: str
     executor_manifest_sha256: str
+    qualification_manifest_sha256: str
     execution_closure_sha256: str
     trust_anchor_identity: str
     verification_subject_sha256: str
@@ -704,6 +729,7 @@ class AuthenticatedEvidenceBindings:
             ("score_evidence_sha256", self.score_evidence_sha256),
             ("source_manifest_sha256", self.source_manifest_sha256),
             ("executor_manifest_sha256", self.executor_manifest_sha256),
+            ("qualification_manifest_sha256", self.qualification_manifest_sha256),
             ("execution_closure_sha256", self.execution_closure_sha256),
             (
                 "verification_subject_sha256",
@@ -725,6 +751,7 @@ class AuthenticatedEvidenceBindings:
             score_evidence_sha256=self.score_evidence_sha256,
             source_manifest_sha256=self.source_manifest_sha256,
             executor_manifest_sha256=self.executor_manifest_sha256,
+            qualification_manifest_sha256=self.qualification_manifest_sha256,
             execution_closure_sha256=self.execution_closure_sha256,
             trust_anchor_identity=self.trust_anchor_identity,
         )
@@ -737,6 +764,7 @@ class AuthenticatedEvidenceBindings:
             self.score_evidence_sha256,
             self.source_manifest_sha256,
             self.executor_manifest_sha256,
+            self.qualification_manifest_sha256,
             self.execution_closure_sha256,
             self.verification_subject_sha256,
             self.verification_receipt_sha256,
@@ -754,6 +782,7 @@ class AuthenticatedEvidenceBindings:
             "score_evidence_sha256": self.score_evidence_sha256,
             "source_manifest_sha256": self.source_manifest_sha256,
             "executor_manifest_sha256": self.executor_manifest_sha256,
+            "qualification_manifest_sha256": self.qualification_manifest_sha256,
             "execution_closure_sha256": self.execution_closure_sha256,
             "trust_anchor_identity": self.trust_anchor_identity,
             "verification_subject_sha256": (self.verification_subject_sha256),
@@ -1175,6 +1204,7 @@ def parse_matched_score_evidence(
             "runtime_profile_sha256",
             "source_evidence_sha256",
             "executor_evidence_sha256",
+            "qualification_manifest_sha256",
             "candidate_scores",
             "payload_sha256",
         },
@@ -1274,6 +1304,10 @@ def parse_matched_score_evidence(
             payload["executor_evidence_sha256"],
             "score_evidence.executor_evidence_sha256",
         ),
+        qualification_manifest_sha256=_sha256(
+            payload["qualification_manifest_sha256"],
+            "score_evidence.qualification_manifest_sha256",
+        ),
         candidate_scores=candidates,
         payload_sha256=declared_sha256,
     )
@@ -1368,6 +1402,7 @@ def matched_execution_closure_sha256(
         ("score evidence", {scores.payload_sha256}),
         ("source manifest", {scores.source_evidence_sha256}),
         ("executor manifest", {scores.executor_evidence_sha256}),
+        ("qualification manifest", {scores.qualification_manifest_sha256}),
         (
             "capability descriptors",
             {candidate.capability_descriptor_sha256 for candidate in scores.candidate_scores},
@@ -1414,6 +1449,7 @@ def matched_execution_closure_sha256(
             },
             "source_manifest_sha256": scores.source_evidence_sha256,
             "executor_manifest_sha256": scores.executor_evidence_sha256,
+            "qualification_manifest_sha256": scores.qualification_manifest_sha256,
             "candidates": [candidate.to_dict() for candidate in scores.candidate_scores],
         }
     )
@@ -1436,6 +1472,7 @@ def matched_verification_subject_sha256(
         score_evidence_sha256=scores.payload_sha256,
         source_manifest_sha256=scores.source_evidence_sha256,
         executor_manifest_sha256=scores.executor_evidence_sha256,
+        qualification_manifest_sha256=scores.qualification_manifest_sha256,
         execution_closure_sha256=matched_execution_closure_sha256(
             frozen,
             scores,
@@ -1459,6 +1496,7 @@ def _validate_authenticated_bindings(
         "score_evidence_sha256": scores.payload_sha256,
         "source_manifest_sha256": scores.source_evidence_sha256,
         "executor_manifest_sha256": scores.executor_evidence_sha256,
+        "qualification_manifest_sha256": scores.qualification_manifest_sha256,
         "execution_closure_sha256": matched_execution_closure_sha256(
             protocol,
             scores,
@@ -1475,6 +1513,7 @@ def _validate_authenticated_bindings(
         "score_evidence_sha256": bindings.score_evidence_sha256,
         "source_manifest_sha256": bindings.source_manifest_sha256,
         "executor_manifest_sha256": bindings.executor_manifest_sha256,
+        "qualification_manifest_sha256": bindings.qualification_manifest_sha256,
         "execution_closure_sha256": bindings.execution_closure_sha256,
         "trust_anchor_identity": bindings.trust_anchor_identity,
         "verification_subject_sha256": bindings.verification_subject_sha256,
@@ -1609,6 +1648,15 @@ def _bootstrap_lower_endpoint(
     seed: int,
     confidence: float,
 ) -> tuple[float, float]:
+    """Return ``(mean, lower)`` for the ``conservative_ci_endpoint`` ranking statistic.
+
+    ``lower`` is the ``(1 - confidence) / 2`` quantile (``numpy.quantile`` with
+    ``method="linear"``) of the bootstrap distribution of the mean — the lower
+    endpoint of a two-sided equal-tail percentile interval.  Per-seed scores are
+    resampled with replacement via ``numpy.random.Generator(PCG64(seed))``; the
+    frozen plan supplies the same seed for every candidate, so ranks replay
+    deterministically.  A singleton vector degenerates to a point mass at its mean.
+    """
     array = np.asarray(values, dtype=np.float64)
     if array.ndim != 1 or array.size == 0 or not bool(np.all(np.isfinite(array))):
         raise ForagerMatchedEvidenceError("selection values must be a non-empty finite vector")
@@ -1863,9 +1911,19 @@ def build_statistics_contract(
     """Build the exact statistics-v3 contract for one sealed transition."""
     open_value = _protocol_instance(open_protocol)
     sealed_value = _protocol_instance(sealed_protocol)
+    open_score_value = (
+        parse_matched_score_evidence(open_evidence.to_dict())
+        if isinstance(open_evidence, MatchedScoreEvidence)
+        else parse_matched_score_evidence(open_evidence)
+    )
+    evaluation_score_value = (
+        parse_matched_score_evidence(evaluation_evidence.to_dict())
+        if isinstance(evaluation_evidence, MatchedScoreEvidence)
+        else parse_matched_score_evidence(evaluation_evidence)
+    )
     replayed_selection = compute_open_selection(
         open_value,
-        open_evidence,
+        open_score_value,
         authenticated_bindings=open_authenticated_bindings,
     )
     try:
@@ -1898,10 +1956,20 @@ def build_statistics_contract(
         raise ForagerMatchedEvidenceError(f"sealed protocol transition is invalid: {exc}") from exc
     _, evidence = validate_score_evidence_against_protocol(
         sealed_value,
-        evaluation_evidence,
+        evaluation_score_value,
         authenticated_bindings=evaluation_authenticated_bindings,
         expected_candidate_ids=transition.evaluation_candidate_ids,
     )
+    qualification_digests = {
+        open_score_value.qualification_manifest_sha256,
+        evidence.qualification_manifest_sha256,
+        open_authenticated_bindings.qualification_manifest_sha256,
+        evaluation_authenticated_bindings.qualification_manifest_sha256,
+    }
+    if len(qualification_digests) != 1:
+        raise ForagerMatchedEvidenceError(
+            "open and evaluation evidence do not share one exact qualification manifest"
+        )
     selection_report_sha256 = _sha256(
         validated_report["payload_sha256"],
         "validated selection report payload_sha256",

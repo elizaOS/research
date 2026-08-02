@@ -1,4 +1,4 @@
-"""Reward-agnostic paired statistics for a future matched Forager suite.
+"""Reward-agnostic paired statistics for the matched Forager comparison suite.
 
 This module deliberately knows nothing about Forager rewards, agents, or execution.  It
 accepts already-computed scalar scores whose metric is declared to be maximized.  Every
@@ -45,6 +45,7 @@ CANONICALIZATION = "utf8-json-sort-keys-compact-no-nan-floats-as-hex"
 DIGEST_ALGORITHM = "sha256"
 RNG_ALGORITHM = "PCG64"
 QUANTILE_METHOD: Literal["linear"] = "linear"
+# 2**20 (~1e6) sign assignments: exact enumeration stays cheap below this pair count.
 EXACT_SIGN_FLIP_MAX_PAIRS = 20
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -717,6 +718,14 @@ class MatchedComparisonContract:
 
 @dataclass(frozen=True, slots=True)
 class BootstrapLowerBound:
+    """One-sided percentile-bootstrap lower endpoint of the mean paired difference.
+
+    ``lower_bound`` is the ``alpha`` quantile (``numpy.quantile`` with
+    ``method="linear"``) of the resampled-mean distribution; ``distribution_sha256``
+    is the SHA-256 of that distribution's little-endian float64 bytes, so the full
+    resample vector is bound without being embedded.
+    """
+
     n_pairs: int
     estimate: float
     lower_bound: float
@@ -755,6 +764,14 @@ class BootstrapLowerBound:
 
 @dataclass(frozen=True, slots=True)
 class SignFlipResult:
+    """One-sided paired sign-flip test outcome with an exact rational p-value.
+
+    ``mode="exact"`` enumerates all ``2**n_pairs`` sign assignments (n <= 20, no
+    add-one correction); ``mode="monte_carlo"`` uses ``draws`` PCG64 resamples with
+    the add-one correction ``p = (extreme + 1) / (draws + 1)``.  ``__post_init__``
+    re-derives these count identities, so an inconsistent payload fails closed.
+    """
+
     n_pairs: int
     nonzero_pairs: int
     observed_mean: float
@@ -825,6 +842,12 @@ def _require_probability_or_one(value: object, name: str) -> float:
 
 @dataclass(frozen=True, slots=True)
 class HolmDecision:
+    """Per-hypothesis outcome of the Holm (1979) step-down correction.
+
+    Raw and adjusted p-values are carried as exact integer fractions; ``reject``
+    is the familywise decision at the contract's frozen alpha.
+    """
+
     hypothesis_id: str
     original_index: int
     rank: int
@@ -881,6 +904,14 @@ def _comparison_input_sha256(
 
 @dataclass(frozen=True, slots=True)
 class PrimaryComparisonResult:
+    """Primary superiority gate: bootstrap lower bound strictly above the frozen margin.
+
+    Raw scores never appear here; ``matched_inputs_sha256`` and
+    ``paired_differences_sha256`` bind the caller-held vectors.  ``__post_init__``
+    re-derives ``superiority_passed`` from the bootstrap endpoint and margin, so
+    the pass flag cannot be edited independently of its inputs.
+    """
+
     comparison: ComparisonSpec
     matched_inputs_sha256: str
     paired_differences_sha256: str
@@ -917,6 +948,12 @@ class PrimaryComparisonResult:
 
 @dataclass(frozen=True, slots=True)
 class SecondaryComparisonResult:
+    """Secondary sign-flip outcome joined to its Holm decision.
+
+    Construction enforces that the Holm decision names the same hypothesis and
+    carries exactly the sign-flip test's raw rational p-value.
+    """
+
     comparison: ComparisonSpec
     matched_inputs_sha256: str
     paired_differences_sha256: str
@@ -973,6 +1010,13 @@ class DescriptiveDiagnosticExclusion:
 
 @dataclass(frozen=True, slots=True)
 class MatchedComparisonResult:
+    """Complete analysis output: contract, primary gate, secondary tests, exclusions.
+
+    ``__post_init__`` replays the entire analysis (paired differences, bootstrap,
+    sign-flip, Holm) from the embedded contract, so a tampered result cannot be
+    made valid merely by recomputing its integrity digest.
+    """
+
     contract: MatchedComparisonContract
     primary: PrimaryComparisonResult
     secondary: tuple[SecondaryComparisonResult, ...]
@@ -1166,7 +1210,16 @@ def paired_differences(
 def paired_percentile_bootstrap_lower_bound(
     differences: tuple[float, ...], spec: BootstrapSpec
 ) -> BootstrapLowerBound:
-    """Compute the frozen one-sided percentile lower bound of the paired mean."""
+    """Compute the frozen one-sided percentile lower bound of the paired mean.
+
+    Percentile bootstrap in the sense of Efron (1979; Efron & Tibshirani, *An
+    Introduction to the Bootstrap*, 1993, ch. 13): the ``1 - confidence`` quantile of
+    the resampled-mean distribution.  Each resample mean is accumulated in exact
+    dyadic-rational arithmetic and rounded to float once, so the distribution is
+    bit-reproducible across platforms.  The frozen protocol states no
+    seed-superpopulation model or bootstrap regularity assumptions, so this endpoint
+    is a frozen resampling summary, not an established population confidence bound.
+    """
 
     checked = _require_score_tuple(differences, "differences")
     if type(spec) is not BootstrapSpec:
@@ -1204,7 +1257,13 @@ def paired_percentile_bootstrap_lower_bound(
 
 
 def paired_sign_flip_test(differences: tuple[float, ...], spec: PermutationSpec) -> SignFlipResult:
-    """One-sided paired sign-flip test; exact for n<=20, Monte Carlo otherwise."""
+    """One-sided paired sign-flip test; exact for n<=20, Monte Carlo otherwise.
+
+    Zero differences are kept and count inclusively toward the extreme event.  The
+    Monte Carlo branch applies the add-one correction ``(extreme + 1) / (draws + 1)``
+    so a resampled p-value can never be zero (Phipson & Smyth, 2010, "Permutation
+    p-values should never be zero").
+    """
 
     checked = _require_score_tuple(differences, "differences")
     if type(spec) is not PermutationSpec:
@@ -1308,7 +1367,15 @@ def holm_adjust(
     p_values: tuple[tuple[int, int], ...],
     familywise_alpha: float,
 ) -> tuple[HolmDecision, ...]:
-    """Apply stable Holm correction using exact rational p-values."""
+    """Apply the Holm (1979) step-down correction using exact rational p-values.
+
+    Adjusted p-values are the running maximum of ``(m - k) * p_(k)`` capped at 1,
+    computed entirely in :class:`fractions.Fraction`; ties sort by original index,
+    making the output deterministic.
+
+    Reference: Holm, S. (1979), "A simple sequentially rejective multiple test
+    procedure", Scandinavian Journal of Statistics 6(2), 65-70.
+    """
 
     id_objects = _require_exact_tuple(hypothesis_ids, "hypothesis_ids")
     p_objects = _require_exact_tuple(p_values, "p_values")

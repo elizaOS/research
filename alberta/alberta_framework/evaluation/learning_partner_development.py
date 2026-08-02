@@ -1,8 +1,9 @@
 # mypy: disable-error-code="call-arg"
 """Development-only evaluation for a genuine online learning-partner rung.
 
-This module runs one uninterrupted recurring Lewis signaling life and records
-prequential primitives plus read-only phase-boundary probes.  It deliberately
+This module runs one uninterrupted recurring Lewis signaling life (Lewis 1969,
+*Convention*) and records prequential primitives plus read-only phase-boundary
+probes.  It deliberately
 defines no scientific acceptance threshold, artifact writer, CLI, replay, or
 promotion path.  Every serialized report is explicitly development-only.
 

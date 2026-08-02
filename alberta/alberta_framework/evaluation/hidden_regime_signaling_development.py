@@ -2,9 +2,13 @@
 """Development-only evaluation for the hidden-regime Lewis lifecycle.
 
 The evaluator runs a helper and beneficiary through one uninterrupted hidden
-regime life.  Both roles receive only their ordinary local input, their local
-action, and the common scalar reward.  Segment identity, schedule position,
-target permutations, and replacement provenance remain evaluator-only facts.
+regime life.  The dyad is a Lewis sender--receiver signaling game (Lewis 1969,
+*Convention*; Skyrms 2010, *Signals*): the helper privately observes a ternary
+cue and emits a ternary message; the beneficiary sees only the delivered
+symbol and acts; both share one binary reward.  Both roles receive only their
+ordinary local input, their local action, and the common scalar reward.
+Segment identity, schedule position, target permutations, and replacement
+provenance remain evaluator-only facts.
 
 This module deliberately defines no acceptance threshold, artifact writer,
 CLI, held-out protocol, or promotion path.  Its default schedule is long
@@ -92,6 +96,10 @@ RESERVED_DEVELOPMENT_SEED_NAMESPACE = "hidden-regime-signaling-v0-reserved-devel
 RESERVED_DEVELOPMENT_SEED_NAMESPACE_EXECUTED = False
 
 CONSTANT_CHANNEL_SYMBOL = 0
+# Each role persists a (4 slots x 3 inputs x 3 actions) float32 value bank
+# (36 scalars), 2 x 4 relevance scalars, 23 int32/float32 lifecycle scalars
+# (four per-slot counters of 4 plus seven scalar cursors), and a 2-word
+# uint32 RNG key: 69 four-byte scalars = 276 bytes per role, 552 per dyad.
 EXPECTED_DYAD_STATE_BYTES = 552
 DEVELOPMENT_CANDIDATE_PROVENANCE = (
     "learning_rate=0.25, epsilon=0.1, relevance_rate=0.1, lease_length=16, "
@@ -132,8 +140,8 @@ DEFAULT_DEVELOPMENT_SEGMENT_LENGTHS: tuple[int, ...] = tuple(
 )
 
 SELECTIVE_FULL: Literal["selective_full"] = "selective_full"
-# Compatibility-preserving semantic alias: serialized development reports keep
-# the established ``selective_full`` identifier for the selective/evidence cell.
+# Semantic alias for the selective/evidence factorial cell; serialized reports
+# use the ``selective_full`` string.
 SELECTIVE_EVIDENCE: Literal["selective_full"] = SELECTIVE_FULL
 WRITABLE_EVIDENCE: Literal["writable_evidence"] = "writable_evidence"
 SELECTIVE_LRU: Literal["selective_lru"] = "selective_lru"
@@ -217,7 +225,13 @@ def _default_development_learner() -> SlotSignalingConfig:
 
 @dataclasses.dataclass(frozen=True)
 class HiddenRegimeDevelopmentConfig:
-    """Exact nonpromoting world, learner, and descriptive metric window."""
+    """Exact nonpromoting world, learner, and descriptive metric window.
+
+    ``metric_window`` is the width, in transitions, of the legacy early/late
+    segment-reward descriptors (clipped to the segment length).  It is
+    serialized as ``legacy_metric_window`` and is never direct-retention
+    evidence; the retention probes use ``learner.lease_length`` windows.
+    """
 
     world: HiddenRegimeWorldConfig = dataclasses.field(default_factory=_default_development_world)
     learner: SlotSignalingConfig = dataclasses.field(default_factory=_default_development_learner)
@@ -350,7 +364,8 @@ class HiddenRegimeConditionSpec:
 
     @property
     def writable_lru_ablation(self) -> bool:
-        """Compatibility diagnostic for the historical combined ablation."""
+        """``True`` only for the combined writable+LRU cell, mirroring
+        the single-flag ``SlotSignalingConfig.writable_lru_ablation``."""
 
         return (
             self.durable_write_policy == DURABLE_WRITE_WRITABLE
@@ -3667,6 +3682,8 @@ def validate_hidden_regime_run_result(run: HiddenRegimeRunResult) -> tuple[str, 
     if run.seed_pair.namespace == RESERVED_DEVELOPMENT_SEED_NAMESPACE:
         errors.append("run uses the intentionally unexecuted reserved namespace")
     trace = run.trace
+    # Gate 1 — structure: every trace leaf must have the expected shape,
+    # dtype, and finiteness before any check below indexes into it.
     expected_shapes = _expected_trace_shapes(run.config.num_steps)
     expected_dtypes = _expected_trace_dtypes()
     for field in dataclasses.fields(trace):
@@ -3680,6 +3697,8 @@ def validate_hidden_regime_run_result(run: HiddenRegimeRunResult) -> tuple[str, 
     if errors:
         return tuple(errors)
 
+    # Gate 2 — value domains: ternary symbols, slot ids, lifecycle statuses,
+    # non-negative counters, and commit/retire sentinel pairs.
     ternary_fields = (
         "world_cue_pre",
         "world_cue_post",
@@ -3771,6 +3790,9 @@ def validate_hidden_regime_run_result(run: HiddenRegimeRunResult) -> tuple[str, 
     if errors:
         return tuple(errors)
 
+    # Gate 3 — world reconstruction: cursors, pre/post continuity, the segment
+    # schedule, oracle targets, prequential reward, and lease boundaries must
+    # all rebuild exactly from the config and the named world seed.
     steps = np.asarray(trace.step_index, dtype=np.int32)
     if not np.array_equal(steps, np.arange(run.config.num_steps, dtype=np.int32)):
         errors.append("step_index is not the uninterrupted zero-based life")
@@ -3861,6 +3883,8 @@ def validate_hidden_regime_run_result(run: HiddenRegimeRunResult) -> tuple[str, 
     if not np.array_equal(trace.beneficiary_lease_boundary, expected_boundary):
         errors.append("beneficiary lease boundaries do not reconstruct from learner config")
 
+    # Channel intervention: the delivered symbol must match the condition's
+    # channel exactly (identity, constant zero, or isolated-stream shuffle).
     if spec.channel == DIRECT_TERNARY_CHANNEL:
         if not _array_equal(trace.delivered_message, trace.helper_message):
             errors.append("direct channel changed the helper message")
@@ -3876,6 +3900,10 @@ def validate_hidden_regime_run_result(run: HiddenRegimeRunResult) -> tuple[str, 
         if not np.array_equal(trace.delivered_message, np.asarray(delivered, dtype=np.int8)):
             errors.append("shuffled channel does not match its isolated world RNG stream")
 
+    # Per-role audit: write gating, pre/post state continuity, exact value-bank
+    # and status/generation reconstruction from ordinary writes plus atomic
+    # commits, lease and relevance diagnostics, the candidate-confirmation
+    # lifecycle, and the selective durable-mutation audit.
     for role, enabled in (
         ("helper", spec.helper_write),
         ("beneficiary", spec.beneficiary_write),
@@ -4301,6 +4329,8 @@ def validate_hidden_regime_run_result(run: HiddenRegimeRunResult) -> tuple[str, 
             elif pre_status[step, slot] != SLOT_VACANT:
                 errors.append(f"{role} vacancy commit did not target a vacant slot")
 
+    # Cross-role synchronization: the two roles run one joint lifecycle state
+    # machine, so freeze controls gate both and lifecycle fields must agree.
     if not spec.helper_write or not spec.beneficiary_write:
         for role in ("helper", "beneficiary"):
             if np.any(np.asarray(getattr(trace, f"{role}_committed_slot")) >= 0):
@@ -4364,6 +4394,8 @@ def validate_hidden_regime_run_result(run: HiddenRegimeRunResult) -> tuple[str, 
         ):
             errors.append(f"synchronized lifecycle field {name} differs by role")
 
+    # Derived report: the summary must reconstruct exactly from the primitive
+    # trace, and the resource report must describe the constant matched dyad.
     try:
         recomputed_summary = reconstruct_hidden_regime_summary(
             trace,
@@ -4388,8 +4420,12 @@ def validate_hidden_regime_run_result(run: HiddenRegimeRunResult) -> tuple[str, 
     )
     if expected_resource != run.resource:
         errors.append("resource report does not match initial/final persistent state")
+    # The literal must stay equal to EXPECTED_DYAD_STATE_BYTES; the byte
+    # derivation lives next to that constant at the top of the module.
     if not run.resource.resource_constant or run.resource.final_state_bytes != 552:
         errors.append("condition is not the exact constant 552-byte dyad")
+    # Trace endpoints: step 0 pre-state and step N-1 post-state must equal the
+    # actual initial and final persistent learner states, field by field.
     initial_state = SlotSignalingAgent(
         dataclasses.replace(
             run.config.learner,
@@ -4440,6 +4476,8 @@ def validate_hidden_regime_run_result(run: HiddenRegimeRunResult) -> tuple[str, 
                 final_expected,
             ):
                 errors.append(f"{role} final {state_name} differs from trace")
+    # Same-implementation determinism: a full named-RNG replay must be
+    # bit-identical.  This is a consistency check, not cross-backend evidence.
     replay_trace, replay_final_state = _deterministic_replay(run, spec)
     for field in dataclasses.fields(trace):
         if not _array_equal(getattr(trace, field.name), getattr(replay_trace, field.name)):

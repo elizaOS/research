@@ -1,4 +1,21 @@
-"""Strict nonpromoting artifact for hidden-partner development runs."""
+"""Strict nonpromoting artifact for hidden-partner development runs.
+
+:mod:`~alberta_framework.evaluation.hidden_partner_development` executes the
+paired uninterrupted lives and computes the run summaries and development
+aggregate; this module packages those completed summaries into a versioned,
+digest-protected JSON record and validates such records fail-closed.
+Validation reconstructs everything it can rather than trusting the file:
+seed pairs must re-derive exactly from the declared role's namespace, runs
+must follow the frozen condition table, the aggregate must reproduce
+byte-for-byte from the stored run summaries, and the pinned source hashes
+must match the current working tree.
+
+The v1 schema binds exactly one protocol: any deviation from the default
+development protocol is rejected, so a protocol change requires a new schema
+version rather than a silently drifting record.  Both roles ("tuning-replay"
+and "robustness") stay development-only — the record is structurally unable
+to promote a scientific claim.
+"""
 
 from __future__ import annotations
 
@@ -293,6 +310,8 @@ def validate_hidden_partner_development_artifact(
         except (TypeError, ValueError) as error:
             errors.append(f"protocol is invalid: {error}")
         else:
+            # A v1 record attests to exactly one frozen protocol; a variant
+            # protocol needs a new schema version, not a mutated record.
             if reconstructed_protocol.to_config() != (
                 HiddenPartnerDevelopmentProtocol().to_config()
             ):

@@ -5,9 +5,9 @@ Run with::
     python -m alberta_framework.evaluation.continual_multiagent_cli \
         --output outputs/continual_multiagent/evidence.json
 
-The default run uses thirty paired seeds.  A smoke run may be requested for
-development, but it exits nonzero because it cannot satisfy the promoted
-minimum-seed acceptance threshold.
+The default run uses thirty paired seeds.  Passing a small ``--seed-count``
+gives a quick development run, but it exits nonzero because the artifact
+cannot satisfy the promoted minimum-seed acceptance threshold.
 """
 
 from __future__ import annotations

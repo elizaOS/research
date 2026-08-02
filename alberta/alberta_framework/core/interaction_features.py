@@ -3,7 +3,17 @@
 This module is a concrete Step 2 probe.  It restricts feature construction to
 pairwise products of existing scalar observations, then studies whether an
 online learner can manage a bounded set of those constructed features by
-testing, scoring, promoting, and replacing them.
+testing, scoring, promoting, and replacing them — the generate-and-test view
+of representation search: cheap generators propose features, online utility
+testers decide which survive.
+
+References:
+    Mahmood & Sutton (2013). "Representation Search through Generate and
+        Test."
+    Sutton, Bowling, & Pilarski (2022). "The Alberta Plan for AI Research."
+        (Step 2: feature construction.)
+    Elsayed, Vasan, & Mahmood (2024). "Streaming Deep Reinforcement Learning
+        Finally Works."  (ObGD update bounding.)
 """
 
 import functools
@@ -124,7 +134,17 @@ class InteractionCurationPriorityOverride:
 
 @chex.dataclass(frozen=True)
 class InteractionFeatureUpdateResult:
-    """Result of one pairwise interaction feature update."""
+    """Result of one pairwise interaction feature update.
+
+    ``metrics`` columns (all float32):
+    0. mean squared error over active tasks
+    1. mean absolute error over active tasks
+    2. mean active-feature utility
+    3. min active-feature utility
+    4. max candidate utility (0 when there are no candidates)
+    5. replacement flag (1.0 if a slot was replaced this step)
+    6. ObGD bounding scale applied to the update (1.0 when unbounded)
+    """
 
     state: InteractionFeatureState
     pre_curation_state: InteractionFeatureState
@@ -165,7 +185,11 @@ class InteractionFeatureUpdateResult:
 
 @chex.dataclass(frozen=True)
 class InteractionFeatureLearningResult:
-    """Result from a scan-based interaction feature run."""
+    """Result from a scan-based interaction feature run.
+
+    ``metrics`` rows follow the 7-column layout documented on
+    :class:`InteractionFeatureUpdateResult`.
+    """
 
     state: InteractionFeatureState
     metrics: Float[Array, "num_steps 7"]
@@ -181,9 +205,18 @@ class FixedBudgetInteractionLearner:
 
     ``scale_robust=True`` opts into per-coordinate normalized output updates
     and signed loss-intervention utilities.  The default remains the original
-    LMS/OBGD contribution-utility path.  Robust mode adds one second moment
+    LMS/ObGD contribution-utility path.  Robust mode adds one second moment
     per active feature and candidate plus one per task; this fixed cost is
     exposed by :meth:`memory_accounting`.
+
+    ``use_obgd=True`` (default, LMS path only) applies ObGD-style overshoot
+    bounding (Observation-bounded Gradient Descent; Elsayed et al. 2024,
+    "Streaming Deep Reinforcement Learning Finally Works"): the aggregate
+    weight/bias update is uniformly downscaled whenever
+    ``obgd_kappa * max(||error||, 1) * (L1 update magnitude)`` exceeds one,
+    so no single sample can overshoot its target.  Higher ``obgd_kappa``
+    bounds more conservatively; the default 2.0 matches
+    :class:`~alberta_framework.core.optimizers.ObGDBounding`.
 
     With ``independent_relevance_probe=True``, ``conditional_v1`` (the default)
     makes candidate heads learn the residual of the currently readable durable
@@ -864,6 +897,10 @@ class FixedBudgetInteractionLearner:
     ) -> tuple[Array, Array]:
         """Diagonally preconditioned NLMS for the deployed linear head.
 
+        NLMS (normalized least mean squares; Nagumo & Noda 1967, standard in
+        adaptive filtering, e.g. Haykin, *Adaptive Filter Theory*) divides the
+        LMS step by the input energy so the step size becomes scale-free.
+
         The diagonal contains the causal feature second moment, the current
         squared value, and the current bank's mean energy.  The shared energy
         term is a scale-equivariant ridge: a near-zero Gaussian product cannot
@@ -903,8 +940,8 @@ class FixedBudgetInteractionLearner:
         """Independent normalized residual-probe updates for dormant candidates.
 
         Candidate heads are not summed into the deployed prediction, so each
-        is a separate one-coordinate probe rather than one 91-coordinate
-        model.  Its error is the deployed residual minus its own proposed
+        is a separate one-coordinate probe rather than a coordinate of one
+        joint model.  Its error is the deployed residual minus its own proposed
         contribution; this makes the head a stable residual predictor rather
         than an unbounded accumulator of deployed gradients.  The common
         bank-energy ridge still prevents a near-zero product from taking an

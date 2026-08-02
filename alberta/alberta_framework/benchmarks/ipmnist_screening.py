@@ -48,6 +48,28 @@ identical seeds):
   max (the paper's local/global distinction).
 - ``upgd_w_*`` hyperparameter-neighborhood star around the published
   UPGD-W configuration (sigma, utility decay, weight decay).
+- ``guarded_cbp_adam``: AdamW+CBP (the screening leader) plus UPGD-style
+  utility *protection only* — Adam's applied per-weight delta is scaled by
+  ``1 - guard_scale * gate`` with the gate from the UPGD ``-w*g`` utility
+  EMA; no perturbation (CBP supplies regeneration). ``guard_scale=0``
+  reduces bit-exactly to ``adamw_cbp`` (pinned).
+- ``adamw_cbp_noreset``: ``adamw_cbp`` WITHOUT the per-unit Adam
+  moment/count reset at CBP replacement (the leader resets by default) —
+  dissects whether optimizer-state freshness at recycle is load-bearing.
+  ``cbp_replacement_rate=0`` reduces to ``adamw_control`` (pinned).
+- ``upgd_w_sigma0``: lean UPGD-W with ``sigma=0`` — pure utility-gated
+  SGD + decoupled decay, no perturbation; the noise draw (~85-90% of the
+  UPGD step cost) is skipped entirely. Bit-exact against the control
+  factory run at ``noise_std=0`` (pinned).
+- ``upgd_alpha_utility``: UPGD-W whose protection signal is per-weight
+  step-size relevance — an IDBD ``log_alpha``/trace pair maintained as a
+  *passive statistic* on the raw gradient (never applied as a step size);
+  the gate is a scale-free squashing of each weight's log-step-size drift
+  from init. ``meta_step_size=0`` reduces to the closed-form half-gated
+  step (pinned).
+- ``adamw_cbp_{r3e5,r3e4,m50,m200}``: axis-aligned mini-star around the
+  untuned ``adamw_cbp`` leader (replacement rate 3e-5/3e-4, maturity
+  50/200).
 
 Everything here is a development screening diagnostic — never promotable
 scientific evidence. Benchmark executions happen through the CLI
@@ -1165,6 +1187,32 @@ class AdamCBPState:
     cbp: CBPState
 
 
+def adam_elem_step(
+    param: Array,
+    m: Array,
+    v: Array,
+    count: Array,
+    grad: Array,
+    hp: Mapping[str, float],
+) -> tuple[Array, Array, Array, Array]:
+    """Adam *delta* with per-element bias-correction counts (not applied).
+
+    Returns ``(step, new_m, new_v, new_count)`` so gated variants can scale
+    the applied delta without touching the moment statistics
+    (:func:`guarded_adam_update`); :func:`adam_elem_update` applies it as
+    ``param - step``.
+    """
+    new_count = count + 1.0
+    new_m = hp["beta1"] * m + (1.0 - hp["beta1"]) * grad
+    new_v = hp["beta2"] * v + (1.0 - hp["beta2"]) * grad * grad
+    m_hat = new_m / (1.0 - jnp.power(jnp.float32(hp["beta1"]), new_count))
+    v_hat = new_v / (1.0 - jnp.power(jnp.float32(hp["beta2"]), new_count))
+    step = hp["step_size"] * m_hat / (jnp.sqrt(v_hat) + hp["eps"])
+    if hp["weight_decay"] != 0.0:
+        step = step + hp["step_size"] * hp["weight_decay"] * param
+    return step, new_m, new_v, new_count
+
+
 def adam_elem_update(
     param: Array,
     m: Array,
@@ -1179,20 +1227,19 @@ def adam_elem_update(
     every element shares the same count (pinned by a unit test); per-element
     counts let CBP restart bias correction for recycled units only.
     """
-    new_count = count + 1.0
-    new_m = hp["beta1"] * m + (1.0 - hp["beta1"]) * grad
-    new_v = hp["beta2"] * v + (1.0 - hp["beta2"]) * grad * grad
-    m_hat = new_m / (1.0 - jnp.power(jnp.float32(hp["beta1"]), new_count))
-    v_hat = new_v / (1.0 - jnp.power(jnp.float32(hp["beta2"]), new_count))
-    step = hp["step_size"] * m_hat / (jnp.sqrt(v_hat) + hp["eps"])
-    if hp["weight_decay"] != 0.0:
-        step = step + hp["step_size"] * hp["weight_decay"] * param
+    step, new_m, new_v, new_count = adam_elem_step(param, m, v, count, grad, hp)
     return param - step, new_m, new_v, new_count
 
 
 def _make_adamw_cbp_learner(
     hp: Mapping[str, float],
+    *,
+    reset_recycled_optimizer: bool = True,
 ) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """AdamW+CBP; ``reset_recycled_optimizer=False`` keeps stale per-unit
+    Adam moments/counts across CBP replacements (the ``adamw_cbp_noreset``
+    dissection arm)."""
+
     def init_fn(params: dict[str, Array]) -> AdamCBPState:
         zeros = {name: jnp.zeros_like(value) for name, value in params.items()}
         return AdamCBPState(  # type: ignore[call-arg]
@@ -1218,8 +1265,126 @@ def _make_adamw_cbp_learner(
             new_params[name], new_m[name], new_v[name], new_count[name] = adam_elem_update(
                 value, state.m[name], state.v[name], state.count[name], grads[name], hp
             )
-        opt_arrays = {
-            name: jnp.stack([new_m[name], new_v[name], new_count[name]])
+        if reset_recycled_optimizer:
+            opt_arrays: dict[str, Array] | None = {
+                name: jnp.stack([new_m[name], new_v[name], new_count[name]])
+                for name in new_params
+            }
+            new_params, opt_arrays, new_cbp = _cbp_update(
+                new_params, opt_arrays, state.cbp, a1, da1, a2, da2, key, hp
+            )
+            assert opt_arrays is not None
+            new_m = {name: opt_arrays[name][0] for name in new_params}
+            new_v = {name: opt_arrays[name][1] for name in new_params}
+            new_count = {name: opt_arrays[name][2] for name in new_params}
+        else:
+            new_params, _, new_cbp = _cbp_update(
+                new_params, None, state.cbp, a1, da1, a2, da2, key, hp
+            )
+        metrics = _step_metrics(new_params, x, y, loss, logits)
+        return new_params, AdamCBPState(  # type: ignore[call-arg]
+            m=new_m, v=new_v, count=new_count, cbp=new_cbp
+        ), metrics
+
+    return init_fn, full_step
+
+
+def _make_adamw_cbp_noreset_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    return _make_adamw_cbp_learner(hp, reset_recycled_optimizer=False)
+
+
+# =============================================================================
+# (j) Guarded AdamW+CBP: utility protection on Adam's delta, CBP regeneration
+# =============================================================================
+
+
+@chex.dataclass(frozen=True)
+class GuardedAdamCBPState:
+    """Per-element Adam moments/counts, UPGD utility EMA + clock, CBP state."""
+
+    m: dict[str, Array]
+    v: dict[str, Array]
+    count: dict[str, Array]
+    utility: dict[str, Array]
+    step: Array
+    cbp: CBPState
+
+
+def guarded_adam_update(
+    params: dict[str, Array],
+    m: dict[str, Array],
+    v: dict[str, Array],
+    count: dict[str, Array],
+    grads: dict[str, Array],
+    gate: dict[str, Array],
+    hp: Mapping[str, float],
+) -> tuple[dict[str, Array], dict[str, Array], dict[str, Array], dict[str, Array]]:
+    """Adam step whose *applied* delta is scaled by ``1 - guard_scale * gate``.
+
+    Protection only: the moment statistics see the raw gradients (exactly as
+    UPGD's gate scales the applied update, not the utility bookkeeping), and
+    there is no perturbation term. With ``guard_scale = 0`` the gating is
+    skipped entirely and every parameter takes the plain
+    :func:`adam_elem_step` delta, so the ``guarded_cbp_adam`` arm reduces
+    bit-exactly to ``adamw_cbp`` (pinned by a unit test).
+    """
+    guard = hp["guard_scale"]
+    new_params: dict[str, Array] = {}
+    new_m: dict[str, Array] = {}
+    new_v: dict[str, Array] = {}
+    new_count: dict[str, Array] = {}
+    for name in params:
+        step, new_m[name], new_v[name], new_count[name] = adam_elem_step(
+            params[name], m[name], v[name], count[name], grads[name], hp
+        )
+        if guard == 0.0:
+            new_params[name] = params[name] - step
+        else:
+            new_params[name] = params[name] - step * (1.0 - guard * gate[name])
+    return new_params, new_m, new_v, new_count
+
+
+def _make_guarded_cbp_adam_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    def init_fn(params: dict[str, Array]) -> GuardedAdamCBPState:
+        zeros = {name: jnp.zeros_like(value) for name, value in params.items()}
+        return GuardedAdamCBPState(  # type: ignore[call-arg]
+            m=dict(zeros),
+            v=dict(zeros),
+            count={name: jnp.zeros_like(value) for name, value in params.items()},
+            utility={name: jnp.zeros_like(value) for name, value in params.items()},
+            step=jnp.array(0, dtype=jnp.int32),
+            cbp=_init_cbp_state(params["w1"].shape[1], params["w2"].shape[1]),
+        )
+
+    def full_step(
+        params: dict[str, Array],
+        state: GuardedAdamCBPState,
+        x: Array,
+        y: Array,
+        key: Array,
+    ) -> tuple[dict[str, Array], GuardedAdamCBPState, StepMetrics]:
+        (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+            params, x, y
+        )
+        _, _, a1, z2, a2 = _forward_with_activations(params, x)
+        da1, da2 = _activation_loss_grads(params, logits, y, z2)
+        clock = state.step + jnp.array(1, dtype=jnp.int32)
+        utility, gate = _upgd_utility_and_gate(
+            params, grads, state.utility, clock, hp["utility_decay"]
+        )
+        new_params, new_m, new_v, new_count = guarded_adam_update(
+            params, state.m, state.v, state.count, grads, gate, hp
+        )
+        # Recycled units also reset their guard utility (row 3): fresh units
+        # restart at the neutral sigmoid(0) = 0.5 gate.
+        opt_arrays: dict[str, Array] | None = {
+            name: jnp.stack(
+                [new_m[name], new_v[name], new_count[name], utility[name]]
+            )
             for name in new_params
         }
         new_params, opt_arrays, new_cbp = _cbp_update(
@@ -1227,12 +1392,164 @@ def _make_adamw_cbp_learner(
         )
         assert opt_arrays is not None
         metrics = _step_metrics(new_params, x, y, loss, logits)
-        return new_params, AdamCBPState(  # type: ignore[call-arg]
+        return new_params, GuardedAdamCBPState(  # type: ignore[call-arg]
             m={name: opt_arrays[name][0] for name in new_params},
             v={name: opt_arrays[name][1] for name in new_params},
             count={name: opt_arrays[name][2] for name in new_params},
+            utility={name: opt_arrays[name][3] for name in new_params},
+            step=clock,
             cbp=new_cbp,
         ), metrics
+
+    return init_fn, full_step
+
+
+# =============================================================================
+# (k) Perturbation dissection: lean UPGD-W with sigma = 0
+# =============================================================================
+
+
+def _make_upgd_w_sigma0_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Zero-noise lean UPGD-W: utility gate + decoupled decay, no perturbation.
+
+    Skips the per-step 282,160-element normal draw entirely (~85-90% of the
+    UPGD-W step cost) instead of drawing and scaling by zero; the per-step
+    RNG chain (``key, step_key = split(key)``) is untouched, so the
+    trajectory is bit-exact against the control factory run with
+    ``noise_std = 0`` (pinned by a unit test).
+    """
+    if hp["noise_std"] != 0.0:
+        raise ValueError(
+            f"upgd_w_sigma0 requires noise_std=0, got {hp['noise_std']!r}"
+        )
+
+    def init_fn(params: dict[str, Array]) -> LeanUPGDState:
+        return LeanUPGDState(  # type: ignore[call-arg]
+            utility={name: jnp.zeros_like(value) for name, value in params.items()},
+            step=jnp.array(0, dtype=jnp.int32),
+        )
+
+    def full_step(
+        params: dict[str, Array], state: LeanUPGDState, x: Array, y: Array, key: Array
+    ) -> tuple[dict[str, Array], LeanUPGDState, StepMetrics]:
+        del key  # no perturbation: the step consumes no randomness
+        (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+            params, x, y
+        )
+        zeros = {name: jnp.zeros_like(value) for name, value in params.items()}
+        new_params, new_state = lean_upgd_w_update(params, state, grads, zeros, dict(hp))
+        return new_params, new_state, _step_metrics(new_params, x, y, loss, logits)
+
+    return init_fn, full_step
+
+
+# =============================================================================
+# (l) UPGD-W gated by passive IDBD step-size relevance instead of -w*g utility
+# =============================================================================
+
+
+@chex.dataclass(frozen=True)
+class UPGDAlphaGateState:
+    """Clock plus the passive IDBD statistics that drive the protection gate."""
+
+    step: Array
+    log_alpha: dict[str, Array]
+    trace: dict[str, Array]
+
+
+def upgd_alpha_utility_update(
+    params: dict[str, Array],
+    state: UPGDAlphaGateState,
+    grads: dict[str, Array],
+    noise: dict[str, Array],
+    hp: Mapping[str, float],
+) -> tuple[dict[str, Array], UPGDAlphaGateState]:
+    """UPGD-W step whose protection signal is per-weight step-size relevance.
+
+    An IDBD ``log_alpha``/trace pair (Meyer error-free equations, exactly as
+    :func:`upgd_idbd_update`) is maintained as a *passive statistic* on the
+    raw loss gradient — it is never applied as a step size; the applied step
+    keeps the protocol's fixed ``step_size``, decoupled decay, and
+    perturbation. Protection instead reads each weight's log-step-size drift
+    from its initial value ``la0 = ln(initial_step_size)``:
+
+    - ``log_alpha_i += meta * g_i * h_i`` (old trace), clipped to
+      ``[-10, 0]``; ``h_i = h_i * max(0, 1 - alpha_i * g_i^2) + alpha_i * g_i``.
+    - ``s_i = log_alpha_i - la0``; ``gate_i = sigmoid(s_i / max_j |s_j|)``
+      (network-global normalizer, mirroring UPGD's global-max gate; when all
+      drifts are zero the gate is exactly 0.5). The normalization is
+      scale-free — only the *ordering and relative size* of drifts matters,
+      the rank-like reading of "alpha as relevance".
+    - ``w_i' = w_i * (1 - lr*wd) - lr * (g_i + xi_i) * (1 - gate_i)``.
+
+    Weights whose gradients correlate over time (consistent learners) grow
+    ``log_alpha`` and are protected; weights whose gradients decorrelate
+    (e.g. the input layer right after a permutation switch) *shed* protection
+    because sign-alternating meta-gradients drive ``log_alpha`` down. With
+    ``meta_step_size = 0`` every drift stays zero and the update reduces
+    bit-exactly to the closed-form half-gated step (pinned by a unit test).
+    """
+    step_size = hp["step_size"]
+    decay = 1.0 - step_size * hp["weight_decay"]
+    meta = hp["meta_step_size"]
+    la0 = math.log(hp["initial_step_size"])
+    count = state.step + jnp.array(1, dtype=jnp.int32)
+    new_log_alpha: dict[str, Array] = {}
+    new_trace: dict[str, Array] = {}
+    for name in params:
+        g = grads[name]
+        la = jnp.clip(
+            state.log_alpha[name] + meta * g * state.trace[name],
+            _IDBD_LOG_ALPHA_MIN,
+            _IDBD_LOG_ALPHA_MAX,
+        )
+        alpha = jnp.exp(la)
+        new_log_alpha[name] = la
+        new_trace[name] = state.trace[name] * jnp.maximum(0.0, 1.0 - alpha * g * g) + alpha * g
+    drift = {name: new_log_alpha[name] - la0 for name in params}
+    drift_max = jnp.max(
+        jnp.stack([jnp.max(jnp.abs(drift[name])) for name in sorted(params)])
+    )
+    safe_max = jnp.where(drift_max > 0.0, drift_max, 1.0)
+    new_params: dict[str, Array] = {}
+    for name in params:
+        gate = jax.nn.sigmoid(
+            jnp.where(drift_max > 0.0, drift[name] / safe_max, 0.0)
+        )
+        new_params[name] = params[name] * decay - step_size * (
+            (grads[name] + noise[name]) * (1.0 - gate)
+        )
+    return new_params, UPGDAlphaGateState(  # type: ignore[call-arg]
+        step=count, log_alpha=new_log_alpha, trace=new_trace
+    )
+
+
+def _make_upgd_alpha_utility_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    noise_std = hp["noise_std"]
+    la0 = math.log(hp["initial_step_size"])
+
+    def init_fn(params: dict[str, Array]) -> UPGDAlphaGateState:
+        return UPGDAlphaGateState(  # type: ignore[call-arg]
+            step=jnp.array(0, dtype=jnp.int32),
+            log_alpha={
+                name: jnp.full_like(value, la0) for name, value in params.items()
+            },
+            trace={name: jnp.zeros_like(value) for name, value in params.items()},
+        )
+
+    def full_step(
+        params: dict[str, Array], state: UPGDAlphaGateState, x: Array, y: Array, key: Array
+    ) -> tuple[dict[str, Array], UPGDAlphaGateState, StepMetrics]:
+        (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+            params, x, y
+        )
+        noise = _sorted_flat_noise(key, params, noise_std)
+        new_params, new_state = upgd_alpha_utility_update(params, state, grads, noise, hp)
+        return new_params, new_state, _step_metrics(new_params, x, y, loss, logits)
 
     return init_fn, full_step
 
@@ -1394,7 +1711,80 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             factory=_make_adamw_cbp_learner,
             description="AdamW with CBP-style recycling (Nature-combination reference arm).",
         ),
+        ScreeningSpec(
+            name="guarded_cbp_adam",
+            base_learner="adamw",
+            mechanism="utility_guarded_recycling",
+            hyperparameters={
+                **ADAMW_PROTOCOL_HYPERPARAMETERS,
+                **_CBP_DEFAULTS,
+                "utility_decay": 0.9999,
+                "guard_scale": 1.0,
+            },
+            factory=_make_guarded_cbp_adam_learner,
+            description=(
+                "AdamW+CBP with UPGD-style utility protection scaling Adam's "
+                "applied delta by 1 - gate; no perturbation (CBP regenerates)."
+            ),
+        ),
+        ScreeningSpec(
+            name="adamw_cbp_noreset",
+            base_learner="adamw",
+            mechanism="dormant_unit_recycling",
+            hyperparameters={**ADAMW_PROTOCOL_HYPERPARAMETERS, **_CBP_DEFAULTS},
+            factory=_make_adamw_cbp_noreset_learner,
+            description=(
+                "adamw_cbp WITHOUT the per-unit Adam moment/count reset at "
+                "replacement (moment-freshness dissection; the leader resets)."
+            ),
+        ),
+        ScreeningSpec(
+            name="upgd_w_sigma0",
+            base_learner="upgd_w",
+            mechanism="perturbation_dissection",
+            hyperparameters=_upgd_hp(noise_std=0.0),
+            factory=_make_upgd_w_sigma0_learner,
+            description=(
+                "Lean UPGD-W with sigma=0: pure utility-gated SGD + decoupled "
+                "decay, no perturbation (noise draw skipped entirely)."
+            ),
+        ),
+        ScreeningSpec(
+            name="upgd_alpha_utility",
+            base_learner="upgd_w",
+            mechanism="alpha_protection_signal",
+            hyperparameters=_upgd_hp(meta_step_size=1e-2, initial_step_size=0.01),
+            factory=_make_upgd_alpha_utility_learner,
+            description=(
+                "UPGD-W whose protection gate reads passive IDBD per-weight "
+                "step-size drift instead of the -w*g utility EMA."
+            ),
+        ),
     ]
+    for cbp_overrides, tag in (
+        ({"cbp_replacement_rate": 3e-5}, "r3e5"),
+        ({"cbp_replacement_rate": 3e-4}, "r3e4"),
+        ({"cbp_maturity_threshold": 50.0}, "m50"),
+        ({"cbp_maturity_threshold": 200.0}, "m200"),
+    ):
+        specs.append(
+            ScreeningSpec(
+                name=f"adamw_cbp_{tag}",
+                base_learner="adamw",
+                mechanism="dormant_unit_recycling",
+                hyperparameters={
+                    **ADAMW_PROTOCOL_HYPERPARAMETERS,
+                    **_CBP_DEFAULTS,
+                    **cbp_overrides,
+                },
+                factory=_make_adamw_cbp_learner,
+                description=(
+                    "adamw_cbp leader mini-star: "
+                    + ", ".join(f"{k}={v}" for k, v in cbp_overrides.items())
+                    + "."
+                ),
+            )
+        )
     for kappa, wd, tag in (
         (1.0, 0.01, "k1"),
         (2.0, 0.01, "k2"),

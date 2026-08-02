@@ -1,4 +1,27 @@
-"""Reproducible benchmark integrations for Alberta agents."""
+"""Reproducible benchmark integrations for Alberta agents.
+
+This package re-exports the public surface of five benchmark families:
+
+* **Forager/Foragax** (``forager``, ``forager_results``, ``causal_map_forager``)
+  — the continual foraging testbed (arXiv:2605.01131) with Alberta agents,
+  importers for the authors' official per-seed result archives, and paired
+  seed-level comparisons.
+* **Historical Forager** (``historical_forager``,
+  ``historical_forager_provenance``) — the reconstructed paper-era NumPy
+  runtime, with fail-closed pairing rules that keep it from being mixed with
+  current Foragax runs.
+* **Runtime profiles** (``runtime_profile``) — structural validation and
+  hashing of cross-harness environment/RNG identity.
+* **Slowly changing regression** (``slowly_changing_regression``,
+  ``slowly_changing_regression_v2``) — the Dohare et al. (2024)
+  loss-of-plasticity regression stream and its sharded development protocol.
+* **Input-permuted MNIST** (``upgd_ipmnist``) — the UPGD replication lane
+  (Elsayed & Mahmood, ICLR 2024).
+
+The matched-current campaign machinery (``forager_matched_*``,
+``foragax_open_screen``) is deliberately not re-exported here; those modules
+are imported explicitly by their runners and CLIs.
+"""
 
 from alberta_framework.benchmarks.causal_map_forager import (
     CAUSAL_MAP_STATE_SCHEMA,

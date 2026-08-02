@@ -1,9 +1,22 @@
 # mypy: disable-error-code="attr-defined,call-arg"
-"""Production-facing Step 4 SARSA control facade.
+"""Production-facing Step 4 SARSA control facade (Alberta Plan Step 4, Control I).
 
 This module keeps the packaged Step 4 surface narrow: construct a SARSA agent,
 prime it with an initial feature vector, run one online transition, or scan over
 pre-collected feature/reward arrays.
+
+The science lives in :mod:`alberta_framework.core.sarsa`: a Horde-backed
+epsilon-greedy semi-gradient SARSA(lambda) (Sutton & Barto 2018, §10.1) with
+one control demon per action.  The defaults follow the streaming deep-RL
+stability recipe of Elsayed et al. 2024 ("Streaming Deep Reinforcement
+Learning Finally Works"): sparse weight initialization (``sparsity``),
+parameterless layer normalization (``use_layer_norm``), and global ObGD
+update bounding (``bounder="obgd"`` with sensitivity ``bounder_kappa``).
+
+References:
+    Sutton & Barto (2018). "Reinforcement Learning: An Introduction," §10.1.
+    Elsayed et al. (2024). "Streaming Deep Reinforcement Learning Finally
+        Works."
 """
 
 from __future__ import annotations

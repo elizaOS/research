@@ -1,4 +1,13 @@
-"""Contracts for the inert hidden-partner world lifecycle v6 design."""
+"""Contracts for the inert hidden-partner world lifecycle v6 design.
+
+The object under test
+(:mod:`alberta_framework.evaluation.hidden_partner_lifecycle_world_v6`) is a
+frozen, digest-bound design *manifest*, not a runnable protocol: it must
+stay nonexecuting, unseeded, and nonpromoting until every named
+prerequisite is certified.  The tests pin the manifest's exact content and
+prove, via source/AST inspection, that the module cannot construct worlds,
+derive seeds, or publish artifacts.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +24,12 @@ from alberta_framework.evaluation import hidden_partner_lifecycle_world_v6 as de
 pytestmark = pytest.mark.unit
 
 
+# The EXPECTED_* tables restate, as independent literals, the frozen values
+# published by the v6 design manifest (digest-bound via DESIGN_PAYLOAD_SHA256).
+# Restating them here turns any manifest edit into an explicit test failure
+# instead of letting the suite inherit its own expectations.  The birth bank
+# deliberately omits the critical pairs (0, 2) and (4, 5): the agent must
+# discover them through the lifecycle, never start with them.
 EXPECTED_BIRTH_BANK = (
     (0, 4),
     (0, 5),

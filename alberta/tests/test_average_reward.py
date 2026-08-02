@@ -406,7 +406,7 @@ def test_epsilon_one_freezes_actor_but_not_critic() -> None:
     )
 
 
-def test_update_logs_policy_that_sampled_next_action_before_parameter_update() -> None:
+def test_update_samples_successor_from_committed_parameters_across_execution_paths() -> None:
     config = AverageRewardHordeActorCriticConfig(
         n_actions=2,
         hidden_sizes=(4,),
@@ -421,27 +421,55 @@ def test_update_logs_policy_that_sampled_next_action_before_parameter_update() -
         jnp.array([1.0, 0.0], dtype=jnp.float32),
     )
     next_observation = jnp.array([0.0, 1.0], dtype=jnp.float32)
-    expected_sample, _ = agent.sample_policy(state, next_observation)
+    stale_sample, _ = agent.sample_policy(state, next_observation)
     result = agent.update(state, 10.0, next_observation)
+    with jax.disable_jit():
+        eager = agent.update(state, 10.0, next_observation)
 
-    chex.assert_trees_all_equal(result.action, expected_sample.action)
-    chex.assert_trees_all_close(result.policy, expected_sample.behavior_policy)
-    chex.assert_trees_all_close(
-        result.target_policy,
-        expected_sample.target_policy,
+    # The actor did change, so this distinguishes the causal boundary from the
+    # historical pre-update successor-sampling behavior.
+    assert not jnp.array_equal(result.target_policy, stale_sample.target_policy)
+    for candidate in (result, eager):
+        current_target = agent.policy(candidate.state, next_observation)
+        current_behavior = agent.behavior_policy(candidate.state, next_observation)
+        expected_sample, expected_key = agent.sample_policy(
+            candidate.state.replace(rng_key=state.rng_key),
+            next_observation,
+        )
+        chex.assert_trees_all_equal(candidate.target_policy, current_target)
+        chex.assert_trees_all_equal(candidate.policy, current_behavior)
+        chex.assert_trees_all_equal(candidate.state.last_policy_sample, expected_sample)
+        chex.assert_trees_all_equal(candidate.state.rng_key, expected_key)
+        chex.assert_trees_all_equal(
+            candidate.state.last_policy_sample.target_policy,
+            current_target,
+        )
+        chex.assert_trees_all_equal(
+            candidate.state.last_policy_sample.behavior_policy,
+            current_behavior,
+        )
+        chex.assert_trees_all_equal(
+            candidate.target_action_probability,
+            current_target[candidate.action],
+        )
+        chex.assert_trees_all_equal(
+            candidate.behavior_action_probability,
+            current_behavior[candidate.action],
+        )
+
+    scanned = run_average_reward_horde_actor_critic_from_arrays(
+        agent,
+        state,
+        jnp.asarray([10.0], dtype=jnp.float32),
+        next_observation[None, :],
     )
-    chex.assert_trees_all_close(
-        result.behavior_action_probability,
-        expected_sample.behavior_probability,
-    )
-    chex.assert_trees_all_close(
-        result.target_action_probability,
-        expected_sample.target_probability,
-    )
-    chex.assert_trees_all_close(
-        result.state.last_policy_sample,
-        expected_sample,
-    )
+    scanned_target = agent.policy(scanned.state, next_observation)
+    scanned_behavior = agent.behavior_policy(scanned.state, next_observation)
+    chex.assert_trees_all_equal(scanned.target_policies[0], scanned_target)
+    chex.assert_trees_all_equal(scanned.policies[0], scanned_behavior)
+    chex.assert_trees_all_equal(scanned.state.last_policy_sample.target_policy, scanned_target)
+    chex.assert_trees_all_equal(scanned.state.last_policy_sample.behavior_policy, scanned_behavior)
+    chex.assert_trees_all_equal(scanned.actions[0], scanned.state.last_action)
 
 
 def test_average_reward_actor_critic_scan_logs_action_probabilities() -> None:

@@ -956,7 +956,7 @@ def run_multi_head_learning_loop(
 
     Scans over pre-provided observation and target arrays. This is
     designed for settings where data comes from an external source
-    (e.g. security event logs) rather than from a ``ScanStream``.
+    rather than from a ``ScanStream``.
 
     Args:
         learner: Multi-head MLP learner

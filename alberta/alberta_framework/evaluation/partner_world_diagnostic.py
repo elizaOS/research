@@ -56,7 +56,16 @@ from alberta_framework.core.partner_world_model import (
 
 @dataclasses.dataclass(frozen=True)
 class ChangingPartnerDiagnosticConfig:
-    """Frozen shape and development calibration for the A-B-A stream."""
+    """Frozen shape and development calibration for the A-B-A stream.
+
+    The default ``behavior_step_size`` (0.05), ``world_step_size`` (0.25),
+    and ``exploration_probability`` (0.10) match the corresponding defaults
+    of :class:`~alberta_framework.core.integrated_hidden_partner.IntegratedHiddenPartnerConfig`,
+    so this diagnostic exercises the substrate at its shipped rates.
+    ``early_window`` averages the first steps of each phase — adaptation
+    speed immediately after an unsignaled switch — while ``tail_window``
+    averages the last steps, i.e. settled end-of-phase performance.
+    """
 
     seed: int = 0
     phase_length: int = 512

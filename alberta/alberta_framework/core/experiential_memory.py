@@ -9,6 +9,16 @@ in particular, reward is never folded into either reliability or utility.
 All persistent state is held in fixed-shape JAX arrays.  The implementation is
 therefore compatible with ``jax.jit`` and ``jax.lax.scan`` and exposes exact
 array-byte and entry-count accounting.
+
+The design follows the episodic-memory lineage: stored transitions reused as
+learning signal (Lin 1992) and similarity-weighted nearest-neighbor retrieval
+over exemplar keys (Blundell et al. 2016), here with explicit reliability,
+staleness, and safety gating instead of unconditional recall.
+
+References:
+    Lin (1992). "Self-Improving Reactive Agents Based on Reinforcement
+        Learning, Planning and Teaching."
+    Blundell et al. (2016). "Model-Free Episodic Control."
 """
 
 from __future__ import annotations
@@ -40,8 +50,15 @@ class ExperientialMemoryConfig:
         outcome_dim: Width of the stored outcome vector.
         top_k: Maximum neighbors considered by one query.
         min_neighbors: Minimum eligible neighbors required to retrieve.
-        distance_scale: Positive scale for the RBF key similarity.
+        distance_scale: Positive scale for the RBF key similarity
+            ``exp(-mean_squared_distance / distance_scale)``, where the
+            distance is the per-dimension mean of squared key differences.
+            It is therefore in squared key units and must be calibrated to
+            the key representation's magnitude.
         min_similarity: Minimum RBF similarity for an eligible neighbor.
+            With the defaults, a neighbor qualifies when its mean squared
+            per-dimension key distance is at most
+            ``distance_scale * ln(2) ~= 0.69``.
         min_effective_reliability: Minimum reliability after staleness decay.
         max_uncertainty: Maximum query and exemplar uncertainty.
         max_safety_cost: Maximum exemplar safety cost.

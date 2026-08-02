@@ -1,10 +1,18 @@
 # mypy: disable-error-code="call-arg,name-defined"
 """Fixed-budget JAX prototype memory for Step 2 retention.
 
-This module distills the D20 OPMNIST research runner into a scan-compatible
-core learner.  It keeps multiple novelty-allocated prototypes per class and
-predicts with a softmax over nearest-prototype class logits.  The budget is
-static, every step can update the memory, and the state is a JAX PyTree.
+An online nearest-prototype classifier (cf. learning vector quantization,
+Kohonen 1990; nearest-class-mean classification, Mensink et al. 2013): each
+class owns a fixed number of prototype slots, a matched prototype is
+EMA-updated toward the observation, and a sufficiently novel observation
+claims an empty slot or recycles the least-used/oldest one (a fixed-budget,
+distance-only variant of the allocation rule in Platt 1991).  Prediction is a
+softmax over nearest-prototype class logits.
+
+The budget is static, every step can update the memory, and the state is a
+JAX PyTree, so the learner runs under ``jax.lax.scan``.  It is the core of
+the promoted Step 2 retained-view memory
+(:func:`alberta_framework.steps.step2.make_step2_memory_learner`).
 """
 
 from __future__ import annotations
@@ -31,6 +39,13 @@ class PrototypeMemoryConfig:
         novelty_threshold: Mean-squared-distance threshold for allocating a
             new prototype instead of updating the nearest existing one.
         bandwidth: Distance-to-logit bandwidth for softmax prediction.
+
+    ``novelty_threshold`` and ``bandwidth`` are both in units of *mean
+    per-dimension* squared distance, so they are insensitive to
+    ``feature_dim`` but scale with the square of the input magnitude. The
+    defaults are the promoted Step 2 MNIST-pixel calibration
+    (:class:`~alberta_framework.steps.step2.Step2MemoryConfig` uses the same
+    values); retune them for features on a different scale.
     """
 
     feature_dim: int

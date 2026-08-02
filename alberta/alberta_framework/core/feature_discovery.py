@@ -8,6 +8,17 @@ to that utility.
 This is intentionally narrower than a general MLP.  The point is to expose the
 scientific variables called out in Step 2: construction, testing, ranking, and
 discarding of features under a resource budget.
+
+The lifecycle is a generate-and-test loop (Mahmood & Sutton 2013): generators
+propose candidate features, online utility estimates test them, and the
+lowest-utility features are discarded and regenerated.  Utility-gated
+replacement of low-value units is also the core mechanism of continual
+backprop (Dohare et al. 2024).
+
+References:
+    Sutton, Bowling, & Pilarski (2022). "The Alberta Plan for AI Research."
+    Mahmood & Sutton (2013). "Representation Search through Generate and Test."
+    Dohare et al. (2024). "Loss of Plasticity in Deep Continual Learning."
 """
 
 import functools
@@ -168,8 +179,10 @@ class FixedBudgetFeatureLearner:
             utility_decay: EMA decay for feature utility estimates.
             replacement_interval: Steps between utility-based replacement
                 attempts.  Set to ``0`` to disable replacement.
-            replace_fraction: Reserved for sweeps; currently one slot is
-                replaced per replacement event.
+            replace_fraction: Accepted and serialized for sweep-configuration
+                compatibility but not read by the update path: exactly one
+                slot is replaced per replacement event regardless of this
+                value.
             min_feature_age: Minimum active age before a feature can be
                 discarded.
             candidate_count: Number of shadow candidate features to train.
@@ -189,16 +202,17 @@ class FixedBudgetFeatureLearner:
             task_activity_decay: EMA decay for task activity estimates used by
                 inverse-frequency utility balancing.
             future_utility_mix: Mixture weight for the one-step counterfactual
-                output-loss-reduction signal. ``0`` keeps the historical
-                backward-looking utility; ``1`` uses only predicted future loss
-                reduction.
+                output-loss-reduction signal. ``0`` uses only the
+                backward-looking utility EMA; ``1`` uses only predicted future
+                loss reduction.
             future_utility_trace_decay: Discount for temporally extended
                 future-utility traces. ``0`` recovers the one-step
                 counterfactual. Use ``trace_decay_from_half_life`` to sweep
                 eligibility half-lives.
             future_utility_trace_mode: ``"contribution"`` traces
-                ``error * feature`` directly; ``"marginal"`` keeps the older
-                residual-trace times feature-trace proxy for ablation.
+                ``error * feature`` directly; ``"marginal"`` approximates it
+                with the product of separate residual and feature traces
+                (retained as an ablation baseline).
             future_utility_normalization: Optional normalization for the
                 future term: ``"none"``, ``"age"``, ``"uncertainty"``, or
                 ``"uncertainty_age"``.
@@ -221,10 +235,16 @@ class FixedBudgetFeatureLearner:
             resource_exploration: Uniform allocation floor for resource
                 decisions.
             resource_advantage_clip: Absolute clip on utility advantages.
-            plasticity_replacement_multipliers: Conservative, nominal, and
-                aggressive multipliers applied to the base replacement rate.
-            plasticity_promotion_margin_multipliers: Conservative, nominal,
-                and aggressive multipliers applied to the promotion margin.
+            plasticity_replacement_multipliers: Multipliers on the base
+                replacement rate for the learned plasticity manager's
+                conservative, nominal, and aggressive actions.  The effective
+                rate is the manager's softmax-weighted mix of the three, so
+                the defaults ``(0.5, 1.0, 2.0)`` span half to double the
+                configured rate.
+            plasticity_promotion_margin_multipliers: The same three actions
+                applied to the promotion margin.  The defaults
+                ``(1.25, 1.0, 0.8)`` tighten or loosen promotion roughly
+                symmetrically on a log scale (``1.25 = 1 / 0.8``).
         """
         if n_features < 1:
             raise ValueError("n_features must be positive")

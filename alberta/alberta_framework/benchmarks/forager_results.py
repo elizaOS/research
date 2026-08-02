@@ -4,6 +4,17 @@ The official agents write one compressed NumPy archive per seed.  Importing
 those archives keeps Alberta's comparison tied to the authors' implementations
 without copying their code or silently substituting a different DQN/PPO/RTU
 implementation.
+
+Every import path aligns to the Forager paper's field-of-view headline metric
+(arXiv:2605.01131): per-step reward smoothed by an unadjusted
+``MovingAverage(0.999)`` EMA, subsampled every 100 steps, then averaged over
+the last 10% of the sampled curve (``fov_last_10pct_ema_auc``).  Raw NPZ
+imports recompute that transformation from raw rewards; the legacy SQLite path
+never re-smooths its stored, already-transformed curve.  Each imported
+:class:`ForagerRunResult` carries a versioned ``metric_contract`` (see
+:func:`~alberta_framework.benchmarks.forager.forager_metric_contract`)
+describing the exact transformation, so imported and locally executed runs
+stay comparable metric-for-metric.
 """
 
 from __future__ import annotations

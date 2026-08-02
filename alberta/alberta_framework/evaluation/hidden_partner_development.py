@@ -73,6 +73,10 @@ ConditionName = Literal[
     "random_curation",
 ]
 
+# Observation-channel index pairs whose products equal the partner's intended
+# sign in the nonlinear regimes: C uses ``x_t * b_{t-1}`` (channels 0 and 2)
+# and D uses ``u_t * v_t`` (channels 4 and 5).  Regimes A/B are linear in the
+# raw ``x`` channel, so only C and D have a critical pair feature to discover.
 _CRITICAL_C_PAIR = (0, 2)
 _CRITICAL_D_PAIR = (4, 5)
 _FLOAT_EPSILON = 1e-7
@@ -939,6 +943,9 @@ def hidden_partner_run_summary_from_dict(
         integers["initial_state_nbytes"] == integers["final_state_nbytes"]
     ):
         raise ValueError("resource_shape_matched is inconsistent with byte counts")
+    # Recompute the score's fixed anchors: chance reward is 0.5 and the
+    # epsilon-greedy ceiling is (1 - eps) * 0.95 + eps * 0.5 (matching the
+    # partner's intended sign earns E[r] = 0.95 under the 0.05 flip rate).
     expected_normalized = (floats["mean_reward"] - 0.5) / (
         (1.0 - _CONDITIONS_BY_NAME[condition].config.epsilon) * 0.95
         + _CONDITIONS_BY_NAME[condition].config.epsilon * 0.5
@@ -1183,6 +1190,8 @@ class HiddenPartnerDevelopmentRunner:
                 realized_counterfactual_regret=(
                     jnp.max(transition.oracle.counterfactual_rewards) - transition.reward
                 ),
+                # Disagreeing with the intended sign costs E[r] = 0.95 - 0.05
+                # = 0.9 in expectation under the 0.05 partner-flip rate.
                 expected_greedy_regret=jnp.where(
                     planner_action == intended_action,
                     jnp.asarray(0.0, dtype=jnp.float32),
@@ -1590,6 +1599,9 @@ def summarize_hidden_partner_run(
     d_active = _presence_numpy(active_descriptors, _CRITICAL_D_PAIR)
     c_candidate = _presence_numpy(candidate_descriptors, _CRITICAL_C_PAIR)
     d_candidate = _presence_numpy(candidate_descriptors, _CRITICAL_D_PAIR)
+    # Milestone positions in the frozen v0 schedule A B A D A C A B C:
+    # segment 5 is the first C, 8 the recurrent C, 3 the sole D.  Safe to
+    # hard-code: HiddenPartnerMappingConfig rejects any other schedule.
     first_c_mask = segments == 5
     recurrent_c_mask = segments == 8
     d_mask = segments == 3
@@ -1635,6 +1647,9 @@ def summarize_hidden_partner_run(
     )
     helpful = intervened & (model_effect > 0.0)
     harmful = intervened & (model_effect < 0.0)
+    # Epsilon-greedy ceiling: matching the partner's intended sign earns
+    # E[r] = 0.95 (the 0.05 flip rate caps it), exploration earns chance 0.5.
+    # The normalized score maps chance -> 0 and this ceiling -> 1.
     perfect_policy_reward = (1.0 - condition.config.epsilon) * 0.95 + condition.config.epsilon * 0.5
     normalized_control = (float(np.mean(rewards)) - 0.5) / max(
         perfect_policy_reward - 0.5, _FLOAT_EPSILON

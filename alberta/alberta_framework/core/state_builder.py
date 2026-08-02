@@ -18,8 +18,9 @@ write/hold units,
 
 where ``u_t`` contains the current observation and the preceding transition's
 action, reward, and discount.  It carries an RTRL-style online eligibility
-matrix.  With parameters held fixed, that matrix is the exact unrolled
-``dh_t / dtheta``; after an online parameter update, carrying it forward is the
+matrix (real-time recurrent learning; Williams & Zipser 1989).  With
+parameters held fixed, that matrix is the exact unrolled ``dh_t / dtheta``;
+after an online parameter update, carrying it forward is the
 usual changing-parameter eligibility approximation.  A downstream prediction
 or control head can therefore pass the gradient of its loss with respect to
 the emitted state to :meth:`OnlineGatedStateBuilder.learn` without replay or a

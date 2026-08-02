@@ -1,10 +1,24 @@
 # mypy: disable-error-code="call-arg"
 """Sliced isotropic Gaussian regularization for latent representations.
 
+SIGReg is the anti-collapse regularizer introduced with LeJEPA (Balestriero
+& LeCun 2025): project a latent batch onto random unit directions and
+penalize each one-dimensional projection's departure from ``N(0, 1)`` with
+an Epps-Pulley/BHEP normality statistic, driving the batch toward an
+isotropic Gaussian without covariance-matrix machinery.
+
 SIGReg is useful whenever a learner emits a batch of latent features that
 should avoid collapse while retaining a simple Gaussian prior. The functions
 here are model-agnostic: callers can use them as a diagnostic, an auxiliary
 loss in a batch learner, or a gate before trusting imagined rollouts.
+
+References:
+    Balestriero & LeCun (2025). "LeJEPA: Provable and Scalable
+        Self-Supervised Learning Without the Heuristics."
+    Epps & Pulley (1983). "A Test for Normality Based on the Empirical
+        Characteristic Function."
+    Baringhaus & Henze (1988). "A Consistent Test for Multivariate
+        Normality Based on the Empirical Characteristic Function."
 """
 
 from __future__ import annotations
@@ -24,7 +38,9 @@ class SIGRegConfig:
     """Configuration for sliced Gaussian regularization.
 
     Args:
-        n_projections: Number of random unit directions.
+        n_projections: Number of random unit directions.  More directions
+            tighten the sliced approximation to full isotropy, at cost
+            linear in ``n_projections``.
         kernel_width: Gaussian-kernel width used in the Epps-Pulley/BHEP
             statistic. ``1.0`` is the standard simple setting.
         eps: Numerical floor for norms and square roots.
@@ -95,8 +111,9 @@ def epps_pulley_gaussian_statistic(
     """Return the one-dimensional Epps-Pulley/BHEP Gaussian statistic.
 
     This is the biased Gaussian-kernel MMD between the empirical one-
-    dimensional sample distribution and ``N(0, 1)``. It is zero only when the
-    projected distribution matches the target Gaussian in the population limit.
+    dimensional sample distribution and ``N(0, 1)`` (Epps & Pulley 1983; the
+    BHEP form of Baringhaus & Henze 1988). It is zero only when the projected
+    distribution matches the target Gaussian in the population limit.
     """
     width = jnp.asarray(kernel_width, dtype=jnp.float32)
     x = jnp.ravel(jnp.asarray(samples, dtype=jnp.float32))

@@ -1,16 +1,23 @@
 # mypy: disable-error-code="attr-defined,call-arg"
 """Strict development-only diagnostics for frozen world-model snapshots.
 
-The evaluator owns held-out action-conditioned transition probes and only
-calls read-only ``predict`` methods.  It never updates a learner, infers a
-regime identifier, sets a performance threshold, or promotes a claim.  Raw
-per-case predictions and targets are retained so every descriptive aggregate
-can be reconstructed independently.
+The shallow and feed-forward ensemble lane evaluates held-out
+action-conditioned transition probes exclusively through read-only ``predict``
+calls.  The recurrent lane binds an initial frozen snapshot, then scores each
+cached predict-before-update distribution while replaying an ordered real-event
+trace through an isolated adapted state copy.  That functional replay never
+mutates the supplied snapshot and discloses every isolated update and recurrent
+advance.  Neither lane exposes evaluator labels to a learner, infers a regime
+identifier, sets a performance threshold, or promotes a claim.  Raw predictions
+and targets are retained so every descriptive aggregate can be reconstructed
+independently.
 
-Ensemble disagreement and the residual-variance EMA are reported separately.
-The latter remains explicitly non-probabilistic: no likelihood is defined by
-the current world model, so probabilistic calibration, interval coverage, and
-proper scoring-rule claims are unavailable.
+In the feed-forward lane, ensemble disagreement and the residual-variance EMA
+are reported separately; that EMA remains explicitly non-probabilistic because
+the model defines no likelihood.  The recurrent lane reports its actual
+heteroscedastic Gaussian NLL objective and variance heads, but their descriptive
+comparison with realized residuals does not establish calibrated likelihood,
+interval coverage, or any proper-scoring-rule claim.
 """
 
 from __future__ import annotations
@@ -38,6 +45,11 @@ from alberta_framework.core.checkpoints import (
     load_checkpoint_metadata,
     save_checkpoint,
 )
+from alberta_framework.core.recurrent_latent_world_model_ensemble import (
+    RecurrentLatentTransitionRecord,
+    RecurrentLatentWorldModelEnsemble,
+    RecurrentLatentWorldModelEnsembleState,
+)
 from alberta_framework.core.world_model import (
     ActionConditionedWorldModel,
     ActionConditionedWorldModelState,
@@ -53,14 +65,25 @@ WORLD_MODEL_CALIBRATION_REPORT_SCHEMA = "alberta.world-model-calibration.report.
 WORLD_MODEL_CALIBRATION_CHECKPOINT_SCHEMA = (
     "alberta.world-model-calibration.snapshot.v1"
 )
+RECURRENT_WORLD_MODEL_CALIBRATION_CHECKPOINT_SCHEMA = (
+    "alberta.recurrent-world-model-calibration.snapshot.v1"
+)
+RECURRENT_WORLD_MODEL_CALIBRATION_PROBE_SCHEMA = (
+    "alberta.recurrent-world-model-calibration.probes.v1"
+)
+RECURRENT_WORLD_MODEL_CALIBRATION_REPORT_SCHEMA = (
+    "alberta.recurrent-world-model-calibration.report.v1"
+)
 DEVELOPMENT_STATUS = "development-only-not-assessed"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_PATHS = (
+    Path("alberta_framework/core/checkpoints.py"),
     Path("alberta_framework/core/initializers.py"),
     Path("alberta_framework/core/learning_signals.py"),
     Path("alberta_framework/core/multi_head_learner.py"),
     Path("alberta_framework/core/normalizers.py"),
     Path("alberta_framework/core/optimizers.py"),
+    Path("alberta_framework/core/recurrent_latent_world_model_ensemble.py"),
     Path("alberta_framework/core/types.py"),
     Path("alberta_framework/core/world_model.py"),
     Path("alberta_framework/core/world_model_ensemble.py"),
@@ -71,7 +94,11 @@ ModelKind = Literal["ensemble", "single"]
 EpistemicBinning = Literal["equal_count", "frozen_edges"]
 DistributionPartition = Literal["in_distribution", "ood"]
 FrozenModel = WorldModelEnsemble | ActionConditionedWorldModel
-FrozenState = WorldModelEnsembleState | ActionConditionedWorldModelState
+FrozenState = (
+    WorldModelEnsembleState
+    | ActionConditionedWorldModelState
+    | RecurrentLatentWorldModelEnsembleState
+)
 
 _IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 _REGIME_TOKENS = ("regime", "latent", "oracle")
@@ -80,6 +107,14 @@ _LIMITATIONS = (
     "held-out probes supplied here do not establish external validity",
     "ensemble disagreement is descriptive and is not a calibrated probability",
     "residual variance is a non-probabilistic EMA proxy because no likelihood exists",
+    "no performance thresholds, scientific promotion, or comparative claim are made",
+)
+_RECURRENT_LIMITATIONS = (
+    "development diagnostics only; assessment status is not-assessed",
+    "the evaluator-owned ordered trace does not establish external validity",
+    "the initial frozen snapshot is replayed prequentially on an isolated state copy",
+    "heteroscedastic Gaussian NLL is a training objective, not a calibrated-likelihood claim",
+    "epistemic and aleatoric summaries are descriptive and unavailable during warm-up",
     "no performance thresholds, scientific promotion, or comparative claim are made",
 )
 
@@ -96,6 +131,30 @@ def _canonical_json_bytes(value: object) -> bytes:
 
 def _canonical_sha256(value: object) -> str:
     return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def _strict_json_equal(actual: object, expected: object) -> bool:
+    """Compare canonical JSON values without Python's bool/int coercions."""
+    if expected is None:
+        return actual is None
+    if type(expected) in {bool, int, float, str}:
+        return type(actual) is type(expected) and actual == expected
+    if isinstance(expected, list):
+        return (
+            type(actual) is list
+            and len(actual) == len(expected)
+            and all(
+                _strict_json_equal(left, right)
+                for left, right in zip(actual, expected, strict=True)
+            )
+        )
+    if isinstance(expected, Mapping):
+        return (
+            isinstance(actual, Mapping)
+            and set(actual) == set(expected)
+            and all(_strict_json_equal(actual[key], expected[key]) for key in expected)
+        )
+    return False
 
 
 def _file_sha256(path: Path) -> str:
@@ -547,6 +606,220 @@ class WorldModelCalibrationProbeSet:
         )
 
 
+def _canonical_float(name: str, value: object) -> float:
+    if type(value) is not float or not math.isfinite(value):
+        raise ValueError(f"{name} must be a canonical finite JSON float")
+    return value
+
+
+def _canonical_float_tuple(name: str, value: object) -> tuple[float, ...]:
+    if not isinstance(value, tuple) or not value:
+        raise ValueError(f"{name} must be a non-empty tuple")
+    return tuple(_canonical_float(f"{name}[{index}]", item) for index, item in enumerate(value))
+
+
+@dataclasses.dataclass(frozen=True)
+class RecurrentWorldModelCalibrationEvent:
+    """One ordered evaluator-owned real event with explicit boundary observations."""
+
+    event_id: str
+    observation: tuple[float, ...]
+    action: int
+    bootstrap_observation_target: tuple[float, ...]
+    reward_target: float
+    continuation_target: float
+    terminated: bool
+    truncated: bool
+    next_decision_observation: tuple[float, ...]
+    partition: DistributionPartition
+
+    def __post_init__(self) -> None:
+        _validate_identifier("event_id", self.event_id)
+        observation = _canonical_float_tuple("observation", self.observation)
+        bootstrap = _canonical_float_tuple(
+            "bootstrap_observation_target",
+            self.bootstrap_observation_target,
+        )
+        next_decision = _canonical_float_tuple(
+            "next_decision_observation",
+            self.next_decision_observation,
+        )
+        if len(observation) != len(bootstrap) or len(observation) != len(next_decision):
+            raise ValueError("recurrent event observation dimensions must match")
+        if type(self.action) is not int or self.action < 0:
+            raise ValueError("action must be a canonical non-negative integer")
+        _canonical_float("reward_target", self.reward_target)
+        continuation = _canonical_float("continuation_target", self.continuation_target)
+        if not 0.0 <= continuation <= 1.0:
+            raise ValueError("continuation_target must be in [0, 1]")
+        if type(self.terminated) is not bool or type(self.truncated) is not bool:
+            raise ValueError("terminated and truncated must be canonical booleans")
+        if self.terminated and self.truncated:
+            raise ValueError("terminated and truncated cannot both be true")
+        if (continuation == 0.0) != self.terminated:
+            raise ValueError("continuation_target is zero exactly on termination")
+        if self.truncated and continuation <= 0.0:
+            raise ValueError("truncation requires a positive bootstrap continuation")
+        if not (self.terminated or self.truncated) and bootstrap != next_decision:
+            raise ValueError(
+                "off a boundary bootstrap_observation_target must equal "
+                "next_decision_observation"
+            )
+        if self.partition not in {"in_distribution", "ood"}:
+            raise ValueError("partition must be in_distribution or ood")
+
+    def to_config(self) -> dict[str, object]:
+        return {
+            "event_id": self.event_id,
+            "observation": list(self.observation),
+            "action": self.action,
+            "bootstrap_observation_target": list(self.bootstrap_observation_target),
+            "reward_target": self.reward_target,
+            "continuation_target": self.continuation_target,
+            "terminated": self.terminated,
+            "truncated": self.truncated,
+            "next_decision_observation": list(self.next_decision_observation),
+            "partition": self.partition,
+        }
+
+    @classmethod
+    def from_config(
+        cls,
+        payload: Mapping[str, object],
+    ) -> RecurrentWorldModelCalibrationEvent:
+        expected = {
+            "event_id",
+            "observation",
+            "action",
+            "bootstrap_observation_target",
+            "reward_target",
+            "continuation_target",
+            "terminated",
+            "truncated",
+            "next_decision_observation",
+            "partition",
+        }
+        if set(payload) != expected:
+            raise ValueError("recurrent calibration event fields do not match v1")
+
+        def floats(name: str) -> tuple[float, ...]:
+            value = payload.get(name)
+            if not isinstance(value, list):
+                raise ValueError(f"{name} must be a JSON array")
+            return tuple(
+                _canonical_float(f"{name}[{index}]", item)
+                for index, item in enumerate(value)
+            )
+
+        event = cls(
+            event_id=cast(str, payload.get("event_id")),
+            observation=floats("observation"),
+            action=cast(int, payload.get("action")),
+            bootstrap_observation_target=floats("bootstrap_observation_target"),
+            reward_target=_canonical_float("reward_target", payload.get("reward_target")),
+            continuation_target=_canonical_float(
+                "continuation_target",
+                payload.get("continuation_target"),
+            ),
+            terminated=cast(bool, payload.get("terminated")),
+            truncated=cast(bool, payload.get("truncated")),
+            next_decision_observation=floats("next_decision_observation"),
+            partition=cast(DistributionPartition, payload.get("partition")),
+        )
+        if not _strict_json_equal(dict(payload), event.to_config()):
+            raise ValueError("recurrent calibration event is noncanonical")
+        return event
+
+
+@dataclasses.dataclass(frozen=True)
+class RecurrentWorldModelCalibrationProbeSet:
+    """One bounded evaluator-owned ordered event trace, unavailable to the learner."""
+
+    probe_set_id: str
+    events: tuple[RecurrentWorldModelCalibrationEvent, ...]
+    ownership: str = "evaluator-owned-held-out"
+    learner_use: str = "never"
+    regime_identifiers_available: bool = False
+
+    def __post_init__(self) -> None:
+        _validate_identifier("probe_set_id", self.probe_set_id)
+        if not isinstance(self.events, tuple) or not self.events:
+            raise ValueError("recurrent probe set must contain an ordered event tuple")
+        if not all(isinstance(item, RecurrentWorldModelCalibrationEvent) for item in self.events):
+            raise ValueError("events must contain recurrent calibration events")
+        identifiers = [item.event_id for item in self.events]
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("recurrent event identifiers must be unique")
+        for previous, current in zip(self.events, self.events[1:], strict=False):
+            if previous.next_decision_observation != current.observation:
+                raise ValueError(
+                    "each event observation must equal the preceding next-decision observation"
+                )
+        if self.ownership != "evaluator-owned-held-out" or self.learner_use != "never":
+            raise ValueError("recurrent probe ownership and learner-use contracts are fixed")
+        if self.regime_identifiers_available is not False:
+            raise ValueError("regime identifiers must be unavailable")
+
+    def to_config(self) -> dict[str, object]:
+        return {
+            "schema": RECURRENT_WORLD_MODEL_CALIBRATION_PROBE_SCHEMA,
+            "type": type(self).__name__,
+            "development_status": DEVELOPMENT_STATUS,
+            "ownership": self.ownership,
+            "learner_use": self.learner_use,
+            "regime_identifiers_available": self.regime_identifiers_available,
+            "probe_set_id": self.probe_set_id,
+            "events": [event.to_config() for event in self.events],
+        }
+
+    @classmethod
+    def from_config(
+        cls,
+        payload: Mapping[str, object],
+    ) -> RecurrentWorldModelCalibrationProbeSet:
+        expected = {
+            "schema",
+            "type",
+            "development_status",
+            "ownership",
+            "learner_use",
+            "regime_identifiers_available",
+            "probe_set_id",
+            "events",
+        }
+        if set(payload) != expected:
+            raise ValueError("recurrent probe-set fields do not match v1")
+        if payload.get("schema") != RECURRENT_WORLD_MODEL_CALIBRATION_PROBE_SCHEMA:
+            raise ValueError("unsupported recurrent probe-set schema")
+        if payload.get("type") != cls.__name__:
+            raise ValueError("unexpected recurrent probe-set type")
+        if payload.get("development_status") != DEVELOPMENT_STATUS:
+            raise ValueError("recurrent probe set must remain development-only")
+        events = payload.get("events")
+        if not isinstance(events, list) or not events or any(
+            not isinstance(item, Mapping) for item in events
+        ):
+            raise ValueError("recurrent probe events must be a non-empty JSON object array")
+        probes = cls(
+            probe_set_id=cast(str, payload.get("probe_set_id")),
+            events=tuple(
+                RecurrentWorldModelCalibrationEvent.from_config(
+                    cast(Mapping[str, object], item)
+                )
+                for item in events
+            ),
+            ownership=cast(str, payload.get("ownership")),
+            learner_use=cast(str, payload.get("learner_use")),
+            regime_identifiers_available=cast(
+                bool,
+                payload.get("regime_identifiers_available"),
+            ),
+        )
+        if not _strict_json_equal(dict(payload), probes.to_config()):
+            raise ValueError("recurrent probe set is noncanonical")
+        return probes
+
+
 @dataclasses.dataclass(frozen=True)
 class WorldModelCalibrationValidation:
     """Fail-closed report validation outcome without an assessment verdict."""
@@ -760,6 +1033,128 @@ def load_world_model_calibration_snapshot_checkpoint(
     ):
         raise ValueError("restored snapshot state, resources, or hash do not match")
     return model, state
+
+
+def _recurrent_snapshot_descriptor(
+    model: RecurrentLatentWorldModelEnsemble,
+    state: RecurrentLatentWorldModelEnsembleState,
+) -> dict[str, object]:
+    if not isinstance(model, RecurrentLatentWorldModelEnsemble):
+        raise TypeError("model must be a RecurrentLatentWorldModelEnsemble")
+    if not isinstance(state, RecurrentLatentWorldModelEnsembleState):
+        raise TypeError("state must be a RecurrentLatentWorldModelEnsembleState")
+    if not bool(jax.device_get(model.state_valid(state))):
+        raise ValueError("recurrent calibration snapshot state is invalid")
+    model_config = model.to_config()
+    budget = model.resource_budget(state)
+    return {
+        "model_kind": "recurrent_latent_ensemble",
+        "model_config": model_config,
+        "model_config_sha256": _canonical_sha256(model_config),
+        "state_sha256": frozen_world_model_state_sha256(state),
+        "state_logical_scalars": budget.persistent_state_scalars,
+        "state_bytes": budget.persistent_state_bytes,
+        "ensemble_size": model.config.ensemble_size,
+        "observation_dim": model.config.observation_dim,
+        "n_actions": model.config.n_actions,
+        "event_count": int(jax.device_get(state.event_count)),
+        "recurrent_advance_count": int(jax.device_get(state.recurrent_advance_count)),
+        "boundary_count": int(jax.device_get(state.boundary_count)),
+        "uncertainty_warmup_steps": model.config.uncertainty_warmup_steps,
+        "max_updates": model.config.max_updates,
+    }
+
+
+def _recurrent_model_from_config(
+    payload: object,
+) -> RecurrentLatentWorldModelEnsemble:
+    if not isinstance(payload, Mapping):
+        raise ValueError("recurrent snapshot model_config must be an object")
+    model = RecurrentLatentWorldModelEnsemble.from_config(payload)
+    if not _strict_json_equal(dict(payload), model.to_config()):
+        raise ValueError("recurrent snapshot model_config is noncanonical")
+    return model
+
+
+def save_recurrent_world_model_calibration_snapshot_checkpoint(
+    model: RecurrentLatentWorldModelEnsemble,
+    state: RecurrentLatentWorldModelEnsembleState,
+    path: str | Path,
+    *,
+    root: Path = REPO_ROOT,
+) -> None:
+    """Create a source- and descriptor-bound recurrent evaluation snapshot."""
+    destination = Path(path).expanduser()
+    if os.path.lexists(destination):
+        raise FileExistsError(f"refusing to overwrite recurrent snapshot: {destination}")
+    descriptor = _recurrent_snapshot_descriptor(model, state)
+    sources = world_model_calibration_source_snapshot(root)
+    save_checkpoint(
+        state,
+        destination,
+        metadata={
+            "schema": RECURRENT_WORLD_MODEL_CALIBRATION_CHECKPOINT_SCHEMA,
+            "development_status": DEVELOPMENT_STATUS,
+            "scientific_promotion_allowed": False,
+            "calibration_claimed": False,
+            "snapshot": descriptor,
+            "snapshot_sha256": _canonical_sha256(descriptor),
+            "source_sha256": sources,
+            "source_manifest_sha256": _canonical_sha256(sources),
+        },
+    )
+
+
+def load_recurrent_world_model_calibration_snapshot_checkpoint(
+    path: str | Path,
+    *,
+    template_key: Array | None = None,
+    root: Path = REPO_ROOT,
+) -> tuple[RecurrentLatentWorldModelEnsemble, RecurrentLatentWorldModelEnsembleState]:
+    """Restore only an exact canonical recurrent evaluation snapshot."""
+    metadata = load_checkpoint_metadata(path)
+    expected = {
+        "schema",
+        "development_status",
+        "scientific_promotion_allowed",
+        "calibration_claimed",
+        "snapshot",
+        "snapshot_sha256",
+        "source_sha256",
+        "source_manifest_sha256",
+    }
+    if set(metadata) != expected:
+        raise ValueError("recurrent snapshot metadata fields do not match v1")
+    if metadata.get("schema") != RECURRENT_WORLD_MODEL_CALIBRATION_CHECKPOINT_SCHEMA:
+        raise ValueError("unsupported recurrent calibration snapshot schema")
+    if metadata.get("development_status") != DEVELOPMENT_STATUS:
+        raise ValueError("recurrent snapshot must remain development-only")
+    if metadata.get("scientific_promotion_allowed") is not False:
+        raise ValueError("recurrent snapshot must forbid promotion")
+    if metadata.get("calibration_claimed") is not False:
+        raise ValueError("recurrent snapshot cannot claim calibration")
+    sources = world_model_calibration_source_snapshot(root)
+    if metadata.get("source_sha256") != sources or metadata.get(
+        "source_manifest_sha256"
+    ) != _canonical_sha256(sources):
+        raise ValueError("recurrent snapshot source hashes do not match")
+    snapshot = metadata.get("snapshot")
+    if not isinstance(snapshot, Mapping):
+        raise ValueError("recurrent snapshot descriptor is missing")
+    if metadata.get("snapshot_sha256") != _canonical_sha256(snapshot):
+        raise ValueError("recurrent snapshot descriptor digest does not match")
+    model = _recurrent_model_from_config(snapshot.get("model_config"))
+    key = jr.key(0) if template_key is None else template_key
+    template = model.init(key)
+    restored, restored_metadata = load_checkpoint(template, path)
+    if restored_metadata != metadata:
+        raise ValueError("recurrent snapshot metadata changed between reads")
+    if not isinstance(restored, RecurrentLatentWorldModelEnsembleState):
+        raise ValueError("recurrent snapshot state type is invalid")
+    descriptor = _recurrent_snapshot_descriptor(model, restored)
+    if not _strict_json_equal(dict(snapshot), descriptor):
+        raise ValueError("restored recurrent snapshot does not match its descriptor")
+    return model, restored
 
 
 def _python_float(value: object) -> float:
@@ -2276,8 +2671,1359 @@ def save_world_model_calibration_report(
         temporary.unlink(missing_ok=True)
 
 
+def _validate_recurrent_evaluation_inputs(
+    model: RecurrentLatentWorldModelEnsemble,
+    state: RecurrentLatentWorldModelEnsembleState,
+    config: WorldModelCalibrationConfig,
+    probes: RecurrentWorldModelCalibrationProbeSet,
+) -> tuple[int, ...]:
+    if not bool(jax.device_get(model.state_valid(state))):
+        raise ValueError("recurrent calibration initial state is invalid")
+    if config.max_rollout_probes != 0 or config.max_rollout_horizon != 0:
+        raise ValueError("recurrent calibration v1 does not support open-loop probes")
+    if len(probes.events) > config.max_one_step_cases:
+        raise ValueError("recurrent event count exceeds max_one_step_cases")
+    remaining = model.config.max_updates - int(jax.device_get(state.event_count))
+    if len(probes.events) > remaining:
+        raise ValueError("recurrent event trace exceeds the snapshot update capacity")
+    action_regions = _effective_action_regions(config, model.config.n_actions)
+    for event in probes.events:
+        if len(event.observation) != model.config.observation_dim:
+            raise ValueError(f"event {event.event_id} observation dimension does not match model")
+        if event.action >= model.config.n_actions:
+            raise ValueError(f"event {event.event_id} action is outside model action space")
+        values = (
+            *event.observation,
+            *event.bootstrap_observation_target,
+            event.reward_target,
+            event.continuation_target,
+            *event.next_decision_observation,
+        )
+        if any(abs(value) > model.config.max_input_magnitude for value in values):
+            raise ValueError(f"event {event.event_id} exceeds model input bounds")
+    return action_regions
+
+
+def _recurrent_state_region(
+    event: RecurrentWorldModelCalibrationEvent,
+    config: WorldModelCalibrationConfig,
+) -> int:
+    return int(
+        np.digitize(
+            np.asarray(
+                [np.linalg.norm(np.asarray(event.observation, dtype=np.float64))]
+            ),
+            np.asarray(config.state_norm_edges, dtype=np.float64),
+        )[0]
+    )
+
+
+def _evaluate_recurrent_raw_trace(
+    model: RecurrentLatentWorldModelEnsemble,
+    state: RecurrentLatentWorldModelEnsembleState,
+    config: WorldModelCalibrationConfig,
+    probes: RecurrentWorldModelCalibrationProbeSet,
+) -> tuple[dict[str, object], RecurrentLatentWorldModelEnsembleState, dict[str, int]]:
+    action_regions = _validate_recurrent_evaluation_inputs(model, state, config, probes)
+    local_state = state
+    start_cache = model.start(
+        local_state,
+        jnp.asarray(probes.events[0].observation, dtype=jnp.float32),
+    )
+    if not bool(jax.device_get(start_cache.valid)):
+        raise ValueError("first recurrent event could not form an owned start cache")
+    records: list[dict[str, object]] = []
+    member_parameter_updates = 0
+    for index, event in enumerate(probes.events):
+        event_count_before = int(jax.device_get(local_state.event_count))
+        advance_count_before = int(jax.device_get(local_state.recurrent_advance_count))
+        expected_observation = jnp.asarray(event.observation, dtype=jnp.float32)
+        if not np.array_equal(
+            np.asarray(jax.device_get(start_cache.observation)),
+            np.asarray(jax.device_get(expected_observation)),
+        ):
+            raise ValueError(f"event {event.event_id} is stale relative to the owned cache")
+        decision = model.decide(
+            local_state,
+            start_cache,
+            jnp.asarray(event.action, dtype=jnp.int32),
+        )
+        if not bool(jax.device_get(decision.valid)):
+            raise ValueError(f"event {event.event_id} produced an invalid decision cache")
+        prediction = decision.prediction
+        transition = RecurrentLatentTransitionRecord(
+            observation=expected_observation,
+            action=jnp.asarray(event.action, dtype=jnp.int32),
+            reward=jnp.asarray(event.reward_target, dtype=jnp.float32),
+            discount=jnp.asarray(event.continuation_target, dtype=jnp.float32),
+            terminated=jnp.asarray(event.terminated, dtype=jnp.bool_),
+            truncated=jnp.asarray(event.truncated, dtype=jnp.bool_),
+            bootstrap_observation=jnp.asarray(
+                event.bootstrap_observation_target,
+                dtype=jnp.float32,
+            ),
+            next_decision_observation=jnp.asarray(
+                event.next_decision_observation,
+                dtype=jnp.float32,
+            ),
+        )
+        result = model.update(local_state, decision, transition)
+        applied = bool(jax.device_get(result.diagnostics.applied))
+        advanced = bool(jax.device_get(result.diagnostics.recurrent_advanced_once))
+        if not applied or not advanced:
+            raise ValueError(
+                f"event {event.event_id} recurrent transaction rejected before report commit"
+            )
+        event_count_after = int(jax.device_get(result.state.event_count))
+        advance_count_after = int(jax.device_get(result.state.recurrent_advance_count))
+        if event_count_after != event_count_before + 1 or advance_count_after != (
+            advance_count_before + 1
+        ):
+            raise ValueError(f"event {event.event_id} did not advance exactly once")
+        updates = int(np.sum(np.asarray(jax.device_get(result.member_updates_applied))))
+        member_parameter_updates += updates
+        target = [
+            *event.bootstrap_observation_target,
+            event.reward_target,
+            event.continuation_target,
+        ]
+        records.append(
+            {
+                "event_id": event.event_id,
+                "event_index": index,
+                "event_count_before": event_count_before,
+                "event_count_after": event_count_after,
+                "observation": list(event.observation),
+                "action": event.action,
+                "partition": event.partition,
+                "state_region": _recurrent_state_region(event, config),
+                "action_region": action_regions[event.action],
+                "boundary": {
+                    "terminated": event.terminated,
+                    "truncated": event.truncated,
+                    "recurrent_reset": bool(
+                        jax.device_get(result.diagnostics.recurrent_reset)
+                    ),
+                    "next_decision_observation": list(event.next_decision_observation),
+                },
+                "targets": {
+                    "bootstrap_observation": list(event.bootstrap_observation_target),
+                    "reward": event.reward_target,
+                    "continuation": event.continuation_target,
+                    "grounded_vector": target,
+                },
+                "mean_predictions": {
+                    "next_observation": _python_vector(
+                        prediction.mean_next_observation
+                    ),
+                    "reward": _python_float(prediction.mean_reward),
+                    "continuation": _python_float(prediction.mean_continuation),
+                    "grounded_vector": _python_vector(prediction.mean_prediction),
+                },
+                "members": {
+                    "count": model.config.ensemble_size,
+                    "next_observations": _python_matrix(
+                        prediction.member_next_observations
+                    ),
+                    "rewards": _python_vector(prediction.member_rewards),
+                    "continuations": _python_vector(
+                        prediction.member_continuations
+                    ),
+                    "grounded_vectors": _python_matrix(
+                        prediction.member_mean_predictions
+                    ),
+                },
+                "epistemic": {
+                    "available": bool(
+                        jax.device_get(prediction.availability.epistemic)
+                    ),
+                    "warmup_ready": bool(jax.device_get(prediction.warmup_ready)),
+                    "per_head_variance": _python_vector(
+                        prediction.per_head_epistemic_variance
+                    ),
+                    "mean_disagreement": _python_float(
+                        prediction.epistemic_disagreement
+                    ),
+                },
+                "aleatoric": {
+                    "available": bool(
+                        jax.device_get(prediction.availability.aleatoric)
+                    ),
+                    "warmup_ready": bool(jax.device_get(prediction.warmup_ready)),
+                    "member_variances": _python_matrix(
+                        prediction.member_aleatoric_variances
+                    ),
+                    "mean_variance": _python_vector(
+                        prediction.mean_aleatoric_variance
+                    ),
+                    "mean_uncertainty": _python_float(
+                        prediction.aleatoric_uncertainty
+                    ),
+                    "calibrated_likelihood_claimed": False,
+                },
+                "prequential_update": {
+                    "applied_to_isolated_copy": applied,
+                    "recurrent_advanced_once": advanced,
+                    "member_negative_log_likelihoods": _python_vector(
+                        result.member_negative_log_likelihoods
+                    ),
+                    "mean_negative_log_likelihood": _python_float(
+                        result.mean_negative_log_likelihood
+                    ),
+                    "member_parameter_updates_applied": updates,
+                },
+            }
+        )
+        local_state = result.state
+        start_cache = result.next_start_cache
+    return (
+        {"events": records},
+        local_state,
+        {
+            "decide_calls": len(records),
+            "isolated_update_calls": len(records),
+            "recurrent_advances": len(records),
+            "member_parameter_updates": member_parameter_updates,
+        },
+    )
+
+
+def _recurrent_vector(value: object, name: str, *, size: int) -> np.ndarray:
+    if not isinstance(value, list) or len(value) != size:
+        raise ValueError(f"{name} must be a canonical JSON float array of length {size}")
+    return np.asarray(
+        [_canonical_float(f"{name}[{index}]", item) for index, item in enumerate(value)],
+        dtype=np.float64,
+    )
+
+
+def _recurrent_matrix(
+    value: object,
+    name: str,
+    *,
+    rows: int,
+    columns: int,
+) -> np.ndarray:
+    if not isinstance(value, list) or len(value) != rows:
+        raise ValueError(f"{name} must contain exactly {rows} rows")
+    return np.stack(
+        [
+            _recurrent_vector(row, f"{name}[{index}]", size=columns)
+            for index, row in enumerate(value)
+        ]
+    )
+
+
+def _recurrent_case_primitives(
+    record: object,
+    *,
+    observation_dim: int,
+    ensemble_size: int,
+) -> dict[str, object]:
+    event = _mapping(record, "raw recurrent event")
+    expected = {
+        "event_id",
+        "event_index",
+        "event_count_before",
+        "event_count_after",
+        "observation",
+        "action",
+        "partition",
+        "state_region",
+        "action_region",
+        "boundary",
+        "targets",
+        "mean_predictions",
+        "members",
+        "epistemic",
+        "aleatoric",
+        "prequential_update",
+    }
+    if set(event) != expected:
+        raise ValueError("raw recurrent event fields do not match v1")
+    _validate_identifier("raw recurrent event_id", event.get("event_id"))
+    integers = (
+        event.get("event_index"),
+        event.get("event_count_before"),
+        event.get("event_count_after"),
+        event.get("action"),
+        event.get("state_region"),
+        event.get("action_region"),
+    )
+    if any(type(value) is not int or value < 0 for value in integers):
+        raise ValueError("raw recurrent event counters and regions must be non-negative ints")
+    event_count_before = cast(int, event["event_count_before"])
+    if event.get("event_count_after") != event_count_before + 1:
+        raise ValueError("raw recurrent event count must advance exactly once")
+    partition = event.get("partition")
+    if partition not in {"in_distribution", "ood"}:
+        raise ValueError("raw recurrent partition is invalid")
+    observation = _recurrent_vector(
+        event.get("observation"),
+        "raw recurrent observation",
+        size=observation_dim,
+    )
+    target = _mapping(event.get("targets"), "raw recurrent targets")
+    if set(target) != {
+        "bootstrap_observation",
+        "reward",
+        "continuation",
+        "grounded_vector",
+    }:
+        raise ValueError("raw recurrent target fields do not match v1")
+    target_observation = _recurrent_vector(
+        target.get("bootstrap_observation"),
+        "recurrent target observation",
+        size=observation_dim,
+    )
+    target_reward = _canonical_float("recurrent target reward", target.get("reward"))
+    target_continuation = _canonical_float(
+        "recurrent target continuation",
+        target.get("continuation"),
+    )
+    target_vector = _recurrent_vector(
+        target.get("grounded_vector"),
+        "recurrent grounded target",
+        size=observation_dim + 2,
+    )
+    decoded_target = np.concatenate(
+        (target_observation, np.asarray([target_reward, target_continuation]))
+    )
+    if not np.array_equal(target_vector, decoded_target):
+        raise ValueError("recurrent grounded target does not reconstruct")
+
+    means = _mapping(event.get("mean_predictions"), "raw recurrent means")
+    if set(means) != {"next_observation", "reward", "continuation", "grounded_vector"}:
+        raise ValueError("raw recurrent mean fields do not match v1")
+    mean_observation = _recurrent_vector(
+        means.get("next_observation"),
+        "recurrent mean observation",
+        size=observation_dim,
+    )
+    mean_reward = _canonical_float("recurrent mean reward", means.get("reward"))
+    mean_continuation = _canonical_float(
+        "recurrent mean continuation",
+        means.get("continuation"),
+    )
+    mean_vector = _recurrent_vector(
+        means.get("grounded_vector"),
+        "recurrent grounded mean",
+        size=observation_dim + 2,
+    )
+    decoded_mean = np.concatenate(
+        (mean_observation, np.asarray([mean_reward, mean_continuation]))
+    )
+    if not np.array_equal(mean_vector, decoded_mean):
+        raise ValueError("recurrent grounded mean does not reconstruct")
+
+    members = _mapping(event.get("members"), "raw recurrent members")
+    if set(members) != {
+        "count",
+        "next_observations",
+        "rewards",
+        "continuations",
+        "grounded_vectors",
+    } or members.get("count") != ensemble_size:
+        raise ValueError("raw recurrent member fields/count do not match v1")
+    member_observations = _recurrent_matrix(
+        members.get("next_observations"),
+        "recurrent member observations",
+        rows=ensemble_size,
+        columns=observation_dim,
+    )
+    member_rewards = _recurrent_vector(
+        members.get("rewards"),
+        "recurrent member rewards",
+        size=ensemble_size,
+    )
+    member_continuations = _recurrent_vector(
+        members.get("continuations"),
+        "recurrent member continuations",
+        size=ensemble_size,
+    )
+    member_vectors = _recurrent_matrix(
+        members.get("grounded_vectors"),
+        "recurrent member grounded vectors",
+        rows=ensemble_size,
+        columns=observation_dim + 2,
+    )
+    decoded_members = np.concatenate(
+        (
+            member_observations,
+            member_rewards[:, None],
+            member_continuations[:, None],
+        ),
+        axis=1,
+    )
+    if not np.array_equal(member_vectors, decoded_members):
+        raise ValueError("recurrent member grounded vectors do not reconstruct")
+    if not np.allclose(np.mean(member_vectors, axis=0), mean_vector, rtol=0.0, atol=1e-6):
+        raise ValueError("recurrent mean prediction does not reconstruct from members")
+
+    epistemic = _mapping(event.get("epistemic"), "raw recurrent epistemic")
+    if set(epistemic) != {
+        "available",
+        "warmup_ready",
+        "per_head_variance",
+        "mean_disagreement",
+    }:
+        raise ValueError("raw recurrent epistemic fields do not match v1")
+    if type(epistemic.get("available")) is not bool or type(
+        epistemic.get("warmup_ready")
+    ) is not bool:
+        raise ValueError("recurrent epistemic availability flags must be booleans")
+    if epistemic.get("available") is not epistemic.get("warmup_ready"):
+        raise ValueError("recurrent epistemic availability must match warm-up readiness")
+    epistemic_variance = _recurrent_vector(
+        epistemic.get("per_head_variance"),
+        "recurrent epistemic variance",
+        size=observation_dim + 2,
+    )
+    reconstructed_epistemic = np.var(member_vectors, axis=0)
+    if not np.allclose(
+        epistemic_variance,
+        reconstructed_epistemic,
+        rtol=0.0,
+        atol=1e-7,
+    ):
+        raise ValueError("recurrent epistemic variance does not reconstruct")
+    disagreement = _canonical_float(
+        "recurrent epistemic disagreement",
+        epistemic.get("mean_disagreement"),
+    )
+    if not math.isclose(
+        disagreement,
+        float(np.mean(epistemic_variance)),
+        rel_tol=0.0,
+        abs_tol=1e-7,
+    ):
+        raise ValueError("recurrent epistemic disagreement does not reconstruct")
+
+    aleatoric = _mapping(event.get("aleatoric"), "raw recurrent aleatoric")
+    if set(aleatoric) != {
+        "available",
+        "warmup_ready",
+        "member_variances",
+        "mean_variance",
+        "mean_uncertainty",
+        "calibrated_likelihood_claimed",
+    }:
+        raise ValueError("raw recurrent aleatoric fields do not match v1")
+    if type(aleatoric.get("available")) is not bool or type(
+        aleatoric.get("warmup_ready")
+    ) is not bool:
+        raise ValueError("recurrent aleatoric availability flags must be booleans")
+    if aleatoric.get("available") is not epistemic.get("available") or aleatoric.get(
+        "warmup_ready"
+    ) is not epistemic.get("warmup_ready"):
+        raise ValueError("recurrent uncertainty availability flags must agree")
+    if aleatoric.get("calibrated_likelihood_claimed") is not False:
+        raise ValueError("recurrent aleatoric diagnostics cannot claim calibration")
+    member_variances = _recurrent_matrix(
+        aleatoric.get("member_variances"),
+        "recurrent member aleatoric variances",
+        rows=ensemble_size,
+        columns=observation_dim + 2,
+    )
+    if np.any(member_variances <= 0.0):
+        raise ValueError("recurrent aleatoric variances must be positive")
+    mean_variance = _recurrent_vector(
+        aleatoric.get("mean_variance"),
+        "recurrent mean aleatoric variance",
+        size=observation_dim + 2,
+    )
+    if not np.allclose(
+        np.mean(member_variances, axis=0),
+        mean_variance,
+        rtol=0.0,
+        atol=1e-6,
+    ):
+        raise ValueError("recurrent mean aleatoric variance does not reconstruct")
+    mean_uncertainty = _canonical_float(
+        "recurrent mean aleatoric uncertainty",
+        aleatoric.get("mean_uncertainty"),
+    )
+    if not math.isclose(
+        mean_uncertainty,
+        float(np.mean(mean_variance)),
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        raise ValueError("recurrent mean aleatoric uncertainty does not reconstruct")
+
+    update = _mapping(event.get("prequential_update"), "raw recurrent update")
+    if set(update) != {
+        "applied_to_isolated_copy",
+        "recurrent_advanced_once",
+        "member_negative_log_likelihoods",
+        "mean_negative_log_likelihood",
+        "member_parameter_updates_applied",
+    }:
+        raise ValueError("raw recurrent update fields do not match v1")
+    if update.get("applied_to_isolated_copy") is not True or update.get(
+        "recurrent_advanced_once"
+    ) is not True:
+        raise ValueError("every recorded recurrent transaction must apply and advance once")
+    applied_updates = update.get("member_parameter_updates_applied")
+    if type(applied_updates) is not int or not 0 <= applied_updates <= ensemble_size:
+        raise ValueError("recurrent member update count is invalid")
+    member_nll = _recurrent_vector(
+        update.get("member_negative_log_likelihoods"),
+        "recurrent member NLL",
+        size=ensemble_size,
+    )
+    mean_nll = _canonical_float("recurrent mean NLL", update.get("mean_negative_log_likelihood"))
+    reconstructed_nll = 0.5 * np.mean(
+        math.log(2.0 * math.pi)
+        + np.log(member_variances)
+        + np.square(member_vectors - target_vector[None, :]) / member_variances,
+        axis=1,
+    )
+    if not np.allclose(member_nll, reconstructed_nll, rtol=1e-5, atol=1e-5):
+        raise ValueError("recurrent member NLL does not reconstruct")
+    if not math.isclose(mean_nll, float(np.mean(member_nll)), rel_tol=1e-6, abs_tol=1e-6):
+        raise ValueError("recurrent mean NLL does not reconstruct")
+
+    boundary = _mapping(event.get("boundary"), "raw recurrent boundary")
+    if set(boundary) != {
+        "terminated",
+        "truncated",
+        "recurrent_reset",
+        "next_decision_observation",
+    }:
+        raise ValueError("raw recurrent boundary fields do not match v1")
+    for name in ("terminated", "truncated", "recurrent_reset"):
+        if type(boundary.get(name)) is not bool:
+            raise ValueError(f"raw recurrent boundary {name} must be boolean")
+    if boundary.get("recurrent_reset") is not (
+        cast(bool, boundary["terminated"]) or cast(bool, boundary["truncated"])
+    ):
+        raise ValueError("recurrent reset must exactly match a declared boundary")
+    _recurrent_vector(
+        boundary.get("next_decision_observation"),
+        "raw recurrent next-decision observation",
+        size=observation_dim,
+    )
+    squared_error = np.square(mean_vector - target_vector)
+    return {
+        "event_id": event["event_id"],
+        "event_index": cast(int, event["event_index"]),
+        "event_count_before": event_count_before,
+        "observation": observation,
+        "action": cast(int, event["action"]),
+        "partition": partition,
+        "state_region": cast(int, event["state_region"]),
+        "action_region": cast(int, event["action_region"]),
+        "squared_error": squared_error,
+        "realized_mean_squared_error": float(np.mean(squared_error)),
+        "disagreement": disagreement if cast(bool, epistemic["available"]) else None,
+        "uncertainty_available": cast(bool, epistemic["available"]),
+        "member_variances": member_variances,
+        "member_predictions": member_vectors,
+        "target_vector": target_vector,
+        "mean_nll": mean_nll,
+        "member_updates": applied_updates,
+        "boundary": cast(bool, boundary["recurrent_reset"]),
+    }
+
+
+def _recurrent_aleatoric_summary(
+    primitives: Sequence[dict[str, object]],
+    *,
+    observation_dim: int,
+) -> dict[str, object]:
+    applicable = [item for item in primitives if cast(bool, item["uncertainty_available"])]
+    if not applicable:
+        return {
+            "available": False,
+            "descriptive_applicable": False,
+            "warmup_excluded_count": len(primitives),
+            "applicable_event_count": 0,
+            "calibrated_likelihood_claimed": False,
+            "interpretation": "unavailable: every event is inside uncertainty warm-up",
+            "grounded_head_diagnostics": [],
+            "mean_gaussian_nll_training_objective": None,
+        }
+    predicted = np.stack(
+        [cast(np.ndarray, item["member_variances"]) for item in applicable]
+    )
+    member_predictions = np.stack(
+        [cast(np.ndarray, item["member_predictions"]) for item in applicable]
+    )
+    targets = np.stack([cast(np.ndarray, item["target_vector"]) for item in applicable])
+    realized = np.square(member_predictions - targets[:, None, :])
+    names = [f"next_observation_{index}" for index in range(observation_dim)] + [
+        "reward",
+        "continuation",
+    ]
+    diagnostics: list[dict[str, object]] = []
+    for index, name in enumerate(names):
+        mean_predicted = float(np.mean(predicted[:, :, index]))
+        mean_realized = float(np.mean(realized[:, :, index]))
+        diagnostics.append(
+            {
+                "head": name,
+                "mean_predicted_aleatoric_variance": mean_predicted,
+                "mean_realized_member_squared_residual": mean_realized,
+                "predicted_to_realized_ratio": (
+                    mean_predicted / mean_realized if mean_realized > 0.0 else None
+                ),
+            }
+        )
+    return {
+        "available": True,
+        "descriptive_applicable": True,
+        "warmup_excluded_count": len(primitives) - len(applicable),
+        "applicable_event_count": len(applicable),
+        "calibrated_likelihood_claimed": False,
+        "interpretation": (
+            "descriptive heteroscedastic Gaussian variance-head diagnostics; the NLL "
+            "training objective does not establish calibrated likelihood"
+        ),
+        "grounded_head_diagnostics": diagnostics,
+        "mean_gaussian_nll_training_objective": float(
+            np.mean([cast(float, item["mean_nll"]) for item in applicable])
+        ),
+    }
+
+
+def reconstruct_recurrent_world_model_calibration_summary(
+    raw_trace: Mapping[str, object],
+    config: WorldModelCalibrationConfig,
+    *,
+    observation_dim: int,
+    ensemble_size: int,
+    action_regions: tuple[int, ...],
+) -> dict[str, object]:
+    """Reconstruct all recurrent descriptive aggregates from raw event records."""
+    if set(raw_trace) != {"events"}:
+        raise ValueError("raw recurrent trace fields do not match v1")
+    values = _list(raw_trace.get("events"), "raw recurrent events")
+    if not values:
+        raise ValueError("raw recurrent trace must contain events")
+    primitives = [
+        _recurrent_case_primitives(
+            value,
+            observation_dim=observation_dim,
+            ensemble_size=ensemble_size,
+        )
+        for value in values
+    ]
+    for index, item in enumerate(primitives):
+        if item["event_index"] != index:
+            raise ValueError("raw recurrent event indices are noncanonical")
+        if index > 0 and item["event_count_before"] != (
+            cast(int, primitives[index - 1]["event_count_before"]) + 1
+        ):
+            raise ValueError("raw recurrent event-count ownership is discontinuous")
+    all_indices = list(range(len(primitives)))
+    overall = _descriptive_group(
+        primitives,
+        all_indices,
+        observation_dim=observation_dim,
+        minimum_count=config.minimum_descriptive_bin_count,
+    )
+    partitions = []
+    for name in ("in_distribution", "ood"):
+        indices = [
+            index for index, item in enumerate(primitives) if item["partition"] == name
+        ]
+        partitions.append(
+            {
+                "partition": name,
+                **_descriptive_group(
+                    primitives,
+                    indices,
+                    observation_dim=observation_dim,
+                    minimum_count=config.minimum_descriptive_bin_count,
+                ),
+            }
+        )
+    state_regions = []
+    for region in range(len(config.state_norm_edges) + 1):
+        indices = [
+            index for index, item in enumerate(primitives) if item["state_region"] == region
+        ]
+        state_regions.append(
+            {
+                "state_region": region,
+                **_descriptive_group(
+                    primitives,
+                    indices,
+                    observation_dim=observation_dim,
+                    minimum_count=config.minimum_descriptive_bin_count,
+                ),
+            }
+        )
+    action_region_metrics = []
+    for region in sorted(set(action_regions)):
+        indices = [
+            index for index, item in enumerate(primitives) if item["action_region"] == region
+        ]
+        action_region_metrics.append(
+            {
+                "action_region": region,
+                **_descriptive_group(
+                    primitives,
+                    indices,
+                    observation_dim=observation_dim,
+                    minimum_count=config.minimum_descriptive_bin_count,
+                ),
+            }
+        )
+    uncertainty_primitives = [
+        item for item in primitives if cast(bool, item["uncertainty_available"])
+    ]
+    epistemic = _epistemic_summary(uncertainty_primitives, config) if uncertainty_primitives else {
+        "available": False,
+        "reason": "unavailable: every event is inside uncertainty warm-up",
+        "realized_error_definition": "mean squared error across grounded heads",
+        "binning": None,
+        "bins": [],
+        "correlations": [],
+        "coverage_risk_curve": [],
+    }
+    epistemic = {
+        **epistemic,
+        "warmup_excluded_count": len(primitives) - len(uncertainty_primitives),
+        "applicable_event_count": len(uncertainty_primitives),
+    }
+    aleatoric = _recurrent_aleatoric_summary(
+        primitives,
+        observation_dim=observation_dim,
+    )
+    return {
+        "assessment_status": "not-assessed",
+        "thresholds_applied": False,
+        "calibration_claimed": False,
+        "evaluation_protocol": (
+            "prequential-predict-before-update-on-isolated-snapshot-copy"
+        ),
+        "overall_head_squared_error": overall,
+        "partition_metrics": partitions,
+        "state_region_metrics": state_regions,
+        "action_region_metrics": action_region_metrics,
+        "epistemic_diagnostics": epistemic,
+        "aleatoric_variance_head_diagnostics": aleatoric,
+        "prequential_transaction_accounting": {
+            "event_count": len(primitives),
+            "recurrent_advance_count": len(primitives),
+            "boundary_reset_count": sum(
+                int(cast(bool, item["boundary"])) for item in primitives
+            ),
+            "member_parameter_updates_applied": sum(
+                cast(int, item["member_updates"]) for item in primitives
+            ),
+        },
+        "applicability": {
+            "member_predictions_available": True,
+            "uncertainty_warmup_excluded_count": (
+                len(primitives) - len(uncertainty_primitives)
+            ),
+            "epistemic_diagnostics_available": bool(uncertainty_primitives),
+            "aleatoric_diagnostics_available": bool(uncertainty_primitives),
+            "probabilistic_calibration_established": False,
+        },
+    }
+
+
+def _recurrent_resource_accounting(
+    initial_snapshot: Mapping[str, object],
+    config: WorldModelCalibrationConfig,
+    counts: Mapping[str, int],
+    *,
+    ensemble_size: int,
+) -> dict[str, object]:
+    event_count = counts["decide_calls"]
+    return {
+        "initial_snapshot_state_logical_scalars": initial_snapshot.get(
+            "state_logical_scalars"
+        ),
+        "initial_snapshot_state_bytes": initial_snapshot.get("state_bytes"),
+        "bounded_event_capacity": config.max_one_step_cases,
+        "recorded_event_count": event_count,
+        "predict_before_update_decide_calls": counts["decide_calls"],
+        "isolated_copy_update_calls": counts["isolated_update_calls"],
+        "recurrent_advances": counts["recurrent_advances"],
+        "member_prediction_records": event_count * ensemble_size,
+        "member_gradient_candidates": event_count * ensemble_size,
+        "member_parameter_updates_applied": counts["member_parameter_updates"],
+        "external_snapshot_mutations": 0,
+        "learner_visible_evaluator_label_reads": 0,
+        "regime_identifier_reads": 0,
+        "persistent_evaluator_state_bytes": 0,
+    }
+
+
+def build_recurrent_world_model_calibration_report(
+    model: RecurrentLatentWorldModelEnsemble,
+    state: RecurrentLatentWorldModelEnsembleState,
+    config: WorldModelCalibrationConfig,
+    probes: RecurrentWorldModelCalibrationProbeSet,
+    *,
+    root: Path = REPO_ROOT,
+) -> dict[str, object]:
+    """Run a bounded prequential recurrent diagnostic on an isolated state copy."""
+    initial_descriptor = _recurrent_snapshot_descriptor(model, state)
+    state_hash_before = frozen_world_model_state_sha256(state)
+    raw_trace, final_state, counts = _evaluate_recurrent_raw_trace(
+        model,
+        state,
+        config,
+        probes,
+    )
+    if frozen_world_model_state_sha256(state) != state_hash_before:
+        raise RuntimeError("recurrent calibration mutated the supplied frozen snapshot")
+    final_descriptor = _recurrent_snapshot_descriptor(model, final_state)
+    action_regions = _effective_action_regions(config, model.config.n_actions)
+    summary = reconstruct_recurrent_world_model_calibration_summary(
+        raw_trace,
+        config,
+        observation_dim=model.config.observation_dim,
+        ensemble_size=model.config.ensemble_size,
+        action_regions=action_regions,
+    )
+    sources = world_model_calibration_source_snapshot(root)
+    config_payload = config.to_config()
+    probe_payload = probes.to_config()
+    resources = _recurrent_resource_accounting(
+        initial_descriptor,
+        config,
+        counts,
+        ensemble_size=model.config.ensemble_size,
+    )
+    hashes = {
+        "config_sha256": _canonical_sha256(config_payload),
+        "source_manifest_sha256": _canonical_sha256(sources),
+        "initial_snapshot_sha256": _canonical_sha256(initial_descriptor),
+        "final_isolated_state_sha256": _canonical_sha256(final_descriptor),
+        "probe_set_sha256": _canonical_sha256(probe_payload),
+        "raw_trace_sha256": _canonical_sha256(raw_trace),
+        "summary_sha256": _canonical_sha256(summary),
+        "resource_accounting_sha256": _canonical_sha256(resources),
+    }
+    payload: dict[str, object] = {
+        "development_only": True,
+        "assessment_status": "not-assessed",
+        "scientific_promotion_allowed": False,
+        "calibration_claimed": False,
+        "performance_thresholds_applied": False,
+        "evaluation_protocol": (
+            "prequential-predict-before-update-on-isolated-snapshot-copy"
+        ),
+        "config": config_payload,
+        "source_sha256": sources,
+        "initial_snapshot": initial_descriptor,
+        "final_isolated_state": final_descriptor,
+        "probe_set": probe_payload,
+        "raw_trace": raw_trace,
+        "summary": summary,
+        "resource_accounting": resources,
+        "hashes": hashes,
+        "limitations": list(_RECURRENT_LIMITATIONS),
+    }
+    return {
+        "schema": RECURRENT_WORLD_MODEL_CALIBRATION_REPORT_SCHEMA,
+        "payload": payload,
+        "payload_sha256": _canonical_sha256(payload),
+    }
+
+
+def _validate_recurrent_config_payload(payload: Mapping[str, object]) -> None:
+    integer_fields = {
+        "epistemic_bin_count",
+        "minimum_descriptive_bin_count",
+        "max_one_step_cases",
+        "max_rollout_probes",
+        "max_rollout_horizon",
+    }
+    for field in integer_fields:
+        if type(payload.get(field)) is not int:
+            raise ValueError(f"recurrent config {field} must be a canonical JSON integer")
+    for field in (
+        "epistemic_bin_edges",
+        "coverage_fractions",
+        "state_norm_edges",
+    ):
+        values = payload.get(field)
+        if not isinstance(values, list) or any(type(value) is not float for value in values):
+            raise ValueError(f"recurrent config {field} must contain canonical JSON floats")
+    regions = payload.get("action_region_by_action")
+    if not isinstance(regions, list) or any(type(value) is not int for value in regions):
+        raise ValueError("recurrent action regions must contain canonical JSON integers")
+
+
+def _validate_recurrent_snapshot_descriptor(
+    value: object,
+) -> tuple[Mapping[str, object], RecurrentLatentWorldModelEnsemble]:
+    descriptor = _mapping(value, "recurrent snapshot descriptor")
+    expected = {
+        "model_kind",
+        "model_config",
+        "model_config_sha256",
+        "state_sha256",
+        "state_logical_scalars",
+        "state_bytes",
+        "ensemble_size",
+        "observation_dim",
+        "n_actions",
+        "event_count",
+        "recurrent_advance_count",
+        "boundary_count",
+        "uncertainty_warmup_steps",
+        "max_updates",
+    }
+    if set(descriptor) != expected:
+        raise ValueError("recurrent snapshot descriptor fields do not match v1")
+    if descriptor.get("model_kind") != "recurrent_latent_ensemble":
+        raise ValueError("recurrent snapshot model kind is invalid")
+    model_config = descriptor.get("model_config")
+    model = _recurrent_model_from_config(model_config)
+    if descriptor.get("model_config_sha256") != _canonical_sha256(model_config):
+        raise ValueError("recurrent snapshot model-config digest does not match")
+    state_hash = descriptor.get("state_sha256")
+    if type(state_hash) is not str or re.fullmatch(r"[0-9a-f]{64}", state_hash) is None:
+        raise ValueError("recurrent snapshot state digest is invalid")
+    integer_fields = expected - {
+        "model_kind",
+        "model_config",
+        "model_config_sha256",
+        "state_sha256",
+    }
+    if any(
+        type(descriptor.get(field)) is not int or cast(int, descriptor[field]) < 0
+        for field in integer_fields
+    ):
+        raise ValueError("recurrent snapshot numeric descriptors must be non-negative ints")
+    expected_values = {
+        "ensemble_size": model.config.ensemble_size,
+        "observation_dim": model.config.observation_dim,
+        "n_actions": model.config.n_actions,
+        "uncertainty_warmup_steps": model.config.uncertainty_warmup_steps,
+        "max_updates": model.config.max_updates,
+    }
+    if any(
+        descriptor.get(name) != expected_value
+        for name, expected_value in expected_values.items()
+    ):
+        raise ValueError("recurrent snapshot descriptor does not match model config")
+    if descriptor.get("recurrent_advance_count") != descriptor.get("event_count"):
+        raise ValueError("recurrent snapshot event and advance counts must match")
+    if cast(int, descriptor["boundary_count"]) > cast(int, descriptor["event_count"]):
+        raise ValueError("recurrent snapshot boundary count exceeds event count")
+    if cast(int, descriptor["event_count"]) > model.config.max_updates:
+        raise ValueError("recurrent snapshot event count exceeds max_updates")
+    budget = model.resource_budget()
+    if descriptor.get("state_logical_scalars") != budget.persistent_state_scalars or (
+        descriptor.get("state_bytes") != budget.persistent_state_bytes
+    ):
+        raise ValueError("recurrent snapshot resource descriptor does not reconstruct")
+    return descriptor, model
+
+
+def _validate_recurrent_probe_trace_binding(
+    raw_trace: Mapping[str, object],
+    probes: RecurrentWorldModelCalibrationProbeSet,
+    config: WorldModelCalibrationConfig,
+    model: RecurrentLatentWorldModelEnsemble,
+    initial_event_count: int,
+) -> None:
+    records = _list(raw_trace.get("events"), "raw recurrent events")
+    if len(records) != len(probes.events):
+        raise ValueError("raw recurrent event count does not match probe set")
+    action_regions = _effective_action_regions(config, model.config.n_actions)
+    for index, (record_value, event) in enumerate(
+        zip(records, probes.events, strict=True)
+    ):
+        record = _mapping(record_value, f"raw recurrent event {index}")
+        if record.get("event_id") != event.event_id or record.get("event_index") != index:
+            raise ValueError(f"raw recurrent event {index} identity does not match probe")
+        if record.get("event_count_before") != initial_event_count + index or record.get(
+            "event_count_after"
+        ) != initial_event_count + index + 1:
+            raise ValueError(f"raw recurrent event {index} ownership count does not match")
+        if record.get("observation") != list(event.observation):
+            raise ValueError(f"raw recurrent event {index} observation does not match")
+        if record.get("action") != event.action or record.get("partition") != event.partition:
+            raise ValueError(f"raw recurrent event {index} action/partition does not match")
+        if record.get("state_region") != _recurrent_state_region(event, config) or record.get(
+            "action_region"
+        ) != action_regions[event.action]:
+            raise ValueError(f"raw recurrent event {index} evaluator region does not match")
+        target = _mapping(record.get("targets"), f"raw recurrent event {index} targets")
+        if (
+            target.get("bootstrap_observation")
+            != list(event.bootstrap_observation_target)
+            or target.get("reward") != event.reward_target
+            or target.get("continuation") != event.continuation_target
+            or target.get("grounded_vector")
+            != [
+                *event.bootstrap_observation_target,
+                event.reward_target,
+                event.continuation_target,
+            ]
+        ):
+            raise ValueError(f"raw recurrent event {index} targets do not match probe")
+        boundary = _mapping(
+            record.get("boundary"),
+            f"raw recurrent event {index} boundary",
+        )
+        if (
+            boundary.get("terminated") is not event.terminated
+            or boundary.get("truncated") is not event.truncated
+            or boundary.get("recurrent_reset")
+            is not (event.terminated or event.truncated)
+            or boundary.get("next_decision_observation")
+            != list(event.next_decision_observation)
+        ):
+            raise ValueError(f"raw recurrent event {index} boundary does not match probe")
+
+
+def validate_recurrent_world_model_calibration_report(
+    report: Mapping[str, object],
+    *,
+    root: Path = REPO_ROOT,
+    model: RecurrentLatentWorldModelEnsemble | None = None,
+    state: RecurrentLatentWorldModelEnsembleState | None = None,
+    probes: RecurrentWorldModelCalibrationProbeSet | None = None,
+) -> WorldModelCalibrationValidation:
+    """Fail closed on recurrent schema, reconstruction, hashes, or optional replay."""
+    errors: list[str] = []
+    if set(report) != {"schema", "payload", "payload_sha256"}:
+        errors.append("recurrent report top-level fields do not match v1")
+    if report.get("schema") != RECURRENT_WORLD_MODEL_CALIBRATION_REPORT_SCHEMA:
+        errors.append("recurrent calibration report schema is unsupported")
+    payload_value = report.get("payload")
+    payload = cast(Mapping[str, object], payload_value) if isinstance(
+        payload_value,
+        Mapping,
+    ) else {}
+    if not payload:
+        errors.append("recurrent report payload must be an object")
+    expected_payload = {
+        "development_only",
+        "assessment_status",
+        "scientific_promotion_allowed",
+        "calibration_claimed",
+        "performance_thresholds_applied",
+        "evaluation_protocol",
+        "config",
+        "source_sha256",
+        "initial_snapshot",
+        "final_isolated_state",
+        "probe_set",
+        "raw_trace",
+        "summary",
+        "resource_accounting",
+        "hashes",
+        "limitations",
+    }
+    if set(payload) != expected_payload:
+        errors.append("recurrent report payload fields do not match v1")
+    fixed_values = {
+        "development_only": True,
+        "assessment_status": "not-assessed",
+        "scientific_promotion_allowed": False,
+        "calibration_claimed": False,
+        "performance_thresholds_applied": False,
+        "evaluation_protocol": (
+            "prequential-predict-before-update-on-isolated-snapshot-copy"
+        ),
+        "limitations": list(_RECURRENT_LIMITATIONS),
+    }
+    for name, expected in fixed_values.items():
+        if not _strict_json_equal(payload.get(name), expected):
+            errors.append(f"recurrent report {name} is not the fixed v1 value")
+    try:
+        if report.get("payload_sha256") != _canonical_sha256(payload):
+            errors.append("recurrent report payload digest does not match")
+    except (TypeError, ValueError) as error:
+        errors.append(f"recurrent report payload is not canonical JSON: {error}")
+
+    config: WorldModelCalibrationConfig | None = None
+    config_value = payload.get("config")
+    if not isinstance(config_value, Mapping):
+        errors.append("recurrent report config must be an object")
+    else:
+        try:
+            _validate_recurrent_config_payload(config_value)
+            config = WorldModelCalibrationConfig.from_config(config_value)
+            if not _strict_json_equal(dict(config_value), config.to_config()):
+                raise ValueError("config does not reconstruct canonically")
+            if config.max_rollout_probes != 0 or config.max_rollout_horizon != 0:
+                raise ValueError("recurrent report cannot enable open-loop probes")
+        except (TypeError, ValueError) as error:
+            errors.append(f"recurrent report config is invalid: {error}")
+
+    source_value = payload.get("source_sha256")
+    try:
+        current_sources = world_model_calibration_source_snapshot(root)
+    except OSError as error:
+        errors.append(f"cannot hash recurrent calibration sources: {error}")
+        current_sources = {}
+    if source_value != current_sources:
+        errors.append("recurrent report source hashes do not match current sources")
+
+    initial_descriptor: Mapping[str, object] | None = None
+    final_descriptor: Mapping[str, object] | None = None
+    report_model: RecurrentLatentWorldModelEnsemble | None = None
+    try:
+        initial_descriptor, report_model = _validate_recurrent_snapshot_descriptor(
+            payload.get("initial_snapshot")
+        )
+    except (TypeError, ValueError) as error:
+        errors.append(f"recurrent initial snapshot is invalid: {error}")
+    try:
+        final_descriptor, final_model = _validate_recurrent_snapshot_descriptor(
+            payload.get("final_isolated_state")
+        )
+        if report_model is not None and not _strict_json_equal(
+            final_model.to_config(),
+            report_model.to_config(),
+        ):
+            raise ValueError("final isolated-state model config changed")
+    except (TypeError, ValueError) as error:
+        errors.append(f"recurrent final isolated state is invalid: {error}")
+
+    reconstructed_probes: RecurrentWorldModelCalibrationProbeSet | None = None
+    probe_value = payload.get("probe_set")
+    if not isinstance(probe_value, Mapping):
+        errors.append("recurrent report probe_set must be an object")
+    else:
+        try:
+            reconstructed_probes = RecurrentWorldModelCalibrationProbeSet.from_config(
+                probe_value
+            )
+        except (TypeError, ValueError) as error:
+            errors.append(f"recurrent report probe_set is invalid: {error}")
+
+    raw_value = payload.get("raw_trace")
+    summary_value = payload.get("summary")
+    resources_value = payload.get("resource_accounting")
+    if (
+        isinstance(raw_value, Mapping)
+        and config is not None
+        and report_model is not None
+        and reconstructed_probes is not None
+        and initial_descriptor is not None
+        and final_descriptor is not None
+    ):
+        try:
+            _validate_recurrent_evaluation_inputs(
+                report_model,
+                report_model.init(jr.key(0)),
+                config,
+                reconstructed_probes,
+            )
+            if len(reconstructed_probes.events) > (
+                report_model.config.max_updates
+                - cast(int, initial_descriptor["event_count"])
+            ):
+                raise ValueError("recurrent trace exceeds initial snapshot capacity")
+            _validate_recurrent_probe_trace_binding(
+                raw_value,
+                reconstructed_probes,
+                config,
+                report_model,
+                cast(int, initial_descriptor["event_count"]),
+            )
+            action_regions = _effective_action_regions(config, report_model.config.n_actions)
+            reconstructed_summary = reconstruct_recurrent_world_model_calibration_summary(
+                raw_value,
+                config,
+                observation_dim=report_model.config.observation_dim,
+                ensemble_size=report_model.config.ensemble_size,
+                action_regions=action_regions,
+            )
+            if _canonical_json_bytes(reconstructed_summary) != _canonical_json_bytes(
+                summary_value
+            ):
+                raise ValueError("summary does not reconstruct exactly")
+            expected_event_count = len(reconstructed_probes.events)
+            boundary_count = sum(
+                int(event.terminated or event.truncated)
+                for event in reconstructed_probes.events
+            )
+            if final_descriptor["event_count"] != (
+                cast(int, initial_descriptor["event_count"]) + expected_event_count
+            ) or final_descriptor["recurrent_advance_count"] != (
+                cast(int, initial_descriptor["recurrent_advance_count"])
+                + expected_event_count
+            ) or final_descriptor["boundary_count"] != (
+                cast(int, initial_descriptor["boundary_count"]) + boundary_count
+            ):
+                raise ValueError("final isolated-state counters do not reconstruct")
+            transactions = cast(
+                Mapping[str, object],
+                reconstructed_summary["prequential_transaction_accounting"],
+            )
+            counts = {
+                "decide_calls": expected_event_count,
+                "isolated_update_calls": expected_event_count,
+                "recurrent_advances": expected_event_count,
+                "member_parameter_updates": cast(
+                    int,
+                    transactions["member_parameter_updates_applied"],
+                ),
+            }
+            expected_resources = _recurrent_resource_accounting(
+                initial_descriptor,
+                config,
+                counts,
+                ensemble_size=report_model.config.ensemble_size,
+            )
+            if not _strict_json_equal(resources_value, expected_resources):
+                raise ValueError("resource accounting does not reconstruct exactly")
+        except (TypeError, ValueError, KeyError) as error:
+            errors.append(f"recurrent raw trace cannot be reconstructed: {error}")
+    else:
+        if not isinstance(raw_value, Mapping):
+            errors.append("recurrent raw_trace must be an object")
+        if not isinstance(summary_value, Mapping):
+            errors.append("recurrent summary must be an object")
+        if not isinstance(resources_value, Mapping):
+            errors.append("recurrent resource_accounting must be an object")
+
+    hashes_value = payload.get("hashes")
+    expected_hashes = {
+        "config_sha256": config_value,
+        "source_manifest_sha256": source_value,
+        "initial_snapshot_sha256": payload.get("initial_snapshot"),
+        "final_isolated_state_sha256": payload.get("final_isolated_state"),
+        "probe_set_sha256": probe_value,
+        "raw_trace_sha256": raw_value,
+        "summary_sha256": summary_value,
+        "resource_accounting_sha256": resources_value,
+    }
+    if not isinstance(hashes_value, Mapping) or set(hashes_value) != set(expected_hashes):
+        errors.append("recurrent report hash fields do not match v1")
+    else:
+        try:
+            reconstructed_hashes = {
+                name: _canonical_sha256(value) for name, value in expected_hashes.items()
+            }
+            if not _strict_json_equal(dict(hashes_value), reconstructed_hashes):
+                errors.append("one or more recurrent component hashes do not match")
+        except (TypeError, ValueError) as error:
+            errors.append(f"recurrent report components are not canonical JSON: {error}")
+
+    optional = (model, state, probes)
+    if any(value is not None for value in optional) and not all(
+        value is not None for value in optional
+    ):
+        errors.append("recurrent model, state, and probes must be supplied together")
+    elif (
+        model is not None
+        and state is not None
+        and probes is not None
+        and config is not None
+    ):
+        original_hash = frozen_world_model_state_sha256(state)
+        try:
+            live_initial = _recurrent_snapshot_descriptor(model, state)
+            live_raw, live_final_state, live_counts = _evaluate_recurrent_raw_trace(
+                model,
+                state,
+                config,
+                probes,
+            )
+            live_final = _recurrent_snapshot_descriptor(model, live_final_state)
+            live_resources = _recurrent_resource_accounting(
+                live_initial,
+                config,
+                live_counts,
+                ensemble_size=model.config.ensemble_size,
+            )
+            if frozen_world_model_state_sha256(state) != original_hash:
+                raise ValueError("replay mutated the supplied recurrent snapshot")
+            if not _strict_json_equal(live_initial, payload.get("initial_snapshot")):
+                raise ValueError("supplied recurrent snapshot does not match report")
+            if not _strict_json_equal(live_final, payload.get("final_isolated_state")):
+                raise ValueError("replayed final recurrent state does not match report")
+            if probes.to_config() != probe_value:
+                raise ValueError("supplied recurrent probes do not match report")
+            if _canonical_json_bytes(live_raw) != _canonical_json_bytes(raw_value):
+                raise ValueError("recurrent raw predictions do not replay exactly")
+            if not _strict_json_equal(live_resources, resources_value):
+                raise ValueError("recurrent replay resource accounting differs")
+        except (TypeError, ValueError) as error:
+            errors.append(f"recurrent snapshot replay validation failed: {error}")
+    return WorldModelCalibrationValidation(
+        valid=not errors,
+        assessment_status="not-assessed",
+        errors=tuple(errors),
+    )
+
+
+def canonical_recurrent_world_model_calibration_report_bytes(
+    report: Mapping[str, object],
+) -> bytes:
+    """Return the sole canonical recurrent-report JSON encoding."""
+    return _canonical_json_bytes(report) + b"\n"
+
+
+def load_recurrent_world_model_calibration_report(
+    path: str | Path,
+    *,
+    root: Path = REPO_ROOT,
+) -> dict[str, object]:
+    """Load only canonical JSON accepted by the recurrent report validator."""
+    data = Path(path).read_bytes()
+    report = _strict_json_object(data)
+    if data != canonical_recurrent_world_model_calibration_report_bytes(report):
+        raise ValueError("recurrent calibration report is not exact canonical JSON")
+    validation = validate_recurrent_world_model_calibration_report(report, root=root)
+    if not validation.valid:
+        raise ValueError(
+            "invalid recurrent calibration report: " + "; ".join(validation.errors)
+        )
+    return report
+
+
+def save_recurrent_world_model_calibration_report(
+    path: str | Path,
+    report: Mapping[str, object],
+    *,
+    root: Path = REPO_ROOT,
+) -> None:
+    """Atomically create one validated recurrent report without overwrite."""
+    validation = validate_recurrent_world_model_calibration_report(report, root=root)
+    if not validation.valid:
+        raise ValueError(
+            "refusing to save invalid recurrent calibration report: "
+            + "; ".join(validation.errors)
+        )
+    expanded = Path(path).expanduser()
+    destination = expanded.resolve()
+    if os.path.lexists(expanded) or os.path.lexists(destination):
+        raise FileExistsError(f"refusing to overwrite recurrent report: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(canonical_recurrent_world_model_calibration_report_bytes(report))
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, destination, follow_symlinks=False)
+        except FileExistsError as error:
+            raise FileExistsError(
+                f"refusing to overwrite concurrently created recurrent report: {destination}"
+            ) from error
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 __all__ = [
     "DEVELOPMENT_STATUS",
+    "RECURRENT_WORLD_MODEL_CALIBRATION_CHECKPOINT_SCHEMA",
+    "RECURRENT_WORLD_MODEL_CALIBRATION_PROBE_SCHEMA",
+    "RECURRENT_WORLD_MODEL_CALIBRATION_REPORT_SCHEMA",
     "REPO_ROOT",
     "SOURCE_PATHS",
     "WORLD_MODEL_CALIBRATION_CHECKPOINT_SCHEMA",
@@ -2289,15 +4035,25 @@ __all__ = [
     "WorldModelCalibrationProbeSet",
     "WorldModelCalibrationValidation",
     "WorldModelOpenLoopProbe",
+    "RecurrentWorldModelCalibrationEvent",
+    "RecurrentWorldModelCalibrationProbeSet",
+    "build_recurrent_world_model_calibration_report",
     "build_world_model_calibration_report",
+    "canonical_recurrent_world_model_calibration_report_bytes",
     "canonical_world_model_calibration_report_bytes",
     "frozen_world_model_snapshot_sha256",
     "frozen_world_model_state_sha256",
     "load_world_model_calibration_report",
+    "load_recurrent_world_model_calibration_report",
+    "load_recurrent_world_model_calibration_snapshot_checkpoint",
     "load_world_model_calibration_snapshot_checkpoint",
     "reconstruct_world_model_calibration_summary",
+    "reconstruct_recurrent_world_model_calibration_summary",
+    "save_recurrent_world_model_calibration_report",
+    "save_recurrent_world_model_calibration_snapshot_checkpoint",
     "save_world_model_calibration_report",
     "save_world_model_calibration_snapshot_checkpoint",
     "validate_world_model_calibration_report",
+    "validate_recurrent_world_model_calibration_report",
     "world_model_calibration_source_snapshot",
 ]

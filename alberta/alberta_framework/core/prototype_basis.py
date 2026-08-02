@@ -8,6 +8,13 @@ trainable value/readout map.  The same block can be used as:
 * an online supervised learner with prototype activations as features,
 * a recursive feature map by feeding activations into another basis, or
 * a transformer FFN/residual sublayer by mapping hidden states through the basis.
+
+The allocate-on-novelty rule — claim a new center when the nearest-center
+distance exceeds ``novelty_threshold``, otherwise EMA-update the nearest one —
+is the allocation rule of Platt's Resource-Allocating Network (Platt 1991,
+"A Resource-Allocating Network for Function Interpolation", Neural
+Computation 3(2)), simplified to a distance-only novelty test and restricted
+to a fixed budget with least-used/oldest slot recycling.
 """
 
 from __future__ import annotations
@@ -43,6 +50,13 @@ class PrototypeBasisConfig:
         normalize_activations: Normalize active RBF activations to sum to one.
         value_init_scale: Random value initialization scale. Zero gives a
             neutral residual/readout map.
+
+    ``novelty_threshold`` and ``bandwidth`` are both in units of *mean
+    per-dimension* squared distance, so they are insensitive to ``input_dim``
+    but scale with the square of the input magnitude. The defaults mirror the
+    Step 2 MNIST-pixel calibration of
+    :class:`~alberta_framework.core.prototype_memory.PrototypeMemoryConfig`;
+    retune them for inputs on a different scale.
     """
 
     input_dim: int
@@ -316,9 +330,10 @@ class PrototypeBasisBlock:
     ) -> tuple[PrototypeBasisState, Float[Array, " 3"], Array, Array]:
         """Allocate or update a center and return the selected slot.
 
-        This is equivalent to calling the external slot selector followed by
-        :meth:`update_centers`, but computes nearest-center distances once.
-        The return tuple is ``(state, metrics, slot, novel)``.
+        Identical to :meth:`update_centers`, but additionally returns which
+        slot was written and whether it was a novel allocation, so callers
+        (e.g. :meth:`update`) can reset per-slot state tied to a recycled
+        prototype. The return tuple is ``(state, metrics, slot, novel)``.
         """
         return self._update_centers_with_slot_impl(state, observation)
 

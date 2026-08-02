@@ -30,17 +30,20 @@ import json
 import math
 import os
 import re
+import secrets
+import selectors
 import shutil
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, Final, Literal, NoReturn, cast
+from typing import Any, BinaryIO, Final, Literal, NoReturn, cast
 
 MATCHED_CURRENT_QUALIFICATION_SCHEMA_VERSION: Final = (
     "alberta.forager_matched_current_qualification.v1"
@@ -71,7 +74,11 @@ _MAX_QUALIFICATION_ARTIFACT_ENTRIES: Final = 2_048
 _MAX_QUALIFICATION_ARTIFACT_DEPTH: Final = 32
 _MAX_QUALIFICATION_ARTIFACT_BYTES: Final = 4 * 1024**3
 _MAX_PROBE_OUTPUT_BYTES: Final = 4 * 1024 * 1024
+_MAX_GIT_METADATA_BYTES: Final = 4 * 1024
+_MAX_CLEANUP_INSPECTION_BYTES: Final = 4 * 1024
 _PROBE_TIMEOUT_SECONDS: Final = 10 * 60
+_GIT_IDENTITY_TIMEOUT_SECONDS: Final = 60
+_GIT_ARCHIVE_TIMEOUT_SECONDS: Final = 180
 _QUALIFIED_IMAGE_SHA256: Final = "5ecaabefce6439a8731c19e7a55fedb666788242baf035e6ffca86eb31299768"
 _QUALIFIED_RUNTIME_PROFILE_SHA256: Final = (
     "7170418e8082babbf17ebfbbb639ee75fcd8b5ae3931d35b3fb9199ea2bfd9b3"
@@ -84,6 +91,7 @@ _QUALIFIED_UPSTREAM_TREE: Final = "a5ad878ac4be0567c43dfd9177471c4b5a910bfa"
 _QUALIFIED_UPSTREAM_ARCHIVE_SHA256: Final = (
     "1f6976de38f34a697c947891de26ad3373b294195fe82094e9d1d5b8ddfd43b6"
 )
+_QUALIFIED_UPSTREAM_ARCHIVE_SIZE_BYTES: Final = 314_961_920
 _QUALIFIED_UPSTREAM_INVENTORY_SHA256: Final = (
     "fcab40b01123250e837d9feb222d1c086303192dd24b806ab8cb8405cd7300d9"
 )
@@ -94,8 +102,110 @@ _QUALIFIED_PYTHON: Final = "/opt/alberta-runtime/bin/python"
 _CONTAINER_SOURCE_ROOT: Final = "/qualification/source"
 _CONTAINER_CONFIG: Final = "/qualification/configuration.json"
 _CONTAINER_PROBE: Final = "/qualification/probe.py"
+_CONTAINER_BUNDLE_ROOT: Final = "/qualification/bundle"
+_CONTAINER_REPLAY_SOURCE_ROOT: Final = (
+    f"{_CONTAINER_BUNDLE_ROOT}/sources/alberta/source"
+)
 _CONTAINER_WORK_CONFIG: Final = "/run/alberta/configuration.json"
 _CONTAINER_OUTPUT_BASE: Final = "/run/alberta/output"
+_FRESH_SNAPSHOT_REPLAY_SCHEMA: Final = (
+    "alberta.forager_matched_fresh_snapshot_replay.v1"
+)
+_FRESH_SNAPSHOT_REPLAY_SCRIPT: Final = r"""
+import hashlib
+import importlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+MAX_MODULE_BYTES = 512 * 1024 * 1024
+
+def bounded_sha256(path):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size < 0
+            or before.st_size > MAX_MODULE_BYTES
+        ):
+            raise RuntimeError("qualification module is not a bounded regular file")
+        digest = hashlib.sha256()
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise RuntimeError("qualification module ended while being read")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise RuntimeError("qualification module grew while being read")
+        after = os.fstat(descriptor)
+        identity = lambda value: (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_nlink,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        if identity(before) != identity(after):
+            raise RuntimeError("qualification module changed while being read")
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+source_root = Path(sys.argv[1]).resolve(strict=True)
+qualification_root = Path(sys.argv[2]).resolve(strict=True)
+expected_module_sha256 = sys.argv[3]
+module_candidate = (
+    source_root / "alberta_framework" / "benchmarks" / "forager_matched_qualification.py"
+)
+module_sha256_before = bounded_sha256(module_candidate)
+if module_sha256_before != expected_module_sha256:
+    raise RuntimeError("qualification module differs from its trusted parent binding")
+sys.path.insert(0, source_root.as_posix())
+module = importlib.import_module(
+    "alberta_framework.benchmarks.forager_matched_qualification"
+)
+module_path = Path(module.__file__).resolve(strict=True)
+relative_module = module_path.relative_to(source_root).as_posix()
+module_sha256_after = bounded_sha256(module_path)
+if module_sha256_after != module_sha256_before:
+    raise RuntimeError("qualification module changed during import")
+bundle = module.load_matched_current_qualification_bundle(qualification_root)
+protocol, plan = module.build_open_protocol_and_execution_plan(bundle)
+for name, loaded in sorted(sys.modules.items()):
+    if name != "alberta_framework" and not name.startswith("alberta_framework."):
+        continue
+    loaded_file = getattr(loaded, "__file__", None)
+    if loaded_file is None:
+        raise RuntimeError("loaded Alberta module has no concrete staged origin")
+    Path(loaded_file).resolve(strict=True).relative_to(source_root)
+payload = {
+    "schema_version": "alberta.forager_matched_fresh_snapshot_replay.v1",
+    "manifest_sha256": bundle.manifest_sha256,
+    "protocol_sha256": protocol.protocol_sha256,
+    "plan_sha256": plan.plan_sha256,
+    "plan_qualification_manifest_sha256": plan.qualification_manifest_sha256,
+    "qualification_module_path": relative_module,
+    "qualification_module_sha256": module_sha256_after,
+}
+sys.stdout.buffer.write(
+    json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+)
+"""
 
 SourceKey = Literal["alberta", "upstream", "upstream_rng_isolated"]
 
@@ -132,6 +242,14 @@ class ForagerMatchedQualificationError(ValueError):
     """A matched-current qualification input or artifact failed closed."""
 
 
+class QualificationPublishedButUncertainError(ForagerMatchedQualificationError):
+    """The immutable output name is visible but durability or replay is uncertain."""
+
+
+class _BoundedProcessOutputError(RuntimeError):
+    """A child crossed the active stdout or stderr byte limit."""
+
+
 @dataclass(frozen=True, slots=True)
 class QualificationProcessResult:
     """Bounded process result used by the injectable OCI runner."""
@@ -140,8 +258,46 @@ class QualificationProcessResult:
     stdout: bytes
     stderr: bytes
 
+    def __post_init__(self) -> None:
+        if (
+            type(self.returncode) is not int
+            or type(self.stdout) is not bytes
+            or type(self.stderr) is not bytes
+        ):
+            raise TypeError(
+                "qualification process result requires int/bytes/bytes fields"
+            )
+
 
 QualificationRunner = Callable[[Sequence[str]], QualificationProcessResult]
+
+
+@dataclass(frozen=True, slots=True)
+class _ProbeRuntimeIdentity:
+    """Resolved live OCI executable, daemon version, and exact image identity."""
+
+    executable: Path
+    executable_sha256: str
+    version: Mapping[str, Any]
+    image_inspection: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _GitRuntimeIdentity:
+    """Absolute host Git executable identity used only for pinned source staging."""
+
+    executable: Path
+    executable_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _FreshReplayClosure:
+    """Exact parent/child closure that must survive atomic publication."""
+
+    manifest_sha256: str
+    protocol_sha256: str
+    plan_sha256: str
+    qualification_module_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +383,95 @@ class MatchedCurrentQualificationBundle:
     candidate_qualifications: Mapping[str, Any]
     candidate_assets: Mapping[str, Any]
     manifest: Mapping[str, Any]
+    manifest_bytes: bytes
+    manifest_sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidate_qualifications, Mapping) or not isinstance(
+            self.candidate_assets,
+            Mapping,
+        ):
+            raise ForagerMatchedQualificationError(
+                "qualification bundle candidate mappings are invalid"
+            )
+        if not isinstance(self.manifest, Mapping):
+            raise ForagerMatchedQualificationError(
+                "qualification bundle manifest must be a mapping"
+            )
+        if (
+            type(self.manifest_bytes) is not bytes
+            or not self.manifest_bytes
+            or len(self.manifest_bytes) > _MAX_JSON_BYTES
+        ):
+            raise ForagerMatchedQualificationError(
+                "qualification bundle manifest_bytes must be bounded exact bytes"
+            )
+        if type(self.manifest_sha256) is not str or _SHA256.fullmatch(
+            self.manifest_sha256
+        ) is None:
+            raise ForagerMatchedQualificationError(
+                "qualification bundle manifest_sha256 is not lowercase SHA-256"
+            )
+        try:
+            plain_manifest = _plain_json(
+                self.manifest,
+                "qualification bundle manifest",
+            )
+            canonical = _canonical_json_bytes(plain_manifest)
+            frozen_manifest = _freeze_json(plain_manifest)
+        except ForagerMatchedQualificationError:
+            raise
+        except (OverflowError, RecursionError, TypeError, ValueError) as exc:
+            raise ForagerMatchedQualificationError(
+                "qualification bundle manifest is not bounded canonical JSON"
+            ) from exc
+        if not isinstance(plain_manifest, dict):
+            raise ForagerMatchedQualificationError(
+                "qualification bundle manifest must be a JSON object"
+            )
+        if canonical != self.manifest_bytes:
+            raise ForagerMatchedQualificationError(
+                "qualification bundle manifest bytes differ from its exact canonical content"
+            )
+        if hashlib.sha256(self.manifest_bytes).hexdigest() != self.manifest_sha256:
+            raise ForagerMatchedQualificationError(
+                "qualification bundle manifest digest differs from its exact bytes"
+            )
+        if (
+            plain_manifest.get("schema_version")
+            != MATCHED_CURRENT_QUALIFICATION_SCHEMA_VERSION
+        ):
+            raise ForagerMatchedQualificationError(
+                "qualification bundle manifest schema is unsupported"
+            )
+        object.__setattr__(
+            self,
+            "manifest",
+            cast(Mapping[str, Any], frozen_manifest),
+        )
+        object.__setattr__(
+            self,
+            "candidate_qualifications",
+            MappingProxyType(dict(self.candidate_qualifications)),
+        )
+        object.__setattr__(
+            self,
+            "candidate_assets",
+            MappingProxyType(dict(self.candidate_assets)),
+        )
+
+
+def _freeze_json(value: Any) -> Any:
+    if type(value) is dict:
+        return MappingProxyType(
+            {
+                key: _freeze_json(item)
+                for key, item in cast(dict[str, Any], value).items()
+            }
+        )
+    if type(value) is list:
+        return tuple(_freeze_json(item) for item in value)
+    return value
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -410,6 +655,30 @@ def _regular_directory(path: Path, label: str) -> Path:
     return path.resolve()
 
 
+def _bind_project_root(path: Path) -> Path:
+    """Require staging from the project tree that loaded this verifier."""
+    requested = _regular_directory(path, "project root")
+    loaded = _regular_directory(
+        Path(__file__).resolve().parents[2],
+        "loaded Alberta project root",
+    )
+    if requested != loaded:
+        raise ForagerMatchedQualificationError(
+            "project root differs from the loaded Alberta project root"
+        )
+    framework_root = _regular_directory(
+        requested / "alberta_framework",
+        "loaded Alberta source tree",
+    )
+    try:
+        Path(__file__).resolve(strict=True).relative_to(framework_root)
+    except (OSError, ValueError) as exc:
+        raise ForagerMatchedQualificationError(
+            "qualification verifier is outside the loaded Alberta project root"
+        ) from exc
+    return requested
+
+
 def _stat_identity(metadata: os.stat_result) -> tuple[int, ...]:
     return (
         metadata.st_dev,
@@ -429,8 +698,29 @@ def _bounded_tree_walk(
     limits: _TreeWalkLimits,
     skip_descendants: frozenset[Path] = frozenset(),
     fsync: bool = False,
+    normalize_permissions: bool = False,
+    require_normalized_permissions: bool = False,
 ) -> tuple[set[Path], set[Path]]:
-    """Walk one tree with descriptor-relative race checks and hard global bounds."""
+    """Walk one tree with descriptor-relative race checks and hard global bounds.
+
+    TOCTOU model: every entry is opened ``O_NOFOLLOW`` relative to its parent
+    directory descriptor (``dir_fd``), and its stat identity (dev, inode, mode,
+    nlink, size, mtime, ctime) must agree at three points — the pre-open
+    ``stat``, the post-open ``fstat``, and a re-``stat`` through the parent
+    after the entry (or its whole subtree) has been processed.  Any mismatch
+    means the tree mutated mid-walk, and the walk fails closed rather than
+    report a snapshot that never existed.  Only regular files with
+    ``st_nlink == 1`` and non-symlink directories are admitted, so hardlink
+    aliases and special files cannot smuggle content past the digests.
+    ``limits`` bounds files, directories, total entries, depth, and bytes
+    globally, capping what a hostile tree can make the host do.  With
+    ``normalize_permissions=True``, chmod happens on the already-opened
+    descriptor while its parent descriptor remains held; no absolute child
+    path is reopened.  ``require_normalized_permissions`` verifies those
+    modes through the same descriptor discipline.  With ``fsync=True`` every
+    admitted file and directory is also made durable — that is how
+    :func:`_durably_sync_verified_tree` reuses this walk before publication.
+    """
     if any(
         type(value) is not int or value < 1
         for value in (
@@ -442,6 +732,10 @@ def _bounded_tree_walk(
         )
     ):
         raise AssertionError("tree-walk limits must be positive integers")
+    if normalize_permissions and require_normalized_permissions:
+        raise AssertionError(
+            "permission normalization and verification must be separate walks"
+        )
     canonical_root = _regular_directory(root, label)
     canonical_skips: set[Path] = set()
     for path in skip_descendants:
@@ -487,6 +781,50 @@ def _bounded_tree_walk(
     ):
         os.close(root_descriptor)
         raise ForagerMatchedQualificationError(f"{label} changed before traversal")
+
+    def permission_stable_fields(value: os.stat_result) -> tuple[int, ...]:
+        return (
+            value.st_dev,
+            value.st_ino,
+            stat.S_IFMT(value.st_mode),
+            value.st_nlink,
+            value.st_size,
+            value.st_mtime_ns,
+        )
+
+    def normalize_descriptor(
+        descriptor: int,
+        before: os.stat_result,
+        *,
+        directory: bool,
+    ) -> os.stat_result:
+        if directory:
+            if not stat.S_ISDIR(before.st_mode):
+                raise ForagerMatchedQualificationError(
+                    "qualification permission entry changed type"
+                )
+            target_mode = 0o755
+        else:
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise ForagerMatchedQualificationError(
+                    "qualification permission entry changed type"
+                )
+            target_mode = 0o755 if stat.S_IMODE(before.st_mode) & 0o111 else 0o644
+        try:
+            os.fchmod(descriptor, target_mode)
+            after = os.fstat(descriptor)
+        except OSError as exc:
+            raise ForagerMatchedQualificationError(
+                "cannot safely normalize qualification permissions"
+            ) from exc
+        if (
+            permission_stable_fields(before) != permission_stable_fields(after)
+            or stat.S_IMODE(after.st_mode) != target_mode
+        ):
+            raise ForagerMatchedQualificationError(
+                "qualification permission entry changed during normalization"
+            )
+        return after
 
     state = _TreeWalkState()
     files: set[Path] = set()
@@ -588,6 +926,19 @@ def _bounded_tree_walk(
                         raise ForagerMatchedQualificationError(
                             f"a directory in {label} changed before traversal"
                         )
+                    if normalize_permissions:
+                        child_opened = normalize_descriptor(
+                            child_descriptor,
+                            child_opened,
+                            directory=True,
+                        )
+                    elif (
+                        require_normalized_permissions
+                        and stat.S_IMODE(child_opened.st_mode) != 0o755
+                    ):
+                        raise ForagerMatchedQualificationError(
+                            "qualification directory is not traversable by the fixed OCI user"
+                        )
                     if child_path not in canonical_skips:
                         walk(child_descriptor, child_path, child_depth, child_opened)
                     check_opened_entry(
@@ -639,6 +990,19 @@ def _bounded_tree_walk(
                     raise ForagerMatchedQualificationError(
                         f"a file in {label} changed before traversal"
                     )
+                if normalize_permissions:
+                    opened = normalize_descriptor(
+                        file_descriptor,
+                        opened,
+                        directory=False,
+                    )
+                elif (
+                    require_normalized_permissions
+                    and stat.S_IMODE(opened.st_mode) not in {0o644, 0o755}
+                ):
+                    raise ForagerMatchedQualificationError(
+                        "qualification file is not readable by the fixed OCI user"
+                    )
                 if fsync:
                     os.fsync(file_descriptor)
                 check_opened_entry(
@@ -667,6 +1031,24 @@ def _bounded_tree_walk(
             )
 
     try:
+        if normalize_permissions:
+            root_metadata = normalize_descriptor(
+                root_descriptor,
+                root_metadata,
+                directory=True,
+            )
+            root_current = os.lstat(canonical_root)
+            if _stat_identity(root_metadata) != _stat_identity(root_current):
+                raise ForagerMatchedQualificationError(
+                    f"{label} changed during root permission normalization"
+                )
+        elif (
+            require_normalized_permissions
+            and stat.S_IMODE(root_metadata.st_mode) != 0o755
+        ):
+            raise ForagerMatchedQualificationError(
+                "qualification directory is not traversable by the fixed OCI user"
+            )
         walk(root_descriptor, canonical_root, 0, root_metadata)
         root_after = os.fstat(root_descriptor)
         root_current = os.lstat(canonical_root)
@@ -678,6 +1060,34 @@ def _bounded_tree_walk(
     finally:
         os.close(root_descriptor)
     return files, directories
+
+
+def _normalize_qualification_tree_permissions(root: Path) -> None:
+    """Make the tree OCI-readable without reopening absolute child paths."""
+    limits = _TreeWalkLimits(
+        files=_MAX_QUALIFICATION_FILES,
+        directories=_MAX_QUALIFICATION_DIRECTORIES,
+        entries=_MAX_QUALIFICATION_ENTRIES,
+        depth=_MAX_QUALIFICATION_DEPTH,
+        bytes=_MAX_QUALIFICATION_BYTES,
+    )
+    canonical_root = _regular_directory(root, "qualification permission tree")
+    files, directories = _bounded_tree_walk(
+        canonical_root,
+        label="qualification permission tree",
+        limits=limits,
+        normalize_permissions=True,
+    )
+    verified_files, verified_directories = _bounded_tree_walk(
+        canonical_root,
+        label="OCI-readable qualification tree",
+        limits=limits,
+        require_normalized_permissions=True,
+    )
+    if verified_files != files or verified_directories != directories:
+        raise ForagerMatchedQualificationError(
+            "qualification tree changed during permission normalization"
+        )
 
 
 def _durably_sync_verified_tree(root: Path) -> None:
@@ -787,6 +1197,59 @@ def _copy_tree(source: Path, destination: Path, *, alberta_filter: bool) -> None
             target.chmod(0o755 if stat.S_IMODE(metadata.st_mode) & 0o111 else 0o644)
 
 
+def _alberta_snapshot_fingerprint(
+    root: Path,
+) -> tuple[tuple[str, ...], tuple[tuple[str, bool, int, str], ...]]:
+    """Fingerprint exactly the live Alberta entries admitted by ``_copy_tree``."""
+    from alberta_framework.benchmarks import forager_matched_executor as executor
+
+    try:
+        directories, files = executor._source_tree_snapshot(  # noqa: SLF001
+            _regular_directory(root, "Alberta source tree")
+        )
+    except ValueError as exc:
+        raise ForagerMatchedQualificationError(
+            "cannot capture a stable Alberta source snapshot"
+        ) from exc
+
+    def excluded(path: str) -> bool:
+        parts = PurePosixPath(path).parts
+        return "__pycache__" in parts or path.endswith((".pyc", ".pyo"))
+
+    retained_directories = tuple(path for path in directories if not excluded(path))
+    retained_files = tuple(
+        (
+            path,
+            bool(mode & 0o111),
+            len(raw),
+            hashlib.sha256(raw).hexdigest(),
+        )
+        for path, mode, raw in files
+        if not excluded(path)
+    )
+    if not retained_files:
+        raise ForagerMatchedQualificationError(
+            "filtered Alberta source snapshot must contain regular files"
+        )
+    return retained_directories, retained_files
+
+
+def _copy_alberta_tree_stably(source: Path, destination: Path) -> None:
+    """Copy one filtered Alberta tree and reject persistent concurrent drift."""
+    before = _alberta_snapshot_fingerprint(source)
+    _copy_tree(source, destination, alberta_filter=True)
+    after = _alberta_snapshot_fingerprint(source)
+    if after != before:
+        raise ForagerMatchedQualificationError(
+            "live Alberta source changed during snapshot staging"
+        )
+    copied = _alberta_snapshot_fingerprint(destination)
+    if copied != before:
+        raise ForagerMatchedQualificationError(
+            "staged Alberta source differs from its stable live snapshot"
+        )
+
+
 def _archive_tree(source_root: Path, archive_path: Path) -> None:
     """Write one normalized deterministic USTAR archive."""
     source_root = _regular_directory(source_root, "archive source root")
@@ -888,43 +1351,175 @@ def _extract_git_archive(archive_path: Path, destination: Path) -> None:
             target.chmod(0o755 if member.mode & 0o111 else 0o644)
 
 
-def _git_value(checkout: Path, *arguments: str) -> str:
-    completed = subprocess.run(
-        ["git", "-C", os.fspath(checkout), *arguments],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        check=False,
-        timeout=60,
+def _git_environment() -> dict[str, str]:
+    """Return the minimal host environment admitted for pinned Git reads."""
+    return {
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_PAGER": "cat",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": "/nonexistent",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": os.defpath,
+        "TZ": "UTC",
+        "XDG_CONFIG_HOME": "/nonexistent",
+    }
+
+
+def _bind_git_runtime(requested: str | Path = "git") -> _GitRuntimeIdentity:
+    """Resolve and hash the one host Git executable admitted during staging."""
+    if isinstance(requested, Path):
+        requested_text = requested.as_posix()
+    elif type(requested) is str and requested:
+        requested_text = requested
+    else:
+        raise TypeError("Git runtime must be a non-empty str or Path")
+    resolved_text: str | None
+    if "/" in requested_text:
+        resolved_text = requested_text
+    else:
+        resolved_text = shutil.which(requested_text, path=os.defpath)
+    if resolved_text is None:
+        raise ForagerMatchedQualificationError("cannot resolve the host Git executable")
+    try:
+        executable = Path(resolved_text).resolve(strict=True)
+        metadata = executable.stat()
+    except OSError as exc:
+        raise ForagerMatchedQualificationError(
+            "cannot inspect the host Git executable"
+        ) from exc
+    if not stat.S_ISREG(metadata.st_mode) or not os.access(executable, os.X_OK):
+        raise ForagerMatchedQualificationError(
+            "host Git executable is not an executable regular file"
+        )
+    executable_sha256, _size = _sha256_file(
+        executable,
+        maximum=_MAX_SOURCE_BYTES,
     )
+    return _GitRuntimeIdentity(
+        executable=executable,
+        executable_sha256=executable_sha256,
+    )
+
+
+def _rebind_git_runtime(identity: _GitRuntimeIdentity) -> None:
+    """Fail if the resolved host Git executable changes around a source read."""
+    if type(identity) is not _GitRuntimeIdentity:
+        raise TypeError("Git runtime identity must be a _GitRuntimeIdentity")
+    try:
+        executable_sha256, _size = _sha256_file(
+            identity.executable,
+            maximum=_MAX_SOURCE_BYTES,
+        )
+    except (OSError, ValueError) as exc:
+        raise ForagerMatchedQualificationError(
+            "host Git executable changed after binding"
+        ) from exc
+    if (
+        executable_sha256 != identity.executable_sha256
+        or not os.access(identity.executable, os.X_OK)
+    ):
+        raise ForagerMatchedQualificationError(
+            "host Git executable changed after binding"
+        )
+
+
+def _git_command(
+    identity: _GitRuntimeIdentity,
+    checkout: Path,
+    *arguments: str,
+) -> tuple[str, ...]:
+    return (
+        identity.executable.as_posix(),
+        "--no-replace-objects",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.pager=cat",
+        "-c",
+        "tar.umask=0002",
+        "-C",
+        os.fspath(checkout),
+        *arguments,
+    )
+
+
+def _git_value(
+    identity: _GitRuntimeIdentity,
+    checkout: Path,
+    *arguments: str,
+) -> str:
+    _rebind_git_runtime(identity)
+    try:
+        completed = _run_bounded_process(
+            _git_command(identity, checkout, *arguments),
+            timeout=_GIT_IDENTITY_TIMEOUT_SECONDS,
+            maximum_stdout_bytes=_MAX_GIT_METADATA_BYTES,
+            maximum_stderr_bytes=_MAX_GIT_METADATA_BYTES,
+            environment=_git_environment(),
+        )
+    finally:
+        _rebind_git_runtime(identity)
     if completed.returncode != 0 or completed.stderr:
         raise ForagerMatchedQualificationError("git identity query failed")
     try:
-        return completed.stdout.decode("ascii").strip()
+        raw = completed.stdout
+        if not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+            raise ForagerMatchedQualificationError(
+                "git identity query did not return one canonical line"
+            )
+        value = raw[:-1].decode("ascii")
     except UnicodeError as exc:
         raise ForagerMatchedQualificationError("git identity is not ASCII") from exc
+    if re.fullmatch(r"[0-9a-f]{40}", value) is None:
+        raise ForagerMatchedQualificationError("git identity is not a canonical SHA-1")
+    return value
 
 
 def _build_exact_git_archive(checkout: Path, output: Path) -> None:
     checkout = _regular_directory(checkout, "upstream checkout")
-    commit = _git_value(checkout, "rev-parse", "HEAD")
-    tree = _git_value(checkout, "rev-parse", "HEAD^{tree}")
+    git_runtime = _bind_git_runtime()
+    commit = _git_value(git_runtime, checkout, "rev-parse", "HEAD")
+    tree = _git_value(git_runtime, checkout, "rev-parse", "HEAD^{tree}")
     if commit != _QUALIFIED_UPSTREAM_COMMIT or tree != _QUALIFIED_UPSTREAM_TREE:
         raise ForagerMatchedQualificationError("upstream checkout is not the frozen commit/tree")
     with output.open("xb") as handle:
-        completed = subprocess.run(
-            ["git", "-C", os.fspath(checkout), "archive", "--format=tar", commit],
-            stdin=subprocess.DEVNULL,
-            stdout=handle,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=180,
-        )
+        _rebind_git_runtime(git_runtime)
+        try:
+            completed = _run_bounded_process(
+                _git_command(
+                    git_runtime,
+                    checkout,
+                    "archive",
+                    "--format=tar",
+                    commit,
+                ),
+                timeout=_GIT_ARCHIVE_TIMEOUT_SECONDS,
+                maximum_stdout_bytes=_QUALIFIED_UPSTREAM_ARCHIVE_SIZE_BYTES,
+                maximum_stderr_bytes=_MAX_GIT_METADATA_BYTES,
+                stdout_sink=handle,
+                environment=_git_environment(),
+            )
+        finally:
+            _rebind_git_runtime(git_runtime)
         handle.flush()
         os.fsync(handle.fileno())
-    if completed.returncode != 0 or completed.stderr:
+    if completed.returncode != 0 or completed.stdout or completed.stderr:
         raise ForagerMatchedQualificationError("git archive generation failed")
-    digest, _size = _sha256_file(output)
-    if digest != _QUALIFIED_UPSTREAM_ARCHIVE_SHA256:
+    digest, size = _sha256_file(
+        output,
+        maximum=_QUALIFIED_UPSTREAM_ARCHIVE_SIZE_BYTES,
+    )
+    if (
+        size != _QUALIFIED_UPSTREAM_ARCHIVE_SIZE_BYTES
+        or digest != _QUALIFIED_UPSTREAM_ARCHIVE_SHA256
+    ):
         raise ForagerMatchedQualificationError("generated upstream archive digest drifted")
 
 
@@ -933,6 +1528,28 @@ def _stage_sources(
     upstream_checkout: Path,
     root: Path,
 ) -> dict[SourceKey, _StagedSource]:
+    """Stage the three content-addressed source trees every probe and executor run binds to.
+
+    * ``upstream`` — a ``git archive`` of the frozen upstream commit/tree
+      (identities pinned in ``_QUALIFIED_UPSTREAM_*``), extracted through the
+      bounded extractor and bound as ``provenance_kind="git_tree"``: its
+      identity is the git tree itself, cross-checked against the pinned
+      archive and inventory digests.
+    * ``upstream_rng_isolated`` — the same archive re-extracted, with
+      ``src/rtu_ppo.py`` replaced by the deterministic RNG-isolation
+      derivation (patch digest pinned in ``_QUALIFIED_RNG_PATCH_SHA256``).
+      The result matches no git tree, so it is re-archived as a normalized
+      USTAR snapshot and bound as ``provenance_kind="reviewed_snapshot"``
+      with a full snapshot descriptor recording the derivation.
+    * ``alberta`` — the live ``alberta_framework/`` working tree, copied with
+      ``__pycache__``/bytecode filtered out.  A base commit is recorded as a
+      reference point only; the working tree may differ from it, so the
+      binding is likewise a reviewed snapshot whose identity is purely its
+      normalized archive/inventory content digests.
+
+    Each staged source carries its archive digest, size, and canonical
+    inventory so downstream consumers rebind by content, never by path.
+    """
     from alberta_framework.benchmarks import forager_matched_executor as executor
     from alberta_framework.benchmarks import forager_matched_open_protocol as protocol_builder
     from alberta_framework.benchmarks import forager_rtu_ppo_rng_isolation as rng_patch
@@ -1022,10 +1639,9 @@ def _stage_sources(
     alberta_dir.mkdir()
     alberta_root = alberta_dir / "source"
     alberta_root.mkdir()
-    _copy_tree(
+    _copy_alberta_tree_stably(
         project_root / "alberta_framework",
         alberta_root / "alberta_framework",
-        alberta_filter=True,
     )
     alberta_archive = alberta_dir / "source.tar"
     _archive_tree(alberta_root, alberta_archive)
@@ -1100,6 +1716,31 @@ def _stage_sources(
             patch_path,
         ),
     }
+
+
+def _reverify_staged_source(source: _StagedSource) -> None:
+    """Rebind every transitive source file immediately around a probe run."""
+    if type(source) is not _StagedSource:
+        raise TypeError("staged source must be a _StagedSource")
+    from alberta_framework.benchmarks import forager_matched_executor as executor
+
+    try:
+        inventory = executor.source_inventory(source.root)
+        normalized_sha256 = executor.source_inventory_sha256(source.root)
+    except ValueError as exc:
+        raise ForagerMatchedQualificationError(
+            f"staged source changed for {source.key}"
+        ) from exc
+    expected_inventory_sha256 = source.binding.inventory_sha256
+    if (
+        type(expected_inventory_sha256) is not str
+        or _SHA256.fullmatch(expected_inventory_sha256) is None
+        or _plain_json(inventory) != _plain_json(source.inventory)
+        or normalized_sha256 != expected_inventory_sha256
+    ):
+        raise ForagerMatchedQualificationError(
+            f"staged source changed for {source.key}"
+        )
 
 
 def _stage_executor_qualification_roots(root: Path) -> _StagedExecutorQualifications:
@@ -1215,6 +1856,19 @@ def _materialize_configurations(
     sources: Mapping[SourceKey, _StagedSource],
     root: Path,
 ) -> dict[str, _MaterializedConfiguration]:
+    """Materialize the original/derived configuration byte pair for every candidate.
+
+    Alberta candidates use builder-generated worker envelopes: canonical JSON
+    whose digest must equal the frozen fingerprint, with ``original ==
+    derived`` and an empty transform list.  External candidates read the
+    original bytes from the staged upstream tree (or the pinned
+    ``outputs/forager`` FOV screening baselines), verify them against the
+    frozen original digest, then replay the declared byte-preserving integer
+    transforms (:func:`_replace_integer_literals`) to produce the derived
+    bytes, which must match the frozen derived digest.  Both files are
+    written side by side so any verifier can replay the transform offline
+    and confirm nothing beyond the declared integers changed.
+    """
     from alberta_framework.benchmarks import forager_matched_executor as executor
     from alberta_framework.benchmarks import forager_matched_open_protocol as builder
     from alberta_framework.benchmarks.forager_matched_protocol import ConfigurationBinding
@@ -2136,27 +2790,51 @@ def _container_probe(argv: Sequence[str]) -> int:
 def _cleanup_interrupted_probe_container(
     materialized: tuple[str, ...],
     cidfile: Path,
-) -> Literal["cid_not_materialized", "force_removed"]:
+    container_name: str | None,
+) -> Literal[
+    "not_a_container_run",
+    "force_removed_by_id",
+    "force_removed_by_name",
+    "already_absent_by_name",
+]:
     """Force-remove a probe container after its foreground client is interrupted."""
-    if not cidfile.exists():
-        return "cid_not_materialized"
-    if not cidfile.is_file() or cidfile.is_symlink():
-        raise ForagerMatchedQualificationError("OCI probe cidfile is not a regular file")
-    try:
-        container_id = _read_stable(
-            cidfile,
-            "OCI probe cidfile",
-            maximum=128,
-        ).decode("ascii").strip()
-    except UnicodeDecodeError as exc:
-        raise ForagerMatchedQualificationError("OCI probe cidfile is not ASCII") from exc
-    if re.fullmatch(r"[0-9a-f]{64}", container_id) is None:
+    if container_name is None:
+        return "not_a_container_run"
+    if re.fullmatch(r"alberta-matched-qualification-[0-9a-f]{32}", container_name) is None:
         raise ForagerMatchedQualificationError(
-            "OCI probe cidfile does not contain an exact container ID"
+            "OCI probe cleanup name violates its exact internal contract"
         )
+    cleanup_target = container_name
+    cleanup_state: Literal[
+        "force_removed_by_id",
+        "force_removed_by_name",
+        "already_absent_by_name",
+    ] = "force_removed_by_name"
+    cidfile_error: BaseException | None = None
+    if cidfile.exists():
+        if not cidfile.is_file() or cidfile.is_symlink():
+            cidfile_error = ForagerMatchedQualificationError(
+                "OCI probe cidfile is not a regular file"
+            )
+        else:
+            try:
+                container_id = _read_stable(
+                    cidfile,
+                    "OCI probe cidfile",
+                    maximum=128,
+                ).decode("ascii").strip()
+                if re.fullmatch(r"[0-9a-f]{64}", container_id) is None:
+                    raise ForagerMatchedQualificationError(
+                        "OCI probe cidfile does not contain an exact container ID"
+                    )
+            except (UnicodeDecodeError, ForagerMatchedQualificationError) as exc:
+                cidfile_error = exc
+            else:
+                cleanup_target = container_id
+                cleanup_state = "force_removed_by_id"
     try:
         cleanup = subprocess.run(
-            (materialized[0], "rm", "--force", container_id),
+            (materialized[0], "rm", "--force", cleanup_target),
             check=False,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -2168,63 +2846,332 @@ def _cleanup_interrupted_probe_container(
             "OCI probe container cleanup could not be completed"
         ) from exc
     if cleanup.returncode != 0:
+        try:
+            absence = _run_bounded_process(
+                (
+                    materialized[0],
+                    "container",
+                    "ls",
+                    "--all",
+                    "--quiet",
+                    "--no-trunc",
+                    f"--filter=name=^/{container_name}$",
+                ),
+                timeout=60,
+                maximum_stdout_bytes=_MAX_CLEANUP_INSPECTION_BYTES,
+                maximum_stderr_bytes=_MAX_CLEANUP_INSPECTION_BYTES,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ForagerMatchedQualificationError(
+                "OCI probe cleanup could not prove the exact name absent"
+            ) from exc
+        if absence.returncode != 0 or absence.stdout or absence.stderr:
+            raise ForagerMatchedQualificationError(
+                "OCI probe cleanup did not remove or prove absent the exact name"
+            )
+        cleanup_state = "already_absent_by_name"
+    if cidfile_error is not None:
         raise ForagerMatchedQualificationError(
-            "OCI probe container cleanup did not force-remove the ID"
+            f"OCI probe cidfile contract failed after cleanup={cleanup_state}"
+        ) from cidfile_error
+    return cleanup_state
+
+
+def _run_bounded_process(
+    command: Sequence[str],
+    *,
+    timeout: float,
+    maximum_stdout_bytes: int,
+    maximum_stderr_bytes: int,
+    stdout_sink: BinaryIO | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> QualificationProcessResult:
+    """Drain both pipes into bounded memory or a caller-owned stdout sink."""
+    if (
+        not isinstance(timeout, (int, float))
+        or isinstance(timeout, bool)
+        or not math.isfinite(float(timeout))
+        or timeout <= 0
+    ):
+        raise ValueError("bounded process timeout must be finite and positive")
+    if any(
+        type(limit) is not int or limit < 0
+        for limit in (maximum_stdout_bytes, maximum_stderr_bytes)
+    ):
+        raise ValueError("bounded process output limits must be nonnegative integers")
+    materialized_environment: dict[str, str] | None = None
+    if environment is not None:
+        if not isinstance(environment, Mapping):
+            raise TypeError("bounded process environment must be a mapping")
+        materialized_environment = {}
+        for env_key, value in environment.items():
+            if (
+                type(env_key) is not str
+                or not env_key
+                or "=" in env_key
+                or "\x00" in env_key
+                or type(value) is not str
+                or "\x00" in value
+            ):
+                raise ValueError("bounded process environment is invalid")
+            materialized_environment[env_key] = value
+    materialized = tuple(command)
+    process = subprocess.Popen(  # noqa: S603
+        materialized,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+        env=materialized_environment,
+    )
+    if process.stdout is None or process.stderr is None:
+        process.kill()
+        process.wait(timeout=10)
+        raise AssertionError("bounded process pipes were not created")
+    stdout = bytearray()
+    stderr = bytearray()
+    sizes = {"stdout": 0, "stderr": 0}
+    deadline = time.monotonic() + float(timeout)
+    streams: dict[str, tuple[BinaryIO, bytearray, int, BinaryIO | None]] = {
+        "stdout": (
+            cast(BinaryIO, process.stdout),
+            stdout,
+            maximum_stdout_bytes,
+            stdout_sink,
+        ),
+        "stderr": (
+            cast(BinaryIO, process.stderr),
+            stderr,
+            maximum_stderr_bytes,
+            None,
+        ),
+    }
+    try:
+        with selectors.DefaultSelector() as selector:
+            for label, (stream, _buffer, _maximum, _sink) in streams.items():
+                selector.register(stream, selectors.EVENT_READ, label)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(
+                        materialized,
+                        timeout,
+                        output=bytes(stdout),
+                        stderr=bytes(stderr),
+                    )
+                for selector_key, _events in selector.select(min(remaining, 1.0)):
+                    label = cast(Literal["stdout", "stderr"], selector_key.data)
+                    stream, buffer, maximum, sink = streams[label]
+                    allowance = maximum - sizes[label]
+                    chunk = os.read(
+                        selector_key.fd,
+                        min(64 * 1024, allowance + 1),
+                    )
+                    if not chunk:
+                        selector.unregister(selector_key.fileobj)
+                        stream.close()
+                        continue
+                    accepted = min(len(chunk), allowance)
+                    if accepted:
+                        if sink is None:
+                            buffer.extend(chunk[:accepted])
+                            written = accepted
+                        else:
+                            written_result = sink.write(chunk[:accepted])
+                            if written_result is None:
+                                written = 0
+                            else:
+                                written = written_result
+                            if written != accepted:
+                                raise ForagerMatchedQualificationError(
+                                    "bounded process stdout sink accepted a partial write"
+                                )
+                        sizes[label] += written
+                    if accepted != len(chunk):
+                        raise _BoundedProcessOutputError(
+                            "child output exceeds its active byte limit"
+                        )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 and process.poll() is None:
+            raise subprocess.TimeoutExpired(
+                materialized,
+                timeout,
+                output=bytes(stdout),
+                stderr=bytes(stderr),
+            )
+        returncode = process.wait(timeout=max(remaining, 0.001))
+        return QualificationProcessResult(
+            returncode,
+            b"" if stdout_sink is not None else bytes(stdout),
+            bytes(stderr),
         )
-    return "force_removed"
+    except BaseException:
+        if process.poll() is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired as exc:
+            raise ForagerMatchedQualificationError(
+                "bounded child could not be reaped after termination"
+            ) from exc
+        raise
+    finally:
+        if not process.stdout.closed:
+            process.stdout.close()
+        if not process.stderr.closed:
+            process.stderr.close()
 
 
 def _default_runner(command: Sequence[str]) -> QualificationProcessResult:
-    """Run one probe with file-spooled output and interruption cleanup."""
-    with (
-        tempfile.TemporaryDirectory(prefix="alberta-matched-qualification-runner-") as temporary,
-        tempfile.TemporaryFile() as stdout,
-        tempfile.TemporaryFile() as stderr,
-    ):
+    """Run one probe with active output/time bounds and interruption cleanup."""
+    with tempfile.TemporaryDirectory(
+        prefix="alberta-matched-qualification-runner-"
+    ) as temporary:
         materialized = tuple(command)
         cidfile = Path(temporary) / "container.cid"
+        container_name: str | None = None
         if len(materialized) >= 2 and materialized[1] == "run":
+            if any(
+                item == "--name"
+                or item.startswith("--name=")
+                or item == "--cidfile"
+                or item.startswith("--cidfile=")
+                for item in materialized[2:]
+            ):
+                raise ForagerMatchedQualificationError(
+                    "OCI run command already contains a name or cidfile"
+                )
+            container_name = f"alberta-matched-qualification-{secrets.token_hex(16)}"
             materialized = (
                 materialized[0],
                 materialized[1],
                 f"--cidfile={cidfile.as_posix()}",
+                f"--name={container_name}",
                 *materialized[2:],
             )
         try:
-            completed = subprocess.run(
+            completed = _run_bounded_process(
                 materialized,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout,
-                stderr=stderr,
-                check=False,
                 timeout=_PROBE_TIMEOUT_SECONDS,
+                maximum_stdout_bytes=_MAX_PROBE_OUTPUT_BYTES,
+                maximum_stderr_bytes=_MAX_PROBE_OUTPUT_BYTES,
             )
         except subprocess.TimeoutExpired as exc:
-            cleanup_state = _cleanup_interrupted_probe_container(materialized, cidfile)
+            cleanup_state = _cleanup_interrupted_probe_container(
+                materialized, cidfile, container_name
+            )
             raise ForagerMatchedQualificationError(
                 f"OCI probe exceeded its timeout; cleanup={cleanup_state}"
             ) from exc
+        except _BoundedProcessOutputError as exc:
+            cleanup_state = _cleanup_interrupted_probe_container(
+                materialized, cidfile, container_name
+            )
+            raise ForagerMatchedQualificationError(
+                f"OCI probe output exceeds its bound; cleanup={cleanup_state}"
+            ) from exc
         except Exception as exc:
-            cleanup_state = _cleanup_interrupted_probe_container(materialized, cidfile)
+            cleanup_state = _cleanup_interrupted_probe_container(
+                materialized, cidfile, container_name
+            )
             raise ForagerMatchedQualificationError(
                 f"OCI probe runner failed; cleanup={cleanup_state}"
             ) from exc
         except BaseException:
-            _cleanup_interrupted_probe_container(materialized, cidfile)
+            _cleanup_interrupted_probe_container(materialized, cidfile, container_name)
             raise
-        stdout_size = stdout.tell()
-        stderr_size = stderr.tell()
-        if (
-            stdout_size > _MAX_PROBE_OUTPUT_BYTES
-            or stderr_size > _MAX_PROBE_OUTPUT_BYTES
-        ):
-            raise ForagerMatchedQualificationError("OCI probe output exceeds its bound")
-        stdout.seek(0)
-        stderr.seek(0)
-        return QualificationProcessResult(
-            completed.returncode,
-            stdout.read(),
-            stderr.read(),
+        if completed.returncode != 0 and container_name is not None:
+            _cleanup_interrupted_probe_container(
+                materialized,
+                cidfile,
+                container_name,
+            )
+        return completed
+
+
+def _executor_runner_adapter(runner: QualificationRunner) -> Any:
+    from alberta_framework.benchmarks import forager_matched_executor as executor
+
+    def adapted(command: Sequence[str]) -> Any:
+        result = runner(tuple(command))
+        if type(result) is not QualificationProcessResult:
+            raise ForagerMatchedQualificationError(
+                "qualification runtime inspector returned an invalid result"
+            )
+        return executor.ProcessResult(result.returncode, result.stdout, result.stderr)
+
+    return adapted
+
+
+def _bind_probe_runtime(
+    runtime: str | Path,
+    runner: QualificationRunner,
+) -> _ProbeRuntimeIdentity:
+    """Resolve/hash the OCI CLI and inspect the exact image before any probe."""
+    from alberta_framework.benchmarks import forager_matched_executor as executor
+
+    try:
+        executable = executor._resolve_runtime(runtime)  # noqa: SLF001
+        executable_sha256, _size = _sha256_file(
+            executable,
+            maximum=512 * 1024 * 1024,
+        )
+        version, image_inspection = executor._inspect_runtime_bindings(  # noqa: SLF001
+            executable,
+            _executor_runner_adapter(runner),
+        )
+    except (TypeError, ValueError, OSError) as exc:
+        raise ForagerMatchedQualificationError(
+            f"cannot bind qualification OCI runtime: {exc}"
+        ) from exc
+    return _ProbeRuntimeIdentity(
+        executable=executable,
+        executable_sha256=executable_sha256,
+        version=version,
+        image_inspection=image_inspection,
+    )
+
+
+def _rebind_probe_runtime(
+    identity: _ProbeRuntimeIdentity,
+    runner: QualificationRunner,
+) -> None:
+    """Require the same executable, daemon version, and image around each probe."""
+    if type(identity) is not _ProbeRuntimeIdentity:
+        raise TypeError("probe runtime identity must be a _ProbeRuntimeIdentity")
+    from alberta_framework.benchmarks import forager_matched_executor as executor
+
+    try:
+        executable_sha256, _size = _sha256_file(
+            identity.executable,
+            maximum=512 * 1024 * 1024,
+        )
+    except (ValueError, OSError) as exc:
+        raise ForagerMatchedQualificationError(
+            "qualification OCI runtime executable changed after binding"
+        ) from exc
+    if executable_sha256 != identity.executable_sha256:
+        raise ForagerMatchedQualificationError(
+            "qualification OCI runtime executable changed after binding"
+        )
+    try:
+        version, image_inspection = executor._inspect_runtime_bindings(  # noqa: SLF001
+            identity.executable,
+            _executor_runner_adapter(runner),
+        )
+    except (TypeError, ValueError, OSError) as exc:
+        raise ForagerMatchedQualificationError(
+            f"cannot rebind qualification OCI runtime: {exc}"
+        ) from exc
+    if (
+        _plain_json(version) != _plain_json(identity.version)
+        or _plain_json(image_inspection) != _plain_json(identity.image_inspection)
+    ):
+        raise ForagerMatchedQualificationError(
+            "qualification OCI daemon version or image identity changed after binding"
         )
 
 
@@ -2258,9 +3205,17 @@ def _probe_command(runtime: str | Path, invocation: ProbeInvocation) -> list[str
         "--env=JAX_SKIP_CUDA_CONSTRAINTS_CHECK=1",
         "--env=LANG=C.UTF-8",
         "--env=LC_ALL=C.UTF-8",
+        "--env=ALL_PROXY=",
+        "--env=HTTP_PROXY=",
+        "--env=HTTPS_PROXY=",
+        "--env=all_proxy=",
+        "--env=http_proxy=",
+        "--env=https_proxy=",
         "--env=LD_LIBRARY_PATH=",
         "--env=LD_PRELOAD=",
         "--env=NVIDIA_VISIBLE_DEVICES=void",
+        "--env=NO_PROXY=",
+        "--env=no_proxy=",
         "--env=PYTHONHASHSEED=0",
         "--env=PYTHONNOUSERSITE=1",
         "--env=PYTHONPATH=",
@@ -2326,6 +3281,31 @@ def _run_probe(
     _verify_probe_payload(payload, invocation)
     stderr_sha = hashlib.sha256(b"").hexdigest()
     return payload, stderr_sha
+
+
+def _run_bound_probe(
+    runtime: _ProbeRuntimeIdentity,
+    invocation: ProbeInvocation,
+    source: _StagedSource,
+    runner: QualificationRunner,
+) -> tuple[dict[str, Any], str]:
+    """Rebind the live runtime and complete source closure around one probe."""
+    if (
+        type(runtime) is not _ProbeRuntimeIdentity
+        or type(invocation) is not ProbeInvocation
+        or type(source) is not _StagedSource
+        or source.key != invocation.source_key
+        or source.root != invocation.source_root
+    ):
+        raise ForagerMatchedQualificationError(
+            "probe request differs from its bound runtime/source closure"
+        )
+    _rebind_probe_runtime(runtime, runner)
+    _reverify_staged_source(source)
+    result = _run_probe(runtime.executable, invocation, runner)
+    _reverify_staged_source(source)
+    _rebind_probe_runtime(runtime, runner)
+    return result
 
 
 def _runtime_qualification() -> Any:
@@ -2433,6 +3413,15 @@ def _assemble_and_write(
     from alberta_framework.benchmarks import forager_matched_open_protocol as builder
 
     runtime = _runtime_qualification()
+    # Receipt <-> protocol bootstrap.  Each capability receipt embeds the
+    # candidate's capability-descriptor digest, which exists only once a
+    # protocol has been built — while the protocol's per-candidate
+    # qualification embeds the receipt digest.  Pass 1 builds a provisional
+    # protocol with placeholder receipt digests, the real receipts are
+    # derived from it, and pass 2 rebuilds the protocol with the real
+    # digests.  The check after both passes proves the capability descriptor
+    # is byte-identical across them — i.e. the descriptor never depended on
+    # the receipt digest, so the fixpoint is exact rather than circular.
     placeholder_receipts = {
         candidate_id: hashlib.sha256(f"pending:{candidate_id}".encode("ascii")).hexdigest()
         for candidate_id in builder.MATCHED_CURRENT_CANDIDATE_IDS
@@ -2600,31 +3589,141 @@ def _assemble_and_write(
     (root / "manifest.json.sha256").write_text(f"{manifest_sha}\n", encoding="ascii")
 
 
-def _publish_directory_no_replace(source: Path, destination: Path, parent: Path) -> None:
-    """Atomically publish one sibling directory without replacement."""
+def _directory_inode(metadata: os.stat_result) -> tuple[int, int]:
+    return metadata.st_dev, metadata.st_ino
+
+
+def _directory_descriptor_matches_path(
+    descriptor: int,
+    path: Path,
+    expected_identity: tuple[int, int],
+) -> bool:
+    try:
+        opened = os.fstat(descriptor)
+        current = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(opened.st_mode)
+        and stat.S_ISDIR(current.st_mode)
+        and not path.is_symlink()
+        and _directory_inode(opened) == expected_identity
+        and _directory_inode(current) == expected_identity
+    )
+
+
+def _directory_entry_matches_descriptor(
+    parent_descriptor: int,
+    entry_name: str,
+    held_descriptor: int,
+    expected_identity: tuple[int, int],
+) -> bool:
+    try:
+        entry = os.stat(
+            entry_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        held = os.fstat(held_descriptor)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(entry.st_mode)
+        and stat.S_ISDIR(held.st_mode)
+        and _directory_inode(entry) == expected_identity
+        and _directory_inode(held) == expected_identity
+    )
+
+
+def _publish_directory_no_replace[PublishResult](
+    source: Path,
+    destination: Path,
+    parent: Path,
+    *,
+    expected_parent_identity: tuple[int, int] | None = None,
+    expected_source_identity: tuple[int, int] | None = None,
+    post_publish_validator: Callable[[Path], PublishResult] | None = None,
+) -> PublishResult | None:
+    """Atomically publish one sibling directory and replay it under held inodes."""
     if source.parent != parent or destination.parent != parent:
         raise ForagerMatchedQualificationError("qualification publication is not sibling-local")
+    for name, label in (
+        (source.name, "qualification staging directory"),
+        (destination.name, "qualification destination directory"),
+    ):
+        if not name or name in {".", ".."} or "/" in name or "\x00" in name:
+            raise ForagerMatchedQualificationError(f"{label} name is unsafe")
+    if source.name == destination.name:
+        raise ForagerMatchedQualificationError(
+            "qualification staging and destination names must differ"
+        )
     directory_flags = (
         os.O_RDONLY
         | getattr(os, "O_DIRECTORY", 0)
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
+    parent_fd = -1
+    staging_fd = -1
+    published_fd = -1
+    published = False
     try:
+        parent_path_metadata = parent.lstat()
+        source_path_metadata = source.lstat()
+        if not stat.S_ISDIR(parent_path_metadata.st_mode) or parent.is_symlink():
+            raise ForagerMatchedQualificationError(
+                "qualification output parent changed before publication"
+            )
+        if not stat.S_ISDIR(source_path_metadata.st_mode) or source.is_symlink():
+            raise ForagerMatchedQualificationError(
+                "qualification staging directory changed before publication"
+            )
+        parent_identity = (
+            _directory_inode(parent_path_metadata)
+            if expected_parent_identity is None
+            else expected_parent_identity
+        )
+        source_identity = (
+            _directory_inode(source_path_metadata)
+            if expected_source_identity is None
+            else expected_source_identity
+        )
+        if _directory_inode(parent_path_metadata) != parent_identity:
+            raise ForagerMatchedQualificationError(
+                "qualification output parent changed before publication"
+            )
+        if _directory_inode(source_path_metadata) != source_identity:
+            raise ForagerMatchedQualificationError(
+                "qualification staging directory changed before publication"
+            )
         parent_fd = os.open(parent, directory_flags)
     except OSError as exc:
         raise ForagerMatchedQualificationError(
             "cannot safely open qualification output parent"
         ) from exc
     try:
-        opened = os.fstat(parent_fd)
-        current = parent.lstat()
-        if (
-            not stat.S_ISDIR(opened.st_mode)
-            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        if not _directory_descriptor_matches_path(
+            parent_fd,
+            parent,
+            parent_identity,
         ):
             raise ForagerMatchedQualificationError(
                 "qualification output parent changed before publication"
+            )
+        try:
+            staging_fd = os.open(source.name, directory_flags, dir_fd=parent_fd)
+        except OSError as exc:
+            raise ForagerMatchedQualificationError(
+                "cannot safely open qualification staging directory"
+            ) from exc
+        if not _directory_entry_matches_descriptor(
+            parent_fd,
+            source.name,
+            staging_fd,
+            source_identity,
+        ):
+            raise ForagerMatchedQualificationError(
+                "qualification staging directory changed before publication"
             )
         libc = ctypes.CDLL(None, use_errno=True)
         try:
@@ -2657,9 +3756,77 @@ def _publish_directory_no_replace(source: Path, destination: Path, parent: Path)
             raise ForagerMatchedQualificationError(
                 f"atomic qualification publication failed with errno {error}"
             )
+        published = True
         os.fsync(parent_fd)
+        if not _directory_descriptor_matches_path(
+            parent_fd,
+            parent,
+            parent_identity,
+        ):
+            raise ForagerMatchedQualificationError(
+                "qualification output parent changed after publication"
+            )
+        try:
+            published_fd = os.open(destination.name, directory_flags, dir_fd=parent_fd)
+        except OSError as exc:
+            raise ForagerMatchedQualificationError(
+                "cannot safely open published qualification directory"
+            ) from exc
+        if not _directory_entry_matches_descriptor(
+            parent_fd,
+            destination.name,
+            staging_fd,
+            source_identity,
+        ) or not _directory_entry_matches_descriptor(
+            parent_fd,
+            destination.name,
+            published_fd,
+            source_identity,
+        ):
+            raise ForagerMatchedQualificationError(
+                "published qualification differs from the held staging inode"
+            )
+        try:
+            os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ForagerMatchedQualificationError(
+                "qualification staging name was recreated after publication"
+            )
+        result = (
+            None
+            if post_publish_validator is None
+            else post_publish_validator(destination)
+        )
+        if not _directory_descriptor_matches_path(
+            parent_fd,
+            parent,
+            parent_identity,
+        ) or not _directory_entry_matches_descriptor(
+            parent_fd,
+            destination.name,
+            published_fd,
+            source_identity,
+        ):
+            raise ForagerMatchedQualificationError(
+                "published qualification changed during replay verification"
+            )
+        return result
+    except BaseException as exc:
+        if published:
+            raise QualificationPublishedButUncertainError(
+                f"qualification was published at {destination} but durability or replay "
+                "verification is uncertain; do not reuse this output root"
+            ) from exc
+        raise
     finally:
-        os.close(parent_fd)
+        if published_fd >= 0:
+            os.close(published_fd)
+        if staging_fd >= 0:
+            os.close(staging_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
 
 def _paths_overlap(first: Path, second: Path) -> bool:
@@ -2694,6 +3861,282 @@ def _reject_qualification_output_overlap(
     return canonical_output
 
 
+def _fresh_snapshot_replay_command(
+    runtime: Path,
+    qualification_root: Path,
+    *,
+    qualification_module_sha256: str,
+) -> list[str]:
+    """Build the exact sandboxed OCI command for a fresh snapshot replay."""
+    qualification_root = _regular_directory(
+        qualification_root,
+        "fresh replay qualification root",
+    )
+    if (
+        type(qualification_module_sha256) is not str
+        or _SHA256.fullmatch(qualification_module_sha256) is None
+    ):
+        raise ForagerMatchedQualificationError(
+            "fresh replay qualification module digest is invalid"
+        )
+    if stat.S_IMODE(qualification_root.lstat().st_mode) != 0o755:
+        raise ForagerMatchedQualificationError(
+            "fresh replay qualification root is not OCI-readable"
+        )
+    root_value = qualification_root.as_posix()
+    if any(character in root_value for character in (",", "\n", "\r", "\x00")):
+        raise ForagerMatchedQualificationError(
+            "fresh replay OCI mount path contains an unsafe character"
+        )
+    return [
+        runtime.as_posix(),
+        "run",
+        "--rm",
+        "--pull=never",
+        "--network=none",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        "--user=65532:65532",
+        "--cpus=2.0",
+        "--memory=4g",
+        "--memory-swap=4g",
+        "--pids-limit=256",
+        "--tmpfs=/run/alberta:rw,noexec,nosuid,nodev,size=1g,uid=65532,gid=65532,mode=0700",
+        (
+            "--mount=type=bind,"
+            f"source={root_value},"
+            f"destination={_CONTAINER_BUNDLE_ROOT},readonly"
+        ),
+        "--env=HOME=/run/alberta",
+        "--env=JAX_ENABLE_COMPILATION_CACHE=false",
+        "--env=JAX_PLATFORM_NAME=cpu",
+        "--env=JAX_PLATFORMS=cpu",
+        "--env=JAX_SKIP_CUDA_CONSTRAINTS_CHECK=1",
+        "--env=LANG=C.UTF-8",
+        "--env=LC_ALL=C.UTF-8",
+        "--env=ALL_PROXY=",
+        "--env=HTTP_PROXY=",
+        "--env=HTTPS_PROXY=",
+        "--env=all_proxy=",
+        "--env=http_proxy=",
+        "--env=https_proxy=",
+        "--env=LD_LIBRARY_PATH=",
+        "--env=LD_PRELOAD=",
+        "--env=NVIDIA_VISIBLE_DEVICES=void",
+        "--env=NO_PROXY=",
+        "--env=no_proxy=",
+        "--env=PYTHONPATH=",
+        "--env=TMPDIR=/run/alberta",
+        "--env=TZ=UTC",
+        "--env=XDG_CACHE_HOME=/run/alberta",
+        f"--workdir={_CONTAINER_BUNDLE_ROOT}",
+        f"sha256:{_QUALIFIED_IMAGE_SHA256}",
+        _QUALIFIED_PYTHON,
+        "-I",
+        "-B",
+        "-c",
+        _FRESH_SNAPSHOT_REPLAY_SCRIPT,
+        _CONTAINER_REPLAY_SOURCE_ROOT,
+        _CONTAINER_BUNDLE_ROOT,
+        qualification_module_sha256,
+    ]
+
+
+def _run_fresh_snapshot_replay(
+    qualification_root: Path,
+    runtime: _ProbeRuntimeIdentity,
+    runner: QualificationRunner,
+    *,
+    expected_manifest_sha256: str,
+    expected_protocol_sha256: str,
+    expected_plan_sha256: str,
+    expected_qualification_module_sha256: str,
+) -> None:
+    """Replay staged loader/protocol/plan semantics inside the bound OCI image."""
+    if type(runtime) is not _ProbeRuntimeIdentity:
+        raise TypeError("fresh replay runtime must be a _ProbeRuntimeIdentity")
+    qualification_root = _regular_directory(
+        qualification_root,
+        "fresh replay qualification root",
+    )
+    expected = {
+        "manifest_sha256": expected_manifest_sha256,
+        "protocol_sha256": expected_protocol_sha256,
+        "plan_sha256": expected_plan_sha256,
+        "qualification_module_sha256": expected_qualification_module_sha256,
+    }
+    if any(
+        type(value) is not str or _SHA256.fullmatch(value) is None
+        for value in expected.values()
+    ):
+        raise ForagerMatchedQualificationError(
+            "fresh-process staged replay expected digests are invalid"
+        )
+    module_relative = "alberta_framework/benchmarks/forager_matched_qualification.py"
+    source_root = _regular_directory(
+        qualification_root / "sources" / "alberta" / "source",
+        "fresh replay source root",
+    )
+    module_path = source_root.joinpath(*PurePosixPath(module_relative).parts)
+    module_sha256, _module_size = _sha256_file(
+        module_path,
+        maximum=_MAX_SOURCE_BYTES,
+    )
+    if module_sha256 != expected_qualification_module_sha256:
+        raise ForagerMatchedQualificationError(
+            "fresh replay qualification module differs from its trusted binding"
+        )
+    try:
+        completed = runner(
+            _fresh_snapshot_replay_command(
+                runtime.executable,
+                qualification_root,
+                qualification_module_sha256=module_sha256,
+            )
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ForagerMatchedQualificationError(
+            "fresh-process staged replay could not run"
+        ) from exc
+    if type(completed) is not QualificationProcessResult:
+        raise ForagerMatchedQualificationError(
+            "fresh-process staged replay runner returned the wrong result type"
+        )
+    stdout_raw = completed.stdout
+    stderr_raw = completed.stderr
+    if len(stdout_raw) > _MAX_JSON_BYTES or len(stderr_raw) > _MAX_PROBE_OUTPUT_BYTES:
+        raise ForagerMatchedQualificationError(
+            "fresh-process staged replay output exceeds its bound"
+        )
+    if completed.returncode != 0:
+        detail = stderr_raw[-4096:].decode("utf-8", errors="replace")
+        raise ForagerMatchedQualificationError(
+            f"fresh-process staged replay failed: {detail}"
+        )
+    if stderr_raw:
+        raise ForagerMatchedQualificationError(
+            "fresh-process staged replay wrote unexpected stderr"
+        )
+    value = _decode_json(stdout_raw, "fresh-process staged replay")
+    if type(value) is not dict or stdout_raw != _canonical_json_bytes(value):
+        raise ForagerMatchedQualificationError(
+            "fresh-process staged replay output is not canonical JSON"
+        )
+    payload = cast(dict[str, Any], value)
+    if set(payload) != {
+        "schema_version",
+        "manifest_sha256",
+        "protocol_sha256",
+        "plan_sha256",
+        "plan_qualification_manifest_sha256",
+        "qualification_module_path",
+        "qualification_module_sha256",
+    }:
+        raise ForagerMatchedQualificationError(
+            "fresh-process staged replay fields drifted"
+        )
+    if (
+        payload["schema_version"] != _FRESH_SNAPSHOT_REPLAY_SCHEMA
+        or payload["manifest_sha256"] != expected_manifest_sha256
+        or payload["protocol_sha256"] != expected_protocol_sha256
+        or payload["plan_sha256"] != expected_plan_sha256
+        or payload["plan_qualification_manifest_sha256"]
+        != expected_manifest_sha256
+        or payload["qualification_module_path"] != module_relative
+        or payload["qualification_module_sha256"] != module_sha256
+    ):
+        raise ForagerMatchedQualificationError(
+            "fresh-process staged replay differs from the parent closure"
+        )
+
+
+def _verify_staged_bundle_in_fresh_process(
+    bundle: MatchedCurrentQualificationBundle,
+    runtime: _ProbeRuntimeIdentity,
+    runner: QualificationRunner,
+) -> _FreshReplayClosure:
+    """Compare parent and sandboxed child closures, then re-load every byte."""
+    if type(bundle) is not MatchedCurrentQualificationBundle:
+        raise TypeError("staged bundle must be a MatchedCurrentQualificationBundle")
+    if type(runtime) is not _ProbeRuntimeIdentity:
+        raise TypeError("staged replay runtime must be a _ProbeRuntimeIdentity")
+    root = _regular_directory(bundle.output_root, "fresh replay qualification root")
+    root_identity = _directory_inode(root.lstat())
+    protocol, plan = build_open_protocol_and_execution_plan(bundle)
+    trusted_module_path = Path(__file__).resolve(strict=True)
+    trusted_module_sha256, _trusted_size = _sha256_file(
+        trusted_module_path,
+        maximum=_MAX_SOURCE_BYTES,
+    )
+    staged_module = (
+        root
+        / "sources"
+        / "alberta"
+        / "source"
+        / "alberta_framework"
+        / "benchmarks"
+        / "forager_matched_qualification.py"
+    )
+    staged_module_sha256, _staged_size = _sha256_file(
+        staged_module,
+        maximum=_MAX_SOURCE_BYTES,
+    )
+    if staged_module_sha256 != trusted_module_sha256:
+        raise ForagerMatchedQualificationError(
+            "staged qualification module differs from the loaded trusted verifier"
+        )
+    closure = _FreshReplayClosure(
+        manifest_sha256=bundle.manifest_sha256,
+        protocol_sha256=plan.protocol.protocol_sha256,
+        plan_sha256=plan.plan_sha256,
+        qualification_module_sha256=trusted_module_sha256,
+    )
+    if protocol.protocol_sha256 != closure.protocol_sha256:
+        raise ForagerMatchedQualificationError(
+            "parent protocol and execution-plan protocol binding differ"
+        )
+    _rebind_probe_runtime(runtime, runner)
+    try:
+        _run_fresh_snapshot_replay(
+            root,
+            runtime,
+            runner,
+            expected_manifest_sha256=closure.manifest_sha256,
+            expected_protocol_sha256=closure.protocol_sha256,
+            expected_plan_sha256=closure.plan_sha256,
+            expected_qualification_module_sha256=(
+                closure.qualification_module_sha256
+            ),
+        )
+    finally:
+        _rebind_probe_runtime(runtime, runner)
+    if _directory_inode(root.lstat()) != root_identity:
+        raise ForagerMatchedQualificationError(
+            "qualification root changed during fresh-process replay"
+        )
+    rebound = load_matched_current_qualification_bundle(root)
+    rebound_protocol, rebound_plan = build_open_protocol_and_execution_plan(rebound)
+    if rebound_plan.protocol.protocol_sha256 != rebound_protocol.protocol_sha256:
+        raise ForagerMatchedQualificationError(
+            "reloaded protocol and execution-plan protocol binding differ"
+        )
+    rebound_closure = _FreshReplayClosure(
+        manifest_sha256=rebound.manifest_sha256,
+        protocol_sha256=rebound_protocol.protocol_sha256,
+        plan_sha256=rebound_plan.plan_sha256,
+        qualification_module_sha256=_sha256_file(
+            staged_module,
+            maximum=_MAX_SOURCE_BYTES,
+        )[0],
+    )
+    if rebound_closure != closure:
+        raise ForagerMatchedQualificationError(
+            "qualification closure changed during fresh-process replay"
+        )
+    return closure
+
+
 def qualify_matched_current_candidates(
     project_root: Path,
     upstream_checkout: Path,
@@ -2723,6 +4166,7 @@ def qualify_matched_current_candidates(
             "RNG parity qualification root": executor.DEFAULT_RNG_PARITY_QUALIFICATION_ROOT,
         },
     )
+    project_root = _bind_project_root(project_root)
     output_root.parent.mkdir(parents=True, exist_ok=True)
     output_parent = _regular_directory(output_root.parent, "qualification output parent")
     final_root = output_parent / output_root.name
@@ -2732,17 +4176,27 @@ def qualify_matched_current_candidates(
         )
     if final_root.exists() or final_root.is_symlink():
         raise ForagerMatchedQualificationError("qualification output root already exists")
+    parent_metadata = output_parent.lstat()
+    parent_identity = _directory_inode(parent_metadata)
     temporary = Path(tempfile.mkdtemp(prefix=f".{final_root.name}.partial-", dir=output_parent))
+    temporary_metadata = temporary.lstat()
+    temporary_identity = _directory_inode(temporary_metadata)
     try:
         executor_qualifications = _stage_executor_qualification_roots(temporary)
         sources = _stage_sources(project_root, upstream_checkout, temporary)
         configurations = _materialize_configurations(project_root, sources, temporary)
         invocations = _probe_invocations(sources, configurations)
         active_runner = _default_runner if runner is None else runner
+        runtime_identity = _bind_probe_runtime(runtime, active_runner)
         probes: dict[str, Mapping[str, Any]] = {}
         probe_stderr: dict[str, str] = {}
         for invocation in invocations:
-            probe, stderr_sha = _run_probe(runtime, invocation, active_runner)
+            probe, stderr_sha = _run_bound_probe(
+                runtime_identity,
+                invocation,
+                sources[invocation.source_key],
+                active_runner,
+            )
             probes[invocation.candidate_id] = probe
             probe_stderr[invocation.candidate_id] = stderr_sha
         _assemble_and_write(
@@ -2754,14 +4208,45 @@ def qualify_matched_current_candidates(
             probes,
             probe_stderr,
         )
+        _normalize_qualification_tree_permissions(temporary)
         # Replay every generated binding before any final path becomes visible.
-        load_matched_current_qualification_bundle(temporary)
+        staged_bundle = load_matched_current_qualification_bundle(temporary)
+        staged_closure = _verify_staged_bundle_in_fresh_process(
+            staged_bundle,
+            runtime_identity,
+            active_runner,
+        )
         _durably_sync_verified_tree(temporary)
-        _publish_directory_no_replace(temporary, final_root, output_parent)
+
+        def validate_published(path: Path) -> MatchedCurrentQualificationBundle:
+            published = load_matched_current_qualification_bundle(path)
+            published_closure = _verify_staged_bundle_in_fresh_process(
+                published,
+                runtime_identity,
+                active_runner,
+            )
+            if published_closure != staged_closure:
+                raise ForagerMatchedQualificationError(
+                    "published qualification differs from its staged fresh replay"
+                )
+            return published
+
+        published_bundle = _publish_directory_no_replace(
+            temporary,
+            final_root,
+            output_parent,
+            expected_parent_identity=parent_identity,
+            expected_source_identity=temporary_identity,
+            post_publish_validator=validate_published,
+        )
+    except QualificationPublishedButUncertainError:
+        raise
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
-    return load_matched_current_qualification_bundle(final_root)
+    if published_bundle is None:
+        raise AssertionError("qualification publication omitted its final replay")
+    return published_bundle
 
 
 def _bound_path(root: Path, value: Any, label: str, *, directory: bool) -> Path:
@@ -3692,7 +5177,9 @@ def load_matched_current_qualification_bundle(
         runtime_qualification=runtime,
         candidate_qualifications=MappingProxyType(qualifications),
         candidate_assets=assets,
-        manifest=MappingProxyType(manifest),
+        manifest=cast(Mapping[str, Any], _freeze_json(manifest)),
+        manifest_bytes=manifest_raw,
+        manifest_sha256=digest,
     )
 
 
@@ -3712,6 +5199,7 @@ def build_open_protocol_and_execution_plan(
     plan = executor.build_execution_plan(
         protocol,
         dict(bundle.candidate_assets),
+        qualification_manifest_sha256=bundle.manifest_sha256,
         candidate_ids=builder.MATCHED_CURRENT_CANDIDATE_IDS,
         cpu_qualification_root=bundle.cpu_qualification_root,
         rng_parity_qualification_root=bundle.rng_parity_qualification_root,
@@ -3749,7 +5237,7 @@ def _cli(argv: Sequence[str]) -> int:
         "output_root": bundle.output_root.as_posix(),
         "candidate_count": len(bundle.candidate_qualifications),
         "candidate_order": list(bundle.candidate_qualifications),
-        "manifest_sha256": hashlib.sha256(_canonical_json_bytes(bundle.manifest)).hexdigest(),
+        "manifest_sha256": bundle.manifest_sha256,
         "promotion_authorized": False,
         "external_verification_required": True,
     }
@@ -3764,6 +5252,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments and arguments[0] == "container-probe":
             return _container_probe(arguments[1:])
         return _cli(arguments)
+    except QualificationPublishedButUncertainError as exc:
+        sys.stderr.write(f"matched Forager qualification: PUBLISHED-UNCERTAIN: {exc}\n")
+        return 3
     except (
         ValueError,
         OSError,
@@ -3780,6 +5271,7 @@ __all__ = [
     "MATCHED_CURRENT_QUALIFICATION_SCHEMA_VERSION",
     "MatchedCurrentQualificationBundle",
     "ForagerMatchedQualificationError",
+    "QualificationPublishedButUncertainError",
     "ProbeInvocation",
     "QualificationProcessResult",
     "build_open_protocol_and_execution_plan",

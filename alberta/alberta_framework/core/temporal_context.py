@@ -1,5 +1,25 @@
 # mypy: disable-error-code="call-arg,name-defined"
-"""Causal temporal/context features for non-stationary Step 2 streams."""
+"""Causal temporal/context features for non-stationary Step 2 streams.
+
+The featurizer augments each observation with cheap context blocks a
+downstream linear or shallow learner can exploit under drift:
+
+1. **EMA copy** — a slow exponential average of the observation stream, a
+   causal summary of the recent input regime.
+2. **Innovation** — the difference between the current observation and that
+   EMA, isolating what just changed.
+3. **Phase code** — ``sin``/``cos`` of the absolute step count at fixed
+   periods (two features per period), a Fourier-style time encoding that lets
+   even a linear readout represent target functions that vary periodically in
+   time; the sin/cos pair covers arbitrary phase offsets.
+
+Caveat: the phase code depends on the absolute step counter, not on the
+observations, so it leaks global time into the feature vector — the same
+observation maps to different features at different steps.  It helps only
+when the stream's nonstationarity is genuinely periodic near the configured
+periods; on aperiodic streams it is a spurious clock signal a downstream
+learner can overfit.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +42,10 @@ class TemporalContextConfig:
     the current step counter, then the EMA is advanced after the observation is
     exposed.  This is meant for streams whose target changes with slowly moving
     latent context, such as rotating relevant subspaces.
+
+    The default ``periods`` (50, 100, 200) span drift timescales of tens to a
+    few hundred steps; set them to the stream's known drift periods when those
+    are available.
     """
 
     input_dim: int

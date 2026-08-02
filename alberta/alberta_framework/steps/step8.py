@@ -1,5 +1,25 @@
 # mypy: disable-error-code="call-arg"
-"""Production-facing Step 8 one-step world-model facade."""
+"""Production-facing Step 8 one-step world-model facade.
+
+Step 8 is the environment-prediction surface of the model-based progression:
+learn a one-step model — expected reward and next observation (or observation
+delta, with ``predict_delta=True``) given the current observation and action —
+online, from the same stream the control learner sees.  Step 7's Dyna backups
+and Step 9's guarded dreaming both consume this model.  The implementation
+lives in :mod:`alberta_framework.core.world_model`.
+
+Network defaults follow the streaming stability recipe used across the
+package (Elsayed et al. 2024, "Streaming Deep Reinforcement Learning Finally
+Works"): sparse initialization (``sparsity=0.9``, the recipe's default),
+LeakyReLU with the conventional 0.01 negative slope, and parameterless layer
+normalization.  ``utility_decay=0.99`` sets the EMA horizon (~100 steps) of
+the hidden-unit utility diagnostics.
+
+:func:`step8_ensemble_predict` reports prediction variance across several
+independently trained model states; ensemble disagreement as an epistemic
+novelty signal follows Pathak et al. (2019), "Self-Supervised Exploration
+via Disagreement."
+"""
 
 from __future__ import annotations
 

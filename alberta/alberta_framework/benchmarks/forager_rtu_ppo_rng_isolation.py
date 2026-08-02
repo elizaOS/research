@@ -33,6 +33,10 @@ UPSTREAM_SOURCE_ARCHIVE_SHA256: Final = (
     "1f6976de38f34a697c947891de26ad3373b294195fe82094e9d1d5b8ddfd43b6"
 )
 UPSTREAM_SOURCE_PATH: Final = "src/rtu_ppo.py"
+# Arbitrary-but-frozen fold-in tag deriving the agent-side key stream from the
+# run seed (``agent_root = fold_in(root, tag)``) so agent-side draws never
+# consume the environment chain.  The specific value carries no meaning, but
+# the pinned EXPECTED_* digests and probe words below depend on it.
 ISOLATED_AGENT_RNG_NAMESPACE: Final = 0xA63E7C11
 REQUIRED_PRNG_IMPL: Final = "threefry2x32"
 PATCH_SCHEMA_VERSION: Final = (

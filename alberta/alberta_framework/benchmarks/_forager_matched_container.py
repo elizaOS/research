@@ -28,6 +28,12 @@ EXTRACT_ROOT = Path("/run/alberta/scoring-input")
 EXECUTION_SOURCE_ROOT = Path("/run/alberta/source")
 EXECUTION_CONFIG = Path("/run/alberta/configuration.json")
 SOURCE_TREE_HASH_SCHEME = "canonical-entry-json+mode+size+bytes-v1"
+# Verify-then-exec mini-program passed to ``python -c``.  It closes the
+# check-to-use (TOCTOU) window that hashing a script and then letting Python
+# re-open it by path would leave: the file is read once through an
+# O_NOFOLLOW descriptor, fstat identity before/after the read rejects a
+# concurrent rewrite, the SHA-256 is checked on the bytes actually read, and
+# exec runs those same in-memory bytes — the path is never opened again.
 VERIFIED_SCRIPT_LAUNCHER = (
     "import hashlib,os,stat,sys\n"
     "path,expected,*args=sys.argv[1:]\n"
@@ -47,6 +53,12 @@ VERIFIED_SCRIPT_LAUNCHER = (
     "scope={'__name__':'__main__','__file__':path,'__package__':None,'__cached__':None}\n"
     "exec(compile(raw,path,'exec'),scope,scope)"
 )
+# Defensive resource caps for untrusted-shaped inputs.  The payload cap is
+# deliberately below the raw-archive cap: 480 MiB of payload plus worst-case
+# USTAR overhead (per-member header block and padding for MAX_MEMBERS entries,
+# end-of-archive blocks, record padding) must still fit inside the 512 MiB
+# archive bound — checked at import time next to
+# ``_maximum_ustar_stream_size`` below.
 MAX_MEMBERS = 20_000
 MAX_OUTPUT_DIRECTORIES = 20_000
 MAX_OUTPUT_DEPTH = 64

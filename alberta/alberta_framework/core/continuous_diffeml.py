@@ -1,9 +1,24 @@
 # mypy: disable-error-code="arg-type, call-arg, no-any-return"
 """Continuous DiffEML layers trained by ordinary backpropagation.
 
+"EML" here is the two-input primitive ``exp(x) - log(y)``; this module builds
+on its clipped, softplus-guarded relaxation
+:func:`alberta_framework.core.diffeml.stable_eml_operator`.  The design is an
+EML analogue of differentiable logic-gate networks (Petersen, Borgelt,
+Kuehne & Deussen, "Deep Differentiable Logic Gate Networks", NeurIPS 2022),
+with the Boolean gate library replaced by the real-valued EML node.
+
 This module is intentionally separate from the hard-gate DiffEML selector
-path.  It uses the stable real EML primitive as a differentiable feature block
-over real-valued inputs, then updates all parameters with Adam.
+path.  It provides three stages:
+
+1. dense continuous EML blocks over real-valued inputs, trained with Adam
+   (:func:`continuous_diffeml_forward`);
+2. sparse circuits whose two sources per node are picked by softmax
+   selectors, annealed toward hard routing, then compiled to fixed source
+   indices (:func:`compile_sparse_continuous_eml_circuit`); and
+3. inference-only approximate EML kernels (lookup tables or polynomials)
+   that avoid transcendental functions for hardened deployment
+   (:func:`approximate_stable_eml_operator`).
 """
 
 from __future__ import annotations
@@ -22,6 +37,13 @@ from alberta_framework.core.diffeml import stable_eml_operator
 ApproximationKind = Literal["lut", "poly"]
 LossKind = Literal["mse", "softmax_cross_entropy"]
 
+# Hardened-inference tables for ``exp(x)`` and ``log(softplus(y) + 1e-6)``.
+# The [-8, 8] grid equals the default ``input_clip`` of
+# ``stable_eml_operator``, so the exp table covers exactly the domain the
+# exact operator sees; right inputs beyond the grid saturate at the table
+# edges (the exact operator does not clip ``y``).  257 knots give 256
+# uniform intervals of width 1/16; for ``exp`` the linear-interpolation
+# relative error is bounded by ``h**2 / 8`` (about 5e-4).
 _APPROX_LUT_MIN = -8.0
 _APPROX_LUT_MAX = 8.0
 _APPROX_LUT_SIZE = 257
@@ -246,7 +268,17 @@ def continuous_diffeml_forward(
     input_clip: float = 8.0,
     output_clip: float = 30.0,
 ) -> Array:
-    """Run a continuous DiffEML forward pass on one example or a batch."""
+    """Run a continuous DiffEML forward pass on one example or a batch.
+
+    Each block computes left/right affine projections, applies the stable EML
+    primitive, and squashes with ``tanh(eml_scale * eml)``.  ``input_clip``
+    bounds the argument of ``exp`` and ``output_clip`` bounds each raw node
+    output, preventing overflow and gradient blow-up in deep stacks (see
+    :func:`alberta_framework.core.diffeml.stable_eml_operator`).  ``eml_scale``
+    then compresses the clipped output (range ``±output_clip``) so moderate
+    node values land on the responsive part of ``tanh`` rather than its
+    saturated tails.
+    """
     squeeze = inputs.ndim == 1
     x = inputs[None, :] if squeeze else inputs
 

@@ -1,13 +1,20 @@
 """CLI for the frozen sparse-FTL decision-fidelity evidence artifact.
 
-Generate promoted evidence with::
+The only promoted run is already consumed: the frozen configuration on
+held-out seeds 30--59, pinned immutably at
+``outputs/ftl_decision/evidence.v1.json``.  Rerunning the frozen protocol is
+reproducibility evidence, never a new promotion, and must write to a NEW
+path::
 
     python -m alberta_framework.evaluation.ftl_decision_cli \
-        --output outputs/ftl_decision/evidence.v1.json
+        --output /new/path/ftl-decision-evidence.json
+
+Caveat: unlike ``recurring_feature_cli``, ``--output`` defaults to the pinned
+canonical path and generation has no overwrite guard — it clobbers whatever
+the target path holds.  Callers must supply a fresh path themselves.
 
 Generation exposes no seed, learner, bootstrap, or threshold tuning flags.
-The only promoted run uses the already-frozen configuration and held-out seeds
-30--59.  Verification validates an existing artifact without rerunning JAX.
+Verification validates an existing artifact without rerunning JAX.
 
 Exit status is 0 for accepted evidence, 1 for a valid scientific rejection,
 and 2 for an invalid artifact or execution error.
@@ -33,6 +40,8 @@ from alberta_framework.evaluation.ftl_decision_fidelity import (
     run_ftl_decision_fidelity_evaluation,
 )
 
+# The sha-pinned immutable promoted artifact.  Nothing in this CLI refuses to
+# overwrite it; pass --output with a new path for any rerun.
 DEFAULT_OUTPUT = Path("outputs/ftl_decision/evidence.v1.json")
 
 

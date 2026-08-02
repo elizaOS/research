@@ -32,9 +32,10 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int
 
 from alberta_framework.core.multi_head_learner import MultiHeadMLPLearner, MultiHeadMLPState
+from alberta_framework.core.types import LMSState
 
 # ---------------------------------------------------------------------------
 # Subtask specification (Python-level; JAX arrays extracted for scan use)
@@ -246,6 +247,431 @@ class STOMPState:
     option_discount: Float[Array, ""]
     option_steps: Int[Array, ""]
     step_count: Int[Array, ""]
+
+
+DISPATCH_OWNER_INVALID = -1
+DISPATCH_OWNER_BASE_PRIMITIVE = 0
+DISPATCH_OWNER_OPTION = 1
+
+
+@chex.dataclass(frozen=True)
+class DispatchedPrimitiveActionDecision:
+    """Fail-closed ownership and safety audit for one dispatch replacement."""
+
+    owner: Int[Array, ""]
+    state_static_contract_valid: Bool[Array, ""]
+    state_values_finite: Bool[Array, ""]
+    state_counters_valid: Bool[Array, ""]
+    rng_key_valid: Bool[Array, ""]
+    ownership_valid: Bool[Array, ""]
+    state_valid: Bool[Array, ""]
+    observation_static_contract_valid: Bool[Array, ""]
+    observation_valid: Bool[Array, ""]
+    observation_matches: Bool[Array, ""]
+    proposed_action_static_contract_valid: Bool[Array, ""]
+    proposed_action_valid: Bool[Array, ""]
+    safety_action_mask_static_contract_valid: Bool[Array, ""]
+    counterfactual_action_safe: Bool[Array, ""]
+    proposed_action_safe: Bool[Array, ""]
+    counterfactual_action: Int[Array, ""]
+    proposed_action: Int[Array, ""]
+    effective_action: Int[Array, ""]
+    used_safe_base_fallback: Bool[Array, ""]
+    applied: Bool[Array, ""]
+    failed_closed: Bool[Array, ""]
+
+
+@chex.dataclass(frozen=True)
+class DispatchedPrimitiveActionReplacementResult:
+    """Potentially replaced STOMP dispatch state plus its exact audit."""
+
+    state: STOMPState
+    decision: DispatchedPrimitiveActionDecision
+
+
+def _all_floating_leaves_finite(tree: Any) -> Array:
+    """Bounded full-tree finiteness check, excluding typed PRNG keys."""
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for leaf in jax.tree_util.tree_leaves(tree):
+        if hasattr(leaf, "dtype") and jax.dtypes.issubdtype(
+            leaf.dtype, jax.dtypes.prng_key
+        ):
+            continue
+        array = jnp.asarray(leaf)
+        if jnp.issubdtype(array.dtype, jnp.inexact):
+            valid = valid & jnp.all(jnp.isfinite(array))
+    return valid
+
+
+def _all_integer_leaves_nonnegative(tree: Any) -> Array:
+    """Check learner/model counter leaves without constraining float values."""
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for leaf in jax.tree_util.tree_leaves(tree):
+        if hasattr(leaf, "dtype") and jax.dtypes.issubdtype(
+            leaf.dtype, jax.dtypes.prng_key
+        ):
+            continue
+        array = jnp.asarray(leaf)
+        if jnp.issubdtype(array.dtype, jnp.integer):
+            valid = valid & jnp.all(array >= 0)
+    return valid
+
+
+def _stomp_static_dispatch_contract(
+    state: STOMPState,
+    *,
+    n_options: int,
+    n_primitive_actions: int,
+    observation_dim: int,
+) -> tuple[bool, bool]:
+    """Return fixed shape/dtype and typed-key contract flags."""
+
+    float32_shapes = (
+        (state.base_last_obs, (observation_dim,)),
+        (state.option_start_obs, (observation_dim,)),
+        (state.option_policies.q_weights, (n_options, n_primitive_actions, observation_dim)),
+        (state.option_policies.traces, (n_options, n_primitive_actions, observation_dim)),
+        (state.option_policies.average_rewards, (n_options,)),
+        (state.option_models.cumreward_ema, (n_options,)),
+        (state.option_models.env_return_ema, (n_options,)),
+        (state.option_models.duration_ema, (n_options,)),
+        (state.option_models.baseline_mass_ema, (n_options,)),
+        (state.option_models.discount_ema, (n_options,)),
+        (
+            state.option_models.next_state_weights,
+            (n_options, observation_dim, observation_dim),
+        ),
+    )
+    scalar_float32 = (
+        state.base_average_reward,
+        state.option_cumreward,
+        state.option_env_cumreward,
+        state.option_baseline_mass,
+        state.option_discount,
+    )
+    scalar_int32 = (
+        state.base_last_action,
+        state.last_primitive_action,
+        state.executing_option,
+        state.option_last_intra_action,
+        state.option_steps,
+        state.step_count,
+        state.base_learner_state.step_count,
+    )
+    static_valid = all(
+        value.shape == expected and value.dtype == jnp.float32
+        for value, expected in float32_shapes
+    )
+    static_valid = static_valid and all(
+        value.shape == () and value.dtype == jnp.float32 for value in scalar_float32
+    )
+    static_valid = static_valid and all(
+        value.shape == () and value.dtype == jnp.int32 for value in scalar_int32
+    )
+    static_valid = static_valid and (
+        state.option_models.n_completions.shape == (n_options,)
+        and state.option_models.n_completions.dtype == jnp.int32
+    )
+    n_total_actions = n_primitive_actions + n_options
+    learner = state.base_learner_state
+    head_collections_valid = (
+        len(learner.head_params.weights) == n_total_actions
+        and len(learner.head_params.biases) == n_total_actions
+        and len(learner.head_optimizer_states) == n_total_actions
+        and len(learner.head_traces) == n_total_actions
+    )
+    static_valid = static_valid and head_collections_valid
+    trunk_depth = len(learner.trunk_params.weights)
+    trunk_collections_valid = (
+        len(learner.trunk_params.biases) == trunk_depth
+        and len(learner.hidden_unit_utilities) == trunk_depth
+        and len(learner.trunk_traces) == 2 * trunk_depth
+        and len(learner.trunk_optimizer_states) == 2 * trunk_depth
+        and learner.normalizer_state is None
+    )
+    static_valid = static_valid and trunk_collections_valid
+    trunk_input_width = observation_dim
+    if trunk_collections_valid:
+        for layer_idx in range(trunk_depth):
+            weight = learner.trunk_params.weights[layer_idx]
+            bias = learner.trunk_params.biases[layer_idx]
+            utility = learner.hidden_unit_utilities[layer_idx]
+            expected_weight_shape = (
+                int(weight.shape[0]) if weight.ndim == 2 else 0,
+                trunk_input_width,
+            )
+            expected_bias_shape = (expected_weight_shape[0],)
+            static_valid = static_valid and (
+                weight.ndim == 2
+                and weight.shape == expected_weight_shape
+                and weight.dtype == jnp.float32
+                and bias.shape == expected_bias_shape
+                and bias.dtype == jnp.float32
+                and utility.shape == expected_bias_shape
+                and utility.dtype == jnp.float32
+                and learner.trunk_traces[2 * layer_idx].shape == weight.shape
+                and learner.trunk_traces[2 * layer_idx].dtype == jnp.float32
+                and learner.trunk_traces[2 * layer_idx + 1].shape == bias.shape
+                and learner.trunk_traces[2 * layer_idx + 1].dtype == jnp.float32
+            )
+            trunk_input_width = expected_weight_shape[0]
+        for optimizer_state in learner.trunk_optimizer_states:
+            static_valid = static_valid and (
+                isinstance(optimizer_state, LMSState)
+                and optimizer_state.step_size.shape == ()
+                and optimizer_state.step_size.dtype == jnp.float32
+            )
+    if head_collections_valid:
+        for head_idx in range(n_total_actions):
+            weight = learner.head_params.weights[head_idx]
+            bias = learner.head_params.biases[head_idx]
+            trace_pair = learner.head_traces[head_idx]
+            optimizer_pair = learner.head_optimizer_states[head_idx]
+            pairs_valid = (
+                isinstance(trace_pair, tuple)
+                and len(trace_pair) == 2
+                and isinstance(optimizer_pair, tuple)
+                and len(optimizer_pair) == 2
+            )
+            static_valid = static_valid and pairs_valid
+            if not pairs_valid:
+                continue
+            weight_trace, bias_trace = trace_pair
+            static_valid = static_valid and (
+                weight.shape == (1, trunk_input_width)
+                and weight.dtype == jnp.float32
+                and bias.shape == (1,)
+                and bias.dtype == jnp.float32
+                and weight_trace.shape == weight.shape
+                and weight_trace.dtype == jnp.float32
+                and bias_trace.shape == bias.shape
+                and bias_trace.dtype == jnp.float32
+            )
+            for optimizer_state in optimizer_pair:
+                static_valid = static_valid and (
+                    isinstance(optimizer_state, LMSState)
+                    and optimizer_state.step_size.shape == ()
+                    and optimizer_state.step_size.dtype == jnp.float32
+                )
+    rng_key_valid = (
+        state.rng_key.shape == ()
+        and jax.dtypes.issubdtype(state.rng_key.dtype, jax.dtypes.prng_key)
+    )
+    return static_valid, rng_key_valid
+
+
+def replace_dispatched_primitive_action(
+    state: STOMPState,
+    decision_observation: Array,
+    proposed_action: Array,
+    safety_action_mask: Array | None = None,
+) -> DispatchedPrimitiveActionReplacementResult:
+    """Replace only the decision owner that will receive next-step credit.
+
+    The current primitive action is the safe fallback. An invalid proposal,
+    stale observation, inconsistent owner state, or unsafe fallback fails
+    closed as an exact state no-op. A valid but unsafe proposal uses the safe
+    current action without consuming RNG or changing credit ownership.
+    """
+
+    if not isinstance(state, STOMPState):
+        raise TypeError("state must be a STOMPState")
+    if state.option_policies.q_weights.ndim != 3:
+        raise TypeError("state.option_policies.q_weights must have rank 3")
+    n_options = state.option_policies.q_weights.shape[0]
+    n_primitive_actions = state.option_policies.q_weights.shape[1]
+    observation_dim = state.option_policies.q_weights.shape[2]
+    if n_options < 1 or n_primitive_actions < 1 or observation_dim < 1:
+        raise TypeError("STOMP dispatch dimensions must all be positive")
+
+    raw_observation = jnp.asarray(decision_observation)
+    observation_static_contract_valid = (
+        raw_observation.shape == (observation_dim,)
+        and raw_observation.dtype == jnp.float32
+    )
+    obs = (
+        raw_observation
+        if observation_static_contract_valid
+        else jnp.zeros((observation_dim,), dtype=jnp.float32)
+    )
+    raw_proposal = jnp.asarray(proposed_action)
+    proposed_action_static_contract_valid = (
+        raw_proposal.shape == () and raw_proposal.dtype == jnp.int32
+    )
+    proposal = (
+        raw_proposal
+        if proposed_action_static_contract_valid
+        else jnp.asarray(-1, dtype=jnp.int32)
+    )
+    if safety_action_mask is None:
+        safety = jnp.ones((n_primitive_actions,), dtype=jnp.bool_)
+        safety_action_mask_static_contract_valid = True
+    else:
+        raw_safety = jnp.asarray(safety_action_mask)
+        safety_action_mask_static_contract_valid = (
+            raw_safety.shape == (n_primitive_actions,)
+            and raw_safety.dtype == jnp.bool_
+        )
+        safety = (
+            raw_safety
+            if safety_action_mask_static_contract_valid
+            else jnp.zeros((n_primitive_actions,), dtype=jnp.bool_)
+        )
+
+    no_option = state.executing_option == -1
+    option_index_valid = (state.executing_option >= 0) & (
+        state.executing_option < n_options
+    )
+    owner = jnp.where(
+        no_option,
+        jnp.asarray(DISPATCH_OWNER_BASE_PRIMITIVE, dtype=jnp.int32),
+        jnp.where(
+            option_index_valid,
+            jnp.asarray(DISPATCH_OWNER_OPTION, dtype=jnp.int32),
+            jnp.asarray(DISPATCH_OWNER_INVALID, dtype=jnp.int32),
+        ),
+    )
+    counterfactual = state.last_primitive_action
+    counterfactual_valid = (counterfactual >= 0) & (
+        counterfactual < n_primitive_actions
+    )
+    base_owner_valid = (
+        no_option
+        & (state.base_last_action >= 0)
+        & (state.base_last_action < n_primitive_actions)
+        & (state.base_last_action == counterfactual)
+    )
+    option_owner_valid = (
+        option_index_valid
+        & (state.base_last_action == n_primitive_actions + state.executing_option)
+        & (state.option_last_intra_action == counterfactual)
+    )
+    ownership_valid = (
+        counterfactual_valid
+        & (base_owner_valid | option_owner_valid)
+    )
+    static_contract_valid, typed_rng_key_valid = _stomp_static_dispatch_contract(
+        state,
+        n_options=n_options,
+        n_primitive_actions=n_primitive_actions,
+        observation_dim=observation_dim,
+    )
+    state_values_finite = _all_floating_leaves_finite(state)
+    state_counters_valid = (
+        _all_integer_leaves_nonnegative(state.base_learner_state)
+        & jnp.all(state.option_models.n_completions >= 0)
+        & (state.option_steps >= 0)
+        & (state.step_count >= 0)
+        & (state.option_steps <= state.step_count)
+        & (state.option_baseline_mass >= 0.0)
+        & (state.option_discount >= 0.0)
+        & (state.option_discount <= 1.0)
+        & jnp.all(state.option_models.duration_ema >= 0.0)
+        & jnp.all(state.option_models.baseline_mass_ema >= 0.0)
+        & jnp.all(state.option_models.discount_ema >= 0.0)
+        & jnp.all(state.option_models.discount_ema <= 1.0)
+    )
+    state_valid = (
+        jnp.asarray(static_contract_valid, dtype=jnp.bool_)
+        & jnp.asarray(typed_rng_key_valid, dtype=jnp.bool_)
+        & state_values_finite
+        & state_counters_valid
+        & ownership_valid
+    )
+    observation_valid = jnp.all(jnp.isfinite(obs))
+    observation_matches = (
+        jnp.asarray(observation_static_contract_valid, dtype=jnp.bool_)
+        & observation_valid
+        & jnp.all(jnp.isfinite(state.base_last_obs))
+        & jnp.array_equal(
+            jax.lax.bitcast_convert_type(obs, jnp.int32),
+            jax.lax.bitcast_convert_type(state.base_last_obs, jnp.int32),
+        )
+    )
+    proposed_valid = (
+        jnp.asarray(proposed_action_static_contract_valid, dtype=jnp.bool_)
+        & (proposal >= 0)
+        & (proposal < n_primitive_actions)
+    )
+    safe_counterfactual_index = jnp.clip(counterfactual, 0, n_primitive_actions - 1)
+    safe_proposal_index = jnp.clip(proposal, 0, n_primitive_actions - 1)
+    counterfactual_safe = counterfactual_valid & safety[safe_counterfactual_index]
+    proposed_safe = proposed_valid & safety[safe_proposal_index]
+    common_valid = (
+        state_valid
+        & observation_matches
+        & jnp.asarray(safety_action_mask_static_contract_valid, dtype=jnp.bool_)
+        & counterfactual_safe
+    )
+    apply_proposal = common_valid & proposed_valid & proposed_safe
+    use_fallback = common_valid & proposed_valid & ~proposed_safe
+    failed_closed = ~common_valid | ~proposed_valid
+    effective_action = jnp.where(
+        apply_proposal,
+        proposal,
+        jnp.where(
+            use_fallback,
+            counterfactual,
+            jnp.asarray(-1, dtype=jnp.int32),
+        ),
+    )
+    changed = apply_proposal & (proposal != counterfactual)
+    next_state = state.replace(
+        last_primitive_action=jnp.where(
+            apply_proposal,
+            proposal,
+            state.last_primitive_action,
+        ),
+        base_last_action=jnp.where(
+            apply_proposal & (owner == DISPATCH_OWNER_BASE_PRIMITIVE),
+            proposal,
+            state.base_last_action,
+        ),
+        option_last_intra_action=jnp.where(
+            apply_proposal & (owner == DISPATCH_OWNER_OPTION),
+            proposal,
+            state.option_last_intra_action,
+        ),
+    )
+    decision = DispatchedPrimitiveActionDecision(
+        owner=jnp.where(
+            state_valid,
+            owner,
+            jnp.asarray(DISPATCH_OWNER_INVALID, dtype=jnp.int32),
+        ),
+        state_static_contract_valid=jnp.asarray(
+            static_contract_valid, dtype=jnp.bool_
+        ),
+        state_values_finite=state_values_finite,
+        state_counters_valid=state_counters_valid,
+        rng_key_valid=jnp.asarray(typed_rng_key_valid, dtype=jnp.bool_),
+        ownership_valid=ownership_valid,
+        state_valid=state_valid,
+        observation_static_contract_valid=jnp.asarray(
+            observation_static_contract_valid, dtype=jnp.bool_
+        ),
+        observation_valid=observation_valid,
+        observation_matches=observation_matches,
+        proposed_action_static_contract_valid=jnp.asarray(
+            proposed_action_static_contract_valid, dtype=jnp.bool_
+        ),
+        proposed_action_valid=proposed_valid,
+        safety_action_mask_static_contract_valid=jnp.asarray(
+            safety_action_mask_static_contract_valid, dtype=jnp.bool_
+        ),
+        counterfactual_action_safe=counterfactual_safe,
+        proposed_action_safe=proposed_safe,
+        counterfactual_action=counterfactual,
+        proposed_action=proposal,
+        effective_action=effective_action,
+        used_safe_base_fallback=use_fallback,
+        applied=changed,
+        failed_closed=failed_closed,
+    )
+    return DispatchedPrimitiveActionReplacementResult(
+        state=next_state,
+        decision=decision,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1618,6 +2044,11 @@ def subtasks_from_feature_scores(
 
 
 __all__ = [
+    "DISPATCH_OWNER_BASE_PRIMITIVE",
+    "DISPATCH_OWNER_INVALID",
+    "DISPATCH_OWNER_OPTION",
+    "DispatchedPrimitiveActionDecision",
+    "DispatchedPrimitiveActionReplacementResult",
     "IntraOptionPoliciesState",
     "OptionModelsState",
     "STOMPAgent",
@@ -1630,5 +2061,6 @@ __all__ = [
     "SubtaskSpec",
     "check_option_terminated",
     "compute_pseudo_reward",
+    "replace_dispatched_primitive_action",
     "subtasks_from_feature_scores",
 ]

@@ -159,8 +159,8 @@ class OffPolicyHordeLearner:
 
     Full GTD/GQ/TDC MSPBE correction is intentionally out of scope for this
     first backend because it requires secondary weights and a different
-    objective.  See ``docs/research/step3_off_policy_horde.md`` for the exact
-    boundary.
+    objective; the corrected variant with secondary weights is
+    :class:`NonlinearSharedGTDHordeLearner` in this module.
     """
 
     def __init__(

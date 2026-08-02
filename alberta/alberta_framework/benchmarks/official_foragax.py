@@ -1,15 +1,52 @@
 """Run and verify the official continual-Foragax agent implementations.
 
-This module deliberately treats an official result as more than an ``.npz``
-file.  A completed run is accompanied by an atomic manifest that binds the
-artifact to a clean source checkout, an exact historical config blob, the
-official lock file, the supplied Python interpreter, and the effective seed.
+"Official" means the upstream ``continual-foragax-agents`` entry points
+(:data:`OFFICIAL_FORAGAX_REPOSITORY`), executed unmodified at
+descriptor-pinned commits rather than reimplemented.  This module
+deliberately treats an official result as more than an ``.npz`` file.  A
+completed run is accompanied by an atomic manifest that binds the artifact
+to a clean source checkout, an exact historical config blob, the official
+lock file, the supplied Python interpreter, and the effective seed.
 
 The official entry points use incompatible meanings for ``--max_steps``:
 ``continuing_main.py`` counts environment interactions, while ``rtu_ppo.py``
 counts rollout updates.  The public request therefore uses environment steps
 and only emits a PPO override when the requested horizon is exactly divisible
 by the selected config's rollout length.
+
+Every stage of the evidence lifecycle lives in this one module, in file
+order:
+
+1. **Trust identity** — pinned upstream commits, the manifest schema
+   version, and SHA-256-pinned trust/endorsement descriptors
+   (``protocols/official_foragax-1.4*.json``) whose profiles allowlist
+   every executable source/config/lock combination; nothing outside a
+   descriptor profile can run.
+2. **Requests and plans** — :class:`OfficialForagaxRunRequest` /
+   :class:`OfficialForagaxBatchRunRequest` validate into frozen plans via
+   :func:`prepare_official_foragax_run` /
+   :func:`prepare_official_foragax_batch_run`, which probe the runtime and
+   construct one exact command (a batch is the upstream runner's own
+   half-open index-range sweep, not a loop over single runs).
+3. **Hardened filesystem primitives** — ``O_NOFOLLOW`` descriptor walks,
+   atomic write+fsync helpers, and typed output-tree hashing, so manifests
+   bind the bytes actually on disk rather than whatever a symlink points
+   at.
+4. **Execution** — :func:`run_official_foragax` /
+   :func:`run_official_foragax_batch` run a plan inside a networkless,
+   read-only OCI sandbox (contract ``oci-read-only-stdout-tar-v4``:
+   results leave the container only as a tar stream on stdout) and publish
+   the manifest atomically under a stale-recoverable running lock.
+5. **Verification** — :func:`verify_official_foragax_manifest` /
+   :func:`verify_official_foragax_batch_manifest` /
+   :func:`reverify_official_foragax_evidence` fail closed unless manifest
+   hash, trust binding, provenance, sanitized logs, and NPZ artifacts all
+   agree.
+6. **Import** — :func:`official_foragax_run_spec_from_manifest` /
+   :func:`official_foragax_batch_run_specs_from_manifest` turn verified
+   manifests into attested comparison specs for ``forager_results``;
+   :func:`main` is the run CLI (one index or an index range, with
+   ``--dry-run`` producing a plan only).
 """
 
 from __future__ import annotations
@@ -95,6 +132,20 @@ _OFFICIAL_FORAGAX_RUNTIME_CLASSES = frozenset(
         OFFICIAL_FORAGAX_MATCHED_RUNTIME_CLASS,
     }
 )
+# What each official run is allowed to claim.  Every track records
+# ``paper_reproduction_claimed: False`` (see ``_claim``):
+#   head_diagnostics — diagnostic execution of the upstream HEAD runner with
+#     changed horizons/NTK payloads/scheduling; explicitly not a paper
+#     evaluation.
+#   historical_paper_lock_sensitivity — the exact historical source, config,
+#     and lock at one revision (enforced in ``_validate_trust_profile``).
+#     The locked Foragax environment registry cannot execute the declared
+#     paper FOV environment, so this track measures lock sensitivity only.
+#   matched_current_environment_comparator — the frozen paper algorithm and
+#     config executed in the matched current Foragax environment
+#     (``matched_current_foragax_0_55_cuda12``) for cross-harness comparison
+#     against this framework's own agents; not a paper-lock reproduction.
+# Non-OCI (test-only) executors are restricted to "synthetic_test" instead.
 _OFFICIAL_FORAGAX_SCIENTIFIC_TRACKS = frozenset(
     {
         "head_diagnostics",
@@ -102,6 +153,11 @@ _OFFICIAL_FORAGAX_SCIENTIFIC_TRACKS = frozenset(
         "matched_current_environment_comparator",
     }
 )
+# Superseded manifest schemas, recognized only so verification can reject
+# them with a targeted message: 1.1-1.3 predate the exact hyperparameter /
+# agent-access binding and the typed output-tree hash, so their artifacts
+# stay archival evidence and never verify.  The only upgrade path is a rerun
+# under the current schema.
 _ARCHIVAL_MANIFEST_SCHEMA_VERSIONS = frozenset({"1.1", "1.2", "1.3"})
 _TRUST_DESCRIPTOR_PATH = (
     Path(__file__).resolve().parent

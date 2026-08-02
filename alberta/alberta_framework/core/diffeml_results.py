@@ -1,5 +1,9 @@
 """Result validation helpers for DiffEML paper-quality benchmarks.
 
+DiffEML is the differentiable-EML circuit family of
+:mod:`~alberta_framework.core.diffeml`: softmax mixtures over hard
+``exp(x) - log(y)`` threshold gates that harden into exact Boolean circuits.
+
 The helpers in this module are intentionally small and conservative. They do
 not decide whether a result is impressive; they only prevent paper artifacts
 from making logic-network claims without the minimum evidence needed to inspect
@@ -18,6 +22,13 @@ Provenance = Literal["paper_reported", "local_reproduced", "pending"]
 RunKind = Literal["diffeml", "continuous_diffeml", "difflogic", "logictreenet", "baseline"]
 
 DIFFEML_SCHEMA_VERSION = "diffeml.result.v1"
+# Metric semantics: "soft" scores the differentiable evaluation (convex
+# mixtures over the gate library); "hard" scores the argmax-hardened gate
+# selection evaluated in float; "packed" re-evaluates the hardened circuit as
+# the bit-packed Boolean deploy artifact
+# (:func:`~alberta_framework.core.diffeml_image.packed_hard_logits`).
+# Requiring the packed number blocks claims that hold only for the float
+# simulation of the deployed circuit.
 REQUIRED_DIFFEML_METRICS = (
     "train_soft_accuracy",
     "train_hard_accuracy",
@@ -25,6 +36,7 @@ REQUIRED_DIFFEML_METRICS = (
     "test_hard_accuracy",
     "packed_hard_test_accuracy",
 )
+# Same packed Boolean circuit, but scored with an int8-quantized linear head.
 OPTIONAL_DIFFEML_METRICS = (
     "packed_int8_head_test_accuracy",
 )

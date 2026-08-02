@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added an opt-in, stateless `OptionSearchControl` for Prototype's learned
+  STOMP option models. It recomputes completion-supported differential
+  semi-MDP targets and absolute Bellman residuals after each accepted backup,
+  uses a fixed resource budget and stable tie order, and commits only the base
+  value learner while preserving real traces, option/lifecycle state, action
+  ownership, OaK counters, and RNG. The current action cache is deliberately
+  not refreshed, so value effects begin only at a later extended-action
+  selection boundary. This is L0 value-backup prioritization, not calibrated
+  or combined primitive/option search and not evidence of control benefit.
+- **Matched-current Forager qualification provenance v2**: the exact canonical
+  UTF-8 qualification-manifest bytes and SHA-256 now flow into the execution
+  plan/executor manifest, score evidence, execution closure, verification
+  subject/request, resolver bindings, open and sealed campaign summaries, seal,
+  and final-analysis bundle. Every replay boundary cross-checks the shared
+  digest, qualification copies preserve their original bytes, legacy v1
+  carriers fail closed, and typed plans replay, re-prepare, and freeze their exact
+  protocol/candidate/source closure from the retained host assets. Direct construction
+  now reparses the protocol, enforces the qualified runtime lock, reconstructs the whole
+  executor manifest from live qualified inputs, and rejects forged candidate indexes,
+  same-ID substitutions, altered capability receipts, cyclic mappings, and source drift
+  after preparation. Qualification now takes a stable, descriptor-backed snapshot of the
+  live Alberta source tree, revalidates all transitive staged sources and the bound absolute
+  OCI executable/daemon/exact image before and after every probe, and accepts only the
+  project tree that loaded the verifier. Fresh loader/protocol/plan replay runs under the
+  same fixed non-root user in the exact networkless, read-only, capability-dropped OCI image,
+  with actively capped output, both-case proxy credentials cleared, a deterministic
+  OCI-readable content-tree mode contract normalized through held descriptor-relative
+  handles, and all transitive project imports confined to the staged snapshot. The pinned
+  upstream Git archive is likewise produced by one system-path-resolved, content-rebound Git
+  executable under a minimal environment, with 4 KiB metadata caps and an exact-size streamed
+  archive cap, an explicit built-in tar format/default umask, and no repository-selected
+  archive command before its size and SHA-256 are accepted. The complete closure is
+  replayed both before fsync/rename and again under the held-inode post-publication validator.
+  Post-rename validation or durability uncertainty preserves the occupied destination,
+  exits with the distinct `PUBLISHED-UNCERTAIN` status, and forbids path reuse. The
+  shared-source family is named for its RNG-isolated source contract rather than recurrent
+  architecture. The live executor now drains stdout/stderr concurrently into separate,
+  actively bounded sinks, preserves its 512 MiB/16 MiB asymmetric limits, never persists an
+  overflow witness byte, and performs bounded kill/reap plus cidfile cleanup. Both runners
+  assign collision-resistant container names and fall back to exact-name force removal if an
+  interruption lands before the cidfile is materialized. Completed nonzero clients are cleaned
+  too; an unsuccessful removal is accepted only after a separate actively bounded daemon query
+  proves the exact random name absent. Malformed nested caches retain layer-specific error
+  contracts. The added provenance remains content
+  identity—not endorsement, promotion authority, or a performance claim.
 - **Beat-SOTA screening lane** (`benchmarks/ipmnist_screening.py`, 47 tests):
   22 mechanism-combination arms on a validated 60-task proxy (an exact
   bit-prefix of the 200-task protocol; control parity pinned bitwise) —
@@ -148,6 +193,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counter-hash RNG. Config/source/report/comparison hashes and atomic I/O make
   the artifact reconstructing. Campaigns remain `not-assessed`; no threshold,
   completed Prototype campaign, or scientific claim is supplied.
+- Added a strict development-only privileged continual-control reference suite
+  outside the ordinary matched-condition list. It runs one independently
+  initialized learner per evaluator regime identity and retains it on
+  recurrence, a stationary-multitask learner trained from an exactly budgeted
+  frozen extra stream, and an exact frozen counterfactual action-outcome upper
+  reference. Canonical reports and checkpoints bind source/config hashes,
+  decision ownership, extra-data and callback counts, resources, unavailable
+  recurrence states, and privilege/comparability disclosures. These are
+  descriptive `not-assessed` context bounds, not baselines or evidence.
 - Added the WP4 shallow world-model reference: an action-indexed affine
   regularized-FTL/ridge learner over grounded next-observation, reward, and
   continuation targets. It predicts before recursively updating fixed
@@ -157,15 +211,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   allocation accounting, and exposes a pure one-step supplied-linear-value
   action scorer. This is L0 mechanism coverage, not a paper reproduction,
   calibrated model, MPC result, or control-benefit claim.
+- Added an isolated bounded recurrent latent world-model ensemble with one
+  trainable GRU and grounded mean/heteroscedastic-variance heads per bootstrap
+  member. Exact start/decision/transition ownership, predict-before-update NLL,
+  final-target/reset-cache boundaries, one recurrent advance per accepted
+  event, stopped-target representation gradients, atomic failure handling,
+  fixed resource accounting, JIT/scan, and digest-bound checkpoint continuation
+  have L0 tests. Added it as an opt-in fourth mutually exclusive Prototype
+  model lane with exact dispatched-decision caching, transactional causal
+  signal state, real-NLL-only builder/mixer/candidate-audit routing, and whole-transition
+  rollback on recurrent rejection. It is not a replay, planning, calibration,
+  or efficacy result.
+- Added a bounded `PartnerPolicyFusion` L0 core with fixed typed
+  message batches, five explicit routes, discrete score-based blending, a
+  caller-owned hard action mask, one exact decision-bound feedback record, and
+  contextual logistic reliability updates from realized assistance plus
+  observed safety. Stale, duplicate, and misattributed feedback is an atomic
+  no-op; cold-start acceptance is labeled uncalibrated development exploration.
+  Checkpoint, resource, eager/JIT, and scan contracts are tested. Added an
+  opt-in `PrototypeAgent` composition that binds the full lifecycle ID, applies
+  prior feedback before the next fusion decision, derives real OaK base and
+  keyboard proposals, rewrites the exact primitive credit owner, synchronizes
+  the recurrent action cache, and rolls back the whole transition on unsafe
+  base dispatch or corrupt post-state. It makes no calibration, benefit, or
+  WP8 completion claim.
+- Added a strict development-only `ExperientialMemory` transfer evaluator. It
+  runs a fixed evaluator-owned recurring A/B/A trace from an immutable empty
+  snapshot, preserves exact query-before-write ownership, and records raw
+  neighbor/gate predictions, no-memory fallbacks, harmful recall, abstention
+  causes, eviction provenance, first/return descriptions, loophole checks, and
+  exact resources. Config, protocol, source, snapshot, canonical report, and
+  checkpoint hashes reconstruct fail closed with eager/compiled parity. It has
+  no threshold or transfer, retention, efficacy, promotion, WP8, or SOTA claim.
+- Added a stateless `ExperientialMemoryPolicy` and opt-in `PrototypeAgent`
+  composition. Retrieved action vectors are categorical score mass—not rounded
+  action identifiers—and selection is the lowest-index safe positive-mass
+  argmax. Prototype queries the next decision before writing a grounded
+  one-hot of the primitive action that actually executed plus bootstrap
+  representation and reward, then composes memory dispatch before partner
+  fusion. Full lifecycle IDs, no-memory state-shape preservation, whole-event
+  rollback, checkpoints, curation, eager/JIT/scan behavior, and exact resources
+  are tested. The resource declaration exposes two deterministic pre-state
+  queries and zero RNG; no transfer or control benefit is claimed.
+- Added a strict option-keyboard policy proposal and primitive-dispatch
+  boundary. It computes the deterministic chord argmax from current option
+  values, verifies exact decision-observation ownership and the complete fixed
+  STOMP/OaK state, applies a caller-owned hard safety mask, and rewrites either
+  the base primitive-action cache or the active option's intra-option cache so
+  subsequent TD credit follows the action actually executed. Unsafe proposals
+  use an independently safe base; unsafe bases and corrupt inputs are exact
+  fail-closed no-ops. RNG/state shape and package exports are preserved. This
+  is L0 ownership/safety integration, not chord-learning or control-benefit
+  evidence.
+- Added a strict development-only frozen world-model snapshot evaluator. It
+  retains raw ensemble-member and mean grounded predictions/targets, derives
+  reconstructable disagreement/error bins, correlations, coverage-risk, and
+  ID/OOD plus state/action-region summaries, and keeps the residual EMA
+  explicitly separate and non-probabilistic. Exact open-loop diagnostics are
+  optional and bounded; configs, probes, sources, snapshots, traces, summaries,
+  resources, checkpoints, and no-overwrite reports are hash-bound. It applies
+  no threshold and makes no calibration or scientific claim.
+- Extended that instrumentation with a separate recurrent development adapter.
+  It binds a frozen initial snapshot, scores each exact cached distribution
+  before one update of an isolated copy, and retains reconstructable member
+  means, heteroscedastic variances, NLLs, warm-up applicability, ID/OOD and
+  evaluator-owned state/action regions, final isolated-state counters, sources,
+  resources, canonical reports, and source-bound snapshot checkpoints. The
+  supplied snapshot remains unchanged. The Gaussian objective is not evidence
+  of calibrated likelihood, and no threshold, efficacy, or promotion claim is
+  made.
+- Added a strict recurrent-only retention companion that requires exact ordered
+  case reuse after an evaluator-owned intervening context and recurrent resets,
+  then reconstructs phase, recurrence-entry, ID/OOD, and within-occurrence NLL
+  summaries from the source-bound prequential trace. It keeps the supplied
+  snapshot unchanged and remains development-only `not-assessed`; it is not a
+  retention, calibration, Prototype integration, or scientific claim.
+- Added a strict development-only average-reward actor/critic A/B/A companion.
+  Regime identities, reward tables, preferred actions, and value targets remain
+  evaluator-only while exact cached target/epsilon-mixture behavior policies,
+  critic error, actor margin, churn, return/recovery, plasticity, action
+  activity, resources, source hashes, and checkpoints remain reconstructable.
+  The core now learns from the cached decision, commits the update, and samples
+  its successor from committed parameters. Raw `pi / b` is diagnostic and the
+  logged `(1 - epsilon) pi / b` term is explicitly the behavior-score chain
+  rule, not off-policy correction. The probe is one-seed, `not-assessed`, and
+  supplies no retention, efficacy, Prototype, promotion, or SOTA claim.
+- Added an isolated bounded continuous average-reward actor/critic. It uses a
+  direct affine-`tanh` diagonal Gaussian without latent clipping or endpoint
+  adjustment, retains exact pre-`tanh` decision ownership and stable
+  transformed target/behavior log densities, and applies the analytically
+  cancelling latent-density ratio to the complete actor eligibility trace.
+  Actor, critic, traces, LMS states, differential reward baseline, typed RNG,
+  and saturating counters are separate; one successor is sampled only after an
+  atomic finite commit. Strict config/checkpoint/resources, density/score,
+  saturation, rollback, causal-cache, eager/JIT/scan, and public-export tests
+  pass. This is L0 mechanism coverage with no state-distribution correction,
+  off-policy convergence, retention, efficacy, or SOTA claim.
+- Added a strict continuous actor/critic recurrence evaluator over one fixed
+  12-event, one-action-dimensional A/B/A life from an immutable source-bound
+  snapshot. It reconstructs cached latent/action ownership, transformed
+  target/behavior densities, the exact latent ratio, rewards, same-state
+  gauge-centered critic error, actor error/churn, plasticity/activity,
+  successor ownership, counters, resources, final state, and exact live replay.
+  Reports and checkpoints are hash-bound, no-overwrite, and subject to absolute
+  byte/scalar ceilings. A symmetric eight-float32-ULP allowance is isolated to
+  transformed diagnostic-density reconstruction; the policy-defining latent
+  ratio remains bit-exact and larger tampering fails. The result is
+  development-only `not-assessed`, with no retention, efficacy, convergence,
+  calibration, promotion, or SOTA claim.
+- Added a tiny matched-stream world-model retention diagnostic comparing the
+  shallow reference, plain bootstrap ensemble, and atomic model-only rehearsal
+  over uninterrupted A/B/A lives with interleaved noisy-TV outcomes. Raw
+  grounded errors, adaptation/recurrence descriptions, ensemble disagreement,
+  typed signals, replay composition, and logical resource/event accounting
+  reconstruct from fixed streams. The two-seed, 18-step protocol is
+  resource-unmatched and permanently `not-assessed`; it supports no retention,
+  superiority, control, or SOTA claim.
 - Added identity, fixed-trace, and online trainable gated state builders under
   one causal fixed-budget contract, including checkpoint parity and a
   development-only partially observable diagnostic.
-- Added a gradient-level `assess_gradient_joy` control-plane audit for the
-  literal question “does this candidate gradient/update spark joy?” It uses
+- Added a multi-objective candidate-update safety audit under the historical
+  `assess_gradient_joy` API. It uses
   caller-supplied objective, retention, and safety probes under a required
   `probe_independence_attested` contract plus a trust bound, fails closed on
   unavailable, unattested, or invalid evidence, and requires explicit
-  availability for all eight separately reported learning-value channels.
+  availability for all eight separately reported learning-value channels. The
+  `LearningValue.delight` evidence channel is valid only when its bits exactly
+  equal the finite float32 advantage-surprisal product; it remains evidence
+  rather than a candidate-update verdict.
   Raw-candidate factors produce a tentative soft-weighted update; both stages
   must satisfy objective, retention, and safety magnitude gates. Numeric
   controls must survive as finite normal float32 values, and cosine alignment
@@ -180,12 +353,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binds probe evidence to the dispatched decision and commits only an accepted
   effective delta into the advanced recurrent builder state. No realized-
   benefit result is claimed.
+- Added the paper-defined `KondoGate` forward/sparse-gather boundary. Delight
+  is derived internally as advantage times selected-action surprisal, and
+  “sparks joy” means selection for a backward pass. Finite-temperature
+  Bernoulli-price and deterministic fixed-rate top-k modes have typed RNG,
+  bounded accounting, strict checkpoints, caller-declared force preservation,
+  and an explicit flag requiring caller-managed full-shape fallback on
+  overflow. When configured capacity is below batch size, the fixed-capacity
+  gather gives downstream autodiff a genuinely smaller input; tests inspect
+  that backward JAXPR rather than equating a masked full-batch loss with saved work.
+  This is L0 mechanism coverage with no integrated consumer, measured compute
+  saving, DG reproduction, or learning/safety claim.
+- Added a bounded `LearningValueRouter` for the eight separately typed
+  learning-value channels. Each channel has explicit producer/object/units/
+  domain metadata, independent validation, and causal pre-update Welford
+  normalization. Six exact-mask routes serve the paper-DG actor, exploration,
+  model memory/replay, adaptation/change, safety, and the complete evidence
+  bundle for the separate candidate-update audit; there is no default sum.
+  Invalid unrelated inputs cannot suppress valid safety learning, delight must
+  exactly equal its float32 advantage-surprisal product, and the router performs
+  neither the candidate audit nor Kondo selection. Fixed resources, counter-capacity behavior,
+  strict checkpoints, and eager/JIT/scan parity are mechanism-tested; no
+  calibration or consumer-benefit claim is made.
 - Added an isolated continuing categorical actor-critic for the separate
-  paper-specific Delightful Policy Gradient experiment. Ordinary and
-  delightful modes share the actor, differential critic, reward-rate baseline,
+  paper-specific DG policy-gradient experiment. Ordinary and paper-specific DG
+  modes share the actor, differential critic, reward-rate baseline,
   typed RNG, and action sampler; the actor trace is fixed to zero, and the
-  detached delight coefficient never gates critic/baseline or explicit
-  safety/model/representation routes. Exact on-policy records, atomic failure,
+  detached paper-defined delight coefficient never gates critic/baseline
+  or explicit safety/model/representation routes. Exact on-policy records, atomic failure,
   JIT/scan/checkpoint parity, gate strata, effective sample size, and logical
   resource accounting are contract-tested. A strict development runner now
   compares both modes under paired random-number schedules on contextual
@@ -281,9 +476,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity, fixed-trace, and online-gated modes, exact recurrence/event counts,
   cached-action semantics, scan parity, and config-bound checkpoints. The
   online-gated learner now rejects non-finite/overflowing gradients atomically;
-  Prototype now has one ensemble model-loss gradient producer but still lacks
-  the balanced multi-objective representation-gradient set, so this is not a
-  learned-state efficacy claim.
+  a successor opt-in Prototype mixer combines its real grounded-model gradient
+  with the current base-Q or intra-option control semi-gradient. It records
+  source norms, weights, clipping, cosine/conflict, and failures, excludes
+  delayed option-start and replay gradients, and sends the exact mixed
+  candidate to both builder learning and the candidate-update audit boundary. GVF,
+  inverse, feature-utility, causal-deletion, empirical-balancing, and matched
+  Forager evidence remain absent, so this is not a learned-state efficacy claim.
 - Added an opt-in `sample_one_hot` Prototype dream-observation mode for wholly
   one-hot control features. It projects finite model outputs to categorical
   mass, samples on an RNG stream isolated from legacy anchor/action choices,

@@ -9,10 +9,13 @@ evaluator-owned sequence of raw ``(observation, action, outcome)`` events:
 * :class:`ModelReplayRehearsal` using the same ensemble child configuration.
 
 The stream is an uninterrupted A/B/A recurrence with interleaved stable and
-aleatoric noisy-TV transitions.  Phase, regime, and noisy-TV labels exist only
-in the evaluator trace.  Learners receive no task identifier or boundary.  A
-unique provenance integer lets the evaluator audit replay composition; it is
-not used by the model, priority equation, or representation filter.
+aleatoric noisy-TV transitions — the classic irreducible-noise trap for
+prediction-driven learners (Schmidhuber 1991, "Curious model-building control
+systems"; Burda et al. 2018, "Large-Scale Study of Curiosity-Driven
+Learning").  Phase, regime, and noisy-TV labels exist only in the evaluator
+trace.  Learners receive no task identifier or boundary.  A unique provenance
+integer lets the evaluator audit replay composition; it is not used by the
+model, priority equation, or representation filter.
 
 All errors are computed independently from decoded predictions and common raw
 grounded ``[next_observation, reward, continuation]`` targets.  Internal model
@@ -80,6 +83,10 @@ LEARNER_ORDER: tuple[LearnerName, ...] = (
     "plain_world_model_ensemble",
     "model_replay_rehearsal",
 )
+# The protocol is deliberately tiny (three 6-step phases, two seeds): the
+# report is descriptive only, and strict validation reruns every learner on
+# every load, so the whole harness must stay cheap enough to replay
+# constantly.  The windows below are sized to fit inside one 6-step phase.
 REGIME_SCHEDULE = ("A", "B", "A")
 DEVELOPMENT_SEEDS = (7, 29)
 PHASE_LENGTH = 6
@@ -411,6 +418,14 @@ def _generate_stream(seed: int) -> dict[str, object]:
         outcome_key = jr.fold_in(environment_root, step)
         draw = np.float32(jax.device_get(jr.normal(outcome_key, (), dtype=jnp.float32)))
 
+        # Dynamics design: both regimes are contracting affine maps on the
+        # signal channel (|slope| < 1 keeps the stream bounded), and regime B
+        # flips the slope sign so its dynamics conflict with regime A rather
+        # than extend them.  On noisy-TV steps the distractor channel is
+        # i.i.d. N(0, 1.35^2) — no state or action dependence, hence
+        # irreducibly unpredictable, with a standard deviation exceeding the
+        # signal's magnitude; on other steps it is a predictable contracting
+        # map coupled to the signal.
         signal = observation[0]
         distractor = observation[1]
         if regime == "A":

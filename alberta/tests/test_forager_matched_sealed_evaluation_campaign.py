@@ -1,3 +1,20 @@
+"""Lifecycle tests for
+:mod:`alberta_framework.benchmarks.forager_matched_sealed_evaluation_campaign`.
+
+The sealed-evaluation engine executes the held-out 6-candidate x 30-seed
+block after the seal: it re-authenticates the caller-pinned seal before any
+mutating step, reuses the append-only campaign engine, and finalizes into
+stage-specific unresolved content (never an authority claim).  This suite
+covers the engine lifecycle on a synthetic in-memory sealed context
+(``_sealed_context``): exact 6x30 manifest and inventory, authenticate-
+before-publish event ordering, read-only verification, bound-raw recovery
+and completion-pointer repair, and rejection of false-authority completion
+summaries.
+
+Deeper tamper and authentication attacks around a *real* seal bundle live in
+the twin suite ``test_forager_matched_sealed_evaluation_campaign_adversarial``.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -13,6 +30,7 @@ from alberta_framework.benchmarks import forager_matched_evaluation_campaign as 
 from alberta_framework.benchmarks import forager_matched_evidence as evidence
 from alberta_framework.benchmarks import forager_matched_executor as executor
 from alberta_framework.benchmarks import forager_matched_protocol as protocol
+from alberta_framework.benchmarks import forager_matched_qualification as qualification
 from alberta_framework.benchmarks import forager_matched_seal as seal
 from alberta_framework.benchmarks import (
     forager_matched_sealed_evaluation_campaign as sealed_campaign,
@@ -27,9 +45,78 @@ def _sha(label: str) -> str:
     return hashlib.sha256(label.encode("ascii")).hexdigest()
 
 
+def _qualification_material(label: str) -> tuple[dict[str, Any], bytes, str]:
+    manifest = {
+        "schema_version": "test.qualification.v2",
+        "label": f"café-{label}",
+    }
+    raw = qualification._canonical_json_bytes(manifest)
+    return manifest, raw, hashlib.sha256(raw).hexdigest()
+
+
+def _execution_ready_protocol(
+    frozen: protocol.ForagerMatchedProtocol,
+    base: executor.PreparedCandidate,
+) -> tuple[protocol.ForagerMatchedProtocol, dict[str, dict[str, Any]]]:
+    """Rebind synthetic candidates to one real, fully verifiable test source."""
+    candidates: list[protocol.MatchedCandidate] = []
+    receipts: dict[str, dict[str, Any]] = {}
+    for original in frozen.candidates:
+        candidate = replace(
+            original,
+            implementation_kind=base.candidate.implementation_kind,
+            entrypoint_family=base.candidate.entrypoint_family,
+            source=base.candidate.source,
+            configuration=base.candidate.configuration,
+        )
+        descriptor = protocol.candidate_capability_descriptor_sha256(candidate)
+        candidate = replace(
+            candidate,
+            runtime_binding=replace(
+                candidate.runtime_binding,
+                qualified_capability_descriptor_sha256=descriptor,
+            ),
+        )
+        receipt = executor_fixtures._receipt(  # noqa: SLF001
+            candidate.to_dict(),
+            entrypoint=base.entrypoint_path,
+            invocation_style=base.invocation_style,
+            result_root=base.result_root,
+            patch_sha256=base.rng_isolation_patch_sha256,
+        )
+        receipt_sha256 = hashlib.sha256(
+            executor.canonical_json_bytes(receipt)
+        ).hexdigest()
+        candidate = replace(
+            candidate,
+            runtime_binding=replace(
+                candidate.runtime_binding,
+                capability_qualification_receipt_sha256=receipt_sha256,
+            ),
+        )
+        candidates.append(candidate)
+        receipts[candidate.candidate_id] = receipt
+    candidate_tuple = tuple(candidates)
+    return (
+        replace(
+            frozen,
+            candidates=candidate_tuple,
+            candidate_index=MappingProxyType(
+                {item.candidate_id: item for item in candidate_tuple}
+            ),
+        ),
+        receipts,
+    )
+
+
 def _sealed_context(tmp_path: Path) -> sealed_campaign._SealedContext:
     tmp_path.mkdir(parents=True, exist_ok=True)
+    base_plan_root = tmp_path / "base-plan"
+    base_plan_root.mkdir()
+    base_plan = executor_fixtures._plan(base_plan_root)
+    base_candidate = base_plan.candidates[0]
     open_value = protocol_fixtures._build()
+    open_value, receipts = _execution_ready_protocol(open_value, base_candidate)
     result_payload = {
         "schema_version": protocol.FORAGER_MATCHED_SELECTION_RESULT_SCHEMA_VERSION,
         "open_protocol_sha256": open_value.protocol_sha256,
@@ -59,43 +146,28 @@ def _sealed_context(tmp_path: Path) -> sealed_campaign._SealedContext:
         transition,
     )
 
-    base_plan_root = tmp_path / "base-plan"
-    base_plan_root.mkdir()
-    base_plan = executor_fixtures._plan(base_plan_root)
-    base_candidate = base_plan.candidates[0]
-    prepared = tuple(
-        replace(
-            base_candidate,
-            candidate=sealed_protocol.candidate_index[candidate_id],
-            capability_receipt_sha256=(
-                sealed_protocol.candidate_index[
-                    candidate_id
-                ].runtime_binding.capability_qualification_receipt_sha256
-            ),
+    qualification_manifest, qualification_bytes, qualification_digest = (
+        _qualification_material("sealed-context")
+    )
+    assets = {
+        candidate_id: executor.CandidateExecutionAssets(
+            candidate_id=candidate_id,
+            source_root=base_candidate.source_root,
+            source_archive=base_candidate.source_archive,
+            source_inventory=base_candidate.source_inventory,
+            original_configuration=base_candidate.original_configuration,
+            configuration=base_candidate.configuration,
+            capability_receipt=receipts[candidate_id],
         )
         for candidate_id in transition.evaluation_candidate_ids
-    )
-    plan_payload = base_plan.to_dict()
-    plan_payload.update(
-        {
-            "stage": "sealed_evaluation",
-            "protocol_sha256": sealed_protocol.protocol_sha256,
-            "active_seeds": list(sealed_protocol.active_seeds),
-            "horizon": sealed_protocol.horizon,
-            "candidate_order": list(transition.evaluation_candidate_ids),
-        }
-    )
-    plan = executor.MatchedExecutionPlan(
-        protocol=sealed_protocol,
-        candidates=prepared,
-        source_manifest=base_plan.source_manifest,
-        executor_manifest=base_plan.executor_manifest,
-        payload=plan_payload,
-        candidate_index=MappingProxyType(
-            {item.candidate.candidate_id: item for item in prepared}
-        ),
+    }
+    plan = executor.build_execution_plan(
+        sealed_protocol,
+        assets,
+        qualification_manifest_sha256=qualification_digest,
         cpu_qualification_root=base_plan.cpu_qualification_root,
         rng_parity_qualification_root=base_plan.rng_parity_qualification_root,
+        candidate_ids=transition.evaluation_candidate_ids,
     )
     live = executor_fixtures._runtime(tmp_path / "runtime", plan)
 
@@ -107,7 +179,9 @@ def _sealed_context(tmp_path: Path) -> sealed_campaign._SealedContext:
         Any,
         SimpleNamespace(
             output_root=qualification_root,
-            manifest={"schema_version": "test.qualification.v1"},
+            manifest=qualification_manifest,
+            manifest_bytes=qualification_bytes,
+            manifest_sha256=qualification_digest,
             cpu_qualification_root=base_plan.cpu_qualification_root,
             rng_parity_qualification_root=base_plan.rng_parity_qualification_root,
         ),
@@ -123,6 +197,7 @@ def _sealed_context(tmp_path: Path) -> sealed_campaign._SealedContext:
     open_request_values = {
         "stage": "open_tuning",
         "protocol_sha256": open_value.protocol_sha256,
+        "qualification_manifest_sha256": qualification_digest,
         "score_evidence_sha256": _sha("open-score"),
         "source_manifest_sha256": _sha("open-source"),
         "executor_manifest_sha256": _sha("open-executor"),
@@ -163,11 +238,23 @@ def _sealed_context(tmp_path: Path) -> sealed_campaign._SealedContext:
     )
     seal_content = seal.ContentVerifiedSealBundle(
         output_root=seal_root,
-        manifest={"payload_sha256": _sha("seal-manifest")},
+        manifest={
+            "payload_sha256": _sha("seal-manifest"),
+            "open_campaign": {
+                "qualification_manifest_sha256": qualification_digest
+            },
+        },
         open_protocol=open_value,
-        open_score_evidence=cast(Any, SimpleNamespace()),
+        open_score_evidence=cast(
+            Any,
+            SimpleNamespace(
+                qualification_manifest_sha256=qualification_digest,
+            ),
+        ),
         open_verification_request=open_request,
-        recorded_bindings_cache={},
+        recorded_bindings_cache={
+            "qualification_manifest_sha256": qualification_digest,
+        },
         selection_result=selection,
         selection_report={},
         sealed_protocol=sealed_protocol,
@@ -198,6 +285,9 @@ def _status(context: sealed_campaign._SealedContext) -> campaign.CampaignStatus:
         next_candidate_id=context.engine.rebuilt.candidate_ids[0],
         next_seed=context.engine.rebuilt.protocol.active_seeds[0],
         protocol_sha256=context.engine.rebuilt.protocol.protocol_sha256,
+        qualification_manifest_sha256=(
+            context.engine.rebuilt.bundle.manifest_sha256
+        ),
         plan_sha256=context.engine.rebuilt.plan.plan_sha256,
         live_runtime_identity_sha256=context.engine.live_runtime.identity_sha256,
         score_evidence_sha256=None,
@@ -275,11 +365,52 @@ def test_exact_six_by_thirty_manifest_and_initial_inventory(tmp_path: Path) -> N
     assert manifest["fixed_descriptive_candidate_ids"] == list(
         context.engine.rebuilt.candidate_ids[4:]
     )
+    assert manifest["schema_version"] == (
+        sealed_campaign.MATCHED_SEALED_EVALUATION_CAMPAIGN_SCHEMA_VERSION
+    )
+    assert manifest["qualification_manifest_sha256"] == (
+        context.engine.rebuilt.bundle.manifest_sha256
+    )
     assert manifest["content_capture_threat_boundary"] == {
         "campaign_tree_writers": "cooperative_lock_participants_trusted",
         "root_guard_scope": "top_level_inode_and_path_swap_detection_only",
         "noncooperative_same_uid_writers": "out_of_scope",
         "claim_authority": "independent_final_subject_authentication_required",
+    }
+    golden_payload_sha256 = {
+        "sealed-protocol.json": (
+            "4a5386da89dfe6a0ab019f3ee62ebebddf4dd7e98c7a8aec76667a79b24d5c82"
+        ),
+        "sealed-transition.json": (
+            "5b6136e43205c8a5e9362254c3ea84295c58d6f16d0579a75b42488f6a279170"
+        ),
+        "seal-manifest.json": (
+            "aad445405166220d829a425c269fe92cb5f73cbb298fb08efafab2990f13b355"
+        ),
+        "candidate-universe.json": (
+            "2c3b214cf29e013e3f8d88b2558bd94f75e92330bf0ddcc6afd7514279a1ee77"
+        ),
+        "execution-plan.json": (
+            "0876d3957739775eb2edae4832cba85b2d3279b5f85a5012e2a0c03e374f3863"
+        ),
+        "source-manifest.json": (
+            "bbf7d83e5b1e3d4737cfbae990386de5b90f36352d12af4a64e0a9ce96a90899"
+        ),
+        "executor-manifest.json": (
+            "e4f1f36bdff0dabf5662257a60ae48e99f5c952a135306d06f9f1191edce528b"
+        ),
+        "qualification-manifest.json": (
+            "d54fb71f96641d8cbe1eb3b78a3ac9aef3e680b4ea4efba14181dd74a5c1332f"
+        ),
+        "execution-schedule.json": (
+            "8a647b3d23559e84312ec35b34795e403309bc9de10bd57788bb82605292fd49"
+        ),
+        "live-runtime.json": (
+            "809c05a964c02a024fa6c47e440f82ffd2c5edd539d62d24b303d22d0736d6af"
+        ),
+        "campaign.json": (
+            "087a9f7ef7c7a872dc1e0f31ed865d1e6e41d183c106aaf8ccb47708f2b05f31"
+        ),
     }
     _publish_context(context)
     expected = {
@@ -289,6 +420,16 @@ def test_exact_six_by_thirty_manifest_and_initial_inventory(tmp_path: Path) -> N
         *(f"{name}.sha256" for name in sealed_campaign._IMMUTABLE_ARTIFACTS),
     }
     assert {path.name for path in context.engine.root.iterdir()} == expected
+    assert (context.engine.root / "qualification-manifest.json").read_bytes() == (
+        context.engine.rebuilt.bundle.manifest_bytes
+    )
+    for name, expected_sha256 in golden_payload_sha256.items():
+        assert hashlib.sha256((context.engine.root / name).read_bytes()).hexdigest() == (
+            expected_sha256
+        )
+        assert (context.engine.root / f"{name}.sha256").read_bytes() == (
+            f"{expected_sha256}\n".encode("ascii")
+        )
 
 
 def test_prepare_auth_failure_creates_no_output_or_parent(
@@ -611,6 +752,27 @@ def test_full_evaluation_finalizes_stage_specific_unresolved_content(
     assert bundle.completion_summary["sealed_transition_sha256"] == (
         context.inputs.seal_content.sealed_transition_sha256
     )
+    golden_final_sha256 = {
+        "execution-receipt-index.json": (
+            "789408b3e801027bf55d0df25e58ef181b8f83897157516325422455f0f44df0"
+        ),
+        "score-evidence.json": (
+            "0806622d80c6b33a282ef8e81e4e50ab6ac84a8175d353ec4a5ec5403c693a1b"
+        ),
+        "verification-request.json": (
+            "0f94bdf34c64a1fd9c108edd33f4858f5e4046fe3d9a6868a7a6797c70d957ff"
+        ),
+        "completion-summary.json": (
+            "b43451326e5ea357e82d4c2f8085f14d9787d58425bd3089e27aec634f776ca7"
+        ),
+    }
+    for name, expected_sha256 in golden_final_sha256.items():
+        assert hashlib.sha256((context.engine.root / name).read_bytes()).hexdigest() == (
+            expected_sha256
+        )
+        assert (context.engine.root / f"{name}.sha256").read_bytes() == (
+            f"{expected_sha256}\n".encode("ascii")
+        )
 
 
 def test_false_authority_completion_summary_is_rejected_before_persistence(
@@ -618,10 +780,20 @@ def test_false_authority_completion_summary_is_rejected_before_persistence(
 ) -> None:
     context = _sealed_context(tmp_path)
     receipt = cast(Any, SimpleNamespace(payload_sha256=_sha("receipt")))
-    scores = cast(Any, SimpleNamespace(payload_sha256=_sha("scores")))
+    qualification_digest = context.engine.rebuilt.bundle.manifest_sha256
+    scores = cast(
+        Any,
+        SimpleNamespace(
+            payload_sha256=_sha("scores"),
+            qualification_manifest_sha256=qualification_digest,
+        ),
+    )
     request = cast(
         Any,
-        SimpleNamespace(verification_subject_sha256=_sha("final-subject")),
+        SimpleNamespace(
+            verification_subject_sha256=_sha("final-subject"),
+            qualification_manifest_sha256=qualification_digest,
+        ),
     )
     summary = sealed_campaign._completion_summary(
         context.inputs,
@@ -630,6 +802,23 @@ def test_false_authority_completion_summary_is_rejected_before_persistence(
         scores,
         request,
     )
+    assert summary["schema_version"] == (
+        sealed_campaign.MATCHED_SEALED_EVALUATION_COMPLETION_SCHEMA_VERSION
+    )
+    assert summary["qualification_manifest_sha256"] == qualification_digest
+    assert hashlib.sha256(campaign.canonical_json_bytes(summary)).hexdigest() == (
+        "e49377a478b52dedc72ac66df7db760c4ca0f19e51e1052a4fa4dae9e91907df"
+    )
+    legacy = dict(summary)
+    legacy["schema_version"] = "alberta.forager_matched_sealed_evaluation_completion.v1"
+    with pytest.raises(ValueError, match="exact v2 schema"):
+        sealed_campaign._summary_validator(context.inputs)(
+            context.engine,
+            receipt,
+            scores,
+            request,
+            legacy,
+        )
     summary["promotion_authorized"] = True
     summary["protocol_sha256"] = _sha("wrong-protocol")
 

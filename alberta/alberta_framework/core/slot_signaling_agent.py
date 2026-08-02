@@ -18,8 +18,9 @@ confirmed candidate fills a vacancy or atomically replaces one stale durable
 generation.
 Independent static axes control durable test writes (selective or writable)
 and full-bank replacement (failure evidence or least-recently-successful).
-The historical ``writable_lru_ablation`` switch remains a compatibility alias
-for the writable/LRU cell; every cell has identical persistent state.
+``writable_lru_ablation`` is shorthand for the writable/LRU cell and cannot
+be combined with the explicit axis settings; every cell has identical
+persistent state.
 
 Three durable slots cannot preserve more than three arbitrary incompatible
 conventions.  With no regime observation, retrieval must spend ordinary

@@ -1,4 +1,19 @@
-"""Adversarial contract tests for the active UPGD IPMNIST v3 lifecycle."""
+"""Adversarial contract tests for the active UPGD IPMNIST v3 lifecycle.
+
+"Active" means the strict v3 execution contract in
+:mod:`alberta_framework.benchmarks.upgd_ipmnist_v3` — the lifecycle the
+public ``upgd_ipmnist.main`` dispatches to exclusively; the legacy v2 CLI
+survives only as ``main_v2_compat`` for historical shard merging, with its
+unverifiable direct-aggregate mode removed.  v3 splits execution into three
+commands (issue an immutable plan -> execute exactly one learner/seed shard
+-> merge the exact planned Cartesian product), publishes every file
+atomically at a new path, and is permanently nonpromoting because the
+execution envelope is self-recorded.  The benchmark science itself (the
+Elsayed & Mahmood ICLR 2024 Input-permuted MNIST replication) lives in
+:mod:`alberta_framework.benchmarks.upgd_ipmnist` and is not re-tested here;
+these tests attack the lifecycle: dispatch, immutable publication, plan
+issuance, single-seed partials, and exact merge.
+"""
 
 from __future__ import annotations
 
@@ -54,6 +69,10 @@ from alberta_framework.evaluation.upgd_ipmnist_v3 import main as evaluation_main
 REAL_REPLAY_PARTIAL_MEASUREMENTS = v3._replay_partial_measurements
 REAL_LOAD_PINNED_MNIST = v3._load_pinned_mnist
 
+# Shrinks only what v3 leaves free: plan validation pins the pinned-MNIST
+# data identity (input_dim=784, n_classes=10, task_length within the
+# 60,000-row train split), so a tiny fixture may reduce task count/length
+# and hidden widths but not the input/output dimensions.
 TINY = IPMNISTConfig(
     n_tasks=3,
     task_length=2,

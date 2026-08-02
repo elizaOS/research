@@ -116,7 +116,8 @@ bounded action scalars per divergent pair and never emits a reward array. Exit m
 - `3`: the final path was published but durability or replay verification is uncertain.
 
 The harness uses the qualified digest-pinned OCI image, bounded streaming stdout/stderr,
-named-container cleanup on timeout and all exceptional exits, private exact harness bytes,
+named-container cleanup on timeout, interruption, runner exceptions, and completed child
+failure, private exact harness bytes,
 dirfd-anchored Linux `renameat2(RENAME_NOREPLACE)` publication, held-inode destination
 checks, and a strict two-file receipt loader. Linux `renameat2` is required; absence fails
 closed. Noncooperative same-uid writers remain outside the local filesystem threat model.
@@ -191,7 +192,7 @@ receipt/sidecar replay.
 .venv/bin/python -m pytest tests/test_forager_causal_grid_divergence_probe.py -q -o addopts=""
 ```
 
-Final focused result: `39 passed`; ruff, strict mypy, and targeted compilation passed.
+Final focused result: `44 passed`; ruff, strict mypy, and targeted compilation passed.
 
 A read-only `.venv/bin/alberta-evidence-status` check exited `2` in the pre-existing dirty
 worktree, consistent with registered-source drift already present there. It was not

@@ -7,6 +7,12 @@ The task-matrix metrics in this module use a common convention: rows are
 evaluation checkpoints and columns are tasks or regimes. ``first_exposure[j]``
 is the row immediately after task ``j`` was first learned. Values before that
 row may be finite (for forward-transfer probes) or ``NaN`` (not evaluated).
+
+References:
+    Lopez-Paz & Ranzato (2017). "Gradient Episodic Memory for Continual
+        Learning." (backward/forward transfer)
+    De Lange, van de Ven, & Tuytelaars (2023). "Continual Evaluation for
+        Lifelong Learning: Identifying the Stability Gap."
 """
 
 from dataclasses import dataclass
@@ -122,6 +128,9 @@ def compute_backward_transfer(
 ) -> NDArray[np.float64]:
     """Return final minus first-post-exposure performance for each task.
 
+    This is the BWT measure of Lopez-Paz & Ranzato (2017, GEM), generalized
+    from their final-row convention to arbitrary checkpoint matrices.
+
     The sign is normalized so positive values always mean improvement. Unlike
     peak-to-final forgetting, backward transfer can be positive when later
     experience improves an earlier task.
@@ -145,6 +154,10 @@ def compute_forward_transfer(
     higher_is_better: bool = True,
 ) -> NDArray[np.float64]:
     """Return pre-exposure performance relative to a task baseline.
+
+    This is the FWT measure of Lopez-Paz & Ranzato (2017, GEM): performance
+    on a task probed *before* it is ever trained on, minus a task-specific
+    baseline (in GEM, the untrained-network performance).
 
     Task 0, and any task without a finite pre-exposure probe, receives ``NaN``.
     The sign is normalized so positive values always mean beneficial transfer.
@@ -196,6 +209,10 @@ def compute_stability_gap(
     higher_is_better: bool = True,
 ) -> StabilityGap:
     """Measure transient online degradation relative to a reference trace.
+
+    The stability gap (De Lange et al. 2023) is the dip that end-of-task
+    evaluation cannot see: a learner may recover to its reference level by the
+    next checkpoint while still having spent many online steps below it.
 
     The reference may be a scalar target or one value per online step. Gaps are
     clipped at zero, so exceeding the reference is not treated as instability.
@@ -320,6 +337,11 @@ def compute_cumulative_error(
 ) -> NDArray[np.float64]:
     """Compute cumulative error over time.
 
+    Cumulative error is the online-learning (regret-style) view of a run: its
+    slope at time ``t`` is the instantaneous error, so a persistent slope
+    difference between learners is sustained tracking advantage, while a
+    one-time vertical offset is a transient.
+
     Args:
         metrics_history: List of metric dictionaries from learning loop
         error_key: Key to extract error values
@@ -336,6 +358,11 @@ def compute_running_mean(
     window_size: int = 100,
 ) -> NDArray[np.float64]:
     """Compute running mean of values.
+
+    The output has the same length as the input: the first ``window_size - 1``
+    entries are padded with the first fully-windowed mean (they are not
+    partial-window means). If the input is shorter than ``window_size``, the
+    input is returned unchanged.
 
     Args:
         values: Array of values
@@ -396,6 +423,9 @@ def compare_learners(
     metric: str = "squared_error",
 ) -> dict[str, dict[str, float]]:
     """Compare multiple learners on a given metric.
+
+    ``final_100_mean`` averages the last 100 steps (the whole trace when it is
+    shorter), estimating settled performance less noisily than the last value.
 
     Args:
         results: Dictionary mapping learner name to metrics history

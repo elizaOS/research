@@ -1,4 +1,20 @@
-"""Tests for Step 1 baseline optimizers."""
+"""Tests for Step 1 baseline optimizers.
+
+The optimizers under test (:mod:`alberta_framework.core.baseline_optimizers`)
+are the non-meta-learning comparators for Alberta Plan Step 1 (continual
+supervised learning with given features): AdaGain (Jacobsen et al. 2019,
+"Meta-Descent for Online, Continual Prediction"), Adam (Kingma & Ba 2014),
+RMSprop (Tieleman & Hinton 2012), and NADALINE — per-feature normalized LMS
+after Sutton (1988).  Coverage is mechanism-level: state shapes and init
+values, finiteness over a few updates, config round-trips, and one
+analytical contract per method (Adam's exact t=1 bias correction and
+decoupled AdamW decay; NADALINE's scale-invariant step and plain-LMS bias).
+
+Hyperparameter literals here carry no tuning content: init tests restate
+the constructor defaults explicitly (e.g. AdaGain's ``meta_step_size=0.001,
+forgetting_rate=0.1``), and round-trip tests use arbitrary nondefault
+values so serialization bugs cannot hide behind defaults.
+"""
 
 import chex
 import jax.numpy as jnp

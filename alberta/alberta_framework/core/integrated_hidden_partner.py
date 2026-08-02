@@ -52,6 +52,11 @@ applies a uniform belief to the joint-world marginalization.
 ``random_feature_curation=True`` still computes the complete utility-learning
 path from untouched learned state and supplies deterministic transient ranks
 only to active-worst, candidate-best, and candidate-worst transaction choices.
+``action_selection_mode="externally_forced"`` still computes the complete
+ordinary epsilon-greedy decision and advances its RNG identically; only the
+applied action is replaced. The persistent selection flag records that fact,
+while the external action schedule remains the responsibility of the caller
+and, for serialized runs, an external trace digest.
 The grounded-world and representation-gradient mixer lane is an opt-in L0
 mechanism. Its absence preserves the legacy state leaves, resource accounting,
 and transition path. When present, its four predictions are evaluated even if
@@ -121,7 +126,7 @@ import functools
 import math
 from collections.abc import Mapping
 from numbers import Real
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 import chex
 import jax
@@ -176,7 +181,7 @@ from alberta_framework.core.state_builder import (
     StateBuilderLearningDiagnostics,
 )
 
-INTEGRATED_HIDDEN_PARTNER_SCHEMA_VERSION = "alberta.integrated-hidden-partner.l0.v14"
+INTEGRATED_HIDDEN_PARTNER_SCHEMA_VERSION = "alberta.integrated-hidden-partner.l0.v15"
 DEVELOPMENT_LEVEL = "L0"
 
 RAW_OBSERVATION_DIM = 8
@@ -205,6 +210,32 @@ INITIAL_ACTIVE_DESCRIPTORS: tuple[tuple[int, int], ...] = (
 """Unique canonical distractors excluding critical pairs (0, 2) and (4, 5)."""
 
 _INT32_MAX = 2**31 - 1
+
+INTEGRATED_DECISION_CACHE_CHECK_ORDER: tuple[str, ...] = (
+    "predicted_partner_probabilities",
+    "partner_probabilities",
+    "partner_probabilities_valid",
+    "probability_violation",
+    "expected_rewards",
+    "expected_outcomes",
+    "centered_expected_rewards",
+    "model_term",
+    "applied_model_term",
+    "planner_scores",
+    "greedy_action",
+    "cell_evaluations",
+    "control_last_observation",
+    "current_q_value_delta",
+    "control_epsilon",
+    "control_q_bias_disabled",
+    "control_q_trace_bias_disabled",
+    "control_step_count",
+    "grounded_evaluation",
+    "planner_selection",
+    "cached_evaluation_finite",
+    "q_value_delta_finite",
+    "planner_selection_finite",
+)
 
 
 def _require_array_contract(
@@ -268,6 +299,7 @@ class IntegratedHiddenPartnerConfig:
     memory_masked: bool = False
     uniform_partner_belief: bool = False
     random_feature_curation: bool = False
+    action_selection_mode: Literal["agent", "externally_forced"] = "agent"
     evidence_gated_feature_memory: bool = False
     feature_evidence_confirmation_steps: int = 1
     independent_relevance_probe: bool = False
@@ -332,6 +364,13 @@ class IntegratedHiddenPartnerConfig:
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be boolean")
+        if (
+            not isinstance(self.action_selection_mode, str)
+            or self.action_selection_mode not in ("agent", "externally_forced")
+        ):
+            raise ValueError(
+                "action_selection_mode must be 'agent' or 'externally_forced'"
+            )
         if (
             not isinstance(self.relevance_probe_mode, str)
             or self.relevance_probe_mode not in RELEVANCE_PROBE_MODES
@@ -607,7 +646,7 @@ class IntegratedHiddenPartnerConfig:
         }
         expected = {field.name for field in dataclasses.fields(cls)} | metadata
         if set(values) != expected:
-            raise ValueError("integrated config fields do not match the v14 schema")
+            raise ValueError("integrated config fields do not match the v15 schema")
         if values.pop("type") != cls.__name__:
             raise ValueError("integrated config type is invalid")
         if values.pop("schema_version") != INTEGRATED_HIDDEN_PARTNER_SCHEMA_VERSION:
@@ -723,6 +762,7 @@ class IntegratedPlannerSelection:
     noisy_greedy_action: Int[Array, ""]
     random_action: Int[Array, ""]
     explored: Bool[Array, ""]
+    externally_forced: Bool[Array, ""]
     rng_key_before: Array
     rng_key_after: Array
 
@@ -731,10 +771,11 @@ class IntegratedPlannerSelection:
 class IntegratedHiddenPartnerState:
     """All bounded online state plus the active pre-TD decision record.
 
-    ``current_evaluation`` is the model/Q evaluation that selected
+    ``current_evaluation`` is the model/Q evaluation that selected or scored
     ``control.last_action``.  After an update it deliberately reflects the
-    next decision before that transition's SARSA parameter update, rather than
-    recomputing Q with post-update weights.
+    next decision before that transition's SARSA parameter update.  The exact
+    post-update difference is retained in ``current_q_value_delta``, making
+    the pre-TD Q cache reproducible from the committed control state.
     """
 
     state_builder: OnlineGatedStateBuilderState
@@ -752,6 +793,7 @@ class IntegratedHiddenPartnerState:
     consumer_evidence_streak: Int[Array, " 12"]
     consumer_read_idle_steps: Int[Array, " 12"]
     current_evaluation: IntegratedPlannerEvaluation
+    current_q_value_delta: Float[Array, " 2"]
     current_selection: IntegratedPlannerSelection
     step_count: Int[Array, ""]
 
@@ -775,6 +817,25 @@ class IntegratedStartResult:
     state: IntegratedHiddenPartnerState
     action: Int[Array, ""]
     diagnostics: IntegratedStartDiagnostics
+
+
+@chex.dataclass(frozen=True)
+class IntegratedConsumerRouteAudit:
+    """Scalar value-level verdicts for one atomic consumer routing transaction."""
+
+    source_slots_exact: Bool[Array, ""]
+    identity_masks_exact: Bool[Array, ""]
+    stable_prefix_exact: Bool[Array, ""]
+    survivor_values_exact: Bool[Array, ""]
+    reset_values_exact: Bool[Array, ""]
+    no_carry_reset_exact: Bool[Array, ""]
+    behavior_values_exact: Bool[Array, ""]
+    q_values_exact: Bool[Array, ""]
+    trace_values_exact: Bool[Array, ""]
+    last_observation_exact: Bool[Array, ""]
+    grounded_values_exact: Bool[Array, ""]
+    values_exact: Bool[Array, ""]
+    lifecycle_destination_reset_exact: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -887,6 +948,19 @@ class IntegratedUpdateDiagnostics:
     interaction_applied_descriptors: Int[Array, "12 2"]
     shadow_descriptors_changed: Bool[Array, ""]
     route: FeatureBankRouteDiagnostics
+    consumer_route_source_slots_exact: Bool[Array, ""]
+    consumer_route_identity_masks_exact: Bool[Array, ""]
+    consumer_route_stable_prefix_exact: Bool[Array, ""]
+    consumer_route_survivor_values_exact: Bool[Array, ""]
+    consumer_route_reset_values_exact: Bool[Array, ""]
+    consumer_route_no_carry_reset_exact: Bool[Array, ""]
+    consumer_route_behavior_values_exact: Bool[Array, ""]
+    consumer_route_q_values_exact: Bool[Array, ""]
+    consumer_route_trace_values_exact: Bool[Array, ""]
+    consumer_route_last_observation_exact: Bool[Array, ""]
+    consumer_route_grounded_values_exact: Bool[Array, ""]
+    consumer_route_values_exact: Bool[Array, ""]
+    consumer_lifecycle_destination_reset_exact: Bool[Array, ""]
     world_reward_prediction_preupdate: Float[Array, ""]
     world_outcome_prediction_preupdate: Float[Array, " 1"]
     world_reward_error: Float[Array, ""]
@@ -894,6 +968,13 @@ class IntegratedUpdateDiagnostics:
     world_target_valid: Bool[Array, ""]
     td_error: Float[Array, ""]
     average_reward: Float[Array, ""]
+    transition_input_valid: Bool[Array, ""]
+    decision_cache_valid: Bool[Array, ""]
+    decision_cache_check_vector: Bool[Array, " 23"]
+    behavior_gradient_valid: Bool[Array, ""]
+    grounded_path_valid: Bool[Array, ""]
+    candidate_models_valid: Bool[Array, ""]
+    candidate_state_finite: Bool[Array, ""]
     transition_observation_matches: Bool[Array, ""]
     transition_action_matches: Bool[Array, ""]
     transition_semantics_valid: Bool[Array, ""]
@@ -1116,6 +1197,7 @@ class IntegratedHiddenPartnerAgent:
             + _tree_array_nbytes(state.phi)
             + _tree_array_nbytes(state.chi)
             + _tree_array_nbytes(state.current_evaluation)
+            + _tree_array_nbytes(state.current_q_value_delta)
             + _tree_array_nbytes(state.current_selection)
             + _tree_array_nbytes(state.step_count)
         )
@@ -1556,25 +1638,35 @@ class IntegratedHiddenPartnerAgent:
             noisy_greedy_action=noisy_greedy,
             random_action=random_action,
             explored=explored,
+            externally_forced=jnp.asarray(False, dtype=jnp.bool_),
             rng_key_before=control_state.rng_key,
             rng_key_after=key,
         )
 
-    def _current_decision_cache_coherent(
+    def _current_decision_cache_check_vector(
         self,
         state: IntegratedHiddenPartnerState,
         fresh: IntegratedPlannerEvaluation,
-    ) -> Bool[Array, ""]:
-        """Validate every reproducible or internally bound decision-cache leaf.
+    ) -> Bool[Array, " 23"]:
+        """Return every reproducible or internally bound cache check in fixed order.
 
-        ``current_evaluation.q_values`` deliberately records the values used to
-        choose the current action *before* the preceding SARSA update, whereas
-        ``state.control`` contains the post-update weights.  Those historical
-        values therefore cannot be recomputed from the current control state.
-        They are instead required to be finite, bound algebraically into the
-        cached planner scores, and replayed through the exact cached selection
-        RNG record.  Every model-derived leaf is recomputed from current model
-        state and compared exactly.
+        ``current_evaluation.q_values`` records the values used to score the
+        current action *before* the preceding SARSA update.  The persistent
+        ``current_q_value_delta`` binds those historical values exactly to the
+        committed controller.  Model-derived leaves and ordinary policy RNG
+        primitives are recomputed exactly.  In externally-forced mode only the
+        applied action differs from that replayed ordinary policy decision.
+
+        ``probability_violation`` is an advisory reduction over the already
+        exact-bound probability vector. XLA may reassociate that reduction
+        across call-boundary fusion, so that scalar alone permits one float32
+        machine epsilon while its validity bit and every decision input remain
+        exact.
+
+        This is an internal algebraic provenance check, not an authenticity
+        mechanism.  A coordinated coherent mutation of Q values, scores, and
+        their delta still requires an external checkpoint/artifact digest to
+        detect.
         """
 
         cached = state.current_evaluation
@@ -1589,11 +1681,17 @@ class IntegratedHiddenPartnerAgent:
             model_term if self._config.planning_enabled else jnp.zeros_like(model_term)
         )
         planner_scores = cached.q_values + applied_model_term
+        expected_q_delta = fresh.q_values - cached.q_values
         base_checks = (
             exact(cached.predicted_partner_probabilities, fresh.predicted_partner_probabilities),
             exact(cached.partner_probabilities, fresh.partner_probabilities),
             exact(cached.partner_probabilities_valid, fresh.partner_probabilities_valid),
-            exact(cached.probability_violation, fresh.probability_violation),
+            jnp.isclose(
+                cached.probability_violation,
+                fresh.probability_violation,
+                atol=jnp.asarray(2.0**-23, dtype=jnp.float32),
+                rtol=0.0,
+            ),
             exact(cached.expected_rewards, fresh.expected_rewards),
             exact(cached.expected_outcomes, fresh.expected_outcomes),
             exact(cached.centered_expected_rewards, centered),
@@ -1602,6 +1700,18 @@ class IntegratedHiddenPartnerAgent:
             exact(cached.planner_scores, planner_scores),
             exact(cached.greedy_action, jnp.argmax(planner_scores).astype(jnp.int32)),
             exact(cached.cell_evaluations, fresh.cell_evaluations),
+            exact(state.control.last_observation, state.chi),
+            exact(state.current_q_value_delta, expected_q_delta),
+            exact(
+                state.control.epsilon,
+                jnp.asarray(self._config.epsilon, dtype=jnp.float32),
+            ),
+            exact(state.control.q_bias, jnp.zeros((N_ACTIONS,), dtype=jnp.float32)),
+            exact(
+                state.control.q_trace_bias,
+                jnp.zeros((N_ACTIONS,), dtype=jnp.float32),
+            ),
+            exact(state.control.step_count, state.step_count),
         )
 
         if self._grounded_world is None:
@@ -1644,13 +1754,29 @@ class IntegratedHiddenPartnerAgent:
             replay_control,
             cached.planner_scores,
         )
+        ordinary_policy_action = jax.lax.select(
+            selection.explored,
+            selection.random_action,
+            selection.noisy_greedy_action,
+        )
+        externally_forced = self._config.action_selection_mode == "externally_forced"
+        applied_action_coherent = (
+            jnp.asarray(True, dtype=jnp.bool_)
+            if externally_forced
+            else exact(selection.action, ordinary_policy_action)
+        )
         selection_coherent = jnp.all(
             jnp.stack(
                 (
-                    exact(selection.action, replayed_selection.action),
+                    applied_action_coherent,
                     exact(selection.noisy_greedy_action, replayed_selection.noisy_greedy_action),
                     exact(selection.random_action, replayed_selection.random_action),
                     exact(selection.explored, replayed_selection.explored),
+                    exact(ordinary_policy_action, replayed_selection.action),
+                    exact(
+                        selection.externally_forced,
+                        jnp.asarray(externally_forced, dtype=jnp.bool_),
+                    ),
                     exact(
                         jr.key_data(selection.rng_key_before),
                         jr.key_data(replayed_selection.rng_key_before),
@@ -1660,24 +1786,77 @@ class IntegratedHiddenPartnerAgent:
                         jr.key_data(replayed_selection.rng_key_after),
                     ),
                     exact(selection.action, state.control.last_action),
+                    (selection.action >= 0) & (selection.action < N_ACTIONS),
                     exact(jr.key_data(selection.rng_key_after), jr.key_data(state.control.rng_key)),
                 )
             )
         )
-        return (
-            _numeric_tree_finite(cached)
-            & _numeric_tree_finite(selection)
-            & jnp.all(jnp.stack(base_checks))
-            & grounded_coherent
-            & selection_coherent
+        checks = jnp.stack(
+            (
+                *base_checks,
+                grounded_coherent,
+                selection_coherent,
+                _numeric_tree_finite(cached),
+                _numeric_tree_finite(state.current_q_value_delta),
+                _numeric_tree_finite(selection),
+            )
         )
+        if len(INTEGRATED_DECISION_CACHE_CHECK_ORDER) != 23:
+            raise RuntimeError("integrated decision-cache check order must remain width 23")
+        return checks
+
+    def _current_decision_cache_coherent(
+        self,
+        state: IntegratedHiddenPartnerState,
+        fresh: IntegratedPlannerEvaluation,
+    ) -> Bool[Array, ""]:
+        """Return whether all fixed-order decision-cache checks pass."""
+
+        return jnp.all(self._current_decision_cache_check_vector(state, fresh))
 
     def start(
         self,
         raw_observation: Array,
         key: Array,
     ) -> IntegratedStartResult:
-        """Initialize every bounded component and select the first action.
+        """Initialize in ordinary agent-selected action mode."""
+        if self._config.action_selection_mode != "agent":
+            raise ValueError(
+                "start is unavailable when action_selection_mode is externally_forced; "
+                "use start_with_forced_action"
+            )
+        return self._start_impl(raw_observation, key, forced_action=None)
+
+    def start_with_forced_action(
+        self,
+        raw_observation: Array,
+        key: Array,
+        action: Array,
+    ) -> IntegratedStartResult:
+        """Initialize while applying one host-validated external action."""
+        if self._config.action_selection_mode != "externally_forced":
+            raise ValueError(
+                "start_with_forced_action is unavailable when action_selection_mode is agent"
+            )
+        forced_action = _require_array_contract(
+            action,
+            name="forced_action",
+            shape=(),
+            dtype=jnp.int32,
+        )
+        forced_action_host = int(jax.device_get(forced_action))
+        if not 0 <= forced_action_host < N_ACTIONS:
+            raise ValueError(f"forced_action must lie in [0, {N_ACTIONS})")
+        return self._start_impl(raw_observation, key, forced_action=forced_action)
+
+    def _start_impl(
+        self,
+        raw_observation: Array,
+        key: Array,
+        *,
+        forced_action: Array | None,
+    ) -> IntegratedStartResult:
+        """Initialize every bounded component and select or apply the first action.
 
         This is intentionally a host wrapper because component initializers
         attach lifecycle timestamps. The array-level methods it invokes remain
@@ -1779,6 +1958,11 @@ class IntegratedHiddenPartnerAgent:
             control_state,
             evaluation.planner_scores,
         )
+        if forced_action is not None:
+            selection = selection.replace(
+                action=forced_action,
+                externally_forced=jnp.asarray(True, dtype=jnp.bool_),
+            )
         control_with_rng = control_state.replace(rng_key=selection.rng_key_after)
         control_started, action = self._control.start_with_action(
             control_with_rng,
@@ -1800,6 +1984,7 @@ class IntegratedHiddenPartnerAgent:
             consumer_evidence_streak=consumer_evidence_streak,
             consumer_read_idle_steps=consumer_read_idle_steps,
             current_evaluation=evaluation,
+            current_q_value_delta=jnp.zeros((N_ACTIONS,), dtype=jnp.float32),
             current_selection=selection,
             step_count=jnp.asarray(0, dtype=jnp.int32),
         )
@@ -1826,6 +2011,61 @@ class IntegratedHiddenPartnerAgent:
         state: IntegratedHiddenPartnerState,
         transition: HiddenPartnerTransition,
     ) -> IntegratedUpdateResult:
+        """Consume one transition in ordinary agent-selected action mode."""
+        if self._config.action_selection_mode != "agent":
+            raise ValueError(
+                "update is unavailable when action_selection_mode is externally_forced; "
+                "use update_with_forced_next_action"
+            )
+        return self._update_impl(
+            state,
+            transition,
+            forced_next_action=None,
+            forced_next_action_valid=jnp.asarray(True, dtype=jnp.bool_),
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def update_with_forced_next_action(
+        self,
+        state: IntegratedHiddenPartnerState,
+        transition: HiddenPartnerTransition,
+        next_action: Array,
+    ) -> IntegratedUpdateResult:
+        """Consume one transition and apply a dynamic external next action."""
+        if self._config.action_selection_mode != "externally_forced":
+            raise ValueError(
+                "update_with_forced_next_action is unavailable when "
+                "action_selection_mode is agent"
+            )
+        raw_forced_next_action = _require_array_contract(
+            next_action,
+            name="forced_next_action",
+            shape=(),
+            dtype=jnp.int32,
+        )
+        forced_next_action_valid = (raw_forced_next_action >= 0) & (
+            raw_forced_next_action < N_ACTIONS
+        )
+        safe_forced_next_action = jnp.where(
+            forced_next_action_valid,
+            raw_forced_next_action,
+            jnp.asarray(0, dtype=jnp.int32),
+        )
+        return self._update_impl(
+            state,
+            transition,
+            forced_next_action=safe_forced_next_action,
+            forced_next_action_valid=forced_next_action_valid,
+        )
+
+    def _update_impl(
+        self,
+        state: IntegratedHiddenPartnerState,
+        transition: HiddenPartnerTransition,
+        *,
+        forced_next_action: Array | None,
+        forced_next_action_valid: Array,
+    ) -> IntegratedUpdateResult:
         """Consume one exact hidden-partner transition in causal order.
 
         Static shape/dtype violations fail while tracing.  Dynamic transition
@@ -1834,6 +2074,12 @@ class IntegratedHiddenPartnerAgent:
         ``transition_rejected``.  This contract is identical under eager JAX,
         :func:`jax.jit`, and :func:`jax.lax.scan`.
         """
+        _require_array_contract(
+            state.current_q_value_delta,
+            name="state.current_q_value_delta",
+            shape=(N_ACTIONS,),
+            dtype=jnp.float32,
+        )
         raw_current = _require_array_contract(
             transition.observation,
             name="transition.observation",
@@ -1906,7 +2152,9 @@ class IntegratedHiddenPartnerAgent:
             & reward_semantics
             & discount_valid
             & ~terminated
+            & forced_next_action_valid
         )
+        transition_input_valid = transition_valid
 
         next_raw = jnp.where(jnp.isfinite(raw_next), raw_next, state.raw_observation)
         focal_action = jnp.where(
@@ -1931,10 +2179,11 @@ class IntegratedHiddenPartnerAgent:
             state.chi,
             state.grounded_world,
         )
-        complete_decision_cache_valid = self._current_decision_cache_coherent(
+        decision_cache_check_vector = self._current_decision_cache_check_vector(
             state,
             fresh_current_evaluation,
         )
+        complete_decision_cache_valid = jnp.all(decision_cache_check_vector)
         behavior_gradient = self._behavior.input_loss_gradient(
             state.behavior,
             state.chi,
@@ -2007,6 +2256,25 @@ class IntegratedHiddenPartnerAgent:
                         state.grounded_world.update_count,
                         grounded_world_update.state.update_count,
                     )
+                )
+            )
+            executed_joint_index = N_ACTIONS * focal_action + partner_action
+            executed_prediction = grounded_world_update.prediction
+            grounded_world_prediction_matches = (
+                grounded_world_prediction_matches
+                & jnp.array_equal(
+                    executed_prediction.joint_action_index,
+                    executed_joint_index,
+                )
+                & jnp.array_equal(
+                    executed_prediction.raw_predictions,
+                    cached_grounded_evaluation.grounded_raw_predictions[
+                        executed_joint_index
+                    ],
+                )
+                & jnp.array_equal(
+                    executed_prediction.raw_predictions,
+                    executed_prediction.feature_contribution + executed_prediction.row_bias,
                 )
             )
             gradient_mix = mix_representation_gradients(
@@ -2172,6 +2440,29 @@ class IntegratedHiddenPartnerAgent:
                 committed_grounded_world,
                 proposed_descriptors,
             )
+        consumer_route_audit = self._audit_consumer_identity_route(
+            old_descriptors=state.router.descriptors,
+            new_descriptors=proposed_descriptors,
+            route=route_diagnostics,
+            behavior_before=committed_behavior.weights,
+            behavior_after=routed_behavior.weights,
+            q_before=state.control.q_weights,
+            q_after=routed_control.q_weights,
+            trace_before=state.control.q_trace_weights,
+            trace_after=routed_control.q_trace_weights,
+            last_observation_before=state.control.last_observation,
+            last_observation_after=routed_control.last_observation,
+            grounded_before=(
+                None
+                if committed_grounded_world is None
+                else committed_grounded_world.weights
+            ),
+            grounded_after=(
+                None if routed_grounded_world is None else routed_grounded_world.weights
+            ),
+            retired_slot=interaction_update.retired_slot,
+            replaced_slot=interaction_update.replaced_slot,
+        )
         consumer_evidence_streak_post = self._route_consumer_evidence_streak(
             consumer_evidence_streak_updated_pre,
             route_diagnostics,
@@ -2214,6 +2505,11 @@ class IntegratedHiddenPartnerAgent:
             routed_control,
             next_evaluation.planner_scores,
         )
+        if forced_next_action is not None:
+            next_selection = next_selection.replace(
+                action=forced_next_action,
+                externally_forced=jnp.asarray(True, dtype=jnp.bool_),
+            )
         routed_control_with_rng = routed_control.replace(rng_key=next_selection.rng_key_after)
         control_update = self._control.update(
             routed_control_with_rng,
@@ -2227,6 +2523,10 @@ class IntegratedHiddenPartnerAgent:
             control_update.state,
             consumer_write_gate_post,
         )
+        next_q_value_delta = self._control.q_values(
+            committed_control,
+            next_chi,
+        ) - next_evaluation.q_values
         grounded_evaluations_valid = (
             jnp.asarray(True, dtype=jnp.bool_)
             if current_evaluation.grounded_world is None
@@ -2245,7 +2545,13 @@ class IntegratedHiddenPartnerAgent:
             & grounded_path_valid
             & grounded_evaluations_valid
         )
-        transition_valid = transition_valid & candidate_models_valid & route_diagnostics.valid
+        transition_valid = (
+            transition_valid
+            & candidate_models_valid
+            & route_diagnostics.valid
+            & consumer_route_audit.values_exact
+            & consumer_route_audit.lifecycle_destination_reset_exact
+        )
 
         proposed_state = IntegratedHiddenPartnerState(
             state_builder=advanced_builder,
@@ -2262,6 +2568,7 @@ class IntegratedHiddenPartnerAgent:
             consumer_evidence_streak=consumer_evidence_streak_post,
             consumer_read_idle_steps=consumer_read_idle_steps_post,
             current_evaluation=next_evaluation,
+            current_q_value_delta=next_q_value_delta,
             current_selection=next_selection,
             step_count=_saturating_int32_increment(state.step_count),
         )
@@ -2721,6 +3028,41 @@ class IntegratedHiddenPartnerAgent:
                 transition_valid & jnp.any(shadow_descriptors != state.router.descriptors)
             ),
             route=committed_route_diagnostics,
+            consumer_route_source_slots_exact=(
+                consumer_route_audit.source_slots_exact
+            ),
+            consumer_route_identity_masks_exact=(
+                consumer_route_audit.identity_masks_exact
+            ),
+            consumer_route_stable_prefix_exact=(
+                consumer_route_audit.stable_prefix_exact
+            ),
+            consumer_route_survivor_values_exact=(
+                consumer_route_audit.survivor_values_exact
+            ),
+            consumer_route_reset_values_exact=(
+                consumer_route_audit.reset_values_exact
+            ),
+            consumer_route_no_carry_reset_exact=(
+                consumer_route_audit.no_carry_reset_exact
+            ),
+            consumer_route_behavior_values_exact=(
+                consumer_route_audit.behavior_values_exact
+            ),
+            consumer_route_q_values_exact=consumer_route_audit.q_values_exact,
+            consumer_route_trace_values_exact=(
+                consumer_route_audit.trace_values_exact
+            ),
+            consumer_route_last_observation_exact=(
+                consumer_route_audit.last_observation_exact
+            ),
+            consumer_route_grounded_values_exact=(
+                consumer_route_audit.grounded_values_exact
+            ),
+            consumer_route_values_exact=consumer_route_audit.values_exact,
+            consumer_lifecycle_destination_reset_exact=(
+                consumer_route_audit.lifecycle_destination_reset_exact
+            ),
             world_reward_prediction_preupdate=world_prediction.reward,
             world_outcome_prediction_preupdate=world_prediction.outcome,
             world_reward_error=world_update.reward_error,
@@ -2728,6 +3070,13 @@ class IntegratedHiddenPartnerAgent:
             world_target_valid=world_update.target_valid,
             td_error=control_update.td_error,
             average_reward=control_update.average_reward,
+            transition_input_valid=transition_input_valid,
+            decision_cache_valid=decision_cache_valid,
+            decision_cache_check_vector=decision_cache_check_vector,
+            behavior_gradient_valid=behavior_gradient_valid,
+            grounded_path_valid=grounded_path_valid,
+            candidate_models_valid=candidate_models_valid,
+            candidate_state_finite=candidate_state_finite,
             transition_observation_matches=observation_matches,
             transition_action_matches=action_matches,
             transition_semantics_valid=transition_valid,
@@ -3124,6 +3473,251 @@ class IntegratedHiddenPartnerAgent:
             control_state.q_trace_weights,
             control_state.last_observation,
             grounded_state.weights,
+        )
+
+    @staticmethod
+    def _consumer_route_value_checks(
+        before: Array,
+        after: Array,
+        *,
+        safe_source_slots: Array,
+        survivor_mask: Array,
+        carry_survivor_values: Array,
+        no_carry_change: Array,
+    ) -> tuple[Array, Array, Array, Array, Array]:
+        """Independently compare one consumer before and after identity routing."""
+
+        before_prefix = before[..., :BASE_FEATURE_DIM]
+        after_prefix = after[..., :BASE_FEATURE_DIM]
+        before_tail = before[..., BASE_FEATURE_DIM:]
+        after_tail = after[..., BASE_FEATURE_DIM:]
+        gathered = jnp.take(before_tail, safe_source_slots, axis=-1)
+        mask_shape = (1,) * (after_tail.ndim - 1) + (ACTIVE_PAIR_SLOTS,)
+        survivor = survivor_mask.reshape(mask_shape)
+
+        prefix_exact = jnp.array_equal(after_prefix, before_prefix)
+        survivor_exact = ~carry_survivor_values | jnp.all(
+            (~survivor) | (after_tail == gathered)
+        )
+        reset_exact = jnp.all(survivor | (after_tail == 0.0))
+        no_carry_exact = ~no_carry_change | jnp.all(after_tail == 0.0)
+        component_exact = prefix_exact & survivor_exact & reset_exact & no_carry_exact
+        return (
+            prefix_exact,
+            survivor_exact,
+            reset_exact,
+            no_carry_exact,
+            component_exact,
+        )
+
+    @staticmethod
+    def _consumer_destination_zero(
+        value: Array,
+        slot: Array,
+        active: Array,
+    ) -> Array:
+        """Check one dynamic destination without data-dependent output shapes."""
+
+        safe_slot = jnp.clip(slot, 0, ACTIVE_PAIR_SLOTS - 1)
+        destination = jnp.take(value[..., BASE_FEATURE_DIM:], safe_slot, axis=-1)
+        return ~active | jnp.all(destination == 0.0)
+
+    def _audit_consumer_identity_route(
+        self,
+        *,
+        old_descriptors: Array,
+        new_descriptors: Array,
+        route: FeatureBankRouteDiagnostics,
+        behavior_before: Array,
+        behavior_after: Array,
+        q_before: Array,
+        q_after: Array,
+        trace_before: Array,
+        trace_after: Array,
+        last_observation_before: Array,
+        last_observation_after: Array,
+        grounded_before: Array | None,
+        grounded_after: Array | None,
+        retired_slot: Array,
+        replaced_slot: Array,
+    ) -> IntegratedConsumerRouteAudit:
+        """Recompute descriptor routing and all consumer values independently."""
+
+        old_left = old_descriptors[:, 0]
+        old_right = old_descriptors[:, 1]
+        new_left = new_descriptors[:, 0]
+        new_right = new_descriptors[:, 1]
+        old_live = (
+            (old_left >= 0)
+            & (old_left < old_right)
+            & (old_right < BASE_FEATURE_DIM)
+        )
+        new_live = (
+            (new_left >= 0)
+            & (new_left < new_right)
+            & (new_right < BASE_FEATURE_DIM)
+        )
+        identity_match = jnp.all(
+            new_descriptors[:, None, :] == old_descriptors[None, :, :],
+            axis=-1,
+        )
+        identity_match &= new_live[:, None] & old_live[None, :]
+        expected_survivor = new_live & jnp.any(identity_match, axis=1)
+        expected_new = new_live & ~expected_survivor
+        expected_evicted = old_live & ~jnp.any(identity_match, axis=0)
+        raw_source_slots = jnp.argmax(identity_match, axis=1).astype(jnp.int32)
+        expected_source_slots = jnp.where(
+            expected_survivor,
+            raw_source_slots,
+            jnp.asarray(-1, dtype=jnp.int32),
+        )
+        safe_source_slots = jnp.where(
+            expected_survivor,
+            raw_source_slots,
+            jnp.asarray(0, dtype=jnp.int32),
+        )
+        descriptors_changed = jnp.any(new_descriptors != old_descriptors)
+        carry_survivor_values = jnp.asarray(
+            self._config.carry_survivors,
+            dtype=jnp.bool_,
+        ) | ~descriptors_changed
+        no_carry_change = (
+            ~jnp.asarray(self._config.carry_survivors, dtype=jnp.bool_)
+            & descriptors_changed
+        )
+        source_slots_exact = jnp.array_equal(
+            route.source_slots,
+            expected_source_slots,
+        )
+        identity_masks_exact = (
+            route.valid
+            & route.route_applied
+            & jnp.array_equal(route.old_validation.live_mask, old_live)
+            & jnp.array_equal(route.new_validation.live_mask, new_live)
+            & jnp.array_equal(route.survivor_mask, expected_survivor)
+            & jnp.array_equal(route.new_mask, expected_new)
+            & jnp.array_equal(route.evicted_mask, expected_evicted)
+            & (route.survivor_count == jnp.sum(expected_survivor, dtype=jnp.int32))
+            & (route.new_count == jnp.sum(expected_new, dtype=jnp.int32))
+            & (route.evicted_count == jnp.sum(expected_evicted, dtype=jnp.int32))
+            & (route.descriptors_changed == descriptors_changed)
+            & (route.carry_survivors == carry_survivor_values)
+        )
+
+        behavior_checks = self._consumer_route_value_checks(
+            behavior_before,
+            behavior_after,
+            safe_source_slots=safe_source_slots,
+            survivor_mask=expected_survivor,
+            carry_survivor_values=carry_survivor_values,
+            no_carry_change=no_carry_change,
+        )
+        q_checks = self._consumer_route_value_checks(
+            q_before,
+            q_after,
+            safe_source_slots=safe_source_slots,
+            survivor_mask=expected_survivor,
+            carry_survivor_values=carry_survivor_values,
+            no_carry_change=no_carry_change,
+        )
+        trace_checks = self._consumer_route_value_checks(
+            trace_before,
+            trace_after,
+            safe_source_slots=safe_source_slots,
+            survivor_mask=expected_survivor,
+            carry_survivor_values=carry_survivor_values,
+            no_carry_change=no_carry_change,
+        )
+        observation_checks = self._consumer_route_value_checks(
+            last_observation_before,
+            last_observation_after,
+            safe_source_slots=safe_source_slots,
+            survivor_mask=expected_survivor,
+            carry_survivor_values=carry_survivor_values,
+            no_carry_change=no_carry_change,
+        )
+        if grounded_before is None or grounded_after is None:
+            if grounded_before is not None or grounded_after is not None:
+                raise ValueError("grounded consumer route audit requires both value arrays")
+            true = jnp.asarray(True, dtype=jnp.bool_)
+            grounded_checks = (true, true, true, true, true)
+            grounded_values: tuple[Array, ...] = ()
+        else:
+            grounded_checks = self._consumer_route_value_checks(
+                grounded_before,
+                grounded_after,
+                safe_source_slots=safe_source_slots,
+                survivor_mask=expected_survivor,
+                carry_survivor_values=carry_survivor_values,
+                no_carry_change=no_carry_change,
+            )
+            grounded_values = (grounded_after,)
+
+        all_checks = (
+            behavior_checks,
+            q_checks,
+            trace_checks,
+            observation_checks,
+            grounded_checks,
+        )
+        stable_prefix_exact = jnp.all(jnp.stack(tuple(check[0] for check in all_checks)))
+        survivor_values_exact = jnp.all(jnp.stack(tuple(check[1] for check in all_checks)))
+        reset_values_exact = jnp.all(jnp.stack(tuple(check[2] for check in all_checks)))
+        no_carry_reset_exact = jnp.all(jnp.stack(tuple(check[3] for check in all_checks)))
+        component_values_exact = jnp.all(jnp.stack(tuple(check[4] for check in all_checks)))
+
+        lifecycle_enabled = jnp.asarray(
+            self._config.feature_lifecycle_enabled,
+            dtype=jnp.bool_,
+        )
+        retired = lifecycle_enabled & (retired_slot >= 0) & (retired_slot < ACTIVE_PAIR_SLOTS)
+        replaced = (
+            lifecycle_enabled & (replaced_slot >= 0) & (replaced_slot < ACTIVE_PAIR_SLOTS)
+        )
+        routed_values = (
+            behavior_after,
+            q_after,
+            trace_after,
+            last_observation_after,
+        ) + grounded_values
+
+        def lifecycle_destination_exact(slot: Array, active: Array) -> Array:
+            safe_slot = jnp.clip(slot, 0, ACTIVE_PAIR_SLOTS - 1)
+            identity_reset = ~active | ~expected_survivor[safe_slot]
+            consumer_reset = jnp.all(
+                jnp.stack(
+                    tuple(
+                        self._consumer_destination_zero(value, slot, active)
+                        for value in routed_values
+                    )
+                )
+            )
+            return identity_reset & consumer_reset
+
+        lifecycle_destination_reset_exact = lifecycle_destination_exact(
+            retired_slot,
+            retired,
+        ) & lifecycle_destination_exact(replaced_slot, replaced)
+        values_exact = (
+            route.valid
+            & source_slots_exact
+            & identity_masks_exact
+            & component_values_exact
+        )
+        return IntegratedConsumerRouteAudit(
+            source_slots_exact=source_slots_exact,
+            identity_masks_exact=identity_masks_exact,
+            stable_prefix_exact=stable_prefix_exact,
+            survivor_values_exact=survivor_values_exact,
+            reset_values_exact=reset_values_exact,
+            no_carry_reset_exact=no_carry_reset_exact,
+            behavior_values_exact=behavior_checks[4],
+            q_values_exact=q_checks[4],
+            trace_values_exact=trace_checks[4],
+            last_observation_exact=observation_checks[4],
+            grounded_values_exact=grounded_checks[4],
+            values_exact=values_exact,
+            lifecycle_destination_reset_exact=lifecycle_destination_reset_exact,
         )
 
     def _route_feature_consumers(

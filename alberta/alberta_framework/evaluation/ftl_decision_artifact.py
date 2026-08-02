@@ -1093,6 +1093,8 @@ def _validate_and_extract_seed_vectors(
                     "with the equal-sized domain means"
                 )
             oracle = parsed.get("oracle_pick_rate")
+            # 24 = two domains x the frozen probes_per_domain=12, so a genuine
+            # pick rate must be an exact multiple of 1/24.
             probe_count = 24
             if oracle is not None and not math.isclose(
                 oracle * probe_count,

@@ -100,23 +100,22 @@ class Step9DreamingConfig:
         buffer_capacity: Number of recent real observations to retain for
             anchor sampling.
         dreams_update_average_reward: Whether imagined (dream) updates may
-            move the differential-SARSA average-reward estimate rbar.
-            **Default False — a behavior change (2026-07) from the original
-            Step 9, where dream TD errors always updated rbar.** Dyna
-            doctrine: planning backups improve *value* estimates, while the
-            reward-rate estimate is a property of actual behavior in the real
-            environment — imagined experience should not move it. Coupling
-            dreams to rbar distorts the rate estimate in whichever direction
-            the model's reward bias points; the measured effect depends on
-            the bootstrap regime. Under undiscounted updates (discount 1.0)
-            corrupt imagined rewards inflate rbar, which makes real TD errors
-            more negative, speeds unlearning, and *masks* the damage corrupt
-            dreams do to the Q-function. Under discounted updates (e.g. the
-            0.99 used by :func:`step9_update`) the coupling measured strictly
-            worse on both sides of a payoff-flip stress: gated mean regret
-            113.5-115.6 vs ~97 protected, permissive 239.3-251.5 vs ~131
-            (see tests/test_planning_benefit.py). Set True to restore the
-            legacy coupled behavior.
+            move the differential-SARSA average-reward estimate rbar
+            (default False). Dyna doctrine: planning backups improve *value*
+            estimates, while the reward-rate estimate is a property of actual
+            behavior in the real environment — imagined experience should not
+            move it. Coupling dreams to rbar distorts the rate estimate in
+            whichever direction the model's reward bias points; the measured
+            effect depends on the bootstrap regime. Under undiscounted
+            updates (discount 1.0) corrupt imagined rewards inflate rbar,
+            which makes real TD errors more negative, speeds unlearning, and
+            *masks* the damage corrupt dreams do to the Q-function. Under
+            discounted updates (e.g. the 0.99 used by :func:`step9_update`)
+            the coupling measured strictly worse on both sides of a
+            payoff-flip stress: gated mean regret 113.5-115.6 vs ~97
+            protected, permissive 239.3-251.5 vs ~131
+            (see tests/test_planning_benefit.py). Set True to let dream TD
+            errors move rbar anyway.
     """
 
     control: Step6DifferentialSARSAConfig = field(

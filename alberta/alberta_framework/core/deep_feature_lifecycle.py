@@ -15,6 +15,15 @@ earlier layers, outgoing connections are zeroed and downstream weights relearn
 the promoted unit's use.  This keeps the algorithm functional, bounded-budget,
 and JAX-scan compatible while making the early-layer test intentionally
 conservative.
+
+References:
+    Mahmood & Sutton (2013). "Representation Search through Generate and
+        Test."  (The generate/test/replace lifecycle.)
+    Elsayed & Mahmood (2024). "Addressing Loss of Plasticity and Catastrophic
+        Forgetting in Continual Learning."  (UPGD's utility-scaled
+        perturbation bias, mirrored by the opt-in perturbation paths.)
+    Chen, Goodfellow, & Shlens (2015). "Net2Net: Accelerating Learning via
+        Knowledge Transfer."  (Function-preserving promotion.)
 """
 
 from __future__ import annotations
@@ -101,12 +110,14 @@ class DeepFeatureLifecycleConfig:
         function_preserving_promotion: Preserve existing outgoing coefficients
             and compensate the next-layer/head bias by the current activation
             delta when promoting a candidate.  This is an opt-in Net2Net-style
-            hardening path that minimizes the current prediction jump.
+            hardening path (Chen et al. 2015) that minimizes the current
+            prediction jump.
         promotion_output_change_threshold: Maximum current-sample prediction
             change allowed before promotion. ``inf`` disables this guard.
         candidate_perturbation_utility_scaled: Scale candidate input-weight
             perturbations by low normalized candidate utility, matching UPGD's
-            "perturb least useful structure most" bias.
+            "perturb least useful structure most" bias (Elsayed & Mahmood
+            2024).
         active_perturbation_std: Optional UPGD-style perturbation scale applied
             to active trunk weight rows with low layer-local hidden-unit
             utility.  ``0`` disables active perturbation.
@@ -315,7 +326,12 @@ class DeepFeatureLifecycleState:
 
 @chex.dataclass(frozen=True)
 class DeepFeatureLifecycleUpdateResult:
-    """Result of one deep feature lifecycle update."""
+    """Result of one deep feature lifecycle update.
+
+    ``lifecycle_metrics`` columns: total promotions this step (summed over
+    layers), mean candidate utility, max candidate utility, and mean
+    active-unit utility (each aggregated over the per-layer values).
+    """
 
     state: DeepFeatureLifecycleState
     predictions: Float[Array, " n_heads"]
@@ -327,7 +343,11 @@ class DeepFeatureLifecycleUpdateResult:
 
 @chex.dataclass(frozen=True)
 class DeepFeatureLifecycleLearningResult:
-    """Result from a scan-based deep feature lifecycle run."""
+    """Result from a scan-based deep feature lifecycle run.
+
+    ``lifecycle_metrics`` rows follow the 4-column layout documented on
+    :class:`DeepFeatureLifecycleUpdateResult`.
+    """
 
     state: DeepFeatureLifecycleState
     per_head_metrics: Float[Array, "num_steps n_heads 3"]

@@ -1,3 +1,21 @@
+"""Contract tests for :mod:`alberta_framework.benchmarks.forager_matched_seal`.
+
+The seal bundle is the boundary between completed open tuning and held-out
+evaluation: it snapshots the completed-campaign closure, has the external
+resolver authenticate that exact closure, computes the frozen selection, and
+mechanically flips the protocol stage to ``sealed_evaluation``.  What is
+sealed is content — the campaign closure, selection result, and transition
+bytes; what is *not* conferred is authority: persisted resolver bindings are
+cache only, and consumers must re-authenticate via the resolver.
+
+The threat model exercised here is a same-UID local adversary attacking the
+seal around its creation: cross-carrier qualification-manifest tampering,
+self-authenticating caches, staging-name and parent-inode substitution races,
+inventory mutation after artifact reads, path swaps under the loader, and
+fsync/publication failures that must never leave a partially published or
+silently replaced bundle.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -21,6 +39,9 @@ pytestmark = pytest.mark.integration
 
 def _sha(label: str) -> str:
     return hashlib.sha256(label.encode("ascii")).hexdigest()
+
+
+_QUALIFICATION_MANIFEST_SHA256 = _sha("matched-current-qualification-manifest")
 
 
 def _canonical_sha(value: dict[str, Any]) -> str:
@@ -81,8 +102,13 @@ def _completed_campaign(tmp_path: Path) -> tuple[Any, evidence.AuthenticatedEvid
         },
     )
     score_payload = {key: value for key, value in raw_scores.items()}
+    score_payload["qualification_manifest_sha256"] = _QUALIFICATION_MANIFEST_SHA256
     source_manifest = {"schema_version": "test.source-manifest.v1"}
-    executor_manifest = {"schema_version": "test.executor-manifest.v1"}
+    executor_manifest = {
+        "schema_version": executor.MATCHED_EXECUTOR_MANIFEST_SCHEMA_VERSION,
+        "protocol_sha256": open_protocol.protocol_sha256,
+        "qualification_manifest_sha256": _QUALIFICATION_MANIFEST_SHA256,
+    }
     score_payload["source_evidence_sha256"] = _canonical_sha(source_manifest)
     score_payload["executor_evidence_sha256"] = _canonical_sha(executor_manifest)
     score_rows = [dict(item) for item in score_payload["candidate_scores"]]
@@ -94,6 +120,7 @@ def _completed_campaign(tmp_path: Path) -> tuple[Any, evidence.AuthenticatedEvid
         "external_verification_required": True,
         "stage": "open_tuning",
         "protocol_sha256": open_protocol.protocol_sha256,
+        "qualification_manifest_sha256": _QUALIFICATION_MANIFEST_SHA256,
         "active_seeds": list(open_protocol.active_seeds),
         "horizon": open_protocol.horizon,
         "candidate_order": list(candidate_order),
@@ -191,6 +218,7 @@ def _completed_campaign(tmp_path: Path) -> tuple[Any, evidence.AuthenticatedEvid
     request = executor.VerificationRequest(
         stage="open_tuning",
         protocol_sha256=open_protocol.protocol_sha256,
+        qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
         score_evidence_sha256=scores.payload_sha256,
         source_manifest_sha256=scores.source_evidence_sha256,
         executor_manifest_sha256=scores.executor_evidence_sha256,
@@ -220,6 +248,7 @@ def _completed_campaign(tmp_path: Path) -> tuple[Any, evidence.AuthenticatedEvid
         score_evidence_sha256=request.score_evidence_sha256,
         source_manifest_sha256=request.source_manifest_sha256,
         executor_manifest_sha256=request.executor_manifest_sha256,
+        qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
         execution_closure_sha256=request.execution_closure_sha256,
         trust_anchor_identity=request.trust_anchor_identity,
         verification_subject_sha256=request.verification_subject_sha256,
@@ -231,6 +260,7 @@ def _completed_campaign(tmp_path: Path) -> tuple[Any, evidence.AuthenticatedEvid
         "status": "complete_content_only_external_verification_unresolved",
         "stage": "open_tuning",
         "protocol_sha256": open_protocol.protocol_sha256,
+        "qualification_manifest_sha256": _QUALIFICATION_MANIFEST_SHA256,
         "execution_plan_sha256": plan_sha256,
         "source_manifest_sha256": scores.source_evidence_sha256,
         "executor_manifest_sha256": scores.executor_evidence_sha256,
@@ -332,8 +362,27 @@ def test_atomic_seal_round_trip_keeps_content_and_external_trust_separate(
     assert created.output_root == output_root
     assert created.sealed_protocol.stage == "sealed_evaluation"
     assert created.sealed_protocol.active_seeds == created.open_protocol.evaluation_seeds
+    assert created.manifest["schema_version"] == "alberta.forager_matched_seal_bundle.v2"
     assert created.manifest["promotion_authorized"] is False
     assert created.manifest["evaluation_executed"] is False
+    open_campaign = cast(dict[str, Any], dict(created.manifest["open_campaign"]))
+    assert set(open_campaign) == {
+        "protocol_sha256",
+        "qualification_manifest_sha256",
+        "execution_plan_sha256",
+        "source_manifest_sha256",
+        "executor_manifest_sha256",
+        "live_runtime_identity_sha256",
+        "execution_receipt_index_payload_sha256",
+        "score_evidence_payload_sha256",
+        "verification_subject_sha256",
+        "candidate_order",
+        "active_seeds",
+        "completed_cell_count",
+    }
+    assert open_campaign["qualification_manifest_sha256"] == (
+        _QUALIFICATION_MANIFEST_SHA256
+    )
     assert (
         created.manifest["sealed_transition"]["descriptor_sha256"]
         == created.sealed_transition_sha256
@@ -343,6 +392,54 @@ def test_atomic_seal_round_trip_keeps_content_and_external_trust_separate(
         "external_resolver_revalidation_required": True,
         "self_authentication_forbidden": True,
     }
+    golden_payload_sha256 = {
+        "open-protocol.json": (
+            "b11df9dc3ba36b18d963176334a1bb2fa475d970fe27131f56f58fd5af524fa6"
+        ),
+        "open-execution-plan.json": (
+            "6a3fb963c78b3e93046a2ef219915f5df380d615cc53681028aa236284c61804"
+        ),
+        "open-live-runtime.json": (
+            "0f8c71ed1924a8910a68c06cc40bac7ad0db3cb54a8b0542f34464cf7379c22c"
+        ),
+        "open-execution-receipt-index.json": (
+            "2a80de622714094238cf5df2a3cf007e78171a14721a32d1e31039cafad27d3d"
+        ),
+        "open-score-evidence.json": (
+            "bf491e9afabb27b9d4853c8bcc1cebc28b911dd735aef0be3f7b7678bb8d1721"
+        ),
+        "open-verification-request.json": (
+            "dc71ffb09e59239b489ac52d8d1e33a6aafdb0a85e2e516703886ba22691c8b3"
+        ),
+        "open-completion-summary.json": (
+            "9f1d6e4ce1063c732a78b55af177d66585e8f527e9aa6e44046edd80d5e0f09e"
+        ),
+        "open-authenticated-bindings-cache.json": (
+            "ee4227a0d07adb11f6d65ca5491c61add60b6d57ddff9f1b87e40a13a9de30bb"
+        ),
+        "selection-result.json": (
+            "dc7599abf1a4a282b40ffad7389a55388310095b9ef0c8a2920793e7629019b0"
+        ),
+        "selection-report.json": (
+            "441fb17f029aec5b396938a9ef75236663b31266bb83d47f8d0ee7a34df5892f"
+        ),
+        "sealed-protocol.json": (
+            "f8b1dd99afc8dc4324455af347343e090b6dfb90cbcba49cf2cc64d32d27eda8"
+        ),
+        "seal.json": (
+            "4e49e71b1b25f14b49bf9a89156d86c3f1a51f2d69da8e348373962a5e359651"
+        ),
+    }
+    for name, expected_sha256 in golden_payload_sha256.items():
+        assert hashlib.sha256((output_root / name).read_bytes()).hexdigest() == (
+            expected_sha256
+        )
+        assert (output_root / f"{name}.sha256").read_bytes() == (
+            f"{expected_sha256}\n".encode("ascii")
+        )
+    assert created.manifest["payload_sha256"] == (
+        "ada732ee000d894dd262aa47310edfd22f97afc1d61314571f231db0b65cf20d"
+    )
 
     content_only = seal.load_forager_matched_seal_bundle_content(output_root)
     assert len(resolver_calls) == 1
@@ -351,6 +448,15 @@ def test_atomic_seal_round_trip_keeps_content_and_external_trust_separate(
         evidence.AuthenticatedEvidenceBindings,
     )
     assert content_only.selection_result == created.selection_result
+    assert content_only.open_score_evidence.qualification_manifest_sha256 == (
+        _QUALIFICATION_MANIFEST_SHA256
+    )
+    assert content_only.open_verification_request.qualification_manifest_sha256 == (
+        _QUALIFICATION_MANIFEST_SHA256
+    )
+    assert content_only.recorded_bindings_cache["qualification_manifest_sha256"] == (
+        _QUALIFICATION_MANIFEST_SHA256
+    )
     authenticated = seal.authenticate_forager_matched_seal_bundle(
         content_only,
         resolver=resolver,
@@ -358,6 +464,141 @@ def test_atomic_seal_round_trip_keeps_content_and_external_trust_separate(
     )
     assert len(resolver_calls) == 2
     assert authenticated == bindings
+
+
+def test_qualification_manifest_cross_carrier_tampering_fails_closed(
+    tmp_path: Path,
+) -> None:
+    completed, bindings = _completed_campaign(tmp_path)
+    changed_digest = _sha("different-qualification-manifest")
+    plan_payload = seal._decode_canonical(
+        completed.plan.canonical_bytes,
+        "test execution plan",
+    )
+    receipt_index = seal._decode_canonical(
+        completed.execution_receipt_index.canonical_bytes,
+        "test receipt index",
+    )
+
+    assert plan_payload["qualification_manifest_sha256"] == (
+        _QUALIFICATION_MANIFEST_SHA256
+    )
+    assert completed.score_evidence.qualification_manifest_sha256 == (
+        _QUALIFICATION_MANIFEST_SHA256
+    )
+    assert completed.verification_request.qualification_manifest_sha256 == (
+        _QUALIFICATION_MANIFEST_SHA256
+    )
+    assert bindings.qualification_manifest_sha256 == _QUALIFICATION_MANIFEST_SHA256
+    assert completed.completion_summary["qualification_manifest_sha256"] == (
+        _QUALIFICATION_MANIFEST_SHA256
+    )
+
+    changed_score_payload = completed.score_evidence.to_dict()
+    changed_score_payload["qualification_manifest_sha256"] = changed_digest
+    unsigned_score = dict(changed_score_payload)
+    del unsigned_score["payload_sha256"]
+    changed_score_payload["payload_sha256"] = _canonical_sha(unsigned_score)
+    changed_scores = evidence.parse_matched_score_evidence(changed_score_payload)
+    with pytest.raises(seal.ForagerMatchedSealError, match="plan closure drifted"):
+        seal._validate_execution_plan_snapshot(
+            plan_payload,
+            completed.protocol,
+            changed_scores,
+        )
+
+    changed_plan = dict(plan_payload)
+    changed_plan["qualification_manifest_sha256"] = changed_digest
+    with pytest.raises(seal.ForagerMatchedSealError, match="plan closure drifted"):
+        seal._validate_execution_plan_snapshot(
+            changed_plan,
+            completed.protocol,
+            completed.score_evidence,
+        )
+
+    changed_request = completed.verification_request.to_dict()
+    changed_request["qualification_manifest_sha256"] = changed_digest
+    with pytest.raises(executor.ForagerMatchedExecutorError, match="subject"):
+        executor.parse_verification_request(changed_request)
+
+    changed_bindings = bindings.to_dict()
+    changed_bindings["qualification_manifest_sha256"] = changed_digest
+    with pytest.raises(seal.ForagerMatchedSealError, match="bindings cache is invalid"):
+        seal._parse_recorded_bindings(changed_bindings)
+
+    changed_completion = dict(completed.completion_summary)
+    changed_completion["qualification_manifest_sha256"] = changed_digest
+    with pytest.raises(seal.ForagerMatchedSealError, match="completion summary closure"):
+        seal._validate_completion_summary(
+            changed_completion,
+            receipt_index,
+            completed.score_evidence,
+            completed.verification_request,
+        )
+
+
+def test_literal_v1_qualification_carriers_and_seal_manifest_are_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completed, bindings = _completed_campaign(tmp_path)
+    plan_payload = seal._decode_canonical(
+        completed.plan.canonical_bytes,
+        "test execution plan",
+    )
+    legacy_plan = dict(plan_payload)
+    legacy_plan["schema_version"] = "alberta.forager_matched_execution_plan.v1"
+    with pytest.raises(seal.ForagerMatchedSealError, match="plan schema/state"):
+        seal._validate_execution_plan_snapshot(
+            legacy_plan,
+            completed.protocol,
+            completed.score_evidence,
+        )
+
+    legacy_scores = completed.score_evidence.to_dict()
+    legacy_scores["schema_version"] = "alberta.forager_matched_score_evidence.v1"
+    with pytest.raises(evidence.ForagerMatchedEvidenceError, match="unsupported"):
+        evidence.parse_matched_score_evidence(legacy_scores)
+
+    legacy_request = completed.verification_request.to_dict()
+    legacy_request["schema_version"] = "alberta.forager_matched_verification_request.v1"
+    with pytest.raises(executor.ForagerMatchedExecutorError, match="schema/authentication"):
+        executor.parse_verification_request(legacy_request)
+
+    legacy_bindings = bindings.to_dict()
+    legacy_bindings["schema_version"] = "alberta.forager_authenticated_evidence_bindings.v1"
+    with pytest.raises(seal.ForagerMatchedSealError, match="schema/stage"):
+        seal._parse_recorded_bindings(legacy_bindings)
+
+    receipt_index = seal._decode_canonical(
+        completed.execution_receipt_index.canonical_bytes,
+        "test receipt index",
+    )
+    legacy_completion = dict(completed.completion_summary)
+    legacy_completion["schema_version"] = (
+        "alberta.forager_matched_open_tuning_completion.v1"
+    )
+    with pytest.raises(seal.ForagerMatchedSealError, match="completion summary schema/state"):
+        seal._validate_completion_summary(
+            legacy_completion,
+            receipt_index,
+            completed.score_evidence,
+            completed.verification_request,
+        )
+
+    _install_completed_loader(monkeypatch, completed)
+    qualification_root, campaign_root, output_root = _roots(tmp_path)
+    content = seal.create_forager_matched_seal_bundle(
+        qualification_root,
+        campaign_root,
+        output_root,
+        resolver=lambda _request: bindings,
+        expected_trust_anchor_identity=bindings.trust_anchor_identity,
+    )
+    legacy_manifest = dict(content.manifest)
+    legacy_manifest["schema_version"] = "alberta.forager_matched_seal_bundle.v1"
+    with pytest.raises(seal.ForagerMatchedSealError, match="schema/authority"):
+        seal._validate_manifest_shape(legacy_manifest)
 
 
 def test_content_valid_cache_cannot_authenticate_itself(

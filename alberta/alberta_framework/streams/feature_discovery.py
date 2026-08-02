@@ -2,9 +2,15 @@
 
 These streams are designed for the Alberta Plan's Step 2 setting:
 continual supervised learning with vector-valued targets, nonlinear latent
-features, and changing feature relevance.  The latent features are known to the
-stream but hidden from learners, which makes the benchmark useful for evaluating
-feature construction and replacement methods under a fixed resource budget.
+features, and changing feature relevance.  The latent features are known to
+the stream but hidden from learners.
+
+Scope caveat: both oracles here (tanh units, pairwise products) lie *inside*
+the hypothesis class of the corresponding Step 2 learners, so "discovery"
+reduces to selecting and replacing the right features from a representable
+pool under a fixed budget.  Feature *construction* proper — targets whose
+minimal representation lies outside a one-layer feature bank — is probed by
+:mod:`alberta_framework.streams.out_of_class`.
 """
 
 from typing import Any
@@ -141,6 +147,10 @@ class NonlinearFeatureDiscoveryStream:
         """Initialize stream state."""
         key, k_latent, k_bias, k_ctx, k_mask, k_linear = jr.split(key, 6)
 
+        # LeCun-style 1/sqrt(feature_dim) scaling gives each latent a roughly
+        # unit-variance preactivation (at latent_scale = feature_std = 1). The
+        # bias std of 0.25 is small against that, spreading the tanh operating
+        # points across latents without pushing units into saturation.
         latent_weights = (
             self._latent_scale
             * jr.normal(k_latent, (self._n_latents, self._feature_dim), dtype=jnp.float32)
@@ -159,6 +169,9 @@ class NonlinearFeatureDiscoveryStream:
             keep_prob,
             (self._n_contexts, self._n_tasks, self._n_latents),
         )
+        # Dividing each head's weights by sqrt(#active latents) keeps target
+        # variance roughly constant across contexts: a context switch changes
+        # WHICH features matter, not the scale of the regression problem.
         context_weights = dense_context_weights * mask.astype(jnp.float32)
         norm = jnp.sqrt(jnp.maximum(jnp.sum(mask, axis=-1, keepdims=True), 1.0))
         context_weights = context_weights / norm
@@ -328,6 +341,8 @@ class InteractionFeatureDiscoveryStream:
         )
         threshold = jnp.sort(mask_scores, axis=-1)[..., active_count - 1 : active_count]
         mask = mask_scores <= threshold
+        # Same sqrt(#active) normalization as the nonlinear stream: context
+        # switches redirect relevance without changing the target scale.
         context_weights = dense_context_weights * mask.astype(jnp.float32)
         norm = jnp.sqrt(jnp.maximum(jnp.sum(mask, axis=-1, keepdims=True), 1.0))
         context_weights = context_weights / norm

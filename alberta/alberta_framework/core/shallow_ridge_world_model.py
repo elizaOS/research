@@ -17,11 +17,21 @@ or RNG state.  Shapes, numeric magnitudes, update capacity, and checkpoint
 contents are fixed and validated fail-closed.  Invalid or exhausted updates
 leave every state byte unchanged and return no usable prediction signal.
 
+Representation caveat: the feature vector is the raw observation plus a bias
+term, so each action's dynamics model is affine in the observation.  Under
+nonlinear or state-dependent dynamics the ridge solve returns the best global
+affine fit averaged over the visited-state distribution, and both the one-step
+predictions and the planning scores built on them are systematically biased
+wherever the true dynamics deviate from that fit.
+
 The pure planning surface predicts every discrete action and scores it as
 ``predicted_reward + predicted_continuation * linear_value(predicted_next_obs)``.
 It is a one-step diagnostic baseline only.  This module is development/L0
 mechanism code and makes no efficacy, regret, scientific-evidence, or SOTA
-claim.
+claim.  ("Development" and "L0" are this repository's evidence vocabulary,
+defined in ``RESEARCH_STATUS.md``: L0 covers mechanism-level checks — API,
+shape, finite-value, serialization, local update behavior — and development
+modules can never promote scientific claims.)
 """
 
 from __future__ import annotations

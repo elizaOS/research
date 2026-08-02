@@ -2,6 +2,16 @@
 
 Provides infrastructure for running experiments across multiple seeds
 with optional parallelization and aggregation of results.
+
+Two conventions matter for downstream analysis:
+
+* :func:`run_multi_seed_experiment` runs every config on the *same* seed
+  list, so per-seed values are aligned across configs.  Keep it that way:
+  the significance tests in :mod:`alberta_framework.utils.statistics`
+  default to paired tests, which require seed-matched samples.
+* "Final value" summaries are the mean over the last 100 steps (or the
+  whole trace when shorter), not the last step — see
+  :func:`aggregate_metrics`.
 """
 
 from collections.abc import Callable, Sequence
@@ -120,6 +130,12 @@ def run_single_experiment(
 
 def aggregate_metrics(results: list[SingleRunResult]) -> AggregatedResults:
     """Aggregate results from multiple seeds into summary statistics.
+
+    Each metric's per-seed "final value" is the mean over the last 100 steps
+    (the whole trace when shorter).  The 100-step window is a fixed
+    convention here, chosen to estimate settled performance less noisily
+    than the last step; use :func:`get_final_performance` when a different
+    window is needed.
 
     Args:
         results: List of SingleRunResult from multiple seeds

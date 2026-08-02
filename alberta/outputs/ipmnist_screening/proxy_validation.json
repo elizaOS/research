@@ -45,7 +45,7 @@
    "seed": 2
   }
  ],
- "created_unix": 1785622571.7012975,
+ "created_unix": 1785638073.3717835,
  "full_prefix_mean_average_online_accuracy": {
   "adamw": 0.7555799795521629,
   "upgd_w": 0.7773744238747491

@@ -11,10 +11,18 @@ observations.
 The finite evaluator schedule either repeats or holds its last regime forever,
 so the world never terminates or resets.  A bounded schedule cursor continues
 after the diagnostic global int32 step counter saturates.  Cue and channel
-randomness use named independent streams.  This is a development substrate with no acceptance
+randomness use named independent streams.
+
+This is an L1 development substrate (``RESEARCH_STATUS.md`` evidence levels:
+L1 = a component learns in a controlled toy problem) with no acceptance
 threshold, artifact, seed namespace, or performance claim.  Its three-symbol
 channel carries only log2(3) bits per step, and a learner with three durable
 modules cannot retain an unbounded sequence of incompatible permutations.
+
+The intended learners are the fixed-capacity slot-signaling agents
+(:mod:`alberta_framework.core.slot_signaling_agent`), which operate in
+fixed-length slot-residency windows called *leases*; the structural
+manifests below are phased against that lease length.
 """
 
 from __future__ import annotations
@@ -62,6 +70,13 @@ HIDDEN_REGIME_CHANNELS: tuple[HiddenRegimeChannel, ...] = (
 _CUE_RNG_TAG = 0x48524355  # ASCII "HRCU"
 _CHANNEL_RNG_TAG = 0x48524348  # ASCII "HRCH"
 
+# Default development schedule.  The regime order is designed around the
+# learners' three durable slots: A and B recur throughout (retention under
+# interleaving); C-old is used early and then permanently superseded by the
+# incompatible C-new (stale-convention replacement); D-transient appears
+# exactly once, for a single 16-step segment, as a distraction that should
+# not evict a durable convention.  Manifest validation freezes exactly this
+# structure (bank-fill prefix, two C-new before D and one after, 16-step D).
 DEFAULT_REGIME_PERMUTATIONS: tuple[tuple[int, int, int], ...] = (
     (0, 1, 2),  # A
     (1, 2, 0),  # B
@@ -108,11 +123,18 @@ DEFAULT_SEGMENT_LENGTHS: tuple[int, ...] = (
     64,
 )
 
+# A "lease" is the fixed slot-residency window of the slot-signaling learners
+# (:class:`~alberta_framework.core.slot_signaling_agent.SlotSignalingConfig`
+# ``lease_length``); the hidden-regime development calibration pins it to 16
+# steps (see ``evaluation/hidden_regime_signaling_evidence.py``).  Manifest
+# change-point residues are measured modulo this window so that segment
+# boundaries do not systematically align with learner lease boundaries.
+#
 # The structural-generalization candidates preserve the calibrated development
 # exposure exactly: every ordinary regime segment is expanded by sixteen while
-# the deliberately transient D occurrence remains sixteen steps.  Perturbations
-# below are applied after this expansion; scaling a shorter jittered schedule
-# would erase all of its lease-phase variation.
+# the deliberately transient D occurrence remains sixteen steps (exactly one
+# lease).  Perturbations below are applied after this expansion; scaling a
+# shorter jittered schedule would erase all of its lease-phase variation.
 STRUCTURAL_GENERALIZATION_LEASE_STEPS = 16
 STRUCTURAL_GENERALIZATION_BASELINE_SEGMENT_LENGTHS: tuple[int, ...] = tuple(
     length if regime == 4 else length * STRUCTURAL_GENERALIZATION_LEASE_STEPS
@@ -135,6 +157,11 @@ _STRUCTURAL_BASELINE_LENGTHS_BY_REGIME: tuple[tuple[int, ...], ...] = tuple(
     )
     for regime in range(len(DEFAULT_REGIME_PERMUTATIONS))
 )
+# Frozen as literals rather than recomputed: these are the per-regime
+# occurrence counts and step exposures of the default schedule under the x16
+# expansion (total = (1048 - 16) * 16 + 16 = 16,528).  Every candidate
+# manifest must reproduce them exactly, so any drift in the derivation above
+# fails closed instead of silently redefining the protected exposure budget.
 _STRUCTURAL_EXPECTED_OCCURRENCES = (6, 5, 2, 3, 1)
 _STRUCTURAL_EXPECTED_EXPOSURES = (6144, 5376, 1920, 3072, 16)
 _STRUCTURAL_TOTAL_STEPS = 16_528

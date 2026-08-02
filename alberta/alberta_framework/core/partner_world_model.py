@@ -16,8 +16,9 @@ match exactly.  A phase, task, boundary, or absolute-time identifier is never
 an input.
 
 This is a tabular development component, not a learned visual encoder, a
-replication of LeWorldModel, autonomous state construction, or evidence that
-an Alberta Plan step is complete.  Its useful role is to make the causal
+replication of LeWorldModel (an action-conditioned joint-embedding predictive
+world model; arXiv:2603.19312), autonomous state construction, or evidence
+that an Alberta Plan step is complete.  Its useful role is to make the causal
 ordering and resource accounting of a minimal "predict world and agent"
 experiment explicit.
 """

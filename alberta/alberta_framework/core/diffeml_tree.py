@@ -1,10 +1,19 @@
 """Boolean decision trees compiled to hard DiffEML-compatible circuits.
 
-This module is intentionally separate from the differentiable DiffEML learners.
-It provides a pure NumPy hard baseline: fit a greedy Boolean decision tree,
-optionally prune redundant leaves, then compile positive tree paths into a
-NOT/AND/OR Boolean circuit whose gate masks are witnessed by the existing EML
-threshold-template library.
+This module is intentionally separate from the differentiable DiffEML
+learners.  It provides a pure NumPy hard baseline: fit a greedy top-down
+Boolean decision tree (information-gain splitting as in ID3, Quinlan 1986, or
+Gini reduction as in CART, Breiman et al. 1984), optionally prune redundant
+leaves, then compile positive tree paths into a NOT/AND/OR Boolean circuit.
+Every gate mask in the compiled circuit is witnessed by the EML
+threshold-template library of :mod:`alberta_framework.core.diffeml`, whose
+nodes compute the single EML operation ``exp(x) - log(y)`` — so a fitted tree
+is guaranteed to be expressible as a hard EML circuit.
+
+References:
+    Quinlan (1986). "Induction of Decision Trees."
+    Breiman, Friedman, Olshen, & Stone (1984). "Classification and
+        Regression Trees."
 """
 
 from __future__ import annotations
@@ -423,7 +432,7 @@ class BooleanDecisionTree:
         return tree
 
     def compress(self) -> BooleanDecisionTree:
-        """Return a copy with redundant leaves pruned."""
+        """Alias of :meth:`compressed`."""
         return self.compressed()
 
     def export_circuit(
@@ -448,7 +457,7 @@ class BooleanDecisionTree:
         library: DiffEMLGateLibrary | None = None,
         validate_witnesses: bool = True,
     ) -> BooleanCircuit:
-        """Compile the fitted tree into a hard NOT/AND/OR Boolean circuit."""
+        """Alias of :meth:`export_circuit`."""
         return self.export_circuit(
             prune=prune,
             library=library,

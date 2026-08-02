@@ -62,6 +62,14 @@ PARENT_MODE_UTILITY = 1
 PARENT_MODE_MUTATION = 2
 PARENT_MODE_RESIDUAL_IMPRINT = 3
 
+# Generator meta-policy tables (used when ``learn_generator_resources=True``).
+# The tuples below are column-aligned: entry ``i`` of every table describes one
+# policy, pairing an op type and parent-selection mode with multipliers that
+# scale the learner's base replacement rate, promotion margin, candidate
+# minimum age, and residual-imprint scale. Policies are ordered conservative to
+# aggressive: "safe" halves replacement, demands a 25% larger promotion margin,
+# extends candidate trials 1.5x, and never imprints; "aggressive" doubles
+# replacement, relaxes margin and trial age, and fully imprints the residual.
 DEFAULT_GENERATOR_META_POLICY_NAMES = (
     "random_product_safe",
     "mutation_product_nominal",
@@ -109,8 +117,9 @@ class CompositionalFeatureState:
             otherwise feature slot index strictly less than ``i``).
         parent_b: Second parent index (``-1`` for ``OP_RAW``, else
             feature slot index strictly less than ``i``).
-        theta: Per-feature parameter vector of length two used by ``OP_TANH``
-            and ``OP_GATED``.
+        theta: Per-feature parameter vector of length two used only by
+            ``OP_TANH``. ``OP_GATED`` is the fixed ordered operation
+            ``value_a * sigmoid(value_b)`` and does not use ``theta``.
         depth: Topological depth (raw inputs at depth 0).
         output_weights: Output head weights, shape ``(n_tasks, n_features)``.
         output_bias: Output head biases.
@@ -685,7 +694,14 @@ def _imprint_candidate_output_weights(
 
     This is a one-sample least-squares imprint, damped so a refreshed shadow
     feature gets an immediate utility signal without dominating later LMS
-    updates.  Inactive heads already have zero error, so they stay zero.
+    updates.  The undamped one-sample solution is ``errors * v / v**2``; the
+    ``+ 1`` in the denominator ridges it so near-zero feature values cannot
+    blow the coefficient up.  Inactive heads already have zero error, so they
+    stay zero.
+
+    ``CompositionalFeatureLearner._initial_candidate_output_weights`` applies
+    the same formula with a configurable scale; this module-level form is the
+    directly-testable reference.
     """
     denom = candidate_value * candidate_value + 1.0
     return CANDIDATE_IMPRINT_SCALE * errors * candidate_value / (denom * active_count)
@@ -695,8 +711,9 @@ class CompositionalFeatureLearner:
     """Fixed-budget DAG feature learner that composes features of features.
 
     Each feature slot stores an op type, two parent indices, a small parameter
-    vector ``theta`` (used by ``OP_TANH`` and ``OP_GATED``), a topological
-    depth, and standard utility/age tracking.  Output is
+    vector ``theta`` (used only by ``OP_TANH``), a topological depth, and
+    standard utility/age tracking. ``OP_GATED`` is the fixed ordered operation
+    ``value_a * sigmoid(value_b)``. Output is
 
     ``y_k = sum_i output_weights[k, i] * feature_values[i] + output_bias[k]``.
 
@@ -788,14 +805,17 @@ class CompositionalFeatureLearner:
                 With ``promotion_output_mode="blend"``, promoted output weights
                 are ``(1 - promotion_blend) * old + promotion_blend * candidate``.
             promotion_output_mode: How to initialize output weights when a
-                candidate is promoted. ``"scaled_candidate"`` preserves the
-                historical behavior; ``"blend"`` reduces output churn.
+                candidate is promoted. ``"scaled_candidate"`` discards the
+                replaced slot's weights and installs the scaled candidate
+                head; ``"blend"`` interpolates old and candidate weights,
+                which reduces output churn at promotion.
             max_depth: Maximum allowed topological depth for any feature.
             use_obgd: Whether to bound effective updates ObGD-style.
             obgd_kappa: ObGD bounding sensitivity.
             generation_strategy: Parent-generation strategy for fresh
-                candidates/replacements. ``"utility"`` preserves current
-                utility-biased search, ``"uniform"`` is a control,
+                candidates/replacements. ``"utility"`` biases parent
+                selection toward high-utility features, ``"uniform"`` is a
+                control,
                 ``"mutation"`` anchors one parent on high-utility features and
                 samples the other from shallow eligible features, and
                 ``"residual_imprint"`` additionally uses one-step residual
@@ -832,17 +852,19 @@ class CompositionalFeatureLearner:
                 scaffolds for ``generation_strategy="robust_recursive"``.
                 These are task-agnostic local nonlinear basis functions.
             future_utility_mix: Mixture weight for one-step counterfactual
-                output-loss-reduction utility. ``0`` keeps the historical
-                utility signal. When ``future_utility_trace_decay > 0``, the
-                future term uses causal residual/feature traces instead of only
-                the current sample.
+                output-loss-reduction utility. ``0`` uses only the
+                backward-looking magnitude/credit utility. When
+                ``future_utility_trace_decay > 0``, the future term uses
+                causal residual/feature traces instead of only the current
+                sample.
             future_utility_trace_decay: Discount for temporally extended
-                future-utility traces. ``0`` exactly recovers the historical
+                future-utility traces. ``0`` reduces the trace to the
                 one-step counterfactual. Values near ``1`` credit features
                 whose residual alignment recurs over multiple recent steps.
             future_utility_trace_mode: ``"contribution"`` traces
-                ``error * feature`` directly; ``"marginal"`` keeps the older
-                residual-trace times feature-trace proxy for ablation.
+                ``error * feature`` directly; ``"marginal"`` approximates it
+                with the product of separate residual and feature traces,
+                retained as an ablation control.
             future_utility_normalization: Optional normalization for the
                 future term: ``"none"``, ``"age"``, ``"uncertainty"``, or
                 ``"uncertainty_age"``.
@@ -852,8 +874,9 @@ class CompositionalFeatureLearner:
                 applied only to future-utility task credit. ``0`` disables it.
             future_utility_task_activity_decay: EMA decay for task activity
                 frequencies used by rare-task future credit.
-            candidate_scoring_mode: ``"legacy"`` keeps the historical utility
-                update. ``"energy_novelty"`` uses matching-pursuit residual
+            candidate_scoring_mode: ``"legacy"`` scores candidates with the
+                same magnitude/credit blend used for active slots.
+                ``"energy_novelty"`` uses matching-pursuit residual
                 alignment normalized by feature energy, with candidate scores
                 optionally downweighted by active-feature correlation.
             candidate_score_trace_decay: Discount for the opt-in residual,
@@ -866,10 +889,10 @@ class CompositionalFeatureLearner:
             candidate_novelty_floor: Minimum novelty gate for highly
                 correlated candidates.
             candidate_selector: Optional finite-candidate selector for the
-                promotion candidate choice. ``"legacy"`` preserves the
-                historical argmax-utility heuristic. ``"hedge"`` or
-                ``"exp3"`` uses a bounded-loss selector over candidate slots
-                before the usual promotion margin check.
+                promotion candidate choice. ``"legacy"`` promotes the
+                argmax-utility candidate. ``"hedge"`` or ``"exp3"`` uses a
+                bounded-loss selector over candidate slots before the usual
+                promotion margin check.
             candidate_selector_learning_rate: Exponentiated-gradient step
                 size for the opt-in candidate selector.
             candidate_selector_exploration: Uniform probability floor for the
@@ -1598,7 +1621,16 @@ class CompositionalFeatureLearner:
         return jnp.array(mode, dtype=jnp.int32)
 
     def _op_logits(self, forced_op: Array | None = None) -> Array:
-        """Return generation logits for composing op types."""
+        """Return generation logits for composing op types.
+
+        Probability vectors below are ordered ``[raw, product, sum, tanh,
+        gated]``.  ``OP_RAW`` always gets zero mass: raw slots occupy the
+        fixed prefix of the bank and are never generated.  The per-strategy
+        priors are hand-tuned, not learned; strategies aimed at
+        product-structured recursive targets put most or all mass on
+        ``OP_PRODUCT``, while ``residual_imprint`` splits its mass evenly
+        between ``OP_PRODUCT`` and the parameterized ``OP_TANH``.
+        """
         if forced_op is not None:
             op_ids = jnp.arange(NUM_OPS, dtype=jnp.int32)
             return jnp.where(op_ids == forced_op, 0.0, -1e9)
@@ -1910,7 +1942,7 @@ class CompositionalFeatureLearner:
         current_signal: Array,
         future_signal: Array,
     ) -> Array:
-        """Blend historical utility with causal predicted future utility."""
+        """Blend the backward-looking utility with predicted future utility."""
         if self._future_utility_mix == 0.0:
             return current_signal
         return (
@@ -2403,6 +2435,10 @@ class CompositionalFeatureLearner:
             [feature_credit * d_theta0, feature_credit * d_theta1], axis=-1
         )
 
+        # Backward-looking utility: an equal blend of contribution magnitude
+        # (mean |w| * |f|, how much slot i currently moves the predictions)
+        # and gradient credit (|errors @ W|, how much the residual would move
+        # it).  Same signal as FixedBudgetFeatureLearner in feature_discovery.
         current_utility_signal = (
             0.5 * jnp.mean(jnp.abs(state.output_weights), axis=0) * jnp.abs(feature_values)
             + 0.5 * jnp.abs(feature_credit)
@@ -2587,7 +2623,11 @@ class CompositionalFeatureLearner:
             candidate_signal if self._candidate_count > 0 else new_candidate_utilities,
         )
 
-        # ObGD-style bounding.
+        # ObGD-style global update bounding (Elsayed et al. 2024, "Streaming
+        # Deep Reinforcement Learning Finally Works").  One shared scale keeps
+        # the total L1 update below ``1 / (kappa * max(||errors||, 1))``, so a
+        # rare large-error sample cannot overshoot and wreck the whole bank;
+        # higher kappa is more conservative.
         bounding_scale = jnp.array(1.0, dtype=jnp.float32)
         if self._use_obgd:
             total_step = (
@@ -3516,6 +3556,12 @@ class CompositionalFeatureLearner:
                 DEFAULT_GENERATOR_META_CANDIDATE_MIN_AGE_MULTIPLIERS,
                 dtype=jnp.float32,
             )
+            # Composite churn proxy per policy, charged via the manager's
+            # ``cost_weight`` (a no-op when ``generator_resource_cost_weight``
+            # is 0).  Looser margins and shorter trials enter as reciprocals
+            # so that more aggressive settings cost more.  The hand-set
+            # weights rank replacement churn as the dominant cost, imprint
+            # and margin secondary, and trial age smallest.
             policy_costs = (
                 replacement_cost
                 + 0.25 * imprint_cost

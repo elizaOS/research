@@ -119,7 +119,16 @@ class ContinualMultiAgentConfig:
 
 @dataclass(frozen=True)
 class AcceptanceThresholds:
-    """Explicit default thresholds for the multi-seed acceptance decision."""
+    """Frozen thresholds for the multi-seed acceptance decision.
+
+    Values were calibrated on development seeds 0--29 and frozen before the
+    single promoted run on held-out seeds 30--59 (see RESEARCH_STATUS.md);
+    ``evidence_seed_start=30`` with ``minimum_seed_count=30`` pins exactly
+    that consumed schedule.  The uplift thresholds gate the bootstrap
+    interval's *lower* bound, not the point estimate.  Retuning any value
+    after seeing held-out results is disallowed — a failed gate stays a
+    valid rejection.
+    """
 
     minimum_seed_count: int = 30
     evidence_seed_start: int = 30
@@ -289,6 +298,12 @@ def _select_actions(
     contexts = _visible_contexts(observation)
     seed = int(controller.random_state[0])
     step = int(controller.random_state[1])
+    # Counter-based stream: draws are a pure function of (seed, step), so all
+    # three conditions of one seed see identical exploration randomness (the
+    # common random numbers the paired bootstrap relies on) at a fixed
+    # two-scalar state cost.  Distinct (seed, step) pairs map to distinct
+    # stream seeds because the multiplier 100_003 (prime) exceeds any life
+    # length used here (3 * phase_steps = 192 at the defaults).
     generator = np.random.default_rng(seed * 100_003 + step)
     explore_draws = generator.random(2)
     random_actions = generator.integers(0, 2, size=2, dtype=np.int64)

@@ -8,8 +8,11 @@ scorer.
 
 Every invocation reconstructs the protocol and the 21-candidate selection plan from a verified
 qualification bundle, requalifies the live OCI runtime, and replays all persisted bindings.  The
-two descriptive candidates remain in the canonical universe and open protocol but are never in
-the tuning execution plan or schedule.
+candidate panel and its two descriptive-only arms are frozen in
+:mod:`~alberta_framework.benchmarks.forager_matched_open_protocol`, assembled from the provenance
+in :mod:`~alberta_framework.benchmarks.forager_matched_candidate_universe`.  The two descriptive
+candidates remain in the canonical universe and open protocol but are never in the tuning
+execution plan or schedule.
 """
 
 from __future__ import annotations
@@ -42,7 +45,7 @@ from alberta_framework.benchmarks.forager_matched_evidence import MatchedScoreEv
 from alberta_framework.benchmarks.forager_matched_protocol import ForagerMatchedProtocol
 
 MATCHED_OPEN_CAMPAIGN_SCHEMA_VERSION: Final = (
-    "alberta.forager_matched_open_tuning_campaign.v1"
+    "alberta.forager_matched_open_tuning_campaign.v2"
 )
 MATCHED_OPEN_SCHEDULE_SCHEMA_VERSION: Final = (
     "alberta.forager_matched_open_tuning_schedule.v1"
@@ -55,7 +58,7 @@ MATCHED_ATTEMPT_FAILURE_SCHEMA_VERSION: Final = (
     "alberta.forager_matched_attempt_failure.v1"
 )
 MATCHED_OPEN_COMPLETION_SCHEMA_VERSION: Final = (
-    "alberta.forager_matched_open_tuning_completion.v1"
+    "alberta.forager_matched_open_tuning_completion.v2"
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -104,6 +107,7 @@ class CampaignStatus:
     next_candidate_id: str | None
     next_seed: int | None
     protocol_sha256: str
+    qualification_manifest_sha256: str
     plan_sha256: str
     live_runtime_identity_sha256: str
     score_evidence_sha256: str | None
@@ -111,7 +115,7 @@ class CampaignStatus:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": "alberta.forager_matched_campaign_status.v1",
+            "schema_version": "alberta.forager_matched_campaign_status.v2",
             "classification": "content_only_unendorsed_nonpromoting",
             "state": self.state,
             "output_root": self.output_root.as_posix(),
@@ -120,6 +124,7 @@ class CampaignStatus:
             "next_candidate_id": self.next_candidate_id,
             "next_seed": self.next_seed,
             "protocol_sha256": self.protocol_sha256,
+            "qualification_manifest_sha256": self.qualification_manifest_sha256,
             "plan_sha256": self.plan_sha256,
             "live_runtime_identity_sha256": self.live_runtime_identity_sha256,
             "score_evidence_sha256": self.score_evidence_sha256,
@@ -459,7 +464,7 @@ def _rename_no_replace(source: Path, destination: Path) -> None:
             os.fsencode(source.name),
             parent_fd,
             os.fsencode(destination.name),
-            1,
+            1,  # RENAME_NOREPLACE: fail with EEXIST rather than replace the target
         )
         if result != 0:
             error = ctypes.get_errno()
@@ -480,6 +485,13 @@ def _link_anonymous_no_replace(
     parent: Path,
     destination_name: str,
 ) -> None:
+    """Give a name to an anonymous ``O_TMPFILE`` inode without ever replacing a file.
+
+    ``linkat(fd, "", parent_fd, name, AT_EMPTY_PATH)`` links the open inode
+    itself; unlike ``rename`` it fails with ``EEXIST`` when the name already
+    exists, preserving write-once artifact semantics.  Python's ``os.link``
+    does not expose ``AT_EMPTY_PATH``, hence the direct ``libc`` call.
+    """
     if (
         not destination_name
         or destination_name in {".", ".."}
@@ -509,7 +521,7 @@ def _link_anonymous_no_replace(
             b"",
             parent_fd,
             os.fsencode(destination_name),
-            0x1000,  # AT_EMPTY_PATH
+            0x1000,  # AT_EMPTY_PATH: link the O_TMPFILE inode itself, not a path under it
         )
         if result != 0:
             error = ctypes.get_errno()
@@ -526,6 +538,12 @@ def _link_anonymous_no_replace(
 
 
 def _publish_bytes(path: Path, raw: bytes) -> str:
+    """Publish ``raw`` crash-safely: fill an anonymous ``O_TMPFILE`` inode, then link it in.
+
+    The inode has no directory entry until :func:`_link_anonymous_no_replace`
+    succeeds, so a crash mid-write can never leave a partial artifact visible,
+    and an existing artifact is never replaced.
+    """
     if not raw:
         raise ForagerMatchedCampaignError("empty artifacts are forbidden")
     parent = _regular_directory(path.parent, "artifact parent")
@@ -618,6 +636,16 @@ def _publish_json_pair(path: Path, value: Mapping[str, Any]) -> str:
     return digest
 
 
+def _publish_exact_json_pair(path: Path, raw: bytes, expected_sha256: str) -> None:
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != expected_sha256:
+        raise ForagerMatchedCampaignError(
+            "exact qualification manifest bytes differ from their loader digest"
+        )
+    _publish_bytes(path, raw)
+    _publish_bytes(path.with_name(path.name + ".sha256"), f"{digest}\n".encode("ascii"))
+
+
 def _load_json_pair(
     path: Path,
     label: str,
@@ -696,6 +724,13 @@ def build_seed_major_schedule(protocol: ForagerMatchedProtocol) -> dict[str, Any
 
 def _rebuild_inputs(qualification_root: Path) -> _RebuiltInputs:
     bundle = qualification.load_matched_current_qualification_bundle(qualification_root)
+    if (
+        hashlib.sha256(bundle.manifest_bytes).hexdigest() != bundle.manifest_sha256
+        or qualification._canonical_json_bytes(bundle.manifest) != bundle.manifest_bytes
+    ):
+        raise ForagerMatchedCampaignError(
+            "qualification manifest exact bytes changed after loader verification"
+        )
     protocol = open_protocol.build_forager_matched_open_protocol(
         runtime=bundle.runtime_qualification,
         candidate_qualifications=bundle.candidate_qualifications,
@@ -720,6 +755,7 @@ def _rebuild_inputs(qualification_root: Path) -> _RebuiltInputs:
     plan = executor.build_execution_plan(
         protocol,
         assets,
+        qualification_manifest_sha256=bundle.manifest_sha256,
         candidate_ids=candidate_ids,
         cpu_qualification_root=cpu_root,
         rng_parity_qualification_root=rng_root,
@@ -750,10 +786,18 @@ def _campaign_manifest(
     rebuilt: _RebuiltInputs,
     live: executor.LiveRuntimeIdentity,
 ) -> dict[str, Any]:
-    qualification_manifest_sha = _canonical_sha256(rebuilt.bundle.manifest)
+    qualification_manifest_sha = rebuilt.bundle.manifest_sha256
     universe_sha = universe.MATCHED_CURRENT_CANDIDATE_UNIVERSE_SHA256
     if rebuilt.protocol.selection_plan.candidate_universe_sha256 != universe_sha:
         raise ForagerMatchedCampaignError("protocol candidate-universe binding drifted")
+    if (
+        rebuilt.plan.qualification_manifest_sha256 != qualification_manifest_sha
+        or rebuilt.plan.payload.get("qualification_manifest_sha256")
+        != qualification_manifest_sha
+        or rebuilt.plan.executor_manifest.get("qualification_manifest_sha256")
+        != qualification_manifest_sha
+    ):
+        raise ForagerMatchedCampaignError("qualification manifest plan binding drifted")
     return {
         "schema_version": MATCHED_OPEN_CAMPAIGN_SCHEMA_VERSION,
         "classification": "content_only_unendorsed_nonpromoting",
@@ -859,13 +903,17 @@ def _publish_initial_root(
             ("execution-plan.json", rebuilt.plan.to_dict()),
             ("source-manifest.json", rebuilt.plan.source_manifest),
             ("executor-manifest.json", rebuilt.plan.executor_manifest),
-            ("qualification-manifest.json", rebuilt.bundle.manifest),
             ("execution-schedule.json", rebuilt.schedule),
             ("live-runtime.json", live.unsigned_dict),
             ("campaign.json", _campaign_manifest(rebuilt, live)),
         )
         for name, payload in initial:
             _publish_json_pair(temporary / name, payload)
+        _publish_exact_json_pair(
+            temporary / "qualification-manifest.json",
+            rebuilt.bundle.manifest_bytes,
+            rebuilt.bundle.manifest_sha256,
+        )
         _rename_no_replace(temporary, root)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
@@ -970,6 +1018,29 @@ def _expect_artifact(
     return digest
 
 
+def _expect_qualification_artifact(
+    root: Path,
+    bundle: qualification.MatchedCurrentQualificationBundle,
+) -> str:
+    path = root / "qualification-manifest.json"
+    raw = _read_stable(path, "qualification manifest copy")
+    digest = hashlib.sha256(raw).hexdigest()
+    sidecar = _read_stable(
+        path.with_name(path.name + ".sha256"),
+        "qualification manifest copy digest sidecar",
+        maximum=128,
+    )
+    if (
+        raw != bundle.manifest_bytes
+        or digest != bundle.manifest_sha256
+        or sidecar != f"{digest}\n".encode("ascii")
+    ):
+        raise ForagerMatchedCampaignError(
+            "persisted qualification manifest differs from exact loader-verified bytes"
+        )
+    return digest
+
+
 def _load_context(
     qualification_root: Path,
     output_root: Path,
@@ -1005,6 +1076,7 @@ def _load_context(
         protocol=rebuilt.protocol,
         assets=rebuilt.assets,
         expected_plan_sha256=rebuilt.plan.plan_sha256,
+        expected_qualification_manifest_sha256=rebuilt.bundle.manifest_sha256,
         cpu_qualification_root=rebuilt.bundle.cpu_qualification_root,
         rng_parity_qualification_root=rebuilt.bundle.rng_parity_qualification_root,
     )
@@ -1012,7 +1084,11 @@ def _load_context(
         raise ForagerMatchedCampaignError("execution plan replay digest drifted")
     _expect_artifact(root, "source-manifest.json", rebuilt.plan.source_manifest)
     _expect_artifact(root, "executor-manifest.json", rebuilt.plan.executor_manifest)
-    _expect_artifact(root, "qualification-manifest.json", rebuilt.bundle.manifest)
+    qualification_copy_sha = _expect_qualification_artifact(root, rebuilt.bundle)
+    if qualification_copy_sha != rebuilt.bundle.manifest_sha256:
+        raise ForagerMatchedCampaignError(
+            "persisted qualification manifest differs from its loader-verified digest"
+        )
     _expect_artifact(root, "execution-schedule.json", rebuilt.schedule)
     live_payload, live_file_sha = _load_json_pair(
         root / "live-runtime.json",
@@ -1811,6 +1887,7 @@ def _completion_summary(
         "status": "complete_content_only_external_verification_unresolved",
         "stage": "open_tuning",
         "protocol_sha256": context.rebuilt.protocol.protocol_sha256,
+        "qualification_manifest_sha256": context.rebuilt.bundle.manifest_sha256,
         "execution_plan_sha256": context.rebuilt.plan.plan_sha256,
         "source_manifest_sha256": context.rebuilt.plan.source_manifest_sha256,
         "executor_manifest_sha256": context.rebuilt.plan.executor_manifest_sha256,
@@ -1849,6 +1926,7 @@ def _validate_completion_summary_common(
         "status": "complete_content_only_external_verification_unresolved",
         "stage": context.rebuilt.protocol.stage,
         "protocol_sha256": context.rebuilt.protocol.protocol_sha256,
+        "qualification_manifest_sha256": context.rebuilt.bundle.manifest_sha256,
         "execution_plan_sha256": context.rebuilt.plan.plan_sha256,
         "source_manifest_sha256": context.rebuilt.plan.source_manifest_sha256,
         "executor_manifest_sha256": context.rebuilt.plan.executor_manifest_sha256,
@@ -1893,7 +1971,7 @@ def _validate_open_completion_summary(
     expected = _completion_summary(context, receipt_index, score_evidence, request)
     if campaign_summary != expected:
         raise ForagerMatchedCampaignError(
-            "open completion summary differs from its exact v1 schema"
+            "open completion summary differs from its exact v2 schema"
         )
 
 
@@ -2082,6 +2160,7 @@ def _derive_status(
         next_candidate_id=None if next_cell is None else next_cell[0],
         next_seed=None if next_cell is None else next_cell[1],
         protocol_sha256=context.rebuilt.protocol.protocol_sha256,
+        qualification_manifest_sha256=context.rebuilt.bundle.manifest_sha256,
         plan_sha256=context.rebuilt.plan.plan_sha256,
         live_runtime_identity_sha256=context.live_runtime.identity_sha256,
         score_evidence_sha256=score_sha,

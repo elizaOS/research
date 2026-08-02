@@ -158,9 +158,14 @@ type ExecutionMode = Literal[
     "exact_replay_after_completion",
 ]
 
+# HMAC key and instance nonce behind every process-local capability seal;
+# a fork child is re-keyed at once, so inherited seals stop verifying (see
+# _reset_process_local_capabilities_after_fork).
 _PROCESS_SEAL_KEY = secrets.token_bytes(32)
 _PROCESS_START_NONCE = secrets.token_hex(32)
 _SHA256_LENGTH = 64
+# Fail-closed byte caps enforced before a ledger record or the bound source
+# archive is read into memory; an oversize input is rejected, never truncated.
 _MAX_RECORD_BYTES = 12 * 1024 * 1024
 _MAX_SOURCE_ARCHIVE_BYTES = 64 * 1024 * 1024
 _CASE_DIRECTORY_PREFIX = "case-"
@@ -168,7 +173,12 @@ _STARTED_FILE = "started.json"
 _COMPLETED_FILE = "completed.json"
 _FINALIZED_FILE = "finalized.json"
 _REPLAY_FILE_PATTERN = re.compile(r"replay-(?P<attempt_index>[0-9]{6})\.json\Z")
+# Replay filenames carry the attempt index as exactly six digits, so the
+# attempt namespace of one case is [0, 10**6).
 _MAX_ATTEMPTS_PER_CASE = 1_000_000
+# Raw Linux ABI flag values for the ctypes syscalls below, which CPython's os
+# module does not wrap: AT_EMPTY_PATH (include/uapi/linux/fcntl.h) for linkat
+# and RENAME_NOREPLACE (include/uapi/linux/fs.h) for renameat2.
 _AT_EMPTY_PATH = 0x1000
 _RENAME_NOREPLACE = 1
 _LEDGER_STAGE_SUFFIX = ".execution-ledger-stage-v1"
@@ -734,7 +744,15 @@ def atomic_install_new_immutable(
     max_bytes: int,
     label: str,
 ) -> None:
-    """Atomically install one complete 0444 file at a previously absent plain name."""
+    """Atomically install one complete 0444 file at a previously absent plain name.
+
+    Mechanism: open an ``O_TMPFILE`` anonymous inode in the destination
+    directory, write and seal it (``fchmod`` 0444, ``fsync``), then give it
+    its final name via ``linkat`` with ``AT_EMPTY_PATH`` — which fails with
+    ``EEXIST`` rather than replacing — and ``fsync`` the directory.  A crash
+    at any point leaves either no visible file or the complete immutable
+    record; no partially written record can ever appear under its final name.
+    """
 
     _require(
         bool(name) and name not in {".", ".."} and "/" not in name and "\x00" not in name,
@@ -1110,6 +1128,8 @@ def _validate_seed_pair_payload(value: object) -> dict[str, object]:
         payload["namespace"] == CONSUMED_CALIBRATION_NAMESPACE,
         "case binding seed namespace differs",
     )
+    # 29 == the frozen protocol's N_SEED_PAIRS - 1: indices address the 30
+    # consumed calibration pairs and nothing else.
     _strict_int(payload["index"], "seed_pair.index", maximum=29)
     _strict_int(payload["world_seed"], "seed_pair.world_seed", maximum=0xFFFFFFFF)
     _strict_int(payload["learner_seed"], "seed_pair.learner_seed", maximum=0xFFFFFFFF)
@@ -1158,6 +1178,7 @@ def _require_case_binding(value: object) -> dict[str, object]:
         "case_request_binding_sha256",
     ):
         _strict_sha256(binding[field], f"case binding.{field}")
+    # 239 must stay equal to N_MATCHED_CASES - 1 (30 seed pairs x 8 conditions).
     case_index = _strict_int(binding["case_index"], "case binding.case_index", maximum=239)
     design = _frozen_design()
     case = design.cases[case_index]

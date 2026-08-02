@@ -1,5 +1,45 @@
 # mypy: disable-error-code="call-arg"
-"""Production-facing Step 7 bounded Dyna planning facade."""
+"""Production-facing Step 7 bounded Dyna planning facade.
+
+Alberta Plan Step 7 (incremental average-reward planning): each real
+transition first performs the ordinary Step 6 differential-SARSA control
+update and the Step 8 one-step world-model update, then runs a fixed number
+of model-generated backups from a bounded replay memory of real transitions
+— classic Dyna (Sutton 1990) with pluggable search control.
+
+Search-control strategies (``planning_strategy``):
+
+1. ``random`` — uniform anchor from memory, uniform imagined action.
+2. ``reward`` — anchor with the largest stored ``|reward|``; imagined action
+   ranked by ``|predicted reward|``.
+3. ``surprise`` — anchor with the largest stored model prediction error;
+   action ranked by ``|predicted reward|`` plus predicted transition
+   magnitude.
+4. ``predecessor`` — anchor score adds ``1 / (1 + d)``, where ``d`` is the
+   mean-squared distance between the anchor's stored successor and the
+   agent's current observation: a soft predecessor test, since exact
+   predecessor lookup is unavailable with continuous observations.
+5. ``prioritized`` — pops the highest-priority memory entry, backs it up,
+   and propagates ``|TD| / (1 + d)`` to predecessor entries: bounded
+   prioritized sweeping (Moore & Atkeson 1993).
+6. ``learned`` — anchor score is a per-transition utility (an EMA of the
+   imagined rollout's ``|TD|``, step ``planning_utility_step_size``) plus a
+   fixed ``0.1``-weighted model-surprise bonus.
+
+Non-random strategies pick the imagined action greedily under a model-based
+score, so planned backups are off-policy relative to the epsilon-greedy
+target; with ``planning_apply_importance_correction`` the imagined parameter
+deltas are scaled by a clipped target/behavior probability ratio.  Planning
+output is discarded until the world model has absorbed
+``planning_warmup_steps`` real transitions.
+
+References:
+    Sutton (1990). "Integrated Architectures for Learning, Planning, and
+        Reacting Based on Approximating Dynamic Programming."  (Dyna)
+    Moore & Atkeson (1993). "Prioritized Sweeping: Reinforcement Learning
+        with Less Data and Less Time."
+    Sutton, Bowling, & Pilarski (2022). "The Alberta Plan for AI Research."
+"""
 
 from __future__ import annotations
 
@@ -284,6 +324,10 @@ def _score_planning_actions(
 
     priorities, rewards = jax.vmap(predict_action)(actions)
     selected = jnp.argmax(priorities).astype(jnp.int32)
+    # ``0.0 * rewards[selected]`` is an arithmetic no-op: the returned score
+    # is the selected action's priority.  A non-finite reward prediction does
+    # still propagate into the score, where downstream finiteness checks
+    # can observe it.
     return selected, priorities[selected] + 0.0 * rewards[selected]
 
 
@@ -349,6 +393,10 @@ def _select_planning_anchor(
 
     reward_scores = jnp.where(valid, jnp.abs(memory_rewards), -jnp.inf)
     surprise_scores = jnp.where(valid, memory_priorities, -jnp.inf)
+    # Learned search control: per-anchor utility is an EMA of imagined-rollout
+    # |TD| (seeded at insertion with the model prediction error).  The fixed
+    # 0.1 bonus is a hand-set blend, not a learned quantity; it keeps the
+    # ranking tilted toward high-model-surprise anchors after utilities adapt.
     learned_scores = jnp.where(
         valid,
         memory_utilities + 0.1 * memory_priorities,
@@ -358,6 +406,10 @@ def _select_planning_anchor(
         (memory_next_observations - reference_observation[None, :]) ** 2,
         axis=1,
     )
+    # 1/(1 + d) is a bounded similarity kernel on the mean-squared distance
+    # between each stored successor and the reference observation — a soft
+    # predecessor test for continuous observations (exact predecessor lookup
+    # is unavailable), maximal for transitions that lead exactly here.
     predecessor_scores = jnp.where(
         valid,
         memory_priorities + 1.0 / (1.0 + predecessor_distance),
@@ -600,6 +652,9 @@ def step7_update(
             anchor_observation,
             action,
         )
+        # The 1e-6 floor only guards the division: behavior_prob is either
+        # 1/n_actions (random strategy) or 1.0 (deterministic ranked action),
+        # so the floor never binds in practice.
         importance_ratio = jnp.minimum(
             target_prob / jnp.maximum(behavior_prob, 1e-6),
             config.planning_importance_ratio_clip,

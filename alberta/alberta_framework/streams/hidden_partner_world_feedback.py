@@ -52,6 +52,13 @@ from alberta_framework.streams.hidden_partner_mapping import (
 )
 
 HIDDEN_PARTNER_WORLD_FEEDBACK_CONTRACT_VERSION = "hidden-partner-world-feedback-v1"
+# All default flip rates lie strictly inside (0, 0.5): every noisy channel is
+# individually informative about the hidden sign ``z``, yet none reveals it.
+# The world flip rate 0.03 gives ``z`` an expected persistence of ~33 steps,
+# slow relative to the per-step cue noise, so integrating evidence across
+# steps improves on reading the current cues alone.  The two cues carry
+# different reliabilities (0.25 vs 0.35 flip rate), so a correct filter must
+# weight them unequally rather than averaging them.
 DEFAULT_WORLD_FLIP_PROBABILITY = 0.03
 DEFAULT_CUE_FLIP_PROBABILITIES = (0.25, 0.35)
 DEFAULT_OUTCOME_FLIP_PROBABILITY = 0.15
@@ -230,6 +237,15 @@ class HiddenPartnerWorldFeedbackConfig:
 
 @dataclasses.dataclass(frozen=True)
 class HiddenPartnerWorldFeedbackResourceBudget:
+    """Exact logical persistent-state accounting.
+
+    ``state_nbytes`` counts only leaves of
+    :class:`HiddenPartnerWorldFeedbackState`: float32/int32 scalars, one
+    boolean, and five JAX PRNG keys counted as ten logical uint32 scalars.
+    It excludes Python/config objects, transition outputs, compiler buffers,
+    and device alignment.
+    """
+
     observation_float32_scalars: int
     persistent_float32_scalars: int
     persistent_int32_scalars: int
@@ -241,11 +257,14 @@ class HiddenPartnerWorldFeedbackResourceBudget:
     replay_capacity: int
 
     def to_dict(self) -> dict[str, int]:
+        """Return a JSON-compatible accounting record."""
         return dataclasses.asdict(self)
 
 
 @chex.dataclass(frozen=True)
 class HiddenPartnerWorldFeedbackState:
+    """Fixed-shape causal state for one uninterrupted environment life."""
+
     signal_key: PRNGKeyArray
     partner_key: PRNGKeyArray
     world_key: PRNGKeyArray
@@ -264,6 +283,14 @@ class HiddenPartnerWorldFeedbackState:
 
 @chex.dataclass(frozen=True)
 class HiddenPartnerWorldFeedbackOracle:
+    """Evaluator-only hidden world/schedule diagnostics for one step.
+
+    Includes the hidden world sign before and after the step, per-channel
+    noise-flip indicators, and the full-information optimal focal action
+    (the action a policy knowing ``z`` and the partner's intent would take,
+    with its expected-reward margin and tie flag).
+    """
+
     step_count: Int[Array, ""]
     cycle_index: Int[Array, ""]
     cycle_step: Int[Array, ""]
@@ -297,6 +324,8 @@ class HiddenPartnerWorldFeedbackOracle:
 
 @chex.dataclass(frozen=True)
 class HiddenPartnerWorldFeedbackTransition:
+    """One continuing simultaneous-action transition."""
+
     observation: Float[Array, " 8"]
     focal_action: Int[Array, ""]
     partner_action: Int[Array, ""]
@@ -310,6 +339,8 @@ class HiddenPartnerWorldFeedbackTransition:
 
 @chex.dataclass(frozen=True)
 class _SchedulePosition:
+    """Internal JAX record for a position in the repeating hidden schedule."""
+
     cycle_index: Int[Array, ""]
     cycle_step: Int[Array, ""]
     cycle_length: Int[Array, ""]
@@ -396,6 +427,7 @@ class HiddenPartnerWorldFeedbackWorld:
         return cls(HiddenPartnerWorldFeedbackConfig.from_config(inner))
 
     def init(self, key: Array) -> HiddenPartnerWorldFeedbackState:
+        """Initialize a deterministic life with independent named RNG streams."""
         schedule_key = jr.fold_in(key, _SCHEDULE_RNG_TAG)
         signal_root = jr.fold_in(key, _SIGNAL_RNG_TAG)
         partner_key = jr.fold_in(key, _PARTNER_RNG_TAG)
@@ -433,6 +465,7 @@ class HiddenPartnerWorldFeedbackWorld:
         )
 
     def observe(self, state: HiddenPartnerWorldFeedbackState) -> Array:
+        """Return exactly the eight ordinary, task-oracle-free channels."""
         x, u, v = state.current_signals
         cue_1, cue_2 = state.current_cues
         return jnp.stack(
@@ -453,6 +486,16 @@ class HiddenPartnerWorldFeedbackWorld:
         state: HiddenPartnerWorldFeedbackState,
         focal_action: Array,
     ) -> tuple[HiddenPartnerWorldFeedbackTransition, HiddenPartnerWorldFeedbackState]:
+        """Apply one scalar focal action id under exact simultaneous timing.
+
+        Valid dynamic action ids are ``0`` and ``1``.  Shape and integer
+        dtype are static and checked before tracing; the traced value cannot
+        raise under ``jit``, so an out-of-range id instead *poisons* the
+        transition: ``focal_sign`` becomes NaN (hence NaN outcome and
+        reward) and the world state does not advance.  A policy bug is
+        therefore loudly visible to finiteness checks rather than being
+        silently coerced onto a legal action.
+        """
         action = jnp.asarray(focal_action)
         if action.shape != ():
             raise ValueError(f"focal_action must be scalar, got shape {action.shape}")

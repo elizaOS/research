@@ -1,4 +1,16 @@
-"""Public fail-closed validators for active UPGD IPMNIST v3 artifacts."""
+"""Public fail-closed validators for active UPGD IPMNIST v3 artifacts.
+
+Thin shim over :mod:`alberta_framework.benchmarks.upgd_ipmnist_v3`: it
+re-exports the strict plan/partial/artifact validators and adds a CLI entry
+point.  The lane replicates the online Input-Permuted MNIST protocol of UPGD
+(Utility-based Perturbed Gradient Descent; Elsayed & Mahmood, ICLR 2024,
+"Addressing Loss of Plasticity and Catastrophic Forgetting in Continual
+Learning").  Sealed v1/v2 payloads predate this contract and are validated
+separately by :mod:`alberta_framework.evaluation.upgd_ipmnist_nonpromoting`;
+v3 execution is governed by ``UPGD_IPMNIST_V3_RUNBOOK.md``.  Validity never
+grants promotion: the v3 schema is permanently nonpromoting because the
+execution envelope is self-recorded, with no independent attestation.
+"""
 
 from __future__ import annotations
 

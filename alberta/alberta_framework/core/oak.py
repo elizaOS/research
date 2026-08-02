@@ -40,9 +40,10 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int
 
 from alberta_framework.core.options import (
+    DispatchedPrimitiveActionDecision,
     IntraOptionPoliciesState,
     OptionModelsState,
     STOMPAgent,
@@ -50,6 +51,7 @@ from alberta_framework.core.options import (
     STOMPState,
     STOMPUpdateResult,
     SubtaskSpec,
+    replace_dispatched_primitive_action,
     subtasks_from_feature_scores,
 )
 from alberta_framework.core.types import MLPParams
@@ -192,6 +194,102 @@ class OaKArrayResult:
     utility_emas: Float[Array, "num_steps n_options"]
     planning_backups: Int[Array, " num_steps"]
     planning_td_errors: Float[Array, " num_steps"]
+
+
+@chex.dataclass(frozen=True)
+class OaKKeyboardPolicyProposal:
+    """Deterministic fixed-chord proposal bound to one OaK decision state.
+
+    The first three fields intentionally match the partner-fusion option
+    proposal surface. ``declared_score`` is the selected keyboard Q-value;
+    it is descriptive and carries no calibration or benefit claim.
+    """
+
+    available: Bool[Array, ""]
+    action: Int[Array, ""]
+    declared_score: Float[Array, ""]
+    decision_observation: Float[Array, " observation_dim"]
+    keyboard_vector: Float[Array, " n_options"]
+    q_values: Float[Array, " n_primitive_actions"]
+    outer_state_static_contract_valid: Bool[Array, ""]
+    outer_state_values_finite: Bool[Array, ""]
+    outer_state_counters_valid: Bool[Array, ""]
+    outer_state_valid: Bool[Array, ""]
+    stomp_state_valid: Bool[Array, ""]
+    state_valid: Bool[Array, ""]
+    observation_static_contract_valid: Bool[Array, ""]
+    observation_valid: Bool[Array, ""]
+    observation_matches: Bool[Array, ""]
+    keyboard_vector_static_contract_valid: Bool[Array, ""]
+    keyboard_vector_valid: Bool[Array, ""]
+    q_values_valid: Bool[Array, ""]
+
+
+@chex.dataclass(frozen=True)
+class OaKKeyboardDispatchDecision:
+    """Keyboard proposal and ownership-correct effective dispatch audit."""
+
+    proposal: OaKKeyboardPolicyProposal
+    replacement: DispatchedPrimitiveActionDecision
+
+
+@chex.dataclass(frozen=True)
+class OaKKeyboardDispatchResult:
+    """OaK state after one strict keyboard-dispatch attempt."""
+
+    state: OaKState
+    decision: OaKKeyboardDispatchDecision
+
+
+def _oak_outer_state_validity(
+    state: OaKState,
+    config: OaKConfig,
+) -> tuple[Array, Array, Array, Array]:
+    """Validate all OaK-owned dynamic leaves around the nested STOMP state."""
+
+    n_options = config.n_options
+    static_contract_valid = (
+        state.execution_counts.shape == (n_options,)
+        and state.execution_counts.dtype == jnp.int32
+        and state.cumulative_pseudo_rewards.shape == (n_options,)
+        and state.cumulative_pseudo_rewards.dtype == jnp.float32
+        and state.utility_ema.shape == (n_options,)
+        and state.utility_ema.dtype == jnp.float32
+        and state.step_count.shape == ()
+        and state.step_count.dtype == jnp.int32
+        and state.stomp_state.option_policies.q_weights.shape
+        == (
+            config.n_options,
+            config.n_primitive_actions,
+            config.observation_dim,
+        )
+    )
+    values_finite = (
+        jnp.all(jnp.isfinite(state.cumulative_pseudo_rewards))
+        & jnp.all(jnp.isfinite(state.utility_ema))
+    )
+    counter_ceiling = jnp.where(
+        state.step_count < jnp.int32(2_147_483_647),
+        state.step_count + jnp.int32(1),
+        state.step_count,
+    )
+    counters_valid = (
+        (state.step_count >= 0)
+        & (state.step_count == state.stomp_state.step_count)
+        & jnp.all(state.execution_counts >= 0)
+        & jnp.all(state.execution_counts <= counter_ceiling)
+    )
+    valid = (
+        jnp.asarray(static_contract_valid, dtype=jnp.bool_)
+        & values_finite
+        & counters_valid
+    )
+    return (
+        jnp.asarray(static_contract_valid, dtype=jnp.bool_),
+        values_finite,
+        counters_valid,
+        valid,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -856,6 +954,151 @@ class OaKAgent:
         """Compute blended Q-values for a keyboard chord vector."""
         return keyboard_q_values(state.stomp_state, observation, keyboard_vector)
 
+    def propose_keyboard_policy(
+        self,
+        state: OaKState,
+        decision_observation: Array,
+        keyboard_vector: Array,
+    ) -> OaKKeyboardPolicyProposal:
+        """Return a strict deterministic proposal for one fixed chord.
+
+        The observation must be the exact float32 observation already stored
+        by STOMP for its current dispatched action. The chord must be a finite
+        float32 vector of shape ``(n_options,)`` with positive L1 norm. This is
+        a pure counterfactual query: it consumes no RNG and changes no state.
+
+        Invalid values or static input mismatches return ``available=False``
+        with finite sentinel diagnostics.
+        """
+
+        raw_observation = jnp.asarray(decision_observation)
+        observation_static_contract_valid = (
+            raw_observation.shape == (self._config.observation_dim,)
+            and raw_observation.dtype == jnp.float32
+        )
+        observation = (
+            raw_observation
+            if observation_static_contract_valid
+            else jnp.zeros((self._config.observation_dim,), dtype=jnp.float32)
+        )
+        raw_chord = jnp.asarray(keyboard_vector)
+        keyboard_vector_static_contract_valid = (
+            raw_chord.shape == (self._config.n_options,)
+            and raw_chord.dtype == jnp.float32
+        )
+        chord = (
+            raw_chord
+            if keyboard_vector_static_contract_valid
+            else jnp.zeros((self._config.n_options,), dtype=jnp.float32)
+        )
+
+        observation_valid = (
+            jnp.asarray(observation_static_contract_valid, dtype=jnp.bool_)
+            & jnp.all(jnp.isfinite(observation))
+        )
+        chord_l1 = jnp.sum(jnp.abs(chord))
+        keyboard_vector_valid = (
+            jnp.asarray(keyboard_vector_static_contract_valid, dtype=jnp.bool_)
+            & jnp.all(jnp.isfinite(chord))
+            & jnp.isfinite(chord_l1)
+            & (chord_l1 > 0.0)
+        )
+        safe_observation = jnp.where(observation_valid, observation, 0.0)
+        safe_chord = jnp.where(keyboard_vector_valid, chord, 0.0)
+        raw_q_values = keyboard_q_values(
+            state.stomp_state,
+            safe_observation,
+            safe_chord,
+        )
+        q_values_valid = jnp.all(jnp.isfinite(raw_q_values))
+        safe_q_values = jnp.where(q_values_valid, raw_q_values, 0.0)
+        candidate_action = jnp.argmax(safe_q_values).astype(jnp.int32)
+
+        ownership_audit = replace_dispatched_primitive_action(
+            state.stomp_state,
+            observation,
+            candidate_action,
+        ).decision
+        (
+            outer_static_contract_valid,
+            outer_values_finite,
+            outer_counters_valid,
+            outer_state_valid,
+        ) = _oak_outer_state_validity(state, self._config)
+        whole_state_valid = ownership_audit.state_valid & outer_state_valid
+        available = (
+            observation_valid
+            & keyboard_vector_valid
+            & q_values_valid
+            & whole_state_valid
+            & ownership_audit.observation_matches
+        )
+        declared_score = safe_q_values[candidate_action]
+        return OaKKeyboardPolicyProposal(
+            available=available,
+            action=jnp.where(available, candidate_action, jnp.int32(-1)),
+            declared_score=jnp.where(available, declared_score, jnp.float32(0.0)),
+            decision_observation=jnp.where(observation_valid, observation, 0.0),
+            keyboard_vector=jnp.where(keyboard_vector_valid, chord, 0.0),
+            q_values=safe_q_values,
+            outer_state_static_contract_valid=outer_static_contract_valid,
+            outer_state_values_finite=outer_values_finite,
+            outer_state_counters_valid=outer_counters_valid,
+            outer_state_valid=outer_state_valid,
+            stomp_state_valid=ownership_audit.state_valid,
+            state_valid=whole_state_valid,
+            observation_static_contract_valid=jnp.asarray(
+                observation_static_contract_valid, dtype=jnp.bool_
+            ),
+            observation_valid=observation_valid,
+            observation_matches=(
+                jnp.asarray(observation_static_contract_valid, dtype=jnp.bool_)
+                & ownership_audit.observation_matches
+            ),
+            keyboard_vector_static_contract_valid=jnp.asarray(
+                keyboard_vector_static_contract_valid, dtype=jnp.bool_
+            ),
+            keyboard_vector_valid=keyboard_vector_valid,
+            q_values_valid=q_values_valid,
+        )
+
+    def dispatch_keyboard_policy(
+        self,
+        state: OaKState,
+        decision_observation: Array,
+        keyboard_vector: Array,
+        safety_action_mask: Array | None = None,
+    ) -> OaKKeyboardDispatchResult:
+        """Propose and atomically commit one ownership-correct chord action.
+
+        The unconstrained keyboard argmax is audited against the optional hard
+        primitive-action mask. An unsafe proposal uses the independently safe
+        already-selected OaK action. Invalid inputs or an unsafe base action
+        fail closed with effective action ``-1`` and exact state preservation.
+        """
+
+        proposal = self.propose_keyboard_policy(
+            state,
+            decision_observation,
+            keyboard_vector,
+        )
+        replacement = replace_dispatched_primitive_action(
+            state.stomp_state,
+            decision_observation,
+            proposal.action,
+            safety_action_mask=safety_action_mask,
+        )
+        return OaKKeyboardDispatchResult(
+            state=cast(
+                OaKState,
+                state.replace(stomp_state=replacement.state),
+            ),
+            decision=OaKKeyboardDispatchDecision(
+                proposal=proposal,
+                replacement=replacement.decision,
+            ),
+        )
+
     def keyboard_action(
         self,
         state: OaKState,
@@ -882,6 +1125,9 @@ __all__ = [
     "OaKAgent",
     "OaKArrayResult",
     "OaKConfig",
+    "OaKKeyboardDispatchDecision",
+    "OaKKeyboardDispatchResult",
+    "OaKKeyboardPolicyProposal",
     "OaKState",
     "OaKUpdateResult",
     "init_keyboard_chord_learner",

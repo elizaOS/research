@@ -410,6 +410,13 @@ def _validate_executable_imports(
     entrypoints = list(
         dict.fromkeys(cast(str, configuration["entrypoint"]) for configuration in configurations)
     )
+    # Stderr signatures of compilation/cache fallback under the read-only
+    # root: the first two are Numba's warning pair when it cannot persist a
+    # JIT cache ("Cannot cache function ...: no locator available"), the
+    # third is Matplotlib falling back to an ad-hoc temporary config dir, and
+    # the rest are cache-directory/JIT failures.  Any of them means the
+    # frozen MPLCONFIGDIR/NUMBA_CACHE_DIR wiring is broken even though
+    # ``--help`` still exits 0, so the probe fails closed on their presence.
     forbidden = (
         "cannot cache function",
         "no locator available",
@@ -463,6 +470,9 @@ def _validate_executable_imports(
             _fail(f"{variable} is not an exact non-symlink directory")
         metadata = path.stat()
         writable = os.access(path, os.W_OK | os.X_OK)
+        # 65532:65532 is the uid:gid the screen launcher pins via
+        # ``docker run --user`` (the conventional distroless "nonroot"
+        # identity); ownership is re-checked from inside the container.
         if metadata.st_uid != 65532 or metadata.st_gid != 65532 or not writable:
             _fail(f"{variable} is not owned by and writable to the frozen container user")
         cache_directories.append(
@@ -575,6 +585,10 @@ def main() -> None:
         },
     }
     runtime = cast(dict[str, Any], payload["runtime"])
+    # The frozen sandbox contract runs the container as 65532:65532 — the
+    # conventional distroless "nonroot" uid:gid — pinned by the launcher's
+    # ``--user`` flag; verifying it in-process catches a rebuilt image or a
+    # launcher that silently dropped the flag and ran as root.
     if not runtime["nonroot"] or runtime["uid"] != 65532 or runtime["gid"] != 65532:
         _fail("container is not running as the exact frozen nonroot identity")
     if not runtime["root_filesystem_read_only"]:

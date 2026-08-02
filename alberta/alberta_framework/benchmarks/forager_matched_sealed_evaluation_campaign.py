@@ -1,5 +1,14 @@
 """Resumable content-only execution of the matched-current sealed evaluation block.
 
+The sealed block is the held-out stage of the matched-current Forager
+protocol: the exact 6-candidate by 30-seed (180-cell) grid fixed by the seal
+bundle from :mod:`alberta_framework.benchmarks.forager_matched_seal` — the
+boundary between completed open tuning and held-out evaluation.  The six
+candidates are the four the frozen selection advanced plus two fixed
+descriptive references; the 30 seeds are the held-out evaluation seeds of
+:mod:`alberta_framework.benchmarks.forager_matched_open_protocol`, disjoint
+from the open-stage tuning seeds.
+
 Mutating entry points freshly authenticate the caller-pinned seal immediately before
 publication or execution.  Persisted seal bindings are cache content only and are never
 accepted as authority.  Read-only verification, status, and completed-loading entry points
@@ -15,6 +24,7 @@ boundary for any performance or promotion claim.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import stat
@@ -35,10 +45,10 @@ from alberta_framework.benchmarks import forager_matched_seal as seal
 from alberta_framework.benchmarks.forager_matched_evidence import MatchedScoreEvidence
 
 MATCHED_SEALED_EVALUATION_CAMPAIGN_SCHEMA_VERSION: Final = (
-    "alberta.forager_matched_sealed_evaluation_campaign.v1"
+    "alberta.forager_matched_sealed_evaluation_campaign.v2"
 )
 MATCHED_SEALED_EVALUATION_COMPLETION_SCHEMA_VERSION: Final = (
-    "alberta.forager_matched_sealed_evaluation_completion.v1"
+    "alberta.forager_matched_sealed_evaluation_completion.v2"
 )
 
 _REPOSITORY_ROOT: Final = Path(__file__).resolve().parents[2]
@@ -252,6 +262,119 @@ def _require_sha256(value: Any, label: str) -> str:
     return value
 
 
+def _qualification_bundle_manifest_sha256(
+    bundle: qualification.MatchedCurrentQualificationBundle,
+) -> str:
+    """Return the loader-preserved digest after replaying its exact byte identity."""
+    digest = _require_sha256(
+        getattr(bundle, "manifest_sha256", None),
+        "qualification bundle manifest_sha256",
+    )
+    raw = getattr(bundle, "manifest_bytes", None)
+    manifest = getattr(bundle, "manifest", None)
+    if type(raw) is not bytes or not isinstance(manifest, Mapping):
+        raise ForagerMatchedSealedEvaluationCampaignError(
+            "qualification bundle does not preserve its exact manifest bytes"
+        )
+    try:
+        canonical = qualification._canonical_json_bytes(manifest)
+    except (OverflowError, RecursionError, TypeError, ValueError) as exc:
+        raise ForagerMatchedSealedEvaluationCampaignError(
+            "qualification bundle manifest is not canonical JSON"
+        ) from exc
+    if raw != canonical or hashlib.sha256(raw).hexdigest() != digest:
+        raise ForagerMatchedSealedEvaluationCampaignError(
+            "qualification bundle manifest bytes differ from their loader digest"
+        )
+    return digest
+
+
+def _open_qualification_manifest_sha256(
+    bundle: qualification.MatchedCurrentQualificationBundle,
+    content: seal.ContentVerifiedSealBundle,
+) -> str:
+    """Require one qualification identity across the root and authenticated open seal."""
+    bundle_digest = _qualification_bundle_manifest_sha256(bundle)
+    open_campaign = content.manifest.get("open_campaign")
+    if not isinstance(open_campaign, Mapping):
+        raise ForagerMatchedSealedEvaluationCampaignError(
+            "seal manifest omits its open campaign qualification binding"
+        )
+    recorded_bindings = content.recorded_bindings_cache
+    if not isinstance(recorded_bindings, Mapping):
+        raise ForagerMatchedSealedEvaluationCampaignError(
+            "seal recorded bindings cache is not an object"
+        )
+    digests = (
+        bundle_digest,
+        _require_sha256(
+            open_campaign.get("qualification_manifest_sha256"),
+            "seal manifest qualification_manifest_sha256",
+        ),
+        _require_sha256(
+            getattr(content.open_score_evidence, "qualification_manifest_sha256", None),
+            "open score-evidence qualification_manifest_sha256",
+        ),
+        _require_sha256(
+            getattr(content.open_verification_request, "qualification_manifest_sha256", None),
+            "open verification-request qualification_manifest_sha256",
+        ),
+        _require_sha256(
+            recorded_bindings.get("qualification_manifest_sha256"),
+            "open authenticated-bindings qualification_manifest_sha256",
+        ),
+    )
+    if any(value != bundle_digest for value in digests[1:]):
+        raise ForagerMatchedSealedEvaluationCampaignError(
+            "sealed evaluation qualification manifest differs from authenticated open closure"
+        )
+    return bundle_digest
+
+
+def _sealed_input_qualification_manifest_sha256(inputs: _SealedInputs) -> str:
+    """Require the sealed execution plan to carry the exact authenticated open digest."""
+    digest = _open_qualification_manifest_sha256(
+        inputs.rebuilt.bundle,
+        inputs.seal_content,
+    )
+    plan = inputs.rebuilt.plan
+    plan_payload = plan.payload
+    executor_manifest = plan.executor_manifest
+    if (
+        plan.qualification_manifest_sha256 != digest
+        or plan_payload.get("qualification_manifest_sha256") != digest
+        or executor_manifest.get("qualification_manifest_sha256") != digest
+    ):
+        raise ForagerMatchedSealedEvaluationCampaignError(
+            "sealed execution plan qualification-manifest closure drifted"
+        )
+    return digest
+
+
+def _completed_qualification_manifest_sha256(
+    inputs: _SealedInputs,
+    context: campaign._CampaignContext,
+    score_evidence: MatchedScoreEvidence,
+    request: executor.VerificationRequest,
+) -> str:
+    """Require the evaluation score/request closure to retain the sealed-plan digest."""
+    digest = _sealed_input_qualification_manifest_sha256(inputs)
+    context_plan = context.rebuilt.plan
+    values = (
+        _qualification_bundle_manifest_sha256(context.rebuilt.bundle),
+        getattr(context_plan, "qualification_manifest_sha256", None),
+        context_plan.payload.get("qualification_manifest_sha256"),
+        context_plan.executor_manifest.get("qualification_manifest_sha256"),
+        getattr(score_evidence, "qualification_manifest_sha256", None),
+        getattr(request, "qualification_manifest_sha256", None),
+    )
+    if any(value != digest for value in values):
+        raise ForagerMatchedSealedEvaluationCampaignError(
+            "sealed evaluation score/request qualification-manifest closure drifted"
+        )
+    return digest
+
+
 def _validate_mutation_pins(
     *,
     expected_trust_anchor_identity: str,
@@ -316,6 +439,7 @@ def _rebuild_sealed_inputs(
         raise ForagerMatchedSealedEvaluationCampaignError(
             "seal open protocol differs from the qualification reconstruction"
         )
+    qualification_digest = _open_qualification_manifest_sha256(bundle, content)
     if tuple(bundle.candidate_assets) != open_protocol.MATCHED_CURRENT_CANDIDATE_IDS:
         raise ForagerMatchedSealedEvaluationCampaignError(
             "qualification candidate asset order drifted"
@@ -389,6 +513,7 @@ def _rebuild_sealed_inputs(
     plan = executor.build_execution_plan(
         content.sealed_protocol,
         assets,
+        qualification_manifest_sha256=qualification_digest,
         candidate_ids=candidate_ids,
         cpu_qualification_root=bundle.cpu_qualification_root,
         rng_parity_qualification_root=bundle.rng_parity_qualification_root,
@@ -405,7 +530,7 @@ def _rebuild_sealed_inputs(
         assets=assets,
         schedule=evaluation_schedule,
     )
-    return _SealedInputs(
+    inputs = _SealedInputs(
         rebuilt=rebuilt,
         seal_content=content,
         transition=transition,
@@ -414,6 +539,8 @@ def _rebuild_sealed_inputs(
             content.open_verification_request.verification_subject_sha256
         ),
     )
+    _sealed_input_qualification_manifest_sha256(inputs)
+    return inputs
 
 
 def _campaign_manifest(
@@ -421,6 +548,7 @@ def _campaign_manifest(
     live: executor.LiveRuntimeIdentity,
 ) -> dict[str, Any]:
     rebuilt = inputs.rebuilt
+    qualification_digest = _sealed_input_qualification_manifest_sha256(inputs)
     selected = inputs.transition.evaluation_candidate_ids[:4]
     fixed = inputs.transition.evaluation_candidate_ids[4:]
     return {
@@ -456,9 +584,7 @@ def _campaign_manifest(
         "execution_plan_sha256": rebuilt.plan.plan_sha256,
         "source_manifest_sha256": rebuilt.plan.source_manifest_sha256,
         "executor_manifest_sha256": rebuilt.plan.executor_manifest_sha256,
-        "qualification_manifest_sha256": campaign._canonical_sha256(
-            rebuilt.bundle.manifest
-        ),
+        "qualification_manifest_sha256": qualification_digest,
         "live_runtime_identity_sha256": live.identity_sha256,
         "execution_schedule_sha256": cast(
             str,
@@ -496,6 +622,12 @@ def _completion_summary(
     score_evidence: MatchedScoreEvidence,
     request: executor.VerificationRequest,
 ) -> dict[str, Any]:
+    qualification_digest = _completed_qualification_manifest_sha256(
+        inputs,
+        context,
+        score_evidence,
+        request,
+    )
     return {
         "schema_version": MATCHED_SEALED_EVALUATION_COMPLETION_SCHEMA_VERSION,
         "classification": "content_only_unendorsed_nonpromoting",
@@ -507,6 +639,7 @@ def _completion_summary(
         ),
         "sealed_transition_sha256": inputs.seal_content.sealed_transition_sha256,
         "protocol_sha256": context.rebuilt.protocol.protocol_sha256,
+        "qualification_manifest_sha256": qualification_digest,
         "execution_plan_sha256": context.rebuilt.plan.plan_sha256,
         "source_manifest_sha256": context.rebuilt.plan.source_manifest_sha256,
         "executor_manifest_sha256": context.rebuilt.plan.executor_manifest_sha256,
@@ -588,7 +721,7 @@ def _summary_validator(inputs: _SealedInputs) -> _SummaryValidator:
         )
         if campaign._plain(summary) != expected:
             raise ForagerMatchedSealedEvaluationCampaignError(
-                "sealed completion summary differs from its exact v1 schema"
+                "sealed completion summary differs from its exact v2 schema"
             )
 
     return validate
@@ -834,6 +967,7 @@ def _publish_initial_root(
     requested: Path,
     prospective: Path,
 ) -> Path:
+    qualification_digest = _sealed_input_qualification_manifest_sha256(inputs)
     parent, destination = seal._open_destination_parent(requested, prospective)
     staging_name: str | None = None
     staging: seal._OpenDirectory | None = None
@@ -859,7 +993,17 @@ def _publish_initial_root(
                 "sealed evaluation initial artifact inventory is inconsistent"
             )
         for name, payload in payloads:
-            raw = campaign.canonical_json_bytes(payload)
+            raw = (
+                inputs.rebuilt.bundle.manifest_bytes
+                if name == "qualification-manifest.json"
+                else campaign.canonical_json_bytes(payload)
+            )
+            if name == "qualification-manifest.json" and (
+                hashlib.sha256(raw).hexdigest() != qualification_digest
+            ):
+                raise ForagerMatchedSealedEvaluationCampaignError(
+                    "qualification manifest bytes changed before sealed publication"
+                )
             seal._write_pair_at(staging, name, raw)
             expected_files.update((name, f"{name}.sha256"))
         _sync_staging_tree(staging, expected_files)
@@ -947,6 +1091,9 @@ def _load_context(
         protocol=inputs.rebuilt.protocol,
         assets=inputs.rebuilt.assets,
         expected_plan_sha256=inputs.rebuilt.plan.plan_sha256,
+        expected_qualification_manifest_sha256=(
+            inputs.rebuilt.bundle.manifest_sha256
+        ),
         cpu_qualification_root=inputs.rebuilt.bundle.cpu_qualification_root,
         rng_parity_qualification_root=(
             inputs.rebuilt.bundle.rng_parity_qualification_root
@@ -966,11 +1113,14 @@ def _load_context(
         "executor-manifest.json",
         inputs.rebuilt.plan.executor_manifest,
     )
-    campaign._expect_artifact(
+    qualification_copy_sha = campaign._expect_qualification_artifact(
         root,
-        "qualification-manifest.json",
-        inputs.rebuilt.bundle.manifest,
+        inputs.rebuilt.bundle,
     )
+    if qualification_copy_sha != inputs.rebuilt.bundle.manifest_sha256:
+        raise ForagerMatchedSealedEvaluationCampaignError(
+            "sealed qualification manifest copy differs from authenticated digest"
+        )
     persisted_schedule, _schedule_file_sha256 = campaign._load_json_pair(
         root / "execution-schedule.json",
         "sealed evaluation execution schedule",

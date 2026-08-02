@@ -1,4 +1,32 @@
-"""Fail-closed schema tooling for a forbidden hidden-partner tuning grid."""
+"""Fail-closed artifact tooling for the reserved-but-forbidden v4 hidden-partner tuning grid.
+
+The v4 grid (``LEASE_TUNING_GRID`` in
+:mod:`alberta_framework.evaluation.hidden_partner_lifecycle_v2`) tunes the
+evidence-gated confirmed-memory lease of
+:class:`~alberta_framework.core.integrated_hidden_partner.IntegratedHiddenPartnerAgent`:
+eight immutable cells over retention grace steps {2048, 3072, 4096} crossed
+with active-utility evidence thresholds 0.075–0.40, each to be run on eight
+seed pairs derived from ``LEASE_TUNING_NAMESPACE`` and ranked by the frozen
+lexicographic ``TUNING_SELECTION_RULE``.
+
+The namespace was reserved fresh — earlier v3 development seeds were inspected
+while diagnosing downstream consumer interference, so they could no longer
+serve as untouched tuning seeds — but the grid was never executed, and the
+namespace status is pinned ``FORBIDDEN/UNEXECUTED``.  Every production path
+refuses while that status stands: :func:`build_lease_tuning_artifact` and
+:func:`validate_lease_tuning_artifact` both call
+``require_lease_tuning_execution_allowed()`` before touching seeds or
+payloads.  Only the private ``_..._for_testing`` helpers bypass the gate, and
+only for synthetic structural fixtures.
+
+Validation trusts nothing in a candidate artifact: strict JSON loading rejects
+duplicate keys and non-finite constants, the declared source closure is
+re-hashed against the working tree, and every derived quantity — per-window
+NLL/accuracy metrics, consumer read/write gates, confirmed feature-memory
+commitment, lifecycle claims, per-cell aggregates, and the selected cell — is
+reconstructed from run primitives and compared exactly.  The artifact is
+development-only and can never promote scientific evidence.
+"""
 
 from __future__ import annotations
 
@@ -1018,8 +1046,10 @@ def _expected_consumer_gate_arrays(
     left = deployed_states[..., 0]
     right = deployed_states[..., 1]
     live = (0 <= left) & (left < right) & (right < 12)
-    # Lexicographic ``combinations(range(12), 2)`` index. This independently
-    # yields the pinned C=1 and D=38 candidate identities.
+    # Lexicographic ``combinations(range(12), 2)`` index: left*(23-left)//2
+    # counts every pair whose first element precedes ``left``, and
+    # (right-left-1) offsets within that block. This independently yields the
+    # pinned C=1 and D=38 candidate identities.
     identity = np.where(
         live,
         left * (23 - left) // 2 + (right - left - 1),
@@ -1174,6 +1204,9 @@ def _expected_feature_memory_arrays(
     left = shadow_states[..., 0]
     right = shadow_states[..., 1]
     live = (0 <= left) & (left < right) & (right < 12)
+    # Same lexicographic ``combinations(range(12), 2)`` identity index as in
+    # _expected_consumer_gate_arrays; being slot-independent, it lets
+    # commitment follow a surviving descriptor across slot moves.
     identity = np.where(
         live,
         left * (23 - left) // 2 + (right - left - 1),
@@ -2295,6 +2328,8 @@ def _validate_lifecycle(
     c_recurrent_reward = float(
         np.mean(primitives.rewards[recurrent_c_start : recurrent_c_start + RECURRENT_ENTRY_WINDOW])
     )
+    # Retention is the fraction of C's first-visit excess-over-chance reward
+    # (chance = 0.5 on this binary task) preserved on re-entry.
     c_retention_ratio = (c_recurrent_reward - 0.5) / max(c_first_reward - 0.5, 1e-7)
     c_target_created_share = c_first_window.learning_nll_gain / max(
         c_first_window.masked_nll_increase, 1e-12
@@ -2302,6 +2337,11 @@ def _validate_lifecycle(
     d_target_created_share = d_late_window.learning_nll_gain / max(
         d_late_window.masked_nll_increase, 1e-12
     )
+    # The gate constants below (reward floors, accuracy/NLL-gain thresholds,
+    # retention ratio, joint-success fraction) are defined and frozen next to
+    # the grid in hidden_partner_lifecycle_v2; this validator consumes them
+    # unchanged so a reconstructed lifecycle claim passes or fails under
+    # exactly the gates the frozen protocol declares.
     c_task_learned = (
         representation_valid
         and c_mismatches == 0

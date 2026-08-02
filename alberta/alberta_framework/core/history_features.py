@@ -1,4 +1,4 @@
-"""History-feature extractor for recurrent state construction (Step 3 Phase D).
+"""History-feature extractor for recurrent state construction (Step 3).
 
 Implements decaying-trace ("EMA") features over observation channels --
 the simplest form of memory needed for partially observable settings.

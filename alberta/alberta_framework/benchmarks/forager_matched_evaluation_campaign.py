@@ -1,5 +1,12 @@
 """Pure sealed-evaluation scheduling for the matched-current Forager campaign.
 
+The sealed panel has six arms: four slots resolved by open-tuning selection
+(the Alberta winner plus the top three external candidates) and the two fixed
+descriptive candidates (``exact_ppo``, ``search_oracle``), which are never
+selection- or pairing-eligible.  Every arm runs the frozen 30-seed evaluation
+block, giving the 180-cell seed-major schedule built here (see
+:mod:`forager_matched_open_protocol` for the frozen panel and seed blocks).
+
 This module owns only reward-free content construction and replay.  It does
 not read or write campaign state, execute candidates, authenticate a seal, or
 authorize scientific promotion.
@@ -28,6 +35,9 @@ MATCHED_SEALED_EVALUATION_SCHEDULE_SCHEMA_VERSION: Final = (
     MATCHED_SEALED_SCHEDULE_SCHEMA_VERSION
 )
 
+# Frozen matched-current panel shape: 4 selection slots (1 alberta rank +
+# 3 external ranks) + 2 fixed descriptive candidates = 6 arms, each over the
+# 30-seed evaluation block disjoint from tuning => 6 x 30 = 180 cells.
 _EXPECTED_SELECTED_CANDIDATES: Final = 4
 _EXPECTED_FIXED_DESCRIPTIVE_CANDIDATES: Final = 2
 _EXPECTED_EVALUATION_CANDIDATES: Final = 6

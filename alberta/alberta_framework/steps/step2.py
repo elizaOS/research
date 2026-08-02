@@ -8,10 +8,13 @@ heads.  It is not a theorem of universal representation learning; it is the
 current empirically promoted kernel for the supervised Step 2 acceptance
 matrix.
 
-For retained class-view memory, Step 2 also exposes the JAX fixed-budget
-prototype memory distilled from the D20 OPMNIST runner and a packaged
-UPGD-memory learner that updates both the differentiable UPGD path and the
-memory path every step.
+For retained class-view memory, Step 2 also exposes a JAX fixed-budget
+prototype memory and a packaged UPGD-memory learner that updates both the
+differentiable UPGD path and the memory path every step.  The prototype
+memory is distilled from the D20 multi-prototype development lane of the
+online permuted-MNIST (OPMNIST) protocol from the loss-of-plasticity
+literature (Dohare et al. 2024); see the README's "Online Permuted MNIST"
+section and ``tests/test_d20_multiprototype_opmnist.py``.
 """
 
 from __future__ import annotations
@@ -89,7 +92,13 @@ class Step2KernelConfig:
 
 @dataclass(frozen=True)
 class Step2StrictDigitReadoutConfig:
-    """Config for the strict one-branch digit/readout Step 2 learner."""
+    """Config for the strict one-branch digit/readout Step 2 learner.
+
+    ``step_size=0.018`` is a frozen empirical calibration for the
+    sklearn-digits stream family, not a derived value; see
+    :meth:`UPGDLearner.step2_strict_digit_readout_default` for the full set
+    of frozen constants and the two-timescale readout it configures.
+    """
 
     n_heads: int = 10
     hidden_sizes: tuple[int, ...] = (64, 64)
@@ -197,7 +206,27 @@ class Step2AssociativeConfig:
 
 @dataclass(frozen=True)
 class Step2HybridConfig:
-    """Config for the production Step 2 UPGD plus memory learner."""
+    """Config for the production Step 2 UPGD plus memory learner.
+
+    Fields mirror
+    :class:`~alberta_framework.core.upgd_memory.UPGDMemoryConfig`
+    one-for-one; see that class for per-field semantics.  The knobs fall
+    into four groups:
+
+    1. Output-head plasticity pressure — ``upgd_head_loss_pressure_*``
+       (extra head step-size when the fast/slow loss ratio spikes) and
+       ``upgd_head_repetition_*`` (extra head step-size while the target
+       vector repeats).
+    2. Prototype-memory geometry and allocation —
+       ``slots_per_class``, ``memory_update_rate``,
+       ``initial_novelty_threshold`` with its online adaptation
+       (``novelty_adaptation_rate``, ``target_allocation_rate``), and
+       ``memory_bandwidth``.
+    3. Learned memory-vs-UPGD blending — the ``*_logit_*`` coefficients
+       and ``reliability_decay``.
+    4. The causal target-trace prior — ``target_trace_*``, applied only
+       during updates so held-out prediction stays observation-based.
+    """
 
     feature_dim: int = 784
     n_heads: int = 10
@@ -244,7 +273,17 @@ class Step2HybridConfig:
 
 @dataclass(frozen=True)
 class Step2TemporalContextConfig:
-    """Config for the promoted phase-context UPGD stressor kernel."""
+    """Config for the promoted phase-context UPGD stressor kernel.
+
+    ``periods`` drives the sin/cos clock features of
+    :class:`~alberta_framework.core.temporal_context.TemporalContextConfig`:
+    each period contributes one sin/cos pair, and with phase products
+    enabled (as :func:`make_step2_temporal_context` does) every pair is
+    also multiplied against each input channel.  The 13-period grid spans
+    drift timescales from 32 to 192 steps — denser at short periods
+    (8-step spacing through 96) and coarser above.  It is a fixed
+    hyperparameter grid, not a derived quantity.
+    """
 
     feature_dim: int = 12
     n_heads: int = 1
@@ -564,7 +603,9 @@ def run_step2_associative_smoke(
     """Run a deterministic associative-memory integration probe.
 
     This is a package-quality smoke test for the sequence-memory path, not a
-    replacement for the sparse-KV external benchmark suite.  It repeats a small
+    replacement for the external sparse key-value recall probes that promoted
+    the ``token_suffix_pair`` feature family (gate tests:
+    ``tests/test_step2_associative_evidence_gate.py``).  It repeats a small
     set of contexts so a healthy associative table should lower NLL over time.
     """
     cfg = config or Step2AssociativeConfig()

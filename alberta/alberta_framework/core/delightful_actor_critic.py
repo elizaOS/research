@@ -1,16 +1,20 @@
 # mypy: disable-error-code="attr-defined,call-arg"
 """Fail-closed discrete actor-critic integration for Delightful Policy Gradient.
 
-This module is the stateful WP5.4 experiment boundary.  It deliberately supports
+This module is the stateful boundary for the Delightful Policy Gradient (DG)
+experiment — §5.4 of ``CONTINUAL_AGENT_IMPLEMENTATION_PLAN.md``, after
+"Delightful Policy Gradient" (arXiv:2603.14608).  It deliberately supports
 only a continuing, on-policy categorical actor.  The ordinary and delightful
 modes use the same state, critic, reward-rate baseline, random stream, and action
 sampler; the only difference is the detached coefficient returned by
 ``discrete_delightful_policy_gradient``.
 
-The actor has no eligibility trace.  The critic may keep an ordinary differential
-TD trace, and neither that trace, the critic update, nor the average-reward update
-is multiplied by the delight gate.  Safety, model, and representation learners are
-external to this isolated core.  On an accepted transition, their explicit
+The actor has no eligibility trace: a current-sample delight gate must not
+multiply a trace containing historical score gradients.  The critic may keep an
+ordinary differential TD trace, and neither that trace, the critic update, nor
+the average-reward update is multiplied by the paper-defined delight gate.
+Safety, model, and representation learners are external to this isolated core.
+On an accepted transition, their explicit
 routes are reported with unit weight whenever the caller declares them
 available; this module never silently pretends to update those learners.
 
@@ -299,7 +303,7 @@ class DelightfulActorCriticConfig:
 
 @chex.dataclass(frozen=True)
 class DelightfulChannelAvailability:
-    """Availability of external channels that this core must never delight-gate."""
+    """External channels this core must never gate with paper-defined delight."""
 
     safety: Bool[Array, ""]
     model: Bool[Array, ""]
@@ -360,7 +364,11 @@ class DelightfulChannelRouting:
 
 @chex.dataclass(frozen=True)
 class DelightfulActorCriticDiagnostics:
-    """Finite actor signals, gate summaries, and fail-closed verdicts."""
+    """Finite actor signals, gate summaries, and fail-closed verdicts.
+
+    ``delight``-named fields are paper-defined actor-sample quantities and
+    strata, never candidate-update safety-audit verdicts.
+    """
 
     state_valid: Bool[Array, ""]
     input_valid: Bool[Array, ""]
@@ -416,7 +424,10 @@ class DelightfulActorCriticUpdateResult:
 
 @chex.dataclass(frozen=True)
 class DelightfulActorCriticBatchDiagnostics:
-    """Finite aggregate diagnostics over accepted scan transitions."""
+    """Finite aggregate diagnostics over accepted scan transitions.
+
+    Legacy ``delight``-named fields summarize paper-specific DG actor samples.
+    """
 
     attempted_count: Int[Array, ""]
     accepted_count: Int[Array, ""]
@@ -435,7 +446,11 @@ class DelightfulActorCriticBatchDiagnostics:
 
 @chex.dataclass(frozen=True)
 class DelightfulActorCriticArrayResult:
-    """Final state, bounded per-step outputs, and aggregate scan diagnostics."""
+    """Final state, bounded per-step outputs, and aggregate scan diagnostics.
+
+    ``delights`` contains historical paper-specific DG actor-sample values, not
+    literal candidate-gradient verdicts.
+    """
 
     state: DelightfulActorCriticState
     actions: Int[Array, " num_steps"]
@@ -508,7 +523,7 @@ class DelightfulActorCriticResourceBudget:
 
 
 class DelightfulActorCriticAgent:
-    """Linear differential actor-critic with an optional detached delight gate."""
+    """Linear actor-critic with an optional detached paper-defined delight gate."""
 
     def __init__(self, config: DelightfulActorCriticConfig):
         self._config = config

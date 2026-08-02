@@ -1,24 +1,25 @@
 # mypy: disable-error-code="call-arg"
-"""Optimizer-level gradient joy and separate paper-specific actor signals.
+"""Candidate-update safety audit and paper-defined delight signals.
 
-:func:`assess_gradient_joy` implements the literal introspective question
-"does this candidate gradient/update spark joy?" It checks a candidate
-parameter update's first-order effects on independent objective, retention,
-and safety probes plus an update-norm trust bound. This is optimizer
-control-plane logic, not reward, UX delight, or a generic scalar over the eight
-learning-value channels.
+:func:`assess_gradient_joy` is the historical API name for a multi-objective
+candidate-update safety audit. It checks first-order effects on independent
+objective, retention, and safety probes plus an update-norm trust bound. It is
+optimizer control-plane logic and is *not* the paper-defined meaning of
+``delight`` or “sparks joy.” New prose should call it the candidate-update
+audit; compatibility names remain to avoid checkpoint/API breakage.
 
-Separately, :func:`discrete_delightful_policy_gradient` implements the bounded
+:func:`discrete_delightful_policy_gradient` implements the bounded
 discrete-action experiment described in WP5 of
-``CONTINUAL_AGENT_IMPLEMENTATION_PLAN.md``. Its paper-specific signal is
+``CONTINUAL_AGENT_IMPLEMENTATION_PLAN.md``. Its paper-defined signal is
 ``stop_gradient(advantage * -log_probability)``. Callers provide selected
 categorical action log-probabilities and detached advantages, then apply the
 returned scalar loss only to actor parameters.
 
 Critic, world-model, representation, and safety losses must remain outside the
-policy-gradient helper. Kondo compute gating is explicitly unavailable because
-masking a loss inside a full autodiff graph does not demonstrate skipped
-backward work.
+policy-gradient helper. The separate :mod:`alberta_framework.core.kondo_gate`
+module uses paper-defined delight to select samples before autodiff and gathers
+a smaller PyTree, because masking a loss inside a full graph does not
+demonstrate skipped backward work.
 """
 
 from __future__ import annotations
@@ -66,7 +67,9 @@ class LearningValue:
 
     - ``advantage``: return or reward units from the actor's baseline.
     - ``action_surprisal``: nats from a selected action log-probability.
-    - ``delight``: return-nats, ``advantage * action_surprisal``.
+    - ``delight``: paper-defined actor-sample delight, in return-nats,
+      ``advantage * action_surprisal``. It is not the separate candidate-update
+      safety-audit verdict.
     - ``epistemic_surprise``: calibrated reducible-uncertainty units.
     - ``aleatoric_uncertainty``: calibrated outcome-variance units.
     - ``learning_progress``: predictive-loss reduction per model window/version.
@@ -188,7 +191,7 @@ class GradientJoyConfig:
 
 @chex.dataclass(frozen=True)
 class LearningValueAvailability:
-    """Named scalar-validity flags for all eight learning-value channels."""
+    """Named semantic-validity flags for all eight learning-value channels."""
 
     advantage: Bool[Array, ""]
     action_surprisal: Bool[Array, ""]
@@ -215,8 +218,11 @@ class GradientJoyEvidence:
 
     ``learning_value`` retains the eight typed channels and
     ``learning_value_availability`` declares which producers actually emitted
-    them. A channel must be both declared available and scalar-valid. Channels
-    are reported separately and are never aggregated into the joy weight.
+    them. A channel must be both declared available and semantically valid.
+    In particular, the historical ``delight`` field must exactly equal its
+    float32 paper-specific DG ``advantage * action_surprisal`` identity.
+    Channels are reported separately and are never aggregated into the joy
+    weight.
     """
 
     objective_probe_gradient: Any | None
@@ -304,15 +310,15 @@ class GradientJoyDiagnostics:
 
 @chex.dataclass(frozen=True)
 class GradientJoyAssessment:
-    """Detached candidate decision, weakest-link weight, and auditable evidence.
+    """Detached candidate-update audit and auditable evidence.
 
     Acceptance certifies the candidate audit only.  It does not assert that an
     update was representable in a parameter dtype or committed to parameters;
     :class:`GradientJoyApplicationResult` reports that separate boundary.
 
-    ``sparks_joy`` is the literal yes/no spelling of ``accepted``.  It is a
-    read-only alias rather than a second stored field, so serialized state and
-    JAX PyTree structure have only one source of truth.
+    ``sparks_joy`` is retained as a historical read-only alias of ``accepted``.
+    In paper-defined terminology, “sparks joy” instead means Kondo selection
+    for a backward pass; see :class:`~alberta_framework.core.kondo_gate.KondoGateResult`.
     """
 
     accepted: Bool[Array, ""]
@@ -324,9 +330,14 @@ class GradientJoyAssessment:
     diagnostics: GradientJoyDiagnostics
 
     @property
-    def sparks_joy(self) -> Bool[Array, ""]:
-        """Answer literally: does this proposed gradient/update spark joy?"""
+    def candidate_update_audit_passed(self) -> Bool[Array, ""]:
+        """Return whether the multi-objective candidate-update audit passed."""
         return self.accepted
+
+    @property
+    def sparks_joy(self) -> Bool[Array, ""]:
+        """Historical compatibility alias; prefer ``candidate_update_audit_passed``."""
+        return self.candidate_update_audit_passed
 
 
 @chex.dataclass(frozen=True)
@@ -768,7 +779,13 @@ def _learning_value_for_gradient_audit(
     learning_value: LearningValue,
     declared_availability: LearningValueAvailability,
 ) -> tuple[LearningValue, LearningValueAvailability, Array]:
-    """Detach, sanitize, and validate eight explicitly available channels."""
+    """Detach, sanitize, and semantically validate eight available channels.
+
+    The historical ``LearningValue.delight`` field is accepted only when its
+    float32 bits exactly equal the declared paper-defined identity
+    ``advantage * action_surprisal``. It remains evidence supplied to the
+    separate candidate-update safety audit; it never performs Kondo selection.
+    """
     channel_names = (
         "advantage",
         "action_surprisal",
@@ -808,6 +825,24 @@ def _learning_value_for_gradient_audit(
         values[name] = jax.lax.stop_gradient(
             jnp.where(is_valid, scalar, jnp.array(0.0, dtype=jnp.float32))
         )
+
+    expected_paper_dg_delight = values["advantage"] * values["action_surprisal"]
+    expected_paper_dg_bits = jax.lax.bitcast_convert_type(
+        expected_paper_dg_delight,
+        jnp.uint32,
+    )
+    supplied_paper_dg_bits = jax.lax.bitcast_convert_type(
+        values["delight"],
+        jnp.uint32,
+    )
+    paper_dg_identity_valid = (
+        valid["advantage"]
+        & valid["action_surprisal"]
+        & valid["delight"]
+        & jnp.isfinite(expected_paper_dg_delight)
+        & (supplied_paper_dg_bits == expected_paper_dg_bits)
+    )
+    valid["delight"] = jax.lax.stop_gradient(paper_dg_identity_valid)
 
     detached = LearningValue(**values)
     availability = LearningValueAvailability(**valid)
@@ -1705,16 +1740,20 @@ class DelightfulPolicyGradientConfig:
 
     Args:
         mode: ``"ordinary_pg"`` applies the matched ordinary policy-gradient
-            loss. ``"delightful_pg"`` applies the detached sigmoid delight
+            loss. ``"delightful_pg"`` applies the detached sigmoid
+            paper-defined delight
             weight.
         temperature: Positive sigmoid temperature in return-nats.
-        actor_trace_lambda: Must be exactly zero. A current-sample delight gate
+        actor_trace_lambda: Must be exactly zero. A current-sample
+            paper-defined delight gate
             cannot multiply an eligibility trace containing historical score
             gradients.
         diagnostics_epsilon: Positive denominator floor used only in reported
             diagnostics.
         kondo_enabled: Reserved fail-closed flag. ``True`` is rejected because
-            this helper does not skip compiled backward work.
+            this full-batch loss helper cannot skip compiled backward work;
+            use :class:`~alberta_framework.core.kondo_gate.KondoGate` before
+            invoking autodiff instead.
 
     Nonzero numeric controls must be finite normal float32 values; this prevents
     a positive Python value from becoming zero or infinity inside the JAX loss.
@@ -1744,8 +1783,8 @@ class DelightfulPolicyGradientConfig:
             raise ValueError("diagnostics_epsilon must be positive")
         if self.kondo_enabled:
             raise ValueError(
-                "Kondo compute gating is unavailable: this helper computes all "
-                "samples and does not skip measured compiled backward work"
+                "Kondo compute gating is unavailable in this full-batch helper; "
+                "screen and gather with KondoGate before invoking autodiff"
             )
 
     def to_config(self) -> dict[str, Any]:
@@ -1782,7 +1821,11 @@ class DelightfulPolicyGradientDiagnostics:
 
 @chex.dataclass(frozen=True)
 class DelightfulPolicyGradientResult:
-    """Actor loss, typed actor signals, and detached sample coefficients."""
+    """Actor loss, typed actor signals, and detached sample coefficients.
+
+    The ``delight`` field is the paper-defined actor-sample quantity, not the
+    separate candidate-update safety-audit verdict.
+    """
 
     actor_loss: Float[Array, ""]
     ordinary_actor_loss: Float[Array, ""]
@@ -1796,7 +1839,10 @@ class DelightfulPolicyGradientResult:
 
 @chex.dataclass(frozen=True)
 class DelightStratumDiagnostics:
-    """Diagnostics for one of common/rare × success/failure."""
+    """Diagnostics for one of common/rare × success/failure.
+
+    ``mean_delight`` means mean paper-specific DG actor-sample delight.
+    """
 
     count: Int[Array, ""]
     fraction: Float[Array, ""]
@@ -1843,7 +1889,8 @@ def discrete_delightful_policy_gradient(
         selected_log_probabilities: Finite log-probabilities of the sampled
             categorical actions under the explicitly chosen actor objective.
             Off-policy callers must perform their declared importance
-            correction separately; delight is never a substitute for it.
+            correction separately; paper-defined delight is never a
+            substitute for it.
         advantages: Baseline-derived per-sample advantages. The actor
             coefficient is stopped so this loss cannot train the baseline.
         config: Static experimental configuration. Close over it when using

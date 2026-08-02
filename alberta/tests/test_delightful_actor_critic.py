@@ -237,7 +237,7 @@ def test_update_before_start_and_mismatched_behavior_target_fail_closed() -> Non
     _assert_byte_identical(almost_result.state, almost_on_policy)
 
 
-def test_literal_delight_equation_drives_only_current_actor_sample() -> None:
+def test_paper_specific_dg_delight_drives_only_current_actor_sample() -> None:
     config = _config(critic_trace_lambda=0.8)
     agent = DelightfulActorCriticAgent(config)
     initial = agent.init(jax.random.key(4)).replace(
@@ -257,8 +257,8 @@ def test_literal_delight_equation_drives_only_current_actor_sample() -> None:
     log_probability = old.last_sample.behavior_log_probability
     advantage = jnp.asarray(2.0, dtype=jnp.float32)
     surprisal = -log_probability
-    delight = advantage * surprisal
-    gate = jax.nn.sigmoid(delight / config.delight_temperature)
+    paper_dg_delight = advantage * surprisal
+    gate = jax.nn.sigmoid(paper_dg_delight / config.delight_temperature)
     one_hot = jax.nn.one_hot(old.last_sample.action, 2, dtype=jnp.float32)
     score_bias = one_hot - old.last_sample.target_policy
     expected_actor_weights = old.actor_weights + (
@@ -269,7 +269,7 @@ def test_literal_delight_equation_drives_only_current_actor_sample() -> None:
     assert float(diagnostics.selected_log_probability) == pytest.approx(float(log_probability))
     assert float(diagnostics.action_surprisal) == pytest.approx(float(surprisal))
     assert float(diagnostics.advantage) == pytest.approx(float(advantage))
-    assert float(diagnostics.delight) == pytest.approx(float(delight))
+    assert float(diagnostics.delight) == pytest.approx(float(paper_dg_delight))
     assert float(diagnostics.gate_weight) == pytest.approx(float(gate))
     chex.assert_trees_all_close(result.state.actor_weights, expected_actor_weights)
     chex.assert_trees_all_close(result.state.actor_bias, expected_actor_bias)

@@ -1,3 +1,20 @@
+"""Contract tests for :mod:`alberta_framework.benchmarks.forager_matched_campaign`.
+
+The campaign engine executes the open-tuning block of the matched-current
+pipeline, whose phases are: capability qualification -> open-tuning campaign
+(21 candidates x 10 tuning seeds, this module) -> external authentication +
+selection/seal -> sealed 30-seed evaluation -> final analysis.  The engine is
+resumable and content-only: it cannot authenticate its own qualification,
+select winners, or seal.  Tests cover the golden byte contract for every
+persisted artifact, seed-major scheduling that excludes the two
+descriptive-only arms, crash/resume repair paths, and fail-closed rejection
+of tampered, symlinked, hard-linked, or concurrently-written state.
+
+``_context`` assembles a minimal single-candidate campaign around the shared
+executor fixtures, with a stubbed qualification bundle and a fake qualified
+runtime — no OCI runtime or real candidate ever executes.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -14,23 +31,37 @@ from alberta_framework.benchmarks import forager_matched_campaign as campaign
 from alberta_framework.benchmarks import forager_matched_candidate_universe as universe
 from alberta_framework.benchmarks import forager_matched_executor as executor
 from alberta_framework.benchmarks import forager_matched_open_protocol as open_protocol
+from alberta_framework.benchmarks import forager_matched_qualification as qualification
 from tests import test_forager_matched_executor as executor_fixtures
 from tests import test_forager_matched_open_protocol as protocol_fixtures
 
 pytestmark = pytest.mark.integration
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
+# A synthetic ``test...v1`` manifest suffices because the campaign binds the
+# qualification manifest by SHA-256 only and never interprets or authenticates
+# its contents — authentication belongs to the external trust resolver.  Any
+# canonical bytes with a self-consistent digest triple exercise the binding.
+_QUALIFICATION_MANIFEST = {"schema_version": "test.matched_current_qualification.v1"}
+_QUALIFICATION_MANIFEST_BYTES = campaign.canonical_json_bytes(_QUALIFICATION_MANIFEST)
+_QUALIFICATION_MANIFEST_SHA256 = hashlib.sha256(_QUALIFICATION_MANIFEST_BYTES).hexdigest()
 
 
 def _context(tmp_path: Path) -> campaign._CampaignContext:
     fixture_root = tmp_path / "fixture"
     fixture_root.mkdir(parents=True)
-    plan = executor_fixtures._plan(fixture_root)
+    _payload, protocol, assets = executor_fixtures._fixture(fixture_root)
+    candidate_id = next(iter(assets))
+    plan = executor.build_execution_plan(
+        protocol,
+        assets,
+        qualification_manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
+        candidate_ids=(candidate_id,),
+    )
     live = executor_fixtures._runtime(tmp_path / "runtime", plan)
     root = tmp_path / "campaign-root"
     root.mkdir()
     (root / "runs").mkdir()
     (root / "completions").mkdir()
-    candidate_id = plan.candidates[0].candidate.candidate_id
     schedule: dict[str, Any] = {
         "cells": [
             {"ordinal": ordinal, "candidate_id": candidate_id, "seed": seed}
@@ -44,7 +75,9 @@ def _context(tmp_path: Path) -> campaign._CampaignContext:
         bundle=cast(
             Any,
             SimpleNamespace(
-                manifest={},
+                manifest=_QUALIFICATION_MANIFEST,
+                manifest_bytes=_QUALIFICATION_MANIFEST_BYTES,
+                manifest_sha256=_QUALIFICATION_MANIFEST_SHA256,
                 cpu_qualification_root=tmp_path,
                 rng_parity_qualification_root=tmp_path,
             ),
@@ -127,6 +160,39 @@ def _use_loader_context(
     )
 
 
+def _published_context_for_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[campaign._CampaignContext, Path]:
+    context = _context(tmp_path / "fixture")
+    rebuilt = context.rebuilt
+    fixture_universe_sha = rebuilt.protocol.selection_plan.candidate_universe_sha256
+    monkeypatch.setattr(
+        universe,
+        "MATCHED_CURRENT_CANDIDATE_UNIVERSE_SHA256",
+        fixture_universe_sha,
+    )
+    output_root = tmp_path / "published-campaign"
+    campaign._publish_initial_root(output_root, rebuilt, context.live_runtime)
+    monkeypatch.setattr(campaign, "_rebuild_inputs", lambda _root: rebuilt)
+    monkeypatch.setattr(
+        universe,
+        "verify_matched_current_candidate_universe_sources",
+        lambda _root: SimpleNamespace(candidate_universe_sha256=fixture_universe_sha),
+    )
+    monkeypatch.setattr(
+        campaign,
+        "_qualify_live",
+        lambda *_args, **_kwargs: context.live_runtime,
+    )
+    monkeypatch.setattr(
+        executor,
+        "parse_execution_plan",
+        lambda *_args, **_kwargs: rebuilt.plan,
+    )
+    return context, output_root
+
+
 def test_selection_schedule_excludes_both_descriptive_candidates() -> None:
     protocol = protocol_fixtures._build()
 
@@ -153,7 +219,209 @@ def test_selection_schedule_excludes_both_descriptive_candidates() -> None:
     ).hexdigest()
 
 
-def test_open_campaign_v1_golden_byte_contract(tmp_path: Path) -> None:
+def test_rebuild_inputs_forwards_exact_qualification_manifest_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frozen = protocol_fixtures._build()
+    manifest = {
+        "schema_version": "test.matched_current_qualification.v1",
+        "label": "Alberta café",
+    }
+    manifest_bytes = qualification._canonical_json_bytes(manifest)
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    candidate_assets = {
+        candidate_id: object()
+        for candidate_id in open_protocol.MATCHED_CURRENT_CANDIDATE_IDS
+    }
+    bundle = SimpleNamespace(
+        runtime_qualification=object(),
+        candidate_qualifications={},
+        candidate_assets=candidate_assets,
+        cpu_qualification_root=tmp_path / "cpu",
+        rng_parity_qualification_root=tmp_path / "rng-parity",
+        manifest=manifest,
+        manifest_bytes=manifest_bytes,
+        manifest_sha256=manifest_sha256,
+    )
+    expected_candidate_ids = campaign.selection_candidate_ids(frozen)
+    fake_plan = SimpleNamespace(
+        candidates=tuple(
+            SimpleNamespace(candidate=SimpleNamespace(candidate_id=candidate_id))
+            for candidate_id in expected_candidate_ids
+        )
+    )
+    plan_calls: list[dict[str, Any]] = []
+
+    def build_plan(
+        protocol: Any,
+        assets: dict[str, Any],
+        **kwargs: Any,
+    ) -> Any:
+        plan_calls.append({"protocol": protocol, "assets": assets, **kwargs})
+        return fake_plan
+
+    monkeypatch.setattr(
+        campaign.qualification,
+        "load_matched_current_qualification_bundle",
+        lambda _root: bundle,
+    )
+    monkeypatch.setattr(
+        open_protocol,
+        "build_forager_matched_open_protocol",
+        lambda **_kwargs: frozen,
+    )
+    monkeypatch.setattr(executor, "build_execution_plan", build_plan)
+
+    rebuilt = campaign._rebuild_inputs(tmp_path / "qualification")
+
+    assert rebuilt.bundle.manifest_bytes == manifest_bytes
+    assert rebuilt.bundle.manifest_sha256 == manifest_sha256
+    assert len(plan_calls) == 1
+    assert plan_calls[0]["protocol"] is frozen
+    assert tuple(plan_calls[0]["assets"]) == expected_candidate_ids
+    assert plan_calls[0]["qualification_manifest_sha256"] == manifest_sha256
+    assert plan_calls[0]["candidate_ids"] == expected_candidate_ids
+    assert plan_calls[0]["cpu_qualification_root"] == tmp_path / "cpu"
+    assert plan_calls[0]["rng_parity_qualification_root"] == tmp_path / "rng-parity"
+
+    changed_bytes = manifest_bytes + b"\n"
+    changed_bundle = SimpleNamespace(
+        **{
+            **vars(bundle),
+            "manifest_bytes": changed_bytes,
+            "manifest_sha256": hashlib.sha256(changed_bytes).hexdigest(),
+        }
+    )
+    monkeypatch.setattr(
+        campaign.qualification,
+        "load_matched_current_qualification_bundle",
+        lambda _root: changed_bundle,
+    )
+    with pytest.raises(
+        campaign.ForagerMatchedCampaignError,
+        match="exact bytes changed",
+    ):
+        campaign._rebuild_inputs(tmp_path / "qualification")
+    assert len(plan_calls) == 1
+
+
+@pytest.mark.parametrize("carrier", ("plan", "payload", "executor_manifest"))
+def test_campaign_manifest_rejects_each_qualification_digest_carrier_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    carrier: str,
+) -> None:
+    context = _context(tmp_path)
+    plan = context.rebuilt.plan
+    wrong_digest = hashlib.sha256(f"wrong-{carrier}".encode("ascii")).hexdigest()
+    qualification_digest = plan.qualification_manifest_sha256
+    payload = dict(plan.payload)
+    executor_manifest = dict(plan.executor_manifest)
+    plan_digest = qualification_digest
+    if carrier == "plan":
+        plan_digest = wrong_digest
+    elif carrier == "payload":
+        payload["qualification_manifest_sha256"] = wrong_digest
+    else:
+        executor_manifest["qualification_manifest_sha256"] = wrong_digest
+    changed_plan = SimpleNamespace(
+        qualification_manifest_sha256=plan_digest,
+        payload=payload,
+        executor_manifest=executor_manifest,
+        plan_sha256=plan.plan_sha256,
+        source_manifest_sha256=plan.source_manifest_sha256,
+        executor_manifest_sha256=plan.executor_manifest_sha256,
+    )
+    fixture_universe_sha = context.rebuilt.protocol.selection_plan.candidate_universe_sha256
+    monkeypatch.setattr(
+        universe,
+        "MATCHED_CURRENT_CANDIDATE_UNIVERSE_SHA256",
+        fixture_universe_sha,
+    )
+
+    with pytest.raises(
+        campaign.ForagerMatchedCampaignError,
+        match="qualification manifest plan binding drifted",
+    ):
+        campaign._campaign_manifest(
+            replace(context.rebuilt, plan=cast(Any, changed_plan)),
+            context.live_runtime,
+        )
+
+
+@pytest.mark.parametrize("carrier", ("payload", "sidecar"))
+def test_load_context_rejects_persisted_qualification_manifest_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    carrier: str,
+) -> None:
+    context, output_root = _published_context_for_replay(tmp_path, monkeypatch)
+    manifest_path = output_root / "qualification-manifest.json"
+    sidecar_path = output_root / "qualification-manifest.json.sha256"
+    if carrier == "payload":
+        changed = campaign.canonical_json_bytes(
+            {
+                **_QUALIFICATION_MANIFEST,
+                "tampered": True,
+            }
+        )
+        manifest_path.chmod(0o600)
+        manifest_path.write_bytes(changed)
+        manifest_path.chmod(0o400)
+        sidecar_path.chmod(0o600)
+        sidecar_path.write_bytes(
+            f"{hashlib.sha256(changed).hexdigest()}\n".encode("ascii")
+        )
+        sidecar_path.chmod(0o400)
+    else:
+        sidecar_path.chmod(0o600)
+        sidecar_path.write_bytes(f"{'0' * 64}\n".encode("ascii"))
+        sidecar_path.chmod(0o400)
+
+    with pytest.raises(
+        campaign.ForagerMatchedCampaignError,
+        match="persisted qualification manifest differs",
+    ):
+        campaign._load_context(
+            tmp_path / "qualification",
+            output_root,
+            runtime="docker",
+            runner=None,
+        )
+    assert context.rebuilt.bundle.manifest_sha256 == _QUALIFICATION_MANIFEST_SHA256
+
+
+def test_load_context_rejects_literal_v1_open_campaign_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _context_value, output_root = _published_context_for_replay(tmp_path, monkeypatch)
+    path = output_root / "campaign.json"
+    payload, _digest = campaign._load_json_pair(path, "campaign")
+    payload["schema_version"] = "alberta.forager_matched_open_tuning_campaign.v1"
+    raw = campaign.canonical_json_bytes(payload)
+    path.chmod(0o600)
+    path.write_bytes(raw)
+    path.chmod(0o400)
+    sidecar = path.with_name(f"{path.name}.sha256")
+    sidecar.chmod(0o600)
+    sidecar.write_bytes(f"{hashlib.sha256(raw).hexdigest()}\n".encode("ascii"))
+    sidecar.chmod(0o400)
+
+    with pytest.raises(
+        campaign.ForagerMatchedCampaignError,
+        match="persisted campaign.json differs",
+    ):
+        campaign._load_context(
+            tmp_path / "qualification",
+            output_root,
+            runtime="docker",
+            runner=None,
+        )
+
+
+def test_open_campaign_v2_golden_byte_contract(tmp_path: Path) -> None:
     """Keep phase-neutral engine refactors byte-identical for open tuning."""
 
     def digest(raw: bytes) -> str:
@@ -180,9 +448,7 @@ def test_open_campaign_v1_golden_byte_contract(tmp_path: Path) -> None:
         "executor-manifest.json": campaign.canonical_json_bytes(
             context.rebuilt.plan.executor_manifest
         ),
-        "qualification-manifest.json": campaign.canonical_json_bytes(
-            context.rebuilt.bundle.manifest
-        ),
+        "qualification-manifest.json": context.rebuilt.bundle.manifest_bytes,
         "execution-schedule.json": campaign.canonical_json_bytes(frozen_schedule),
         "live-runtime.json": campaign.canonical_json_bytes(
             context.live_runtime.unsigned_dict
@@ -197,25 +463,25 @@ def test_open_campaign_v1_golden_byte_contract(tmp_path: Path) -> None:
             "2c3b214cf29e013e3f8d88b2558bd94f75e92330bf0ddcc6afd7514279a1ee77"
         ),
         "execution-plan.json": (
-            "e6607a63155fc45569c7cbecde433dc53fa54a25e1b36886ab71c5184db4bff6"
+            "3fe36c652f07cf9dbda075ad23bac10a1ff468953c574ed87376dabe94b384ca"
         ),
         "source-manifest.json": (
-            "a7522487a3cb8b00a27ee03ddbb52a8f20b91afe89b8e39984f2d8df9a2d938f"
+            "9aa2a792a6e48438ed91d3ac180e87348ce3f4781fd6a87a987634593b604f23"
         ),
         "executor-manifest.json": (
-            "d533cf646748d779fca6df005dbcbfdaad263aa038044a185361db66235c0f1f"
+            "fd6cdf04b961e3ed8cb25fae7375e396985fcacc536888bb734f5b59db40f369"
         ),
         "qualification-manifest.json": (
-            "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+            "0ac448b2686c7f7da8cc3f2a489bc764f76e215193de67cd62308ac21d83d24a"
         ),
         "execution-schedule.json": (
             "9f97835adcd4a7ff76e521a91e36373b7d37e35a7f8c8e00ea4e1d392d760094"
         ),
         "live-runtime.json": (
-            "f666e63385c02dfdc73b3f160d89fd266b720d746704c1d4063c503d49d0d1ba"
+            "e21cfe5bcc592f83dc696826540d17b9aec5ad850acb4f59ca20d5a24b701e54"
         ),
         "campaign.json": (
-            "30e72d078c4ecf252b8136269800ec5fbd6095a20411d40a82beddd3574f9a75"
+            "e374d229564477e96ab7c02e7328dfdaee7c6d3b7ed19176850fde511e2956ac"
         ),
     }
     assert frozen_schedule["schedule_sha256"] == (
@@ -235,7 +501,7 @@ def test_open_campaign_v1_golden_byte_contract(tmp_path: Path) -> None:
         attempt,
     )
     assert binding_sha256 == (
-        "1fcf66ee62a6651dbd010317634bffe72a20e07bd9bec31a8829a11e22847030"
+        "1c1a91c905cce03ff9faff9eb8cb969eebf8d4bc6a5e6f378e244e2b9c664822"
     )
     artifact = executor.score_seed_archive(
         context.rebuilt.plan,
@@ -256,7 +522,7 @@ def test_open_campaign_v1_golden_byte_contract(tmp_path: Path) -> None:
         artifact.to_dict(),
     )
     assert bundle_sha256 == (
-        "a34d63f4b22945796c1246f4c2586f6fe49b6ec96af0ace1bd98bc3851bfb271"
+        "6f29c96dd419825a99a128033ae608b83fe11fbebd83f43bc6d2c98bd07f16d3"
     )
     pointer = campaign._completion_pointer(
         context,
@@ -267,7 +533,7 @@ def test_open_campaign_v1_golden_byte_contract(tmp_path: Path) -> None:
         bundle_sha256,
     )
     assert digest(campaign.canonical_json_bytes(pointer)) == (
-        "9b93f927c6307580514cfc52efeea506f4f1a647aaa5480f4477cba6bf03b58e"
+        "96249c685eb73edc24890a7fbb01622551a9dc73ea3f03e67b29d20d5781c046"
     )
     campaign._persist_failure(
         attempt,
@@ -285,16 +551,16 @@ def test_open_campaign_v1_golden_byte_contract(tmp_path: Path) -> None:
     _complete_loader_context(completed_context)
     expected_final = {
         "execution-receipt-index.json": (
-            "5520aeaa2d8230b864acc680c56f280f45c6b67ac7ab90d18569a5270eb6b4c0"
+            "4392777d515cde317b560d7d98343f2275fab121b002259f1bb8f626725086b8"
         ),
         "score-evidence.json": (
-            "7721c0dc295bfd04a3eb20bc66a86edfbb79fe095454efe85b61da59b05d1628"
+            "fd5809132b42bb409dff542ebbf6cfa90bac93c12be09b57b9b722cd64379a61"
         ),
         "verification-request.json": (
-            "57b00c314194395b27cab2d3a18f8f32fcd8469b5b7a2e0215279f81169fd73a"
+            "505b8e5e8be4840c3ecb056a2d8e9f8d61c73ea4396acec2ec1b0c1719071dfd"
         ),
         "completion-summary.json": (
-            "3389b01f00fddc39c8bbc8927ab675312544899704eb6a60597bee5d24b7a795"
+            "ced7b22ad99ba7b8fcab1f18a4b5521c5bdfd1778032fdbbbb27212099e12744"
         ),
     }
     for name, expected_digest in expected_final.items():
@@ -309,7 +575,7 @@ def test_open_campaign_v1_golden_byte_contract(tmp_path: Path) -> None:
     )
     normalized_status = replace(status, output_root=Path("/golden/open-campaign"))
     assert digest(campaign.canonical_json_bytes(normalized_status.to_dict())) == (
-        "4374e9c0dfb0955dea6bffd27c667f50bdb7cc76cbdc3322173f16267772c581"
+        "d13a838d672bf497d3db8331af5f7e10558c4b3c275cfefed2908802e9a1ec8a"
     )
 
 
@@ -922,6 +1188,12 @@ def test_persisted_live_runtime_identity_drift_fails_closed(
     )
     output_root = tmp_path / "persisted-runtime"
     campaign._publish_initial_root(output_root, rebuilt, context.live_runtime)
+    assert (output_root / "qualification-manifest.json").read_bytes() == (
+        context.rebuilt.bundle.manifest_bytes
+    )
+    assert (output_root / "qualification-manifest.json.sha256").read_bytes() == (
+        f"{context.rebuilt.bundle.manifest_sha256}\n".encode("ascii")
+    )
     drifted = replace(
         context.live_runtime,
         version={"Client": {"Version": "runtime-drift"}},
@@ -1080,6 +1352,7 @@ def test_cli_writes_canonical_status_to_stdout_and_main_maps_validation_to_exit_
         next_candidate_id="causal_e025_q050",
         next_seed=2_300_001,
         protocol_sha256="1" * 64,
+        qualification_manifest_sha256="4" * 64,
         plan_sha256="2" * 64,
         live_runtime_identity_sha256="3" * 64,
         score_evidence_sha256=None,

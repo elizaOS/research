@@ -7,6 +7,17 @@ continuing, temporally uniform setting.  The algorithms update their value
 weights, traces, policies, and average-reward estimate on every transition.
 They intentionally stay small and linear so they can serve as a stable target
 for later nonlinear Horde/GQ/GTD and actor-critic integrations.
+
+References:
+    Wan, Naik, & Sutton (2021). "Learning and Planning in Average-Reward
+        Markov Decision Processes."  (Differential TD/Q-learning; the
+        TD-error-driven reward-rate update used throughout this module.)
+    Sutton et al. (2009). "Fast Gradient-Descent Methods for
+        Temporal-Difference Learning with Linear Function Approximation."
+        (GTD2/TDC secondary-weight scheme.)
+    Maei (2011). "Gradient Temporal-Difference Learning Algorithms."
+        PhD thesis, University of Alberta.
+    Sutton & Barto (2018), ch. 10.  (Differential semi-gradient SARSA.)
 """
 
 from __future__ import annotations
@@ -601,7 +612,6 @@ class AverageRewardHordeActorCriticAgent:
         """Apply one average-reward actor-critic update."""
         old_features = self._actor_features(state, state.last_observation)
         old_sample = state.last_policy_sample
-        next_sample, key = self.sample_policy(state, next_observation)
         critic_result = self._critic.update(
             state.critic_state,
             state.last_observation,
@@ -647,17 +657,24 @@ class AverageRewardHordeActorCriticAgent:
         )
         actor_weights = jnp.nan_to_num(state.actor_weights + weight_step)
         actor_bias = jnp.nan_to_num(state.actor_bias + bias_step)
-        new_state = state.replace(
+        committed_state = state.replace(
             critic_state=critic_result.state,
             actor_weights=actor_weights,
             actor_bias=actor_bias,
             actor_opt_w=new_opt_w,
             actor_opt_b=new_opt_b,
+            step_count=_saturating_int32_increment(state.step_count),
+        )
+        # The cached prior decision above owns the transition being learned.
+        # Sample the successor only after the critic trunk, actor, optimizer,
+        # reward-rate baseline, and step counter have committed atomically, so
+        # the stored policy is exactly the current policy at next_observation.
+        next_sample, key = self.sample_policy(committed_state, next_observation)
+        new_state = committed_state.replace(
             last_observation=next_observation,
             last_action=next_sample.action,
             last_policy_sample=next_sample,
             rng_key=key,
-            step_count=_saturating_int32_increment(state.step_count),
         )
         return AverageRewardHordeActorCriticUpdateResult(
             state=new_state,
@@ -813,6 +830,15 @@ class DifferentialGTDLearner:
     primitives.  It maintains a primary value function, a secondary correction
     vector, accumulating importance-weighted traces, and a learned reward-rate
     baseline.  Setting ``rho = 1`` gives an on-policy differential TDC update.
+
+    The secondary weights follow the GTD2/TDC scheme (Sutton et al. 2009;
+    Maei 2011): they run an LMS estimate of the expected TD error given the
+    features, and the primary update subtracts the resulting
+    gradient-correction term so the value weights follow the true (rather
+    than semi-) gradient under off-policy sampling.  Note that the config
+    defaults run the secondary weights slower than the primary (0.01 vs
+    0.05), whereas TDC's two-timescale convergence analysis assumes the
+    secondary estimate adapts on the faster timescale.
     """
 
     def __init__(self, config: DifferentialGTDConfig | None = None):
@@ -1243,6 +1269,13 @@ def run_average_reward_horde_actor_critic_from_arrays(
 @dataclasses.dataclass(frozen=True)
 class DifferentialSARSAConfig:
     """Configuration for linear differential SARSA control.
+
+    The reward-rate estimate ``rbar`` learns from the same TD error as the
+    action values.  Wan, Naik & Sutton (2021) parameterize its step-size as
+    the fraction ``eta`` of the value step-size; the defaults here
+    (``average_reward_step_size=0.01`` vs ``q_step_size=0.05``) correspond to
+    ``eta = 0.2``, so ``rbar`` tracks more slowly than the values it
+    baselines.
 
     ``use_bias`` controls the per-action bias term.  The bias is an always-on
     shared parameter: in context-gated representations (where per-task weight

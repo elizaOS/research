@@ -6,7 +6,8 @@
   `2ac35333efae45cf969ce02ec1f2703476fed6c2`
 - **Scope:** continual learning, continual reinforcement learning, world
   models, state construction, plasticity, forgetting, surprise, curiosity,
-  delight, experience reuse, temporal abstraction, and intelligence
+  paper-defined delight/Kondo gating, candidate-update auditing, experience reuse, temporal
+  abstraction, and intelligence
   amplification
 
 The code audit targets the committed snapshot. Concurrent, uncommitted
@@ -66,12 +67,13 @@ The most important findings are:
    Forager results show recurrent or trace-based state can matter more than
    several plasticity mitigations in a continuing, partially observable world.
    Alberta's current fixed-weight GRU does not learn what history to retain.
-6. **Prediction error, epistemic surprise, learning progress, and the
-   paper-specific delight signal are not interchangeable.** Raw error is
-   vulnerable to stochastic “noisy TV.” In Delightful Policy Gradient,
-   delight is advantage multiplied by action surprisal; it is an actor-gradient
-   signal, not the user-requested “does this gradient spark joy?” audit and not
-   a generic replacement for novelty, model uncertainty, or parameter utility.
+6. **Prediction error, epistemic surprise, learning progress, and delight are
+   not interchangeable.** Raw error is vulnerable to stochastic “noisy TV.”
+   Paper-defined delight is advantage multiplied by action surprisal. In
+   *Does This Gradient Spark Joy?*, that signal drives the Kondo decision about
+   which samples receive a backward pass. It is not a generic replacement for
+   novelty, model uncertainty, parameter utility, or the separate
+   multi-objective candidate-update safety audit.
 7. **World models should support both retention and planning, but recent
    evidence warns against assuming that a remembered world automatically
    produces a remembered policy.** The strongest next architecture therefore
@@ -271,15 +273,28 @@ them, not replace them wholesale.
 | 1 | Strong linear/adaptive optimizer coverage | Used by later learners | Unit and smoke coverage; full replication artifacts omitted | **Implemented; re-establish benchmark evidence** |
 | 2 | Extensive nonlinear and feature-lifecycle machinery | Several alternative paths, no single accepted lifecycle | Critical benchmark and theory gates omitted; upstream evidence mixed | **Active research, not complete** |
 | 3 | Horde, mixed and independent demons, linear off-policy TD | Optional Horde in full agent | Nonlinear/off-policy/trace combinations remain open | **Substantial partial implementation** |
-| 4 | SARSA, actor-critic, continuous variants | Step 1–4 pipeline exists | Upstream actor-critic is provisional versus SARSA | **Implemented surfaces; weak closure evidence** |
+| 4 | SARSA, discrete actor-critic, exact-density bounded continuous average-reward actor-critic | Step 1–4 pipeline exists; continuous core and evaluator remain isolated | Actor/critic is provisional versus SARSA; continuous lane has L0 contracts and `not-assessed` A/B/A instrumentation only | **Implemented surfaces; weak closure evidence** |
 | 5 | Average-reward prediction machinery | Available to later components | Small gates | **Kernel implemented** |
 | 6 | Differential continuing control | Used by STOMP/OaK | Small/surrogate environments | **Kernel implemented; benchmark breadth missing** |
-| 7 | One-step planning/Dyna helpers | Not the controlling path of the full prototype | Small gates | **Partial** |
-| 8 | Fixed recurrent perception and one-step model | Optional in `PrototypeAgent`; feedback cycle is absent | CartPole/smoke evidence | **Prototype surface, not the Plan's integrated loop** |
-| 9 | Dream guards and candidate scoring | Prototype samples random anchors/actions and does not use the scoring surface | No learned search controller | **Guarded replay, not learned search control** |
+| 7 | One-step planning/Dyna helpers | Optional guarded dreams and fixed-budget option-model backups can update control | Small gates; no matched-budget planning gain | **Mechanism integrated; planning evidence open** |
+| 8 | Trainable state builders plus bounded feed-forward/recurrent world-model lanes | Opt-in Prototype paths return committed real model gradients to learned state; ranking/replacement feedback is incomplete | Narrow historical FTL result plus nonpromoting development diagnostics | **First causal feedback lane integrated; full lifecycle open** |
+| 9 | Dream guards, typed priorities, replay rehearsal, and candidate scoring | Prototype dreams still use random anchors/actions and do not consume a learned search controller | No promoted matched search-control result | **Guarded planning/replay, not learned search control** |
 | 10 | Subtasks, options, outcome models, extended actions | STOMP executes options and consumes learned option models in bounded backups | No promoted matched-budget planning benefit | **Mechanism implemented; defining control evidence missing** |
-| 11 | Utility EMA, Python-level curation, keyboard functions | Manual/periodic curation; keyboard not the base action path | Small gates | **Mechanism sketch** |
-| 12 | Exo-cerebellum/exo-cortex APIs | Recommendation and augmentation are diagnostics, not control inputs | One-partner surrogate | **Primitive prototype** |
+| 11 | Utility EMA, bounded curation, keyboard proposal and owner-correct dispatch | Explicit consumers can dispatch; automatic chord discovery remains absent | Small gates; no matched option-lifecycle benefit | **Mechanism implemented; lifecycle evidence open** |
+| 12 | Exo-cerebellum/exo-cortex APIs plus bounded partner-policy fusion | Opt-in Prototype path can change the real primitive under hard safety and exact feedback ownership | Historical IA valid rejection; no calibrated closed-loop partner benefit | **Action mechanism integrated; efficacy gate open** |
+
+The continuous Step 4 instrumentation is a strict fixed 12-event,
+one-dimensional A/B/A evaluator starting from an immutable source-bound
+snapshot. Phase/case identities, preferred action centers, rewards, and
+reference values remain evaluator-owned. Its report reconstructs cached
+pre-tanh latent and transformed-action ownership, transformed densities, the
+exact latent action ratio, same-state gauge-centered critic error, actor
+error/churn, plasticity/activity, successor ownership, counters, resources,
+final state, and exact live replay. Only transformed diagnostic densities have
+an explicit symmetric eight-float32-ULP backend allowance; the policy-defining
+ratio remains bit-exact. No-overwrite reports/checkpoints have absolute
+byte/scalar limits. This is `not-assessed` development instrumentation, not a
+continuous retention or control result.
 
 ### Ranked integration gaps
 
@@ -292,7 +307,7 @@ all optional and disabled by default. The separate
 [`AlbertaPipeline`](alberta_framework/pipeline.py) explicitly covers Steps 1–4
 only. Neither object is the complete feedback system described by the Plan.
 
-#### 2. State construction has one causal model-gradient training lane
+#### 2. State construction has a first causal world/control-gradient lane
 
 The legacy `GRUPerceptionConfig` remains an honestly named fixed-weight
 echo-state baseline. `PrototypeAgent` now also accepts the common
@@ -305,22 +320,28 @@ episode-local recurrence at a boundary, and consume the post-reset decision
 observation once. Eager, JIT, scan, and checkpoint tests cover those counts.
 
 The online-gated builder now exposes a source-bound proposal and destination
-commit boundary. An opt-in Prototype lane uses the bounded ensemble's
-predict-before-update representation gradient: it proposes against the exact
-builder state that emitted the modeled representation, then commits only the
-parameter delta into the already-advanced builder state, preserving its hidden
-state and sensitivity. A second opt-in boundary accepts decision-bound,
-independently attested objective, retention, and safety probes and stores the
-delta only when the complete gradient audit literally reports `sparks_joy` and
-its finite-precision application succeeds. Missing, stale, incomplete, or
+commit boundary. An opt-in Prototype lane combines the bounded ensemble's real
+predict-before-update representation gradient with one current control-loss
+semi-gradient. Idle primitive transitions use the base-Q objective; executing
+options use the current intra-option objective. Delayed semi-MDP option-start
+credit and replay gradients are excluded from the current representation. The
+stateless mixer records source norms, weights, clipping, cosine/conflict, and
+failure provenance, then proposes the exact mixed candidate against the builder
+state that emitted the modeled representation. Only the parameter delta is
+committed into the already-advanced builder state, preserving hidden state and
+sensitivity. A second opt-in boundary accepts decision-bound, independently
+attested objective, retention, and safety probes and stores the delta only when
+the complete candidate-update audit passes and its finite-precision
+application succeeds. Missing, stale, incomplete, or
 non-finite sidecars veto only builder learning, not the real control/model
 transition.
 
-This is causal mechanism integration, not a learned-state result. The current
-producer is one world-model objective; balanced prediction, Horde, critic, and
-control gradients are not yet wired into this Prototype lane. Until those
-ablations and the matched Forager gate exist, the builder must not be called a
-learned-state success.
+This is causal mechanism integration, not a learned-state result. It is only a
+two-source grounded-model/current-control path, not an empirically balanced
+objective set: multiple-timescale GVF, inverse, feature-utility, causal
+deletion, and matched mixer ablations remain absent. Until those tests and the
+matched Forager gate exist, the builder must not be called a learned-state
+success.
 
 #### 3. Representation discovery is not in the prototype loop
 
@@ -369,7 +390,7 @@ record, fixed-quota dual-memory sample, and model-member rehearsal as one
 transaction. Replay has separate mask RNG, masks, update counters, and event
 counters; it cannot update causal signal calibration, residual variance, the
 real RNG/counters, actor, critic, or state builder. In Prototype, only the
-commit-gated real representation gradient can reach the builder or literal joy
+commit-gated real representation gradient can reach the builder or candidate-update audit
 audit. Stored transitions retain the final/bootstrap observation—not the
 post-reset decision observation—and representation versions make stale/future
 samples explicit. This is bounded L0 composition; there is no replay-retention
@@ -383,8 +404,15 @@ interrupts an active option after its final update without recording a censored
 option-model completion. This repairs episodic/autoreset semantics and
 integrates a bounded development ensemble, but the variance output is still an
 explicitly uncalibrated residual proxy rather than certified aleatoric
-uncertainty. There is no state/action-region calibration, recurrent latent
-dynamics, or validated multi-step dream consumer yet.
+uncertainty. A separate recurrent latent ensemble and source-bound prequential
+development evaluator now expose real heteroscedastic heads plus descriptive
+ID/OOD and evaluator-owned state/action-region diagnostics. The recurrent model
+is now an opt-in fourth Prototype lane whose exact dispatched cache, real NLL
+gradient, and causal signal state commit transactionally. A companion
+recurrent-reset A/B/A-style diagnostic reconstructs phase and recurrence-entry
+errors from exact reused cases. None of these mechanisms establishes
+calibration, retention, or control benefit, and there is still no validated
+multi-step dream consumer.
 
 This is a useful smoke model, not yet a reliable continual world model or a
 learned search-control process.
@@ -397,6 +425,16 @@ when an option terminates, then consumes those models in an explicitly bounded
 number of differential semi-MDP backups. This closes the mechanism-level
 `model → planning` edge. It does not establish that learned option models
 improve held-out lifetime control over matched model-free option execution.
+An opt-in Prototype composition now provides a stricter value-only search
+slice: it recomputes every supported option's differential semi-MDP Bellman
+residual after each accepted backup, stably selects the largest magnitude, and
+commits only the base learner under a fixed resource budget. It uses the exact
+next decision representation and fresh post-transition option models/reward
+rate, but intentionally preserves the action that OaK already cached for that
+representation. The changed values can influence only a later extended-action
+selection boundary. Completion count is support, not calibration; primitive
+dreams still have a separate random budget, so this is neither combined search
+nor a matched-benefit result.
 
 #### 6. OaK curation is manual and narrow
 
@@ -405,12 +443,30 @@ runs at Python level, finds the worst option, swaps its hand-specified feature
 index, and resets selected arrays. That is a useful testable mechanism, but it
 does not yet measure the counterfactual contribution of a feature, subtask,
 option, or model to lifetime reward or planning accuracy. The option keyboard
-is callable, but its learned chord does not govern the base policy.
+now has a strict deterministic proposal and an opt-in real dispatch boundary.
+The replacement rewrites the precise base or intra-option action cache that
+will receive the next transition's credit, requires exact decision-observation
+identity and a hard safety mask, preserves RNG, and fails closed on corrupt
+state or an unsafe base. Thus an explicit consumer can make a keyboard chord
+govern the next primitive action without miscrediting its counterfactual. The
+default OaK loop still does not autonomously select or learn which chord to
+dispatch, and no lifetime-control or planning benefit has been measured.
 
-#### 7. Prototype IA outputs do not yet alter Prototype actions
+#### 7. Prototype partner fusion is opt-in and action-changing
 
-`PrototypeAgent` returns IA augmentation and recommendations from `update()` as
-diagnostics, while its next controller action remains OaK's action. The
+The legacy IA companion still exposes augmentation and a recommendation as
+diagnostics. Separately, `PrototypeAgent` can now opt into the bounded
+`PartnerPolicyFusion` L0 core as an actual action consumer. On each accepted
+transition it resolves feedback for the exact prior four-word Prototype
+lifecycle ID, derives the real OaK counterfactual score, optionally supplies the
+current OaK keyboard proposal, and chooses among
+ignore/query/accept/discrete-blend/clarification routes under a caller-owned
+hard mask. A changed primitive rewrites the exact base-or-option cache that
+will receive the next credit, and the recurrent model cache receives the same
+effective action. Unsafe base dispatch or a corrupt resulting state rolls back
+the whole Prototype transition; stale, duplicate, or misattributed feedback is
+an atomic no-op. Start remains base-only, and cold-start accepts remain
+explicitly uncalibrated development exploration. The
 standalone recommendation protocol can alter a partner's action and has a
 historical held-out **valid rejection**: reward uplift and both augmentation
 controls passed, but action-changing intervention prevalence missed its frozen
@@ -421,10 +477,9 @@ p=0.75/seeds-60–89 v2 lifecycle is an unissued, permanently development-only
 contract: its self-issued plan has no trusted external pre-run chronology, and
 `internally_accepted` is hard-coded false. Any future acceptance claim requires
 a new schema, untouched seeds, complete shards, and an external chronology
-anchor. Until the composed
-Prototype consumes partner information through an
-auditable fusion rule, that composition demonstrates companion learning rather
-than intelligence amplification.
+anchor. The new composition closes the action-consumption mechanism gap only:
+without a calibrated reliability result or a matched closed-loop partner-uplift
+result, it is not evidence of intelligence amplification.
 
 #### 8. “Every component updates every step” is false as written
 
@@ -820,9 +875,23 @@ epistemic disagreement, aleatoric variance, change-point likelihood, and
 learning progress. Raw squared error should remain a diagnostic, not directly
 become reward, replay priority, or perturbation magnitude.
 
-### 5. “Does this gradient spark joy?” means auditing the candidate update
+The current working tree now has the bounded routing boundary needed to keep
+that separation explicit. `LearningValueRouter` validates the eight named
+channels independently, records their producer/object/units/domain metadata,
+and computes only causal pre-update Welford normalizations. Its named actor,
+exploration, memory, adaptation, safety, and full candidate-audit evidence routes
+mask unavailable fields to exact zero and never create a universal scalar.
+Safety remains independently routable, and the `delight` field
+is accepted only when it exactly matches the float32 advantage-surprisal
+identity. The candidate-update audit independently enforces the same evidence
+identity before treating its eight-channel bundle as complete; it does not
+perform the paper's Kondo selection. This is L0 mechanism coverage: producer-declared uncertainty is not
+thereby calibrated, no consumer benefit has been demonstrated, and the router
+does not decide whether a sample receives a backward pass.
 
-The user-requested criterion is introspective and gradient-level: given a
+### 5. Candidate-update safety audit (separate from paper delight)
+
+The repository also contains an introspective, gradient-level mechanism: given a
 candidate update \(u_c\), does caller-supplied first-order evidence under an
 explicit, caller-attested independence contract predict useful learning without
 retention or safety harm, and is the update small enough to trust? The
@@ -886,9 +955,9 @@ finite-precision addition, and quantization-altered probe verdicts remain
 explicit no-ops. This closes the implementation boundary without upgrading the
 local first-order audit into realized-improvement evidence.
 
-That meaning is distinct from the related 2026 paper family's use of the word
-“delight.” In [Delightful Policy Gradient](https://arxiv.org/abs/2603.14608),
-action
+This candidate-update audit is distinct from the user's paper-defined meaning
+of “delight” and “sparks joy.” In
+[Delightful Policy Gradient](https://arxiv.org/abs/2603.14608), action
 surprisal and delight are:
 
 \[
@@ -915,8 +984,9 @@ variance. The stop-gradient is part of the algorithm: differentiating through
 \(w_t\) defines a different update.
 
 [Does This Gradient Spark Joy?](https://arxiv.org/abs/2603.20526) then uses the
-same \(\chi_t\) to decide whether a sample deserves a backward pass. A Kondo
-gate compares delight with compute price \(c\):
+same \(\chi_t\) to decide whether a sample deserves a backward pass. This is
+the intended meaning of “sparks joy.” A Kondo gate compares delight with
+compute price \(c\):
 
 \[
 p(\text{backward}_t)=\sigma((\chi_t-c)/\tau).
@@ -939,6 +1009,21 @@ that is a source-inspection observation, not a paper result. A real sparse
 implementation must screen with a detached forward pass, gather a static set of
 survivors, recompute them, and differentiate only that subset. This is unlikely
 to help Alberta's normal batch-size-one update.
+
+The current working tree now contains that bounded L0 boundary in
+`KondoGate`. It derives float32 delight internally from advantage and the
+selected-action log probability and implements finite-temperature
+Bernoulli-price and deterministic fixed-rate top-k modes. The latter follows
+the released reference's valid-count/ties-to-even target rule but uses a stable
+lowest-index tie break rather than its threshold-based over-selection. It
+preserves caller-declared forced samples and reports a flag requiring caller-managed full-shape fallback instead
+of silently truncating an over-capacity selection, and exposes a config-bound
+fixed-capacity host gather for downstream autodiff. When capacity is below
+batch size, tests inspect the smaller backward JAXPR. The screen separately
+has eager/JIT/scan parity; invalid transactions, checkpoints, and accounting
+are covered. This establishes mechanism shape only: there is no integrated
+actor/replay/dream consumer, measured kernel/wall-clock saving, DG
+reproduction, learning benefit, or safety result.
 
 The surrounding family adds:
 
@@ -987,7 +1072,8 @@ The right Alberta use is therefore a bounded experiment:
    action log-probability—differential surprisal depends on action units, and
    clipping a Gaussian action breaks the density contract;
 6. add an aleatoric-variance veto for the gambling pathology;
-7. test the Kondo gate as compute allocation only after DG reproduces;
+7. integrate and evaluate the Kondo gate as compute allocation only after DG
+   reproduces;
 8. measure quality per environment step, forward pass, backward pass, and wall
    clock; and
 9. reject the method if it worsens safety, old-skill retention, calibration, or
@@ -999,10 +1085,11 @@ label it an Alberta extension rather than paper-equivalent DG. A minimum
 catastrophe-update floor and change-triggered gate reset are likewise sensible
 safety/nonstationarity extensions, not claims from the papers.
 
-Neither paper-specific delight nor gradient joy should be folded into UPGD
-utility. UPGD asks whether a **parameter** is currently useful. Paper-specific
-delight asks whether an **actor sample** should be emphasized. The gradient-joy
-audit asks whether a **candidate parameter update** passes objective,
+Neither paper-defined delight nor the candidate-update audit should be folded
+into UPGD utility. UPGD asks whether a **parameter** is currently useful.
+Delight asks whether an **actor sample** should be emphasized or selected for
+a backward pass. The separate candidate-update audit asks whether a
+**candidate parameter update** passes objective,
 retention, safety, and trust checks. Epistemic surprise asks whether an
 **environment transition** can teach the model. These are different causal
 objects.
@@ -1032,7 +1119,27 @@ for a bounded experiential layer:
   Agents](https://aclanthology.org/2026.acl-long.27/) finds that retrieved
   experiences can propagate both good and erroneous behavior. Retrieval
   precision, stale-memory detection, and negative transfer are therefore
-  first-class metrics.
+first-class metrics.
+
+The repository now has a bounded typed `ExperientialMemory` and a strict
+development-only evaluator for those failure modes. The evaluator owns one
+fixed recurring A/B/A schedule, queries an immutable empty-snapshot copy before
+each write, and retains the complete neighbor, gate, prediction, fallback,
+harmful-recall, and eviction trace. It compares with a stateless no-memory
+fallback on the same event opportunities and reconstructs first/return
+descriptions without exposing regime or expected-outcome annotations to the
+memory. A separate stateless `ExperientialMemoryPolicy` turns only retrieved
+categorical action mass into a safe lowest-index argmax, with raw mass,
+normalized mass, reliability, provenance, and hard safety kept separate. The
+opt-in Prototype composition now queries this boundary on the next decision
+representation before writing a grounded exemplar of the action that actually
+ran, bootstrap representation, and reward. Memory dispatch precedes partner
+fusion, and required unsafe/corrupt memory transactions roll the whole
+Prototype event back. Full decision identities, no-memory shape compatibility,
+curation, checkpoints, eager/JIT/scan parity, and the two deterministic
+pre-state queries are explicit. This is instrumentation and L0 integration,
+not a transfer result: no threshold is applied and the fallback has no matched
+storage allocation.
 
 Two newer end-to-end studies sharpen the same point:
 
@@ -1065,7 +1172,7 @@ should not import the research internals.
 | Actor forgets despite model memory | Dream Rehearsal preprint | **Component probes immediately; rehearsal experimentally** |
 | Noisy surprise | Disagreement, Plan2Explore, aleatoric mapping, learning progress | **Separate uncertainty channels** |
 | Delightful actor updates | DG and corner-escape papers | **Small isolated experiment** |
-| Compute-budgeted learning | Kondo gate | **Experiment after DG; retain minimum update floor** |
+| Compute-budgeted learning | Kondo gate | **L0 screen/gather exists; integrate and experiment after DG; retain minimum update floor** |
 | Search control | Plan2Explore, Delightful Exploration, prioritized sweeping | **Learn prospective priority; compare to random dreams** |
 | External experiential memory | Era of Experience, memory-reuse study | **Use bounded procedural memory with retrieval evaluation** |
 | Complete OaK lifecycle | Alberta Plan, reward-respecting subtasks, option keyboard | **Connect lifecycle to measured control/planning utility** |
@@ -1129,10 +1236,10 @@ into small local parity tests instead of adopting an aging training stack.
 | [`gurpnijjer/dream-rehearsal`](https://github.com/gurpnijjer/dream-rehearsal) | Apache-2.0 | Reproduction target for the new actor-rehearsal hypothesis |
 | [`ramanans1/plan2explore`](https://github.com/ramanans1/plan2explore) | Apache-2.0 | Conceptual/reference implementation for disagreement planning |
 | `C-CHAIN`, `FIRE`, and several newer research repos | No verified reusable license | Read and independently implement equations only, or obtain permission |
-| [`google-deepmind/egg`](https://github.com/google-deepmind/egg) | Apache-2.0 | Small official DG/Kondo token reference; does not cover the full paper evidence |
+| [`google-deepmind/egg@d005eac`](https://github.com/google-deepmind/egg/tree/d005eac307a0cb6ccb9c63ad03aee39a3e3c30d4) | Apache-2.0 | Pinned initial small DG/Kondo token reference; does not cover the full paper evidence, and its thresholded masked loss is not a sparse-backward implementation |
 | [`iosband/trl-dg`](https://github.com/iosband/trl-dg) | No declared software license | Inspect behavior; independently implement equations |
 | [`lalalune/kondo-gate`](https://github.com/lalalune/kondo-gate) | MIT; community implementation | Useful API comparison, but its masked full backward does not demonstrate compute savings |
-| Later delight paper family | No separate verified reusable implementation | Implement from equations behind an experimental API |
+| Later DG/delight paper family | No separate verified reusable implementation | Implement from equations behind an experimental API |
 
 A repository being public does not make its code reusable. Every imported
 artifact needs a license check, a pinned source revision, attribution, and

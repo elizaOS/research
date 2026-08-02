@@ -1,4 +1,22 @@
-"""Fail-closed contracts for hidden-regime calibration readiness receipts."""
+"""Fail-closed contracts for hidden-regime calibration readiness receipts.
+
+The receipt system under test
+(:mod:`alberta_framework.evaluation.hidden_regime_calibration_readiness`)
+gates a *future* calibration run: it binds a draft to exact source and
+runtime identities, derives certification records by running an explicit
+list of tests only after explicit authorization, and publishes a finalized
+receipt only after a second authorization.  The threat model enforced here
+is silent substitution: a worker that imports project modules from anywhere
+but the content-addressed source ZIP, a certification "pass" manufactured by
+skipping/xfailing/deselecting tests, runtime or dependency drift between
+draft and execution, and replay or tampering of published receipts — all
+must be rejected, and nothing in this suite may actually run a calibration.
+
+Note for grep: several tests *generate* pytest sources containing
+``@pytest.mark.skip``/``xfail`` markers as string payloads — they exist to
+prove the certification harness rejects every non-pass outcome, not to skip
+anything in this suite.
+"""
 
 from __future__ import annotations
 
@@ -1206,6 +1224,9 @@ def test_certification_harness_rejects_every_nonpass_phase_skip_xfail_and_xpass(
 ) -> None:
     spec = CERTIFICATION_SPECS[0]
     source_path = repository / spec.node_ids[0]
+    # The skip/xfail markers below are payload inside a *generated* test
+    # source: this meta-test proves the certification harness rejects every
+    # non-pass outcome.  Nothing in this suite itself is skipped.
     source_path.write_text(
         """import pytest
 

@@ -1,4 +1,14 @@
-"""Run or verify the reserved v4 development-only evidence-lease grid."""
+"""Fail-closed CLI for the forbidden v4 evidence-lease tuning grid.
+
+The v4 tuning namespace is ``FORBIDDEN/UNEXECUTED`` (see
+``LEASE_TUNING_NAMESPACE_STATUS`` in ``hidden_partner_lifecycle_v2``), and no
+v4 artifact was ever written under ``outputs/hidden_partner_development/``.
+While that status holds, both paths exit 2: ``--run`` stops at
+:func:`require_lease_tuning_execution_allowed` before deriving any seed, and
+``--verify`` rejects every artifact because
+:func:`validate_lease_tuning_artifact` applies the same namespace guard before
+any content check.
+"""
 
 from __future__ import annotations
 
@@ -123,10 +133,13 @@ def main(
     record: Mapping[str, object] | None = None,
     wall_seconds: float | None = None,
 ) -> int:
-    """Refuse the retired run path or verify one historical artifact.
+    """Exit 2 on both paths while the v4 namespace remains forbidden.
 
-    ``record`` and ``wall_seconds`` are legacy test seams only.  The reserved
-    namespace is forbidden, so normal CLI use fails before execution or write.
+    ``record`` and ``wall_seconds`` are test seams: with the namespace status
+    patched to ``EXECUTABLE``, tests inject a completed grid record to
+    exercise artifact construction, validation, and serialization without
+    running a life.  Normal CLI use fails closed before any execution or
+    write.
     """
     parsed_argv = list(sys.argv[1:] if argv is None else argv)
     args = _parser().parse_args(parsed_argv)

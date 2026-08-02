@@ -21,8 +21,9 @@ Theoretical background:
        restore on-policy convergence proofs without a secondary weight
        vector.
 
-    This module implements (1), (2), and ETD(lambda) from (4). Gradient-TD
-    variants are deferred because they require a secondary weight vector.
+    This module implements (1), (2), TDC-style Gradient-TD from (3) via
+    :class:`GradientTDLinearLearner` (which maintains the required secondary
+    weight vector), and ETD(lambda) from (4).
 
 The learner has a simple interface::
 

@@ -1,0 +1,14 @@
+WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-08-01 17:19:15,162 INFO loading MNIST from data_home=/home/shaw/milady/alberta/outputs/step2_published_mnist_openml_cache
+2026-08-01 17:19:20,380 INFO running adamw_cbp seed=6 for 200 tasks x 5000 steps (noise_mode=step)
+2026-08-01 17:28:23,954 INFO adamw_cbp seed=6 task 20/200 online_acc=0.8070 elapsed=530.8s
+2026-08-01 17:36:55,079 INFO adamw_cbp seed=6 task 40/200 online_acc=0.8104 elapsed=1041.9s
+2026-08-01 17:44:32,469 INFO adamw_cbp seed=6 task 60/200 online_acc=0.7956 elapsed=1499.3s
+2026-08-01 17:51:19,751 INFO adamw_cbp seed=6 task 80/200 online_acc=0.7908 elapsed=1906.6s
+2026-08-01 17:58:09,464 INFO adamw_cbp seed=6 task 100/200 online_acc=0.7974 elapsed=2316.3s
+2026-08-01 18:04:53,453 INFO adamw_cbp seed=6 task 120/200 online_acc=0.8026 elapsed=2720.3s
+2026-08-01 18:11:45,189 INFO adamw_cbp seed=6 task 140/200 online_acc=0.7984 elapsed=3132.0s
+2026-08-01 18:18:24,401 INFO adamw_cbp seed=6 task 160/200 online_acc=0.7974 elapsed=3531.2s
+2026-08-01 18:24:58,521 INFO adamw_cbp seed=6 task 180/200 online_acc=0.7940 elapsed=3925.3s
+2026-08-01 18:31:31,873 INFO adamw_cbp seed=6 task 200/200 online_acc=0.7974 elapsed=4318.7s
+2026-08-01 18:31:33,417 INFO adamw_cbp seed=6 done: avg online acc 0.7983 (wall 4318.7s) -> outputs/ipmnist_screening/confirm_full/adamw_cbp_seed6.json

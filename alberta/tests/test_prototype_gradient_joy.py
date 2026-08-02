@@ -1,5 +1,5 @@
 # mypy: disable-error-code="attr-defined,call-arg,operator"
-"""Causal representation learning and literal gradient-joy integration."""
+"""Causal representation learning and candidate-update audit integration."""
 
 from __future__ import annotations
 
@@ -497,6 +497,8 @@ def test_complete_matching_evidence_sparks_joy_and_applies_eager_jit_checkpoint(
     assert bool(eager.gradient_joy_decision_id_matches)
     assert bool(eager.sparks_joy)
     assert bool(eager.joyful_gradient_applied)
+    assert bool(eager.candidate_update_audit_passed)
+    assert bool(eager.audited_candidate_update_applied)
     assert bool(eager.gradient_joy_application.assessment.sparks_joy)
     assert bool(eager.gradient_joy_application.effective_assessment.sparks_joy)
     assert bool(eager.gradient_joy_application.applied)
@@ -568,6 +570,38 @@ def test_complete_matching_evidence_sparks_joy_and_applies_eager_jit_checkpoint(
     restored_agent, restored_state = load_prototype_checkpoint(checkpoint)
     resumed = restored_agent.update_transition(restored_state, transition, sidecar)
     _assert_tree_equal(eager, resumed)
+
+
+def test_candidate_sparks_joy_when_builder_capacity_vetoes_the_commit() -> None:
+    agent = _agent(joy=True)
+    state = agent.start(agent.init(jr.key(41)), jnp.asarray([0.25], dtype=jnp.float32))
+    state = _warm_signals(agent, state)
+    maximum = 2**31 - 1
+    saturated_builder = state.state_builder_state.replace(
+        update_count=jnp.asarray(maximum, dtype=jnp.int32)
+    )
+    state = state.replace(state_builder_state=saturated_builder)
+    transition = _transition(state, 0.9)
+    sidecar = _complete_sidecar(state)
+
+    eager = agent.update_transition(state, transition, sidecar)
+    compiled = jax.jit(agent.update_transition)(state, transition, sidecar)
+
+    assert bool(eager.transition_diagnostics.valid)
+    assert eager.gradient_joy_application is not None
+    assert bool(eager.gradient_joy_application.assessment.sparks_joy)
+    assert bool(eager.gradient_joy_application.effective_assessment.sparks_joy)
+    assert bool(eager.gradient_joy_application.applied)
+    assert bool(eager.sparks_joy)
+    assert not bool(eager.state_builder_learning_diagnostics.applied)
+    assert bool(eager.state_builder_learning_diagnostics.rejected)
+    assert not bool(eager.joyful_gradient_applied)
+    chex.assert_trees_all_equal(
+        eager.state.state_builder_state.parameters,
+        state.state_builder_state.parameters,
+    )
+    assert int(eager.state.state_builder_state.update_count) == maximum
+    _assert_tree_equal(eager, compiled)
 
 
 def test_stale_joy_sidecar_vetoes_only_the_builder_update() -> None:

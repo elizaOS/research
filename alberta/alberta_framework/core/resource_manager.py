@@ -9,9 +9,20 @@ The manager is intentionally generic: actions can represent generator choices,
 replacement rates, perturbation schedules, expert policies, or any other
 resource-consuming option.  It does not assume a particular learner.  Each
 update receives the current action losses and optional resource costs, then
-performs a discounted exponentiated-gradient update.  With ``n_contexts > 1``
-the manager learns separate allocations for externally supplied stream states
-or inferred contexts.
+performs a discounted exponentiated-gradient update — Hedge / exponential
+weights (Freund & Schapire 1997) with a preference-decay factor, plus an
+optional Exp3-style importance-weighted variant for sampled-policy-only
+feedback (Auer et al. 2002).  With ``n_contexts > 1`` the manager learns
+separate allocations for externally supplied stream states or inferred
+contexts.
+
+References:
+    Freund & Schapire (1997). "A Decision-Theoretic Generalization of
+        On-Line Learning and an Application to Boosting." (Hedge)
+    Auer, Cesa-Bianchi, Freund, & Schapire (2002). "The Nonstochastic
+        Multiarmed Bandit Problem." (Exp3)
+    Cesa-Bianchi & Lugosi (2006). "Prediction, Learning, and Games."
+        (exponential-weights regret bounds)
 """
 
 from __future__ import annotations
@@ -35,10 +46,12 @@ def optimal_hedge_learning_rate(
 ) -> float:
     """Return the fixed-horizon Hedge rate for bounded losses.
 
-    The bound used throughout the Step 2 theory notes assumes losses in
-    ``[0, loss_bound]`` and an undiscounted full-information exponential
-    weights update.  For ``n_actions == 1`` the regret is identically zero, so
-    the returned learning rate is ``0.0``.
+    For losses in ``[0, loss_bound]`` and an undiscounted full-information
+    exponential-weights update, ``sqrt(8 * ln(n) / (T * L^2))`` is the rate
+    that minimizes the standard regret bound
+    ``ln(n)/eta + eta * T * L^2 / 8`` (Freund & Schapire 1997;
+    Cesa-Bianchi & Lugosi 2006, ch. 2).  For ``n_actions == 1`` the regret is
+    identically zero, so the returned learning rate is ``0.0``.
     """
     if n_actions < 1:
         raise ValueError("n_actions must be positive")
@@ -61,7 +74,8 @@ def finite_candidate_hedge_regret_bound(
 
     For losses in ``[0, loss_bound]`` and update
     ``w_i <- w_i * exp(-learning_rate * loss_i)``, the cumulative mixture loss
-    is at most the best fixed action's cumulative loss plus this value.
+    is at most the best fixed action's cumulative loss plus this value (the
+    standard exponential-weights bound; Cesa-Bianchi & Lugosi 2006, ch. 2).
 
     This is a theorem for the selector abstraction. Discounting, forced
     exploration, partial feedback, nonstationary comparators, and heuristic
@@ -125,7 +139,9 @@ class LearnedResourceManagerUpdateResult:
 class LearnedResourceManager:
     """Contextual Hedge manager over discrete resource policies.
 
-    At every time step, the manager emits a probability vector over resource
+    The update is a discounted variant of exponential weights / Hedge
+    (Freund & Schapire 1997).  At every time step, the manager emits a
+    probability vector over resource
     actions.  After seeing the current losses, it shifts probability mass toward
     actions whose adjusted loss was lower than the manager's own allocation
     baseline.  Optional ``resource_costs`` let experiments encode a preference
@@ -434,7 +450,8 @@ class GeneratorMetaResourceManager:
             advantage_clip: Absolute clip on centered rewards.
             update_rule: ``"hedge"`` updates all finite provenance scores;
                 ``"exp3"`` applies an importance-weighted update to the
-                sampled policy only.
+                sampled policy only (Exp3-style ``reward / probability``
+                estimator; Auer et al. 2002).
             initial_preferences: Optional additive initial log-preferences.
         """
         n_policies = len(policy_names)

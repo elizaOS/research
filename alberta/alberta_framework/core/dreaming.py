@@ -4,6 +4,17 @@
 Dreaming is deliberately separated from world-model learning. The world model
 learns only from real transitions; this module decides whether a predicted
 transition is safe enough to expose to a control learner.
+
+This is the planning half of a Dyna loop (Sutton 1991): model-generated
+transitions stand in for real experience, but here each one must pass
+explicit warmup, model-error, and uncertainty gates before it reaches the
+control learner, so a poor or not-yet-trained model cannot corrupt control
+updates.  Rejections are recorded with per-gate reasons rather than silently
+dropped, keeping the selection auditable.
+
+References:
+    Sutton (1991). "Dyna, an Integrated Architecture for Learning, Planning,
+        and Reacting."
 """
 
 from __future__ import annotations

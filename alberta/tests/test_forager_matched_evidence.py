@@ -1,3 +1,22 @@
+"""Contract tests for :mod:`alberta_framework.benchmarks.forager_matched_evidence`.
+
+The evidence module is the narrow bridge between the frozen protocol and the
+statistics layer: it parses one canonical self-hashed score-evidence bundle,
+validates every bound identity against the protocol, deterministically ranks
+open-tuning candidates, and constructs the statistics contract for the
+open-to-sealed transition.  The tests attack each of those steps: identity
+drift, rehashed rerank/statistic forgery, cross-domain digest reuse, stale
+authenticated bindings, hostile or non-canonical JSON, symlinked and
+ABA-swapped score files — all must fail closed — while selection itself must
+be deterministic, replayable, and able to reverse a mean ranking under the
+conservative CI-endpoint statistic.
+
+Fixture helpers used by sibling suites (``test_forager_matched_seal``):
+``_open_fixture()`` returns ``(open payload, parsed protocol, score bundle)``
+for a two-group panel with hand-picked score vectors, and ``_sealed_fixture()``
+extends it through selection and the sealed transition.
+"""
+
 from __future__ import annotations
 
 import copy
@@ -31,6 +50,9 @@ def _canonical(value: dict[str, Any]) -> bytes:
 
 def _sha(label: str) -> str:
     return hashlib.sha256(label.encode("ascii")).hexdigest()
+
+
+_QUALIFICATION_MANIFEST_SHA256 = _sha("shared-qualification-manifest")
 
 
 def _rehash(payload: dict[str, Any]) -> dict[str, Any]:
@@ -129,6 +151,7 @@ def _score_payload(
             "runtime_profile_sha256": frozen.runtime.runtime_profile_sha256,
             "source_evidence_sha256": _sha(f"source:{frozen.stage}"),
             "executor_evidence_sha256": _sha(f"executor:{frozen.stage}"),
+            "qualification_manifest_sha256": _QUALIFICATION_MANIFEST_SHA256,
             "candidate_scores": candidates,
         }
     )
@@ -144,6 +167,7 @@ def _authenticated(
         score_evidence_sha256=payload["payload_sha256"],
         source_manifest_sha256=payload["source_evidence_sha256"],
         executor_manifest_sha256=payload["executor_evidence_sha256"],
+        qualification_manifest_sha256=payload["qualification_manifest_sha256"],
         execution_closure_sha256=(evidence.matched_execution_closure_sha256(frozen, payload)),
         trust_anchor_identity=(frozen.runtime.qualification_trust_anchor_identity),
         verification_subject_sha256=(evidence.matched_verification_subject_sha256(frozen, payload)),
@@ -240,8 +264,37 @@ def test_score_evidence_round_trip_is_canonical_and_self_hashed() -> None:
 
     assert parsed.canonical_bytes == raw
     assert parsed.to_dict() == payload
+    assert parsed.qualification_manifest_sha256 == payload["qualification_manifest_sha256"]
+    assert parsed.schema_version == "alberta.forager_matched_score_evidence.v2"
     assert evidence.parse_matched_score_evidence(payload) == parsed
     assert evidence.parse_matched_score_evidence(raw.decode("ascii")) == parsed
+
+
+def test_qualification_manifest_digest_is_required_exact_and_lowercase() -> None:
+    _, _, payload = _open_fixture()
+    missing = copy.deepcopy(payload)
+    del missing["qualification_manifest_sha256"]
+    _rehash(missing)
+    with pytest.raises(evidence.ForagerMatchedEvidenceError, match="keys differ"):
+        evidence.parse_matched_score_evidence(missing)
+
+    uppercase = copy.deepcopy(payload)
+    uppercase["qualification_manifest_sha256"] = (payload["qualification_manifest_sha256"].upper())
+    _rehash(uppercase)
+    with pytest.raises(evidence.ForagerMatchedEvidenceError, match="lowercase SHA-256"):
+        evidence.parse_matched_score_evidence(uppercase)
+
+    extra = copy.deepcopy(payload)
+    extra["qualification_manifest_digest"] = extra["qualification_manifest_sha256"]
+    _rehash(extra)
+    with pytest.raises(evidence.ForagerMatchedEvidenceError, match="keys differ"):
+        evidence.parse_matched_score_evidence(extra)
+
+    legacy = copy.deepcopy(payload)
+    legacy["schema_version"] = "alberta.forager_matched_score_evidence.v1"
+    _rehash(legacy)
+    with pytest.raises(evidence.ForagerMatchedEvidenceError, match="unsupported"):
+        evidence.parse_matched_score_evidence(legacy)
 
 
 @pytest.mark.parametrize(
@@ -833,6 +886,9 @@ def test_build_rejects_fully_rehashed_rerank_and_statistic_forgery() -> None:
 @pytest.mark.parametrize(
     "mutator",
     [
+        lambda payload: payload.__setitem__(
+            "qualification_manifest_sha256", _sha("new-qualification")
+        ),
         lambda payload: payload.__setitem__("source_evidence_sha256", _sha("new-source")),
         lambda payload: payload.__setitem__("executor_evidence_sha256", _sha("new-executor")),
         lambda payload: payload["candidate_scores"][0].__setitem__(
@@ -869,6 +925,10 @@ def test_stale_authenticated_bindings_reject_every_artifact_domain(
 @pytest.mark.parametrize(
     "mutator",
     [
+        lambda payload: payload.__setitem__(
+            "qualification_manifest_sha256",
+            payload["source_evidence_sha256"],
+        ),
         lambda payload: payload["candidate_scores"][0]["records"][0].__setitem__(
             "raw_artifact_sha256",
             payload["source_evidence_sha256"],
@@ -903,7 +963,8 @@ def test_execution_closure_rejects_cross_domain_digest_reuse(
         ("score_evidence_sha256", "1" * 64),
         ("source_manifest_sha256", "2" * 64),
         ("executor_manifest_sha256", "3" * 64),
-        ("execution_closure_sha256", "4" * 64),
+        ("qualification_manifest_sha256", "4" * 64),
+        ("execution_closure_sha256", "5" * 64),
         ("trust_anchor_identity", "different_trust_anchor"),
     ],
 )
@@ -919,6 +980,48 @@ def test_binding_subject_rejects_underlying_field_drift(
         match="verification subject",
     ):
         cast(Any, replace)(bindings, **{field: replacement})
+
+
+def test_qualification_manifest_digest_changes_both_hash_domains() -> None:
+    _, frozen, payload = _open_fixture()
+    bindings = _authenticated(frozen, payload)
+    assert evidence.MATCHED_EXECUTION_CLOSURE_SCHEMA_VERSION.endswith(".v2")
+    assert evidence.MATCHED_VERIFICATION_SUBJECT_SCHEMA_VERSION.endswith(".v2")
+    original_closure = evidence.matched_execution_closure_sha256(frozen, payload)
+    original_subject = evidence.matched_verification_subject_sha256(frozen, payload)
+    changed = copy.deepcopy(payload)
+    changed["qualification_manifest_sha256"] = _sha("different-qualification-manifest")
+    _rehash(changed)
+
+    assert evidence.matched_execution_closure_sha256(frozen, changed) != original_closure
+    assert evidence.matched_verification_subject_sha256(frozen, changed) != original_subject
+    with pytest.raises(evidence.ForagerMatchedEvidenceError, match="authenticated"):
+        evidence.validate_score_evidence_against_protocol(
+            frozen,
+            changed,
+            authenticated_bindings=bindings,
+        )
+
+
+def test_authenticated_bindings_v2_serializes_exact_qualification_digest() -> None:
+    _, frozen, payload = _open_fixture()
+    bindings = _authenticated(frozen, payload)
+
+    assert bindings.to_dict() == {
+        "schema_version": "alberta.forager_authenticated_evidence_bindings.v2",
+        "stage": frozen.stage,
+        "protocol_sha256": frozen.protocol_sha256,
+        "score_evidence_sha256": payload["payload_sha256"],
+        "source_manifest_sha256": payload["source_evidence_sha256"],
+        "executor_manifest_sha256": payload["executor_evidence_sha256"],
+        "qualification_manifest_sha256": payload["qualification_manifest_sha256"],
+        "execution_closure_sha256": bindings.execution_closure_sha256,
+        "trust_anchor_identity": frozen.runtime.qualification_trust_anchor_identity,
+        "verification_subject_sha256": bindings.verification_subject_sha256,
+        "verification_receipt_sha256": bindings.verification_receipt_sha256,
+    }
+    with pytest.raises(evidence.ForagerMatchedEvidenceError, match="lowercase SHA-256"):
+        replace(bindings, qualification_manifest_sha256="A" * 64)
 
 
 def test_changed_external_receipt_cannot_validate_a_published_report() -> None:
@@ -987,6 +1090,8 @@ def test_build_statistics_contract_binds_exact_sealed_transition() -> None:
     assert tuple(
         diagnostic.candidate_id for diagnostic in contract.fixed_descriptive_diagnostics
     ) == ("exact_ppo", "search_oracle")
+
+
     assert tuple(
         diagnostic.exclusion_reasons for diagnostic in contract.fixed_descriptive_diagnostics
     ) == (
@@ -1013,6 +1118,41 @@ def test_build_statistics_contract_binds_exact_sealed_transition() -> None:
 
     analysis = statistics.analyze_matched_scores(contract)
     assert statistics.load_canonical_result(analysis.canonical_json(), contract) == analysis
+
+
+def test_build_statistics_contract_rejects_cross_stage_qualification_drift() -> None:
+    (
+        open_protocol,
+        sealed_protocol,
+        selection_result,
+        selection,
+        open_scores,
+        sealed_scores,
+        open_bindings,
+        _sealed_bindings,
+    ) = _sealed_fixture()
+    drifted_scores = copy.deepcopy(sealed_scores)
+    drifted_scores["qualification_manifest_sha256"] = _sha(
+        "different-sealed-qualification-manifest"
+    )
+    _rehash(drifted_scores)
+    drifted_bindings = _authenticated(sealed_protocol, drifted_scores)
+
+    with pytest.raises(
+        evidence.ForagerMatchedEvidenceError,
+        match="share one exact qualification manifest",
+    ):
+        evidence.build_statistics_contract(
+            open_protocol,
+            sealed_protocol,
+            selection_result,
+            selection.report,
+            open_scores,
+            drifted_scores,
+            open_authenticated_bindings=open_bindings,
+            evaluation_authenticated_bindings=drifted_bindings,
+            expected_selection_report_sha256=selection.report_sha256,
+        )
 
 
 def test_build_statistics_contract_rejects_digest_or_transition_drift() -> None:

@@ -1,4 +1,22 @@
-"""Tests for the hash-attested official continual-Foragax runner."""
+"""Tests for the hash-attested official continual-Foragax runner.
+
+The runner (:mod:`alberta_framework.benchmarks.official_foragax`) executes
+the upstream ``continual-foragax-agents`` entry points unmodified inside a
+networkless read-only OCI sandbox and treats a result as evidence only when
+an atomic manifest binds the artifact bytes to a clean descriptor-pinned
+source checkout, config blob, lock file, interpreter, and effective seed —
+see that module's docstring for the five-stage trust/plan/harden/execute/
+verify lifecycle these tests walk in order.
+
+The attestation flow exercised here: build a synthetic git checkout and a
+hash-pinned trust/endorsement descriptor, prepare a frozen plan, run a fake
+(or stubbed-OCI) experiment, publish the manifest atomically, then verify —
+and every deviation must fail closed: dirty or drifted sources, tampered
+manifests or rewards, symlink swaps in outputs, ambiguous result layouts,
+seed mismatches, and interrupted publication (which must remove both
+manifest and lock).  Marked ``slow``: tests construct real git repositories,
+tar archives, and SQLite result databases on disk.
+"""
 
 from __future__ import annotations
 

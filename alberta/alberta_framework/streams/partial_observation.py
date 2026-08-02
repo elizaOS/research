@@ -1,4 +1,4 @@
-"""Partial-observation stream wrapper for POMDP testbeds (Step 3 Phase D).
+"""Partial-observation stream wrapper for POMDP testbeds.
 
 Wraps any ``ScanStream`` so that a configurable subset of observation
 channels is masked at each step. Useful for testing whether agents can

@@ -1,8 +1,23 @@
-"""Learning units for continual learning.
+"""Learning units for continual learning (Alberta Plan Step 1).
 
-Implements learners that combine function approximation with optimizers
-for temporally-uniform learning. Uses JAX's scan for efficient JIT-compiled
-training loops.
+Combines function approximation with pluggable step-size optimizers under
+temporal uniformity: every component updates at every time step, with no
+train/eval phases.  Four learner families live here:
+
+- :class:`LinearLearner` — ``y = w @ x + b`` with any core optimizer
+  (LMS/IDBD/Autostep/ObGD) and an optional online feature normalizer.
+- :class:`MLPLearner` — small MLP with backprop, sparse initialization, and
+  dormant-neuron diagnostics/reset for plasticity studies.
+- :class:`TDLinearLearner` — linear TD value prediction with eligibility
+  traces and TD-aware step-size adaptation (TDIDBD family; Kearney et al.
+  2019).
+- :class:`TrueOnlineTDLearner` — True Online TD(lambda) with Dutch traces
+  (van Seijen & Sutton 2014).
+
+The ``run_*_learning_loop`` functions drive a learner over a
+:class:`~alberta_framework.streams.base.ScanStream` inside ``jax.lax.scan``
+so the whole loop JIT-compiles; the ``*_batched`` variants ``jax.vmap`` the
+same loop over seeds for multi-seed experiments.
 """
 
 import functools
@@ -223,7 +238,6 @@ class LinearLearner:
                 state.normalizer_state, observation
             )
 
-        # Make prediction
         prediction = self.predict(
             LearnerState(
                 weights=state.weights,
@@ -237,17 +251,14 @@ class LinearLearner:
             obs,
         )
 
-        # Compute error (target - prediction)
         error = jnp.squeeze(target) - jnp.squeeze(prediction)
 
-        # Get update from optimizer
         opt_update = self._optimizer.update(
             state.optimizer_state,
             error,
             obs,
         )
 
-        # Apply updates
         new_weights = state.weights + opt_update.weight_delta
         new_bias = state.bias + opt_update.bias_delta
 
@@ -626,8 +637,8 @@ def run_learning_loop_batched[StreamStateT](
 ) -> BatchedLearningResult:
     """Run learning loop across multiple seeds in parallel using jax.vmap.
 
-    This function provides GPU parallelization for multi-seed experiments,
-    typically achieving 2-5x speedup over sequential execution.
+    All seeds share one compiled program, so multi-seed experiments
+    parallelize on accelerators instead of running sequentially.
 
     Supports both plain and normalized learners.
 
@@ -1485,8 +1496,8 @@ def run_mlp_learning_loop_batched[StreamStateT](
 ) -> BatchedMLPResult:
     """Run MLP learning loop across multiple seeds in parallel using jax.vmap.
 
-    This function provides GPU parallelization for multi-seed MLP experiments,
-    typically achieving 2-5x speedup over sequential execution.
+    All seeds share one compiled program, so multi-seed MLP experiments
+    parallelize on accelerators instead of running sequentially.
 
     Args:
         learner: The MLP learner to train
@@ -1734,7 +1745,11 @@ class TrueOnlineTDState:
 
 @chex.dataclass(frozen=True)
 class TrueOnlineTDUpdateResult:
-    """Result of one True Online TD(lambda) update."""
+    """Result of one True Online TD(lambda) update.
+
+    ``metrics`` columns: squared TD error, TD error, mean absolute
+    eligibility trace, and the stored ``v_old`` bootstrap value.
+    """
 
     state: TrueOnlineTDState
     prediction: Prediction
@@ -1746,10 +1761,15 @@ class TrueOnlineTDUpdateResult:
 class TrueOnlineTDLearner:
     """Linear True Online TD(lambda) learner with Dutch traces.
 
-    Implements the van Seijen et al. update for a linear value function with
-    an explicit bias feature. At terminal transitions (``gamma == 0``),
+    Implements the true-online update for a linear value function with an
+    explicit bias feature. At terminal transitions (``gamma == 0``),
     ``v_old`` is reset to zero so repeated one-step supervised transitions
     reduce exactly to LMS.
+
+    References:
+        van Seijen & Sutton (2014). "True Online TD(lambda)." ICML.
+        van Seijen et al. (2016). "True Online Temporal-Difference
+            Learning." JMLR.
     """
 
     def __init__(self, step_size: float = 0.05, trace_decay: float = 0.9):

@@ -739,8 +739,8 @@ def run_sarsa_from_arrays(
     """Run SARSA on pre-collected arrays via ``jax.lax.scan``.
 
     JIT-compiled for maximum throughput. Actions are selected on-policy
-    within the scan. This is the primary loop for security-gym data
-    where observations are pre-collected.
+    within the scan. Use this loop when transitions are pre-collected
+    arrays rather than produced by a live environment interaction loop.
 
     Args:
         agent: SARSA agent

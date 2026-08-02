@@ -7,6 +7,17 @@ source/configuration/runtime/capability bindings for every candidate.  The
 result is replayed through :mod:`forager_matched_protocol` before any canonical
 bytes are returned.
 
+The frozen panel has three strata.  Local Alberta learners (14): a 3x3
+causal-map tuning grid (see ``_EXPLORATION_VALUES`` / ``_RESPAWN_QUANTILES``),
+four Horde actor-critic variants that probe one configuration axis each (see
+:func:`_matched_horde_configurations`), and one RTU/RTRL learner.  External
+learners (7) from the qualified upstream continual-foragax archive: five
+continuing DQN/DRQN baselines plus PPO and RTU-PPO run behind the
+RNG-isolation adapter.  Descriptive-only candidates (2), excluded from
+selection and pairing: ``exact_ppo`` (shares one RNG chain between agent and
+environment, so it is not seed-pairable with isolated-RNG candidates) and
+``search_oracle`` (privileged global-object access, not a learning agent).
+
 No function here executes a Forager seed or reads a result archive.
 """
 
@@ -130,6 +141,9 @@ _MATCHED_CURRENT_METRIC_IMPLEMENTATION_DESCRIPTOR: Final = MappingProxyType(
 )
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+# One hex digit repeated 64 times (all-zeros, all-f, ...) -- the shape of every
+# stand-in digest.  The backreference matches exactly that shape so obvious
+# placeholders are rejected as content bindings even though they are valid hex.
 _PLACEHOLDER_SHA256_RE = re.compile(r"([0-9a-f])\1{63}\Z")
 
 
@@ -155,6 +169,12 @@ MATCHED_CURRENT_PRIMARY_BOOTSTRAP_SEED: Final = 2_400_000
 MATCHED_CURRENT_SECONDARY_MONTE_CARLO_RESAMPLES: Final = 1_000_000
 MATCHED_CURRENT_SECONDARY_SEED: Final = 2_400_001
 
+# Axes of the 3x3 causal-map tuning grid.  ``exploration_probability`` is the
+# coin arbitrating between the exploitation target and an unobserved reachable
+# cell; ``respawn_safety_quantile`` is the one-sided normal quantile that pads
+# online respawn-delay estimates before a collected cell counts as ready (see
+# :class:`CausalMapForagerConfig`).  Each axis brackets the config default
+# (0.05, 0.75) with one setting on either side.
 _EXPLORATION_VALUES: Final = (0.025, 0.05, 0.10)
 _RESPAWN_QUANTILES: Final = (0.5, 0.75, 0.9)
 
@@ -191,7 +211,10 @@ MATCHED_CURRENT_EXTERNAL_CANDIDATE_IDS: Final = (
     "isolated_ppo",
     "isolated_rtu",
 )
-MATCHED_CURRENT_RECURRENT_CANDIDATE_IDS: Final = ("isolated_ppo", "isolated_rtu")
+MATCHED_CURRENT_RNG_ISOLATED_SOURCE_CANDIDATE_IDS: Final = (
+    "isolated_ppo",
+    "isolated_rtu",
+)
 MATCHED_CURRENT_DESCRIPTIVE_CANDIDATE_IDS: Final = ("exact_ppo", "search_oracle")
 MATCHED_CURRENT_CANDIDATE_IDS: Final = (
     MATCHED_CURRENT_ALBERTA_CANDIDATE_IDS
@@ -254,6 +277,7 @@ class _CandidateSpec:
 
 
 def _causal_specs() -> tuple[_CandidateSpec, ...]:
+    """One spec per cell of the 3x3 causal-map grid; only ``candidate_id`` varies."""
     return tuple(
         _CandidateSpec(
             candidate_id=candidate_id,
@@ -526,7 +550,11 @@ def matched_current_metric_implementation_descriptor() -> dict[str, Any]:
 
 
 def matched_current_causal_configurations() -> dict[str, dict[str, Any]]:
-    """Return the full explicit 3x3 causal-map tuning panel."""
+    """Return the full explicit 3x3 causal-map tuning panel.
+
+    The grid crosses ``_EXPLORATION_VALUES`` with ``_RESPAWN_QUANTILES``; all
+    other :class:`CausalMapForagerConfig` fields stay at their defaults.
+    """
     return {
         _causal_candidate_id(exploration, quantile): CausalMapForagerConfig(
             exploration_probability=exploration,
@@ -604,6 +632,15 @@ def _worker_configuration(
 
 
 def _matched_horde_configurations() -> dict[str, dict[str, Any]]:
+    """Return the four frozen Horde variants: the default plus one-axis probes.
+
+    Each non-default variant perturbs exactly one :class:`AlbertaForagerConfig`
+    axis -- exploration (``actor_epsilon`` 0.1 -> 0.05), recurrent capacity
+    (``recurrent_hidden_size`` 0 -> 64), or actor/critic initial step size
+    (1e-3 -> 3e-3).  The body digests pin the historically selected
+    configurations: a change to the config-class defaults fails closed here
+    instead of silently redefining the frozen panel.
+    """
     configurations = {
         "alberta_horde_default": AlbertaForagerConfig().to_dict(),
         "alberta_horde_eps05": AlbertaForagerConfig(actor_epsilon=0.05).to_dict(),
@@ -1117,7 +1154,7 @@ def _validate_shared_qualification_relationships(
             "exact_ppo",
             "search_oracle",
         ),
-        MATCHED_CURRENT_RECURRENT_CANDIDATE_IDS,
+        MATCHED_CURRENT_RNG_ISOLATED_SOURCE_CANDIDATE_IDS,
     )
     for family in source_families:
         first = qualifications[family[0]].source
@@ -1395,7 +1432,7 @@ __all__ = [
     "MATCHED_CURRENT_METRIC",
     "MATCHED_CURRENT_METRIC_IMPLEMENTATION_SHA256",
     "MATCHED_CURRENT_METRIC_SEMANTIC_CONTRACT_SHA256",
-    "MATCHED_CURRENT_RECURRENT_CANDIDATE_IDS",
+    "MATCHED_CURRENT_RNG_ISOLATED_SOURCE_CANDIDATE_IDS",
     "MATCHED_CURRENT_REQUIRED_IMAGE_SHA256",
     "MATCHED_CURRENT_RUNTIME_PROFILE_SHA256",
     "MATCHED_CURRENT_TASK_IDENTITY_SHA256",

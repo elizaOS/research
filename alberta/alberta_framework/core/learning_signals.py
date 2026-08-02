@@ -2,9 +2,11 @@
 """Causal, typed learning-signal estimates from ensemble predictions.
 
 This module is a small development-only mechanism for the learning-value
-channels described in WP5.  It deliberately does not combine its outputs into
-a reward, objective, priority, or generic score.  A consumer must choose a
-named signal and preserve its units.
+channels (typed surprise, learning progress, change detection) planned in
+work package 5 of ``CONTINUAL_AGENT_IMPLEMENTATION_PLAN.md``.  It
+deliberately does not combine its outputs into a reward, objective,
+priority, or generic score.  A consumer must choose a named signal and
+preserve its units.
 
 The causal contract is strict.  At time ``t`` a caller must:
 

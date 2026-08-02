@@ -742,6 +742,9 @@ def _seed_bound_invariants(
             }
         )
     condition_names = [identity["name"] for identity in condition_identities]
+    # Same contract as the streaming evaluator and the v2 report builder: every
+    # comparison runs one candidate against at least two named budget-matched
+    # baselines (see continual_streaming_evaluator / continual_evaluation_report).
     if len(condition_names) < 3 or len(set(condition_names)) != len(condition_names):
         raise ValueError("campaign requires one candidate and at least two unique baselines")
     return {
@@ -828,6 +831,15 @@ def _hash_index(
     draw: int,
     size: int,
 ) -> int:
+    """Derive one bootstrap draw index from a SHA-256 counter.
+
+    Each resample index is a pure function of the declared bootstrap seed and
+    the ``(replicate, stratum, draw)`` counter, so the exact draw pattern named
+    by :data:`BOOTSTRAP_METHOD` is byte-stable across platforms and library
+    versions and reproducible by an independent implementation — unlike a
+    stateful numpy RNG stream.  Reducing the top 8 digest bytes modulo ``size``
+    has negligible bias for small strata (at most ``size / 2**64``).
+    """
     payload = _canonical_json(
         {
             "bootstrap_seed": bootstrap_seed,
@@ -841,6 +853,11 @@ def _hash_index(
 
 
 def _type7_quantile(values: Sequence[float], probability: float) -> float:
+    """Quantile type 7 of Hyndman & Fan (1996): linear interpolation of the
+    order statistics at position ``(n - 1) * p`` — the same definition as
+    numpy's default ``quantile`` method, restated here as part of the frozen
+    bootstrap recipe.
+    """
     if not values:
         raise ValueError("bootstrap quantile requires values")
     ordered = sorted(values)

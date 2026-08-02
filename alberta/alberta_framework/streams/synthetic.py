@@ -141,7 +141,26 @@ class HiddenStateAR2Stream:
         nonlinear_coeff: float = 0.5,
         target_noise_std: float = 0.01,
     ):
-        """Initialize the AR(2) stream."""
+        """Initialize the AR(2) stream.
+
+        Each channel evolves as ``x_t = phi1*x_{t-1} + phi2*x_{t-2} + eps``.
+        The target is the sum of the first ``visible_dim`` channels plus
+        ``nonlinear_coeff * h0 * h1``, where ``h0``/``h1`` are the first two
+        hidden channels — the pairwise product is what makes the hidden block
+        behaviorally relevant to a feature-discovery probe.
+
+        Args:
+            feature_dim: Total number of AR channels emitted per step
+            visible_dim: Channels counted linearly in the target; the rest
+                form the hidden block (must contain at least two channels)
+            phi1: AR lag-1 coefficient
+            phi2: AR lag-2 coefficient; (phi1, phi2) must lie inside the
+                AR(2) stationarity triangle, except for the deterministic
+                copy case (phi1=1, phi2=0, innovation_std=0)
+            innovation_std: Std dev of the per-channel AR innovation
+            nonlinear_coeff: Weight on the hidden h0*h1 interaction term
+            target_noise_std: Std dev of additive target noise
+        """
         if visible_dim <= 0 or visible_dim >= feature_dim:
             raise ValueError("visible_dim must be in [1, feature_dim)")
         if feature_dim - visible_dim < 2:
@@ -333,13 +352,18 @@ class SuttonExperiment1State:
 
 
 class SuttonExperiment1Stream:
-    """Non-stationary stream replicating Experiment 1 from Sutton 1992.
+    """Non-stationary stream modeled on Experiment 1 from Sutton 1992.
 
-    This stream implements the exact task from Sutton's IDBD paper:
+    At the defaults (``noise_std=0.0``, ``bias_drift_rate=0.0``) this
+    reproduces the task from Sutton's IDBD paper:
     - 20 real-valued inputs drawn from N(0, 1)
     - Only first 5 inputs are relevant (weights are ±1)
     - Last 15 inputs are irrelevant (weights are 0)
     - Every change_interval steps, one of the 5 relevant signs is flipped
+
+    Nonzero ``noise_std`` or ``bias_drift_rate`` are extensions beyond the
+    paper: they add target noise and let the nominally irrelevant weights
+    drift away from zero, respectively.
 
     Reference: Sutton, R.S. (1992). "Adapting Bias by Gradient Descent:
     An Incremental Version of Delta-Bar-Delta"
@@ -364,6 +388,11 @@ class SuttonExperiment1Stream:
             num_relevant: Number of relevant inputs with ±1 weights
             num_irrelevant: Number of irrelevant inputs with 0 weights
             change_interval: Number of steps between sign flips
+            noise_std: Std dev of additive target noise (0.0 = the
+                noise-free paper task)
+            bias_drift_rate: Per-step random-walk std dev applied to the
+                irrelevant-input weights (0.0 = they stay exactly zero,
+                as in the paper)
         """
         self._num_relevant = num_relevant
         self._num_irrelevant = num_irrelevant
@@ -846,8 +875,8 @@ class DynamicScaleShiftStream:
     """Non-stationary stream with abruptly changing feature scales.
 
     Both target weights AND feature scales change at specified intervals.
-    This tests whether OnlineNormalizer can track scale shifts faster
-    than Autostep's internal v_i adaptation.
+    This tests whether an online normalizer (e.g. :class:`EMANormalizer`)
+    can track scale shifts faster than Autostep's internal v_i adaptation.
 
     The target is computed from unscaled features to maintain consistent
     difficulty across scale changes (only the feature representation changes,
@@ -992,8 +1021,8 @@ class ScaleDriftStream:
 
     Both target weights and feature scales drift continuously. Weights drift
     in linear space while scales drift in log-space (bounded random walk).
-    This tests continuous scale tracking where OnlineNormalizer's EMA
-    may adapt differently than Autostep's v_i.
+    This tests continuous scale tracking where :class:`EMANormalizer`'s
+    exponential moving statistics may adapt differently than Autostep's v_i.
 
     The target is computed from unscaled features to maintain consistent
     difficulty across scale changes.
@@ -1105,7 +1134,8 @@ class ScaleDriftStream:
         return timestep, new_state
 
 
-# Backward-compatible aliases
+# Original "*Target" class names, kept as aliases because they remain part of
+# the exported API surface (re-exported from streams/__init__.py).
 RandomWalkTarget = RandomWalkStream
 AbruptChangeTarget = AbruptChangeStream
 CyclicTarget = CyclicStream

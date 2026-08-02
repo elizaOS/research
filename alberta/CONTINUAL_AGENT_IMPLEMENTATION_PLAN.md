@@ -57,16 +57,23 @@ separately calibrated signals:
 | Epistemic surprise | Transition/model hypothesis | Exploration and model-memory priority |
 | Aleatoric uncertainty | Environment outcome distribution | Veto noisy-TV and risky imagination |
 | Learning progress | Region or model head | Prefer learnable experience |
-| Delight, \(A[-\log\pi(a\mid s)]\) | Actor sample | Actor-gradient weight and optional compute gate |
-| Prospective delight | Candidate exploratory action | Optional host-policy override |
+| Paper-defined delight, \(A[-\log\pi(a\mid s)]\) | Actor sample | Actor-gradient weight and optional Kondo compute gate |
+| Prospective exploration delight (separate paper extension) | Candidate exploratory action | Optional host-policy override |
 | Safety cost/risk | State/action/trajectory | Shield and full-fidelity safety learning |
 
-The user-facing question “does this gradient spark joy?” is an explicit
-consumer of these channels, not a ninth channel and not their sum. It audits a
-candidate parameter update against caller-attested independently measured
-objective, retention, and safety gradients. The paper-specific delight channel
-\(A[-\log\pi(a\mid s)]\) remains an actor-sample signal with different
-semantics.
+The user-facing question “does this gradient spark joy?” names the Kondo
+compute decision from the paper: compute actor-sample delight
+\(A[-\log\pi(a\mid s)]\) in a forward pass, then decide whether that sample is
+selected for a backward pass. It is not a ninth channel and not a sum of the
+eight channels.
+
+Terminology is strict: unqualified **delight** means
+\(A[-\log\pi(a\mid s)]\), and **sparks joy** means selected by the Kondo gate
+for a backward pass. The existing multi-objective, finite-precision
+candidate-update safety audit is a separate mechanism. Its historical
+`GradientJoy*`, `sparks_joy`, and `joyful_gradient_applied` API names remain
+compatibility aliases only; new text uses `candidate_update_audit_passed` and
+`audited_candidate_update_applied`.
 
 Conflating these signals would recreate exactly the failure modes found in the
 literature.
@@ -85,8 +92,8 @@ literature.
 5. **Checkpoint all learning state.** Parameters alone are insufficient:
    optimizer moments, utilities, traces, recurrent state, memory indexes,
    calibrators, RNG keys, ages, and lifecycle metadata must round-trip.
-6. **Separate safety learning from delight/compute gates.** Rare failures may be
-   suppressed by a delightful actor gradient; the safety-cost learner and
+6. **Separate safety learning from paper-specific DG/compute gates.** Rare failures may be
+   suppressed by a paper-specific actor gradient; the safety-cost learner and
    incident memory must see all of them.
 7. **Ablate every new mechanism.** Additions enter behind explicit config
    modes, with an identical base learner and matched search budgets.
@@ -232,11 +239,19 @@ held-out action scores, forgetting, backward/forward transfer, and worst-window
 performance, with explicit applicability when a longitudinal comparison cannot
 be formed. A hardened adapter runs `PrototypeAgent` through that boundary, and
 checkpoint/report loaders bind the environment, probes, learner state, budget,
-condition order, metrics, and reconstructing core by canonical digests. This is
-still development machinery: held-out probes score one action rather than a
-control rollout, the fresh/oracle/multitask references and realized-resource
-matching are missing, and no multi-seed candidate report exists. The WP1 exit
-gate therefore remains open.
+condition order, metrics, and reconstructing core by canonical digests. A
+separate development-only suite now executes three deliberately privileged
+context references outside the ordinary condition list: one independently
+initialized learner per evaluator regime identity whose state is retained on
+recurrence, a stationary-multitask learner trained on an exactly counted frozen
+extra stream, and an exact frozen counterfactual action-outcome upper reference.
+The suite discloses regime routing, extra data, action-table callbacks,
+initializations, and incompatibility rather than calling these matched
+baselines; stochastic expected-action scores are explicitly not accepted as
+the exact oracle. This is still development machinery: held-out probes score
+one action rather than a control rollout, no realized-resource-matched
+candidate/reference comparison or energy measurement exists, and no multi-seed
+Prototype report has been run. The WP1 exit gate therefore remains open.
 
 A strict paired campaign companion can now execute one complete evaluator per
 declared seed. Explicit seed wrappers bind every learner and environment
@@ -463,11 +478,19 @@ invalid-input handling, scan parity, resource accounting, and checkpoint
 configuration binding have contract tests. The online-gated builder has a
 source-bound pure proposal and atomic advanced-destination commit. An opt-in
 Prototype lane now consumes the bounded ensemble's causal pre-update
-representation gradient; an optional decision-bound gradient-joy audit gates
-the actual finite-precision parameter delta. This is one model-loss producer,
-not the balanced prediction/control/Horde gradient set required by 3.3. The
-balanced-gradient ablations and Forager comparison remain open, so the WP3
-exit gate is not met.
+representation gradient; an optional decision-bound candidate-update audit
+gates the actual finite-precision parameter delta. A successor opt-in mixer now adds
+an explicitly weighted, optionally normalized/clipped current control-loss
+gradient. Idle primitive transitions use the base-Q one-step semi-gradient;
+executing options use the current intra-option semi-gradient, while delayed
+semi-MDP credit owned by the option-start representation is excluded. The
+mixed candidate feeds both the builder proposal and that safety audit;
+real replay gradients never enter it, and valid-range action-owner tampering
+fails closed. This is only the first two-source behavior/world mechanism, not
+the multiple-timescale GVF, inverse, feature-utility, or empirically balanced
+objective set required by 3.3. Its conflict diagnostics and modes are not an
+efficacy result. Matched mixer ablations and the Forager comparison remain
+open, so the WP3 exit gate is not met.
 
 ## WP4 — Build a calibrated continual world-model lane
 
@@ -521,8 +544,26 @@ continuation times a caller-supplied linear successor value. This is L0
 mechanism coverage, not the cited paper's theorem or MPC system: it is fully
 observed, discrete-action, affine, O(feature_dim³) per selected solve, and has
 no uncertainty, replay, recurrence, latency result, or control-benefit result.
-The recurrent latent reference and matched shallow-versus-ensemble comparison
-remain open, so 4.2 is not complete.
+An isolated bounded recurrent latent reference is now implemented with one
+trainable GRU and grounded mean/heteroscedastic-variance heads per bootstrap
+member. Exact observation/action cache ownership, predict-before-update NLL,
+one recurrent advance per accepted event, final-target/reset-cache boundary
+semantics, atomic rejection, fixed resources, JIT/scan, and checkpoint
+continuation are mechanism-tested. An opt-in fourth mutually exclusive
+`PrototypeAgent` world-model lane now owns that exact decision cache, advances
+the recurrent model and its causal signal estimator as one transaction, and
+routes only the accepted real NLL representation gradient to the builder,
+mixer, and candidate-update audit boundary. A rejected recurrent transaction
+rolls back the whole Prototype transition. This is not a planner, replay lane,
+calibrated model, or efficacy result. A fixed two-seed,
+18-transition A/B/A development diagnostic now runs the shallow model, the
+plain ensemble, and model-only rehearsal on the same raw grounded stream and
+reconstructs
+prequential channel errors, recurrence/adaptation summaries, replay
+composition, and logical resource accounting. It is intentionally tiny,
+resource-unmatched, and `not-assessed`; it is not the preregistered
+shallow-versus-ensemble efficacy comparison required by the exit gate. Thus
+4.2 is not complete.
 
 ### 4.3 Calibrate uncertainty
 
@@ -540,10 +581,27 @@ persists distinct member initialization, bootstrap RNG/masks, member counters,
 the signal estimator, and exact resource accounting; predicts before update;
 and exposes typed warm-up availability plus a causal representation gradient.
 The present variance channel is an explicitly uncalibrated residual proxy, not
-a demonstrated aleatoric model. Ensemble dreaming is disabled, and held-out
-error/OOD calibration, state/action-region calibration, recurrent latent
-dynamics, and the shallow-reference comparison remain open. This does not
-close WP4.
+a demonstrated aleatoric model. A strict development evaluator can now freeze
+either an ensemble or single-model snapshot and retain raw held-out member/mean
+predictions and grounded targets. It reconstructs descriptive
+disagreement-versus-error bins, Pearson/Spearman association, coverage-risk,
+and ID/OOD plus derived state/action-region summaries; sparse or unavailable
+fields remain explicit. Optional mean open-loop traces run only for
+caller-declared grounded, exactly reconstructable action sequences. The
+evaluator applies no threshold and expressly makes no probabilistic calibration
+claim because the currently evaluated model defines no likelihood. The
+isolated recurrent latent ensemble in 4.2 defines bounded
+heteroscedastic-Gaussian heads and now has a separate strict development
+adapter. Starting from a hash-bound frozen snapshot, that adapter scores each
+cached distribution before exactly one update of an isolated copy, retains raw
+member means/variances/NLLs, and reconstructs ID/OOD plus evaluator-owned
+state/action-region summaries. Warm-up exclusions, final isolated-state
+counters, sources, resources, reports, and snapshot checkpoints are explicit;
+the supplied snapshot remains unchanged. The Gaussian NLL objective and
+variance head do not establish calibrated likelihood or coverage. Ensemble
+dreaming is still disabled, and external calibration, decision thresholds,
+matched comparisons, and the exit-gate result remain open. This does not close
+WP4.
 
 ### 4.4 Add bounded dual replay
 
@@ -575,11 +633,15 @@ sample, then model-member-only replay updates. Replay has an isolated bootstrap
 key/mask/counter lane and cannot advance the real signal estimator, residual
 statistics, real counters, actor, critic, or builder. The Prototype exposes
 this as a third mutually exclusive world-model lane and routes only the
-commit-gated real representation gradient through builder learning and the joy
-audit. Exact composition state/resources/checkpoints, padding, stale versions,
+commit-gated real representation gradient through builder learning and the
+candidate-update audit. Exact composition state/resources/checkpoints, padding, stale versions,
 rollback, JIT/scan parity, and ensemble v1→v2 migration are tested. Clustering,
 maximally interfered retrieval, actor/critic behavior correction, empirical
-priority calibration, and realized retention/control comparisons remain open.
+priority calibration, and realized control comparisons remain open. The small
+matched-stream A/B/A diagnostic described in 4.2 now exercises replay
+retention and noisy-TV composition, but its two consumed development seeds,
+short horizon, unequal realized work, and lack of a decision threshold support
+no retention or mechanism-selection claim.
 
 ### 4.5 Component retention probes
 
@@ -604,7 +666,29 @@ checked; applicability and runtime unavailability are explicit; raw per-case
 traces are not retained; and calls, records, snapshots, state bytes, reports,
 and checkpoint/resume are bounded and reconstructing. This is pointwise
 mechanism coverage, not calibration/discrimination or longitudinal retention
-evidence, and it is not yet connected to a Prototype multi-regime report.
+evidence, and it is not yet connected to a Prototype multi-regime report. The
+separate world-model A/B/A diagnostic retains raw dynamics, reward, and
+continuation errors, but it does not probe the Prototype representation,
+critic, actor, or option lifecycle and therefore does not substitute for this
+integration gate. A stricter recurrent-only companion now reuses exact ordered
+cases after an evaluator-owned intervening context and declared recurrent
+resets. It reconstructs per-phase, recurrence-entry, ID/OOD, and within-phase
+prequential NLL summaries from one isolated, source-bound snapshot while
+proving the supplied snapshot unchanged. This remains descriptive
+`not-assessed` mechanism coverage: it does not establish recurrent-model
+retention and does not measure the Prototype representation, critic, actor, or
+option lifecycle.
+
+A separate ordinary-policy-gradient actor/critic companion now runs one fixed
+continuing A/B/A schedule with phase identities, reward tables, preferred
+actions, and value targets kept evaluator-only. It retains the exact cached
+target/epsilon-mixture behavior policy, raw target/behavior probability ratio,
+behavior-score chain-rule scale, critic error, actor margin, policy churn,
+realized return/recovery, plasticity, and action activity. The supplied
+snapshot is unchanged and the successor action is sampled only after the
+current update commits. This is still one source-bound development seed with
+no threshold, matched comparator, retention conclusion, or Prototype
+component integration.
 
 ### 4.6 Imagination and rehearsal
 
@@ -625,8 +709,9 @@ behavior cloning competent real episodes.
 real-transition rehearsal mechanism through the atomic composition in 4.4.
 Items 1–3 and 5 remain absent on the ensemble lane: it performs no imagined
 rollout and replay never updates a policy, critic, state builder, or signal
-calibrator. This is rehearsal plumbing, not evidence that replay retains a
-world model or improves control.
+calibrator. The matched-stream development diagnostic now makes the model-only
+rehearsal trace and replay strata inspectable, but is not assessed and does not
+establish that replay retains a world model or improves control.
 
 ### Exit gate
 
@@ -635,7 +720,7 @@ on at least one preregistered complex stream without worse lifetime control.
 Imagined updates improve real return and retention under a held-out transition
 audit; otherwise dreaming remains disabled.
 
-## WP5 — Implement typed surprise, delight, and learning-value routing
+## WP5 — Implement typed surprise, delight/Kondo, candidate auditing, and routing
 
 ### Purpose
 
@@ -650,7 +735,7 @@ Add a JAX-friendly structure similar to:
 LearningValue(
     advantage,
     action_surprisal,
-    delight,
+    delight,  # historical field name: paper-specific actor-sample DG delight
     epistemic_surprise,
     aleatoric_uncertainty,
     learning_progress,
@@ -680,7 +765,25 @@ Use:
 - aleatoric uncertainty to suppress noisy-TV attraction; and
 - raw error only for diagnostics and model training.
 
-### 5.3 Gradient-level “spark joy” audit
+**Implementation status (2026-07-31):** a fixed-state `LearningValueRouter`
+now validates and causally normalizes the eight named channels independently.
+Every channel has explicit producer, causal-object, units, domain, bounds, and
+scale-floor metadata; normalization uses only pre-update Welford state. Six
+typed routes serve the paper-defined-delight actor, exploration, model
+memory/replay, adaptation/change, safety, and the complete evidence input for
+the separate candidate-update safety audit. Inactive or invalid fields are exact
+zero and unavailable, a failure in another channel cannot suppress a valid
+safety cost, and delight is accepted only when it is the
+exact float32 product of valid declared advantage and action surprisal. The
+router performs neither Kondo selection nor an update audit and never forms a
+universal score. Fixed
+resource accounting, counter-capacity disclosure, canonical checkpoints, and
+eager/JIT/scan parity are mechanism-tested. No Prototype/search/memory consumer
+has yet shown an outcome benefit from these routes, and producer-declared
+uncertainty/change values have not thereby become calibrated. Thus 5.1 and
+5.2 have a bounded L0 mechanism, not an exit-gate result.
+
+### 5.3 Candidate-update safety audit (historical gradient-joy API)
 
 For a candidate gradient \(g\), the plain-gradient mode defines
 \(u_c=-\alpha g\). Callers using momentum, preconditioning, clipping, or any
@@ -769,11 +872,18 @@ objective, retention, or safety outcomes.
 **Implementation status (2026-07-31):** the standalone assessment and atomic
 application boundary are implemented, and the Prototype's opt-in learned-state
 lane is their first real consumer. Caller evidence is bound to the dispatched
-decision ID; all eight channel availabilities are explicit; paper delight is
-derived internally; and missing, stale, incomplete, or non-finite evidence
-answers `sparks_joy=False` without dropping the environment transition. The
-candidate is stored only after both the literal candidate verdict and the
-finite-precision effective-delta audit pass. These are mechanism contracts,
+decision ID; all eight channel availabilities are explicit; the standalone
+audit accepts the historical `LearningValue.delight` evidence field only when
+its float32 bits exactly equal valid declared advantage times action surprisal;
+the Prototype derives that paper-defined delight internally; and missing,
+stale, incomplete, or non-finite evidence
+answers `candidate_update_audit_passed=False` without dropping the environment
+transition. The candidate is stored only after both candidate audits and the
+finite-precision effective-delta audit pass. On `PrototypeUpdateResult`,
+`candidate_update_audit_passed` is the formed-candidate verdict, while
+`audited_candidate_update_applied` says that the audited stored delta was
+actually committed. `sparks_joy` and `joyful_gradient_applied` are historical
+compatibility aliases and do not carry the paper's Kondo meaning. These are mechanism contracts,
 not evidence that the accepted updates improve realized objectives or control.
 
 ### 5.4 Paper-specific Delightful Policy Gradient experiment
@@ -811,7 +921,7 @@ interior fixed point under parameter coupling.
 **Implementation status (2026-07-31):** an isolated categorical, continuing,
 on-policy actor-critic now implements the ordinary and Delightful Policy
 Gradient modes with matched state, critic, differential reward-rate baseline,
-typed RNG, and action sampler. The actor trace is fixed to zero; the delight
+typed RNG, and action sampler. The actor trace is fixed to zero; the paper-defined delight
 coefficient is detached; critic/baseline and explicitly available external
 safety, model, and representation routes are never gated. Exact action-record
 validation, atomic rejection, JIT/scan/checkpoint parity, effective sample size,
@@ -824,15 +934,18 @@ environment, full trace, DG equations, strata, metrics, and logical accounting.
 Its seeds and diagnostic thresholds are not preregistered promotion inputs; it
 has no uncertainty intervals, wall-clock/FLOP/energy accounting, continuous or
 off-policy lane, or higher-benchmark result. Therefore the DG exit gate remains
-open. This paper-specific actor experiment is separate from the literal
-candidate-gradient `sparks_joy` audit in 5.3.
+open. This paper-specific actor experiment is separate from the
+candidate-update safety audit in 5.3.
 
 ### 5.5 Kondo compute gate
 
-Only after DG reproduces:
+The mechanism can be tested before a DG reproduction, but no compute/quality
+claim advances until DG itself reproduces:
 
-- use `sigmoid((delight - price) / temperature)` or a target-rate quantile;
-- always reserve a minimum random/full-update fraction;
+- use `sigmoid((delight - price) / temperature)` or a target-rate quantile,
+  where `delight` is exactly advantage times action surprisal;
+- require a nonzero random/full-update reserve for continual-learning
+  deployment; allow zero only for an explicitly labeled paper-equation lane;
 - distinguish the paper's finite-temperature Bernoulli gate from deterministic
   top-\(k\) screening;
 - count actual compiled backward work and wall clock, not only logical masks;
@@ -848,6 +961,25 @@ screening pass, static `top_k`, gather, forward recomputation, and
 differentiation over survivors only when compiled wall-clock and memory
 measurements show a real saving. Expect little value for the normal online
 batch-size-one path; place Kondo first in replay/dream microbatches.
+
+**Implementation status (2026-07-31):** `KondoGate` now implements a bounded,
+typed forward/sparse-gather boundary. It derives float32 delight internally
+from advantage and selected-action log probability, supports the paper's
+finite-temperature Bernoulli price gate and a deterministic fixed-rate top-k
+screen whose dynamic target uses `max(1, round(rate * valid_count))`. Alberta
+uses a stable lowest-index tie break to keep exact capacity rather than the
+released token reference's threshold-based over-selection. The boundary
+preserves caller-declared forced samples and reports a flag requiring caller-managed
+full-shape fallback instead of truncating an over-capacity selection. The
+optional uniform reserve is diagnosed separately from the paper gate. When
+configured capacity is below batch size, the fixed-capacity host gather makes
+the downstream autodiff input genuinely smaller; tests inspect that backward
+JAXPR rather than treating a masked full-batch loss as saved work. The screen
+has eager/JIT/scan coverage; the config-bound gather is intentionally a
+validated host orchestration boundary. Checkpoint, resource, and invalid-input
+contracts are also covered. No actor/replay/dream consumer, measured
+wall-clock or memory saving, DG reproduction, or learning/safety benefit has
+been established, so the WP5 exit gate remains open.
 
 ### 5.6 Delightful exploration
 
@@ -891,11 +1023,49 @@ continuous control before attaching more architecture.
   - explicit behavior/target policy semantics.
 - Finish nonlinear shared-trunk trace support and independent off-policy
   correction as separate configurations.
-- Never use delight as a substitute for importance sampling where a corrected
+- Never use paper-defined delight as a substitute for importance sampling where a corrected
   off-policy objective is required.
 - Let the world model, actor, critic, and shared trunk use different plasticity
   policies and utility states.
 - Add policy churn and actor-channel recovery probes.
+
+**Implementation status (2026-07-31):** the discrete nonlinear Horde-backed
+path has separate actor/critic parameters and optimizer state, a differential
+critic and learned reward-rate baseline, exact target and epsilon-mixture
+behavior-policy records, and ordinary behavior-policy score gradients. Its
+transition boundary now consumes the previously cached decision, atomically
+commits actor/critic/baseline updates, and samples the successor from those
+committed parameters using one RNG draw. The strict development probe described
+in 4.5 makes actor/critic recurrence and plasticity inspectable while keeping
+all regime supervision outside the learner. The raw `pi / b` value is only a
+diagnostic; `(1 - epsilon) pi / b` is the exact chain-rule multiplier for the
+epsilon-mixture behavior objective, not off-policy target-policy correction.
+An isolated bounded continuous companion now uses a direct affine-`tanh`
+diagonal Gaussian with the exact cached pre-`tanh` draw, stable transformed
+target/behavior log densities including the Jacobian, and no Gaussian clipping
+or post-transform endpoint adjustment. The analytically cancelling latent-
+density ratio supplies the exact per-decision action correction
+`rho_t * (lambda * e_(t-1) + score_t)`; it is not a behavior-state-
+distribution correction. Actor, critic, traces, LMS states, reward-rate
+baseline, typed RNG, and counters are separate and bounded. Updates are atomic,
+and the sole successor draw occurs after commit. Strict config/checkpoint,
+resource, saturation, finite-difference, eager/JIT/scan, and causal-cache tests
+provide L0 mechanism coverage only. A strict continuous companion evaluator
+now runs a fixed 12-event, one-action-dimensional A/B/A stream from an
+immutable source-bound snapshot. It keeps preferred centers, reward fixtures,
+phase/case labels, and reference values evaluator-owned; reconstructs cached
+actions, latent/transformed densities, the exact latent action ratio, rewards,
+successor ownership, critic error, actor error/churn, trace/plasticity/activity,
+counters, and resources; and supports exact live replay plus no-overwrite
+reports/checkpoints under absolute byte/scalar ceilings. Same-state four-case
+centering removes only the differential-value additive gauge. Transformed
+diagnostic density reconstruction permits a documented symmetric eight-float32-
+ULP backend bound, while the policy-defining latent ratio remains bit-exact and
+tampering beyond the bound fails. The report is development-only and
+`not-assessed`, with no threshold or retention/control claim. Independent
+nonlinear off-policy correction, component-specific plasticity policies,
+matched SARSA comparisons, continuous efficacy evidence, and all benchmark
+exit gates remain open.
 
 ### Benchmark order
 
@@ -970,6 +1140,35 @@ optimizer/model/trace state for genuinely new semantics.
 - Integrate the option keyboard as an actual policy proposal, not only a
   callable helper.
 
+**Implementation status (2026-07-31):** OaK now exposes a strict deterministic
+keyboard proposal from the exact current chord Q-values and an opt-in dispatch
+boundary. A dispatched primitive replacement updates `last_primitive_action`
+and the actual credit owner—either the base primitive head or the active
+option's intra-option head—so the next real transition cannot train the
+counterfactual action. Exact float32 decision-observation identity, full fixed
+STOMP/OaK state validity, typed RNG preservation, and a caller-owned hard
+action mask are audited. An unsafe proposal uses the already-selected action
+only when that base is independently safe; an unsafe base or invalid state
+fails closed as an exact no-op. This closes the ownership-level keyboard
+proposal/dispatch mechanism, not automatic chord discovery, calibrated search
+control, or the option-lifecycle exit gate. The default OaK loop still uses its
+ordinary policy unless an explicit consumer invokes the new dispatch surface.
+
+An additional opt-in Prototype-only `OptionSearchControl` now reads completed
+option environment-return, baseline-mass, discount, and next-state models and
+allocates a fixed backup budget by recomputed absolute differential semi-MDP
+Bellman residual. Completion count is only an observed-support gate; it is not
+calibrated uncertainty or reachability. Each accepted backup commits only the
+base value learner, preserves real traces, normalizer, action/lifecycle caches,
+OaK counters, policy RNG, option policies, and option models, and is anchored
+to the exact post-transition decision representation. The controller runs
+after OaK has already cached that representation's action, so it deliberately
+does not rewrite the current dispatch; its value effect is first eligible at
+the next extended-action selection boundary. This closes a narrow
+support-aware option-model-to-value edge. It does not supply a shared
+primitive/option search budget, learned or calibrated search control,
+immediate action reselection, or outcome evidence.
+
 ### Exit gate
 
 Discovered options improve lifetime reward or adaptation AUC beyond primitive
@@ -998,6 +1197,33 @@ Retrieval is part of the continual problem. Evaluate interference, retrieval
 precision, negative transfer, stale-memory detection, and eviction—not only
 write throughput.
 
+**Implementation status (2026-07-31):** `ExperientialMemory` provides bounded
+typed query-before-write exemplars with representation-version, similarity,
+reliability, staleness, uncertainty, and safety gates plus deterministic
+utility/recency eviction. A strict development evaluator now runs one fixed
+evaluator-owned recurring A/B/A trace from an immutable empty snapshot against
+a stateless no-memory fallback on the same query/write opportunities. Its raw
+trace reconstructs retrieval precision and error, abstention causes, harmful
+recall, first/return descriptions, action/output variation, eviction
+provenance, exact allocation, and eager/compiled parity; config, protocol,
+sources, snapshots, reports, and checkpoints are hash-bound and fail closed.
+It applies no threshold and establishes no transfer, retention, capacity-
+matched efficacy, or WP8 completion result. `ExperientialMemoryPolicy` now
+interprets retrieved action vectors only as categorical score mass and chooses
+the lowest-index safe positive-mass argmax without mutation or RNG. An opt-in
+`PrototypeAgent` composition queries that policy on the next decision
+representation before writing the grounded current exemplar, records a one-hot
+of the primitive action that actually executed plus bootstrap representation
+and reward, and then passes the memory-modified dispatch and safety mask to
+partner fusion. Full four-word decision identities bind both lifecycle ends;
+unsafe/corrupt required retrieval or write causes whole-Prototype rollback.
+The outer memory wrapper leaves every no-memory state shape unchanged, and
+checkpoint, curation, eager/JIT/scan, and exact logical resource contracts are
+tested. The declared per-event work includes both deterministic pre-state
+queries—the policy proposal and the causal query-before-write step—and zero
+random draws. This is online L0 integration, not a transfer or control-benefit
+result; semantic/procedural consolidation remains open.
+
 ### IA action path
 
 - Define a typed partner message: observation, suggestion, confidence,
@@ -1012,6 +1238,23 @@ write throughput.
 - Log the counterfactual base action and the partner-influenced action.
 - Train on realized assistance value, not agreement with the partner.
 - Test multiple partners with changing reliability and communication cost.
+
+**Implementation status (2026-07-31):** the bounded `PartnerPolicyFusion` L0
+core defines a fixed-capacity typed message batch, five explicit routes,
+discrete score-based blending, and an inviolable caller-supplied action mask.
+An opt-in `PrototypeAgent` path now applies exact prior-decision feedback before
+fusing the next decision, binds both surfaces to the full four-word Prototype
+lifecycle identity, derives the real OaK counterfactual score internally, and
+can consume the current OaK keyboard proposal. A selected primitive rewrites
+the exact base-or-option credit owner; the recurrent model cache records that
+effective action. Unsafe base dispatch or corrupt post-state rolls back the
+whole Prototype transition, while stale, duplicate, and misattributed feedback
+is an atomic no-op. Start remains base-only and missing or invalid sidecars
+fall back safely. Cold-start accepts are explicitly uncalibrated development
+exploration, not trusted confidence. Checkpoints, eager/JIT/scan behavior, and
+logical resources are mechanism-tested. There is still no reliability-
+calibration, partner-benefit, or multi-partner continual result; the exit gate
+remains open.
 
 ### elizaOS boundary
 
@@ -1040,7 +1283,7 @@ as the first debugger.
 |---|---|---|---|
 | 0 | Hand-derived scalar/tabular tests | Equation and update correctness | Numerical parity |
 | 1 | Synthetic drifting prediction streams | Plasticity, forgetting, scaling | Multi-seed preregistered win |
-| 2 | Bandits, six-state, RiverSwim | Average reward, traces, delight | Baseline parity plus mechanism-specific win |
+| 2 | Bandits, six-state, RiverSwim | Average reward, traces, candidate-update audit / paper DG | Baseline parity plus mechanism-specific win |
 | 3 | Forager/Foragax | Partial observability, state, unending change | Learned-state and bounded-resource gates |
 | 4 | MinAtar, Continual World, ContinualBench, Procgen, DMC | Retention, transfer, control breadth | No regression across task orders |
 | 4b | AgarCL and sequential-confounder streams | Naturalistic non-episodic change, throughput, shortcut resistance | Improvement while processing the same experience stream |
@@ -1162,7 +1405,7 @@ All rows are required for the complete-prototype claim:
 | Exploration | Better coverage/return than random and epsilon baselines without noisy-TV fixation |
 | Feature lifecycle | Automated bounded discovery/curation beats random replacement |
 | Skill lifecycle | Discovered options improve control and are composed/retired without task labels |
-| Delight | If enabled, DG improves actor learning and Kondo reduces measured compute with no guardrail regression |
+| Candidate-update audit / optional paper DG and Kondo | Audited updates improve realized outcomes; if DG/Kondo is enabled, it improves actor learning and measured compute without a guardrail regression |
 | Experiential memory | Retrieval improves transfer and survives negative-transfer tests under fixed capacity |
 | IA | Partner signals causally improve decisions under changing reliability and communication cost |
 | Checkpointing | Bitwise or tolerance-defined resume parity for all learner/memory/lifecycle state |

@@ -245,7 +245,11 @@ def run_tree_bdd_compilation(config: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def run_ecoc_readout(config: Mapping[str, Any]) -> dict[str, Any]:
-    """Fit one hard binary circuit per ECOC bit and decode by Hamming distance."""
+    """Fit one hard binary circuit per ECOC bit and decode by Hamming distance.
+
+    Error-correcting output codes follow Dietterich & Bakiri (1995), "Solving
+    multiclass learning problems via error-correcting output codes", JAIR 2.
+    """
     dataset = make_hard_synthesis_dataset(config)
     synthesis = _synthesis_config(config)
     requested_gate_budget = _positive_int(synthesis.get("gate_budget", 32), "gate_budget")
@@ -755,6 +759,15 @@ def _effective_smoke_gate_budget(
     *,
     requested_gate_budget: int,
 ) -> int:
+    """Cap the requested gate budget for ``scale == "smoke"`` runs.
+
+    Greedy synthesis scores every pair of existing sources for each appended
+    gate (see ``fit_binary_hard_circuit``), so per-gate cost grows
+    quadratically with the source count.  The smoke caps therefore shrink as
+    input width grows: >= 32 bits -> 8 gates, >= 16 -> 12, else 16.  Non-smoke
+    scales honor the requested budget unchanged; runners report both the
+    requested and the effective budget in their metrics.
+    """
     if str(config.get("scale", "smoke")) != "smoke":
         return requested_gate_budget
     input_dim = int(dataset.train_x.shape[1])
@@ -771,6 +784,15 @@ def _effective_tree_depth(
     *,
     requested_max_depth: int,
 ) -> int:
+    """Return the tree-depth budget, raising it to 6 for smoke checkerboard.
+
+    The checkerboard label is ``parity(floor(4*x0), floor(4*x1))``; with the
+    grid-boundary threshold bits (0.25, 0.5, 0.75 per axis) each axis cell
+    parity is the XOR of its three boundary bits, so the label is a six-bit
+    parity.  No decision tree of depth < 6 can represent a six-bit parity, so
+    a smaller smoke budget would degenerate to majority voting rather than
+    testing the compiler.
+    """
     if str(config.get("scale", "smoke")) == "smoke" and dataset.task_id == "checkerboard":
         return max(requested_max_depth, 6)
     return requested_max_depth

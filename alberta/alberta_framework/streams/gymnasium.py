@@ -10,7 +10,12 @@ Gymnasium environments cannot be JIT-compiled, so this module provides:
 Supports multiple prediction modes:
 - REWARD: Predict immediate reward from (state, action)
 - NEXT_STATE: Predict next state from (state, action)
-- VALUE: Predict cumulative return via TD learning
+- VALUE: TD-style value target ``reward + gamma * V(next)``.  How much
+  genuine bootstrapping happens depends on the collector:
+  :func:`collect_trajectory` always uses a zero bootstrap (targets reduce
+  to immediate reward), :class:`GymnasiumStream` bootstraps only after
+  ``set_value_estimator`` is called, and :class:`TDStream` bootstraps from
+  a caller-updated value function.
 """
 
 from __future__ import annotations
@@ -37,7 +42,9 @@ class PredictionMode(Enum):
 
     REWARD: Predict immediate reward from (state, action)
     NEXT_STATE: Predict next state from (state, action)
-    VALUE: Predict cumulative return (TD learning with bootstrap)
+    VALUE: TD value target ``reward + gamma * V(next)``; collectors without
+        a value estimator fall back to a zero bootstrap, making the target
+        identical to REWARD
     """
 
     REWARD = "reward"
@@ -200,7 +207,9 @@ def collect_trajectory(
         env: Gymnasium environment instance
         policy: Action selection function. If None, uses random policy
         num_steps: Number of steps to collect
-        mode: What to predict (REWARD, NEXT_STATE, VALUE)
+        mode: What to predict (REWARD, NEXT_STATE, VALUE). VALUE uses a
+            zero bootstrap here, so its targets equal immediate reward;
+            use :class:`TDStream` for genuine bootstrapped TD targets.
         include_action_in_features: If True, features = concat(obs, action)
         seed: Random seed for environment resets and random policy
 
@@ -272,8 +281,10 @@ def learn_from_trajectory(
         learner_state: Initial state (if None, will be initialized)
 
     Returns:
-        Tuple of (final_state, metrics_array) where metrics_array has shape
-        (num_steps, 3) with columns [squared_error, error, mean_step_size]
+        Tuple of (final_state, metrics_array). For a plain learner the
+        metrics have shape (num_steps, 3) with columns
+        [squared_error, error, mean_step_size]; a learner constructed with
+        a normalizer emits a fourth column, normalizer_mean_var.
     """
     if learner_state is None:
         learner_state = learner.init(observations.shape[1])
@@ -299,9 +310,10 @@ def learn_from_trajectory_normalized(
 ) -> tuple[LearnerState, Array]:
     """Learn from a pre-collected trajectory with normalization using jax.lax.scan.
 
-    This is equivalent to ``learn_from_trajectory`` for a learner constructed
-    with a normalizer (e.g. ``LinearLearner(optimizer=..., normalizer=EMANormalizer())``).
-    Retained for backward compatibility.
+    Backward-compatible alias of :func:`learn_from_trajectory`; normalization
+    lives in the learner itself (e.g.
+    ``LinearLearner(optimizer=..., normalizer=EMANormalizer())``), so the two
+    functions are identical.
 
     Args:
         learner: The learner to train (should have a normalizer configured)
@@ -310,8 +322,10 @@ def learn_from_trajectory_normalized(
         learner_state: Initial state (if None, will be initialized)
 
     Returns:
-        Tuple of (final_state, metrics_array) where metrics_array has shape
-        (num_steps, 4) with columns [squared_error, error, mean_step_size, normalizer_mean_var]
+        Tuple of (final_state, metrics_array). The column count follows the
+        learner: with a normalizer configured, shape (num_steps, 4) with
+        columns [squared_error, error, mean_step_size, normalizer_mean_var];
+        without one, only the first 3 columns.
     """
     return learn_from_trajectory(learner, observations, targets, learner_state)
 
@@ -574,7 +588,14 @@ class TDStream:
         return self
 
     def __next__(self) -> TimeStep:
-        """Generate the next time step with TD target."""
+        """Generate the next time step with TD target.
+
+        Caveat: with ``include_action_in_features=True`` the bootstrap
+        features pair the *next* observation with the *current* action —
+        Q(s', a) rather than Q(s', a') — because the next action has not
+        been sampled yet.  The target is therefore biased relative to
+        SARSA's ``reward + gamma * Q(s', a')``.
+        """
         if self._current_obs is None:
             raw_obs, _ = self._env.reset(seed=self._get_reset_seed())
             self._current_obs = _flatten_observation(raw_obs, self._env.observation_space)

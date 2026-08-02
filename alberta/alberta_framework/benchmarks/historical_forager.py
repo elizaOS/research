@@ -1,5 +1,10 @@
 """Dedicated runner for the reconstructed paper-era NumPy Forager family.
 
+"Paper-era" refers to the Forager benchmark of arXiv:2605.01131 (see
+:mod:`alberta_framework.benchmarks.forager` for the maintained testbed and
+:mod:`alberta_framework.benchmarks.historical_forager_provenance` for why the
+reconstruction is not an attestation of the archived paper runs).
+
 This module intentionally does not import the historical environment.  A
 caller supplies a factory from a sealed installation; the trusted adapter
 preflight rejects writable temporary source and checks an exact d140 behavior
@@ -88,6 +93,9 @@ HISTORICAL_FORAGER_TAIL_FRACTION: Final = 0.10
 HISTORICAL_FORAGER_GOLDEN_TRACE_SHA256: Final = (
     "4ec4ff280ab23683124bc4280be06a535f6af888e4e5bff74ab0a0d44562531f"
 )
+# Arbitrary-but-frozen NumPy seed for the 256-action golden preflight walk in
+# ``verify_historical_environment_factory``; the value carries no meaning, but
+# changing it invalidates HISTORICAL_FORAGER_GOLDEN_TRACE_SHA256 above.
 HISTORICAL_FORAGER_GOLDEN_ACTION_SEED: Final = 0x51A7E
 
 _RESULT_FILENAME = "result.json"

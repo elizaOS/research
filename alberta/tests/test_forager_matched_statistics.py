@@ -1,4 +1,18 @@
-"""Synthetic contract tests for reward-agnostic matched Forager statistics."""
+"""Synthetic contract tests for reward-agnostic matched Forager statistics.
+
+The module under test freezes the two analyses of the matched-current
+protocol: the paired percentile bootstrap on seed-paired score differences
+(primary; Efron & Tibshirani 1993, "An Introduction to the Bootstrap") and
+the paired sign-flip randomization test with Holm's step-down familywise
+correction (secondary; Holm 1979, Scand. J. Statist. 6:65-70).  Neither
+output is treated as a population confidence bound or confirmatory test —
+the frozen protocol states no seed-superpopulation model and no sign
+exchangeability — so the tests here pin *mechanical exactness* instead:
+every numeric assertion replays the identical ``PCG64(seed)`` stream or an
+exact-arithmetic (Fraction/dyadic) oracle, and canonical results must
+fail closed under tampering, forgery, non-canonical JSON, and non-finite or
+non-builtin score types.
+"""
 
 from __future__ import annotations
 
@@ -37,6 +51,8 @@ from alberta_framework.benchmarks.forager_matched_statistics import (
 
 pytestmark = pytest.mark.unit
 
+# Four seed-paired scores are the smallest panel that exercises pairing,
+# ranking, and tie behavior; values are arbitrary but fixed.
 SEEDS = (101, 202, 303, 404)
 EVIDENCE = EvidenceBinding(
     horizon=1_000,
@@ -55,6 +71,11 @@ EVIDENCE = EvidenceBinding(
     selection_result_sha256="c" * 64,
     selection_report_sha256="d" * 64,
 )
+# Resample counts are deliberately small: every numeric test replays the
+# identical PCG64(seed) stream (or an exact-arithmetic oracle), so exactness
+# does not depend on the count and small values keep the unit lane fast.
+# Bootstrap and permutation seeds are arbitrary but distinct, so the two
+# generator streams can never coincide by accident.
 BOOTSTRAP = BootstrapSpec(resamples=257, seed=7_001, confidence=0.95)
 PERMUTATION = PermutationSpec(
     monte_carlo_resamples=512,

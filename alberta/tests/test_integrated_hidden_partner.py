@@ -1,4 +1,22 @@
-"""Focused L0 mechanism tests for the integrated hidden-partner kernel."""
+"""Focused L0 mechanism tests for the integrated hidden-partner kernel.
+
+L0 is the lowest rung of this repo's evidence ladder (``RESEARCH_STATUS.md``):
+API, shape, finite-value, serialization, and local-update contracts — never
+learning or performance claims.  The kernel under test
+(:mod:`alberta_framework.core.integrated_hidden_partner`) composes one
+explicit causal transition per step: learned state -> bounded pair discovery
+-> partner prediction -> joint-outcome planning -> differential SARSA.  Its
+central design property, enforced throughout this suite, is that every
+ablation is *shape-matched*: disabled paths still compute their update (then
+discard it), so resource accounting, array shapes, and RNG advancement are
+identical across arms and eager/jit/scan execution.
+
+Tests are deliberately white-box and comment-light — the long test names
+state each contract; fixtures pin the frozen dimension constants
+(``RAW_OBSERVATION_DIM``/``HIDDEN_STATE_DIM``/``ACTIVE_PAIR_SLOTS`` etc.)
+whose values come from the frozen v6 design manifest
+(:mod:`alberta_framework.evaluation.hidden_partner_lifecycle_world_v6`).
+"""
 
 from __future__ import annotations
 
@@ -44,6 +62,11 @@ from alberta_framework.streams.hidden_partner_mapping import (
     HiddenPartnerMappingWorld,
 )
 
+# Same values as V6_INITIAL_ACTIVE_DESCRIPTORS in the frozen v6 design
+# manifest (evaluation.hidden_partner_lifecycle_world_v6).  Deliberately
+# different from the kernel's default INITIAL_ACTIVE_DESCRIPTORS, so the
+# custom-bank round-trip and routing tests exercise a genuinely nondefault
+# descriptor bank.
 V6_TEST_ACTIVE_DESCRIPTORS: tuple[tuple[int, int], ...] = (
     (0, 4),
     (0, 5),
@@ -318,6 +341,21 @@ def test_config_round_trip_and_exact_default_composition() -> None:
     old_schema["schema_version"] = "alberta.integrated-hidden-partner.l0.v14"
     with pytest.raises(ValueError, match="unsupported"):
         IntegratedHiddenPartnerConfig.from_config(old_schema)
+    assert payload["action_selection_mode"] == "agent"
+    forced_payload = IntegratedHiddenPartnerConfig(
+        action_selection_mode="externally_forced"
+    ).to_config()
+    assert (
+        IntegratedHiddenPartnerConfig.from_config(forced_payload).action_selection_mode
+        == "externally_forced"
+    )
+    missing_mode = copy.deepcopy(payload)
+    missing_mode.pop("action_selection_mode")
+    with pytest.raises(ValueError, match="v15 schema"):
+        IntegratedHiddenPartnerConfig.from_config(missing_mode)
+    for invalid_mode in (None, 1, "forced"):
+        with pytest.raises(ValueError, match="action_selection_mode"):
+            IntegratedHiddenPartnerConfig(action_selection_mode=invalid_mode)  # type: ignore[arg-type]
 
 
 def test_start_binds_exact_pre_td_q_provenance_and_control_invariants() -> None:
@@ -404,6 +442,218 @@ def test_externally_forced_start_is_strict_and_preserves_policy_rng_primitives()
             key,
             jnp.asarray(0.0, dtype=jnp.float32),
         )
+
+
+def test_forced_update_replaces_only_applied_action_and_is_fail_closed() -> None:
+    policy = IntegratedHiddenPartnerAgent(
+        IntegratedHiddenPartnerConfig(action_selection_mode="agent")
+    )
+    forced = IntegratedHiddenPartnerAgent(
+        IntegratedHiddenPartnerConfig(action_selection_mode="externally_forced")
+    )
+    environment = _environment()
+    world_state = environment.init(jr.key(8_402))
+    raw = environment.observe(world_state)
+    key = jr.key(18_402)
+    policy_start = policy.start(raw, key)
+    forced_start = forced.start_with_forced_action(raw, key, policy_start.action)
+    transition, _ = environment.step(world_state, policy_start.action)
+    policy_result = policy.update(policy_start.state, transition)
+    forced_next_action = jnp.asarray(1 - int(policy_result.action), dtype=jnp.int32)
+    forced_result = forced.update_with_forced_next_action(
+        forced_start.state,
+        transition,
+        forced_next_action,
+    )
+
+    chex.assert_trees_all_equal(
+        forced_result.diagnostics.next_evaluation,
+        policy_result.diagnostics.next_evaluation,
+    )
+    for field in (
+        "noisy_greedy_action",
+        "random_action",
+        "explored",
+        "rng_key_before",
+        "rng_key_after",
+    ):
+        chex.assert_trees_all_equal(
+            getattr(forced_result.state.current_selection, field),
+            getattr(policy_result.state.current_selection, field),
+        )
+    assert int(forced_result.action) == int(forced_next_action)
+    assert int(forced_result.state.control.last_action) == int(forced_next_action)
+    assert bool(forced_result.state.current_selection.externally_forced)
+    assert not bool(policy_result.state.current_selection.externally_forced)
+    _assert_current_q_value_delta(forced, forced_result.state)
+
+    with pytest.raises(ValueError, match="externally_forced"):
+        forced.update(forced_start.state, transition)
+    with pytest.raises(ValueError, match="agent"):
+        policy.update_with_forced_next_action(
+            policy_start.state,
+            transition,
+            jnp.asarray(0, dtype=jnp.int32),
+        )
+    with pytest.raises(ValueError, match="shape"):
+        forced.update_with_forced_next_action(
+            forced_start.state,
+            transition,
+            jnp.asarray([0], dtype=jnp.int32),
+        )
+    with pytest.raises(TypeError, match="dtype"):
+        forced.update_with_forced_next_action(
+            forced_start.state,
+            transition,
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+
+    invalid = forced.update_with_forced_next_action(
+        forced_start.state,
+        transition,
+        jnp.asarray(2, dtype=jnp.int32),
+    )
+    chex.assert_trees_all_equal(invalid.state, forced_start.state)
+    assert int(invalid.action) == int(forced_start.action)
+    assert bool(invalid.diagnostics.transition_rejected)
+    assert not bool(invalid.diagnostics.all_finite)
+    assert int(invalid.diagnostics.integrated_step_delta) == 0
+
+
+def test_forced_actions_scan_and_closed_form_td_are_causal() -> None:
+    agent = IntegratedHiddenPartnerAgent(
+        IntegratedHiddenPartnerConfig(
+            action_selection_mode="externally_forced",
+            feature_lifecycle_enabled=False,
+            replacement_interval=0,
+            trace_decay=0.5,
+        )
+    )
+    environment = _environment()
+    world_state = environment.init(jr.key(8_403))
+    preview, _ = environment.step(
+        world_state,
+        jnp.asarray(0, dtype=jnp.int32),
+    )
+    initial_action = preview.partner_action
+    start = agent.start_with_forced_action(
+        environment.observe(world_state),
+        jr.key(18_403),
+        initial_action,
+    )
+    first_transition, second_world_state = environment.step(
+        world_state,
+        start.action,
+    )
+    assert float(first_transition.reward) == 1.0
+    warm = agent.update_with_forced_next_action(
+        start.state,
+        first_transition,
+        jnp.asarray(0, dtype=jnp.int32),
+    )
+    second_transition, _ = environment.step(second_world_state, warm.action)
+    branch_zero = agent.update_with_forced_next_action(
+        warm.state,
+        second_transition,
+        jnp.asarray(0, dtype=jnp.int32),
+    )
+    branch_one = agent.update_with_forced_next_action(
+        warm.state,
+        second_transition,
+        jnp.asarray(1, dtype=jnp.int32),
+    )
+    chex.assert_trees_all_equal(
+        branch_zero.diagnostics.next_evaluation,
+        branch_one.diagnostics.next_evaluation,
+    )
+    q_next = branch_zero.diagnostics.next_evaluation.q_values
+    assert float(q_next[0]) != float(q_next[1])
+    assert float(
+        branch_zero.diagnostics.td_error - branch_one.diagnostics.td_error
+    ) == pytest.approx(float(q_next[0] - q_next[1]), abs=1e-7)
+    assert int(branch_zero.action) == 0
+    assert int(branch_one.action) == 1
+
+    forced_actions = jnp.asarray([0, 1, 0], dtype=jnp.int32)
+
+    def scan_step(carry: Any, forced_action: Any) -> tuple[Any, Any]:
+        agent_state, environment_state = carry
+        transition, next_environment_state = environment.step(
+            environment_state,
+            agent_state.control.last_action,
+        )
+        fresh_current_q = agent.control_agent.q_values(
+            agent_state.control,
+            agent_state.chi,
+        )
+        update = agent.update_with_forced_next_action(
+            agent_state,
+            transition,
+            forced_action,
+        )
+        expected_td_error = (
+            transition.reward
+            - agent_state.control.average_reward
+            + transition.discount
+            * update.diagnostics.next_evaluation.q_values[forced_action]
+            - fresh_current_q[agent_state.control.last_action]
+        )
+        return (update.state, next_environment_state), (
+            update.action,
+            update.diagnostics.next_selection.externally_forced,
+            update.diagnostics.td_error,
+            expected_td_error,
+            update.diagnostics.all_finite,
+        )
+
+    (final_state, _), outputs = jax.jit(
+        lambda state, world: jax.lax.scan(
+            scan_step,
+            (state, world),
+            forced_actions,
+        )
+    )(start.state, world_state)
+    actions, externally_forced, td_errors, expected_td_errors, finite = outputs
+
+    chex.assert_trees_all_equal(actions, forced_actions)
+    chex.assert_trees_all_equal(
+        externally_forced,
+        jnp.ones((3,), dtype=jnp.bool_),
+    )
+    chex.assert_trees_all_close(td_errors, expected_td_errors, atol=0.0, rtol=0.0)
+    assert bool(jnp.all(finite))
+    assert int(final_state.step_count) == 3
+    assert int(final_state.control.last_action) == 0
+    _assert_current_q_value_delta(agent, final_state)
+
+    invalid_actions = jnp.asarray([0, 2], dtype=jnp.int32)
+
+    def invalid_scan_step(carry: Any, forced_action: Any) -> tuple[Any, Any]:
+        agent_state, environment_state = carry
+        transition, next_environment_state = environment.step(
+            environment_state,
+            agent_state.control.last_action,
+        )
+        update = agent.update_with_forced_next_action(
+            agent_state,
+            transition,
+            forced_action,
+        )
+        return (
+            update.state,
+            next_environment_state,
+        ), update.diagnostics.integrated_step_delta
+
+    (invalid_final, _), deltas = jax.jit(
+        lambda state, world: jax.lax.scan(
+            invalid_scan_step,
+            (state, world),
+            invalid_actions,
+        )
+    )(start.state, world_state)
+    assert int(deltas[0]) == 1
+    assert int(deltas[1]) == 0
+    assert int(invalid_final.step_count) == 1
 
 
 def test_custom_initial_descriptor_config_roundtrips_ordered_json_lists() -> None:
@@ -1347,6 +1597,7 @@ def test_integrated_transition_acquires_read_before_write_confirmation() -> None
         result.state.control.q_trace_weights[:, BASE_FEATURE_DIM:],
         jnp.zeros((2, ACTIVE_PAIR_SLOTS), dtype=jnp.float32),
     )
+    _assert_current_q_value_delta(agent, result.state)
 
 
 def test_integrated_idle_read_lease_cannot_write_behavior_or_q_columns() -> None:
@@ -2456,6 +2707,8 @@ def test_one_update_is_prequential_and_advances_every_online_counter_once() -> N
         result.state.current_selection,
         diagnostics.next_selection,
     )
+    _assert_current_q_value_delta(agent, result.state)
+    assert not bool(result.state.current_selection.externally_forced)
     chex.assert_trees_all_equal(
         result.state.control.rng_key,
         diagnostics.next_selection.rng_key_after,
@@ -2570,6 +2823,8 @@ def test_feature_lifecycle_freeze_commits_exact_pre_curation_learning(
 
     enabled_result = enabled.update(enabled_state, transition)
     frozen_result = frozen.update(frozen_state, frozen_transition)
+    _assert_current_q_value_delta(enabled, enabled_result.state)
+    _assert_current_q_value_delta(frozen, frozen_result.state)
 
     assert int(enabled_result.diagnostics.interaction_replaced_slot) == 0
     assert int(frozen_result.diagnostics.interaction_replaced_slot) == 0
@@ -2687,6 +2942,8 @@ def test_evidence_lease_retires_then_fills_one_vacancy_atomically() -> None:
     assert int(retired_diagnostics.route.new_count) == 0
     assert int(retired_diagnostics.route.old_live_count) == 12
     assert int(retired_diagnostics.route.new_live_count) == 11
+    assert bool(retired_diagnostics.consumer_route_values_exact)
+    assert bool(retired_diagnostics.consumer_lifecycle_destination_reset_exact)
     np.testing.assert_array_equal(
         retired.state.router.descriptors[0],
         [-1, -1],
@@ -2893,6 +3150,227 @@ def test_atomic_route_moves_all_four_downstream_feature_consumers() -> None:
     assert int(routed_router.generation_count) == 1
 
 
+@pytest.mark.parametrize("compiled", [False, True])
+def test_update_reports_independent_consumer_identity_value_audit(compiled: bool) -> None:
+    agent = IntegratedHiddenPartnerAgent()
+    start, transition, _ = _start_and_transition(agent, seed=7_701)
+    update = jax.jit(agent.update) if compiled else agent.update
+
+    diagnostics = update(start.state, transition).diagnostics
+
+    for verdict in (
+        diagnostics.consumer_route_source_slots_exact,
+        diagnostics.consumer_route_identity_masks_exact,
+        diagnostics.consumer_route_stable_prefix_exact,
+        diagnostics.consumer_route_survivor_values_exact,
+        diagnostics.consumer_route_reset_values_exact,
+        diagnostics.consumer_route_no_carry_reset_exact,
+        diagnostics.consumer_route_behavior_values_exact,
+        diagnostics.consumer_route_q_values_exact,
+        diagnostics.consumer_route_trace_values_exact,
+        diagnostics.consumer_route_last_observation_exact,
+        diagnostics.consumer_route_grounded_values_exact,
+        diagnostics.consumer_route_values_exact,
+        diagnostics.consumer_lifecycle_destination_reset_exact,
+    ):
+        assert bool(verdict)
+
+
+def test_consumer_identity_audit_rejects_each_corrupt_routed_column_eager_and_jit() -> None:
+    agent = IntegratedHiddenPartnerAgent(
+        _grounded_integrated_config(
+            feature_lifecycle_enabled=True,
+            replacement_interval=64,
+        )
+    )
+    start, _, _ = _start_and_transition(agent, seed=7_702)
+    state = start.state
+    assert state.grounded_world is not None
+    old = state.router.descriptors
+    proposed = (
+        old.at[0]
+        .set(old[2])
+        .at[1]
+        .set(old[0])
+        .at[2]
+        .set(jnp.asarray([4, 5], dtype=jnp.int32))
+    )
+    base = jnp.arange(2 * DEPLOYED_FEATURE_DIM, dtype=jnp.float32).reshape(
+        (2, DEPLOYED_FEATURE_DIM)
+    )
+    behavior = state.behavior.replace(weights=base)
+    control = state.control.replace(
+        q_weights=base + 100.0,
+        q_trace_weights=base + 200.0,
+        last_observation=jnp.arange(DEPLOYED_FEATURE_DIM, dtype=jnp.float32) + 300.0,
+    )
+    grounded = state.grounded_world.replace(
+        weights=jnp.arange(
+            state.grounded_world.weights.size,
+            dtype=jnp.float32,
+        ).reshape(state.grounded_world.weights.shape)
+    )
+    routed_behavior, routed_control, routed_grounded, route, _ = (
+        agent._route_feature_consumers_with_grounded(  # noqa: SLF001
+            state.router,
+            behavior,
+            control,
+            grounded,
+            proposed,
+        )
+    )
+
+    def audit(
+        route_diagnostics: Any,
+        behavior_after: jax.Array,
+        q_after: jax.Array,
+        trace_after: jax.Array,
+        observation_after: jax.Array,
+        grounded_after: jax.Array,
+    ) -> Any:
+        return agent._audit_consumer_identity_route(  # noqa: SLF001
+            old_descriptors=old,
+            new_descriptors=proposed,
+            route=route_diagnostics,
+            behavior_before=behavior.weights,
+            behavior_after=behavior_after,
+            q_before=control.q_weights,
+            q_after=q_after,
+            trace_before=control.q_trace_weights,
+            trace_after=trace_after,
+            last_observation_before=control.last_observation,
+            last_observation_after=observation_after,
+            grounded_before=grounded.weights,
+            grounded_after=grounded_after,
+            retired_slot=jnp.asarray(-1, dtype=jnp.int32),
+            replaced_slot=jnp.asarray(2, dtype=jnp.int32),
+        )
+
+    compiled_audit = jax.jit(audit)
+    valid_arguments = (
+        route,
+        routed_behavior.weights,
+        routed_control.q_weights,
+        routed_control.q_trace_weights,
+        routed_control.last_observation,
+        routed_grounded.weights,
+    )
+    for evaluate in (audit, compiled_audit):
+        assert bool(evaluate(*valid_arguments).values_exact)
+
+    destination = BASE_FEATURE_DIM
+    corruptions = (
+        (
+            dataclasses.replace(route, source_slots=route.source_slots.at[0].set(1)),
+            *valid_arguments[1:],
+            "source_slots_exact",
+        ),
+        (
+            route,
+            routed_behavior.weights.at[..., destination].add(0.25),
+            *valid_arguments[2:],
+            "behavior_values_exact",
+        ),
+        (
+            route,
+            valid_arguments[1],
+            routed_control.q_weights.at[..., destination].add(0.25),
+            *valid_arguments[3:],
+            "q_values_exact",
+        ),
+        (
+            route,
+            *valid_arguments[1:3],
+            routed_control.q_trace_weights.at[..., destination].add(0.25),
+            *valid_arguments[4:],
+            "trace_values_exact",
+        ),
+        (
+            route,
+            *valid_arguments[1:4],
+            routed_control.last_observation.at[destination].add(0.25),
+            valid_arguments[5],
+            "last_observation_exact",
+        ),
+        (
+            route,
+            *valid_arguments[1:5],
+            routed_grounded.weights.at[..., destination].add(0.25),
+            "grounded_values_exact",
+        ),
+    )
+    for corruption in corruptions:
+        *arguments, failed_field = corruption
+        for evaluate in (audit, compiled_audit):
+            verdict = evaluate(*arguments)
+            assert not bool(getattr(verdict, failed_field))
+            assert not bool(verdict.values_exact)
+
+    reset_destination = BASE_FEATURE_DIM + 2
+    replacement_corruption = (
+        route,
+        routed_behavior.weights.at[..., reset_destination].set(1.0),
+        *valid_arguments[2:],
+    )
+    for evaluate in (audit, compiled_audit):
+        verdict = evaluate(*replacement_corruption)
+        assert not bool(verdict.reset_values_exact)
+        assert not bool(verdict.behavior_values_exact)
+        assert not bool(verdict.values_exact)
+        assert not bool(verdict.lifecycle_destination_reset_exact)
+
+
+def test_consumer_identity_audit_proves_retired_destination_reset_eager_and_jit() -> None:
+    agent = IntegratedHiddenPartnerAgent(
+        _grounded_integrated_config(
+            feature_lifecycle_enabled=True,
+            replacement_interval=64,
+        )
+    )
+    start, _, _ = _start_and_transition(agent, seed=7_703)
+    state = start.state
+    assert state.grounded_world is not None
+    retired_descriptors = state.router.descriptors.at[0].set(
+        jnp.asarray((-1, -1), dtype=jnp.int32)
+    )
+    routed_behavior, routed_control, routed_grounded, route, _ = (
+        agent._route_feature_consumers_with_grounded(  # noqa: SLF001
+            state.router,
+            state.behavior,
+            state.control,
+            state.grounded_world,
+            retired_descriptors,
+        )
+    )
+
+    def audit(q_after: jax.Array) -> Any:
+        return agent._audit_consumer_identity_route(  # noqa: SLF001
+            old_descriptors=state.router.descriptors,
+            new_descriptors=retired_descriptors,
+            route=route,
+            behavior_before=state.behavior.weights,
+            behavior_after=routed_behavior.weights,
+            q_before=state.control.q_weights,
+            q_after=q_after,
+            trace_before=state.control.q_trace_weights,
+            trace_after=routed_control.q_trace_weights,
+            last_observation_before=state.control.last_observation,
+            last_observation_after=routed_control.last_observation,
+            grounded_before=state.grounded_world.weights,
+            grounded_after=routed_grounded.weights,
+            retired_slot=jnp.asarray(0, dtype=jnp.int32),
+            replaced_slot=jnp.asarray(-1, dtype=jnp.int32),
+        )
+
+    corrupted_q = routed_control.q_weights.at[..., BASE_FEATURE_DIM].set(1.0)
+    for evaluate in (audit, jax.jit(audit)):
+        assert bool(evaluate(routed_control.q_weights).lifecycle_destination_reset_exact)
+        verdict = evaluate(corrupted_q)
+        assert not bool(verdict.reset_values_exact)
+        assert not bool(verdict.q_values_exact)
+        assert not bool(verdict.lifecycle_destination_reset_exact)
+
+
 def test_no_carry_preserves_between_transactions_and_zeros_on_change() -> None:
     agent = IntegratedHiddenPartnerAgent(IntegratedHiddenPartnerConfig(carry_survivors=False))
     start, _, _ = _start_and_transition(agent, seed=8)
@@ -2990,6 +3468,25 @@ def test_external_next_action_advances_rng_before_explicit_sarsa_update() -> Non
     assert int(update.state.last_action) == 1
     assert int(update.action) == 1
     assert int(update.state.step_count) == int(control.step_count) + 1
+
+
+def test_zero_control_learning_rates_keep_exact_zero_q_provenance_delta() -> None:
+    agent = IntegratedHiddenPartnerAgent(
+        IntegratedHiddenPartnerConfig(
+            q_step_size=0.0,
+            average_reward_step_size=0.0,
+            trace_decay=0.9,
+        )
+    )
+    start, transition, _ = _start_and_transition(agent, seed=9_001)
+    result = agent.update(start.state, transition)
+
+    chex.assert_trees_all_equal(
+        result.state.current_q_value_delta,
+        jnp.zeros((2,), dtype=jnp.float32),
+    )
+    _assert_current_q_value_delta(agent, result.state)
+    assert bool(result.diagnostics.all_finite)
 
 
 def test_resource_accounting_is_exact_and_ablation_shape_matched() -> None:
@@ -3501,6 +3998,19 @@ def test_grounded_update_and_all_gradient_modes_are_prequential_and_shape_matche
         atol=0.0,
         rtol=0.0,
     )
+    joint_index = 2 * int(transition.focal_action) + int(transition.partner_action)
+    cached_grounded = before.current_evaluation.grounded_world
+    assert cached_grounded is not None
+    assert int(grounded_update.prediction.joint_action_index) == joint_index
+    chex.assert_trees_all_equal(
+        grounded_update.prediction.raw_predictions,
+        cached_grounded.grounded_raw_predictions[joint_index],
+    )
+    chex.assert_trees_all_equal(
+        grounded_update.prediction.raw_predictions,
+        grounded_update.prediction.feature_contribution + grounded_update.prediction.row_bias,
+    )
+    assert bool(result.diagnostics.grounded_world_prediction_matches_decision)
     assert bool(grounded_update.diagnostics.applied)
     assert int(result.state.grounded_world.update_count) == 1
     assert int(result.diagnostics.grounded_world_step_delta) == 1
@@ -4158,6 +4668,35 @@ def test_grounded_evidence_gated_no_carry_route_is_one_atomic_transaction() -> N
     assert bool(diagnostics.descriptors_changed)
     assert not bool(diagnostics.carry_survivors)
 
+    def audit(q_after: jax.Array) -> Any:
+        return agent._audit_consumer_identity_route(  # noqa: SLF001
+            old_descriptors=old,
+            new_descriptors=proposed,
+            route=diagnostics,
+            behavior_before=behavior.weights,
+            behavior_after=routed_behavior.weights,
+            q_before=control.q_weights,
+            q_after=q_after,
+            trace_before=control.q_trace_weights,
+            trace_after=routed_control.q_trace_weights,
+            last_observation_before=control.last_observation,
+            last_observation_after=routed_control.last_observation,
+            grounded_before=grounded.weights,
+            grounded_after=routed_grounded.weights,
+            retired_slot=jnp.asarray(-1, dtype=jnp.int32),
+            replaced_slot=jnp.asarray(2, dtype=jnp.int32),
+        )
+
+    corrupted_tail = routed_control.q_weights.at[..., BASE_FEATURE_DIM:].set(1.0)
+    for evaluate in (audit, jax.jit(audit)):
+        valid = evaluate(routed_control.q_weights)
+        assert bool(valid.no_carry_reset_exact)
+        assert bool(valid.values_exact)
+        corrupted = evaluate(corrupted_tail)
+        assert not bool(corrupted.no_carry_reset_exact)
+        assert not bool(corrupted.q_values_exact)
+        assert not bool(corrupted.values_exact)
+
 
 def test_invalid_grounded_transition_has_eager_jit_and_scan_atomic_parity() -> None:
     agent = IntegratedHiddenPartnerAgent(_grounded_integrated_config())
@@ -4193,6 +4732,7 @@ def test_complete_table_decision_cache_and_selection_mutations_fail_closed() -> 
     evaluation = state.current_evaluation
     selection = state.current_selection
     one = jnp.asarray(1, dtype=jnp.int32)
+    common_offset = jnp.full((2,), 0.125, dtype=jnp.float32)
     mutations = (
         state.replace(
             current_evaluation=evaluation.replace(
@@ -4231,6 +4771,35 @@ def test_complete_table_decision_cache_and_selection_mutations_fail_closed() -> 
         ),
         state.replace(
             current_evaluation=evaluation.replace(
+                q_values=evaluation.q_values + common_offset,
+                planner_scores=evaluation.planner_scores + common_offset,
+            )
+        ),
+        state.replace(
+            current_q_value_delta=state.current_q_value_delta.at[0].add(0.125)
+        ),
+        state.replace(
+            current_q_value_delta=state.current_q_value_delta.at[0].set(jnp.nan)
+        ),
+        state.replace(
+            control=state.control.replace(
+                last_observation=state.control.last_observation.at[0].add(0.125)
+            )
+        ),
+        state.replace(
+            control=state.control.replace(epsilon=state.control.epsilon + 0.125)
+        ),
+        state.replace(
+            control=state.control.replace(q_bias=state.control.q_bias.at[0].add(0.125))
+        ),
+        state.replace(
+            control=state.control.replace(
+                q_trace_bias=state.control.q_trace_bias.at[0].add(0.125)
+            )
+        ),
+        state.replace(control=state.control.replace(step_count=state.control.step_count + one)),
+        state.replace(
+            current_evaluation=evaluation.replace(
                 centered_expected_rewards=evaluation.centered_expected_rewards.at[0].add(0.125)
             )
         ),
@@ -4267,6 +4836,11 @@ def test_complete_table_decision_cache_and_selection_mutations_fail_closed() -> 
         state.replace(current_selection=selection.replace(explored=~selection.explored)),
         state.replace(
             current_selection=selection.replace(
+                externally_forced=~selection.externally_forced
+            )
+        ),
+        state.replace(
+            current_selection=selection.replace(
                 rng_key_before=jr.fold_in(selection.rng_key_before, 1)
             )
         ),
@@ -4278,6 +4852,26 @@ def test_complete_table_decision_cache_and_selection_mutations_fail_closed() -> 
     )
 
     _assert_cache_mutations_reject_in_eager_jit_and_scan(agent, transition, mutations)
+
+
+def test_current_q_value_delta_static_contract_rejects_shape_and_dtype() -> None:
+    agent = IntegratedHiddenPartnerAgent()
+    start, transition, _ = _start_and_transition(agent, seed=8313)
+
+    with pytest.raises(ValueError, match="current_q_value_delta.*shape"):
+        agent.update(
+            start.state.replace(
+                current_q_value_delta=jnp.zeros((1,), dtype=jnp.float32)
+            ),
+            transition,
+        )
+    with pytest.raises(TypeError, match="current_q_value_delta.*dtype"):
+        agent.update(
+            start.state.replace(
+                current_q_value_delta=jnp.zeros((2,), dtype=jnp.int32)
+            ),
+            transition,
+        )
 
 
 def test_complete_grounded_decision_cache_mutations_fail_closed() -> None:

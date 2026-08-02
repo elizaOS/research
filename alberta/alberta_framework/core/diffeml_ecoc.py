@@ -1,8 +1,17 @@
 """Error-correcting output-code readouts for Boolean DiffEML circuits.
 
-The deployed path represented here is intentionally discrete: a circuit emits
-code bits, and classification is nearest-codeword decoding under Hamming
-distance.  The helpers below avoid a learned floating-point readout head.
+Error-correcting output codes (ECOC) follow Dietterich & Bakiri (1995),
+"Solving multiclass learning problems via error-correcting output codes",
+JAIR 2.  The deployed path represented here is intentionally discrete: a
+circuit emits code bits, and classification is nearest-codeword decoding
+under Hamming distance.  The helpers below avoid a learned floating-point
+readout head.
+
+Nearest-codeword decoding corrects up to ``floor((min_distance - 1) / 2)``
+wrong code bits, so extra bits only help insofar as they raise the pairwise
+minimum distance — check candidates with :func:`codebook_metrics`.
+One-vs-rest codes have minimum distance 2 and correct no bit errors;
+Sylvester-Hadamard codebooks of order ``n`` achieve distance ``n / 2``.
 """
 
 from __future__ import annotations

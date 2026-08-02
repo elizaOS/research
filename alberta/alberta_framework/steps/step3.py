@@ -8,8 +8,8 @@ This module packages the stable Step 3 surface for downstream use:
 * a small smoke run for integration tests.
 
 It intentionally does not claim general TD/GVF feature-discovery closure.
-Research-scale evidence and open boundaries are documented under
-``docs/research/step3_results.md``.
+Research-scale evidence and open boundaries for Step 3 are tracked in
+``RESEARCH_STATUS.md``.
 """
 
 from __future__ import annotations
@@ -329,7 +329,11 @@ def build_step2_to_step3_arrays(
 
     Returns:
         Augmented observations, cumulants, and shifted next observations for
-        :func:`run_horde_learning_loop`.
+        :func:`run_horde_learning_loop`.  The final row's next observation is
+        a duplicate of the final observation (the true successor is
+        unobserved), so the last transition is a synthetic self-loop whose
+        TD target bootstraps on its own features — one boundary row out of
+        ``steps``, kept so all arrays share the same length.
     """
     raw = jnp.asarray(raw_observations, dtype=jnp.float32)
     constructed = jnp.asarray(constructed_features, dtype=jnp.float32)
@@ -363,6 +367,9 @@ def build_step2_to_step3_arrays(
         raise ValueError(msg)
 
     observations = jnp.concatenate([raw, constructed], axis=1)
+    # Boundary row: the successor of the final observation is unobserved, so
+    # the last next-observation duplicates the last observation (a synthetic
+    # self-loop) to keep every array the same length.
     next_observations = jnp.concatenate([observations[1:], observations[-1:]], axis=0)
     return Step3HandoffArrays(
         observations=observations,

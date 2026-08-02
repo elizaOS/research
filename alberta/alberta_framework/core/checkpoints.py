@@ -38,7 +38,11 @@ from typing import Any
 
 import orbax.checkpoint as ocp
 
-# Format version for future compatibility
+# Stamped into checkpoint metadata on save, but deliberately NOT validated on
+# load: compatibility is enforced structurally instead, by restoring into the
+# caller-provided template PyTree (orbax raises ValueError on a tree
+# mismatch). The stamp is provenance for external tooling and any future
+# migration path.
 _FORMAT_VERSION = 2
 
 # Internal metadata key — stripped from user-facing metadata

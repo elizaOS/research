@@ -55,6 +55,15 @@ CONTROL_REPORT_LIMITATIONS = (
     "held-out probes score one action, not a frozen-policy control rollout",
     "plasticity, component survival, and world-model calibration are not emitted",
 )
+# Metric names follow the continual-learning transfer literature: forgetting is
+# the best-to-final degradation measure of Chaudhry et al. (2018, "Riemannian
+# Walk for Incremental Learning"), and backward/forward transfer adapt the
+# BWT/FWT definitions of Lopez-Paz & Ranzato (2017, "Gradient Episodic Memory
+# for Continual Learning") from per-task accuracies to held-out action-score
+# probes over evaluator regimes.  Forward transfer is measured against the
+# protocol's frozen per-regime reference rather than GEM's random-init
+# baseline.  "Direction-normalized" means the sign convention flips with the
+# protocol's ``higher_is_better`` flag so that larger is always better.
 CONTROL_METRIC_DEFINITIONS: Mapping[str, str] = {
     "prequential_return": (
         "mean environment return from actions selected before their corresponding outcomes"
@@ -983,6 +992,7 @@ class _FrozenActionState:
 
 
 def _generation_decision_id(lifecycle_id: tuple[int, int], generation: int) -> DecisionId:
+    """Pack two lifecycle words plus a 64-bit generation counter split across two uint32 words."""
     if generation >= 1 << 64:
         raise ValueError("decision generation is exhausted")
     return (
@@ -1007,6 +1017,8 @@ class FrozenActionControlBaseline:
         n_actions: int,
         action: int = 0,
         name: str = "frozen_action",
+        # Word 0 is ASCII "FROZ": a human-readable tag that identifies this
+        # baseline's decision stream in traces and checkpoints.
         lifecycle_id: tuple[int, int] = (0x46524F5A, 1),
     ):
         self._n_actions = _positive_int(n_actions, name="n_actions")
@@ -1146,6 +1158,8 @@ class RunningRewardBanditControlBaseline:
         *,
         n_actions: int,
         name: str = "running_reward_bandit",
+        # Word 0 is ASCII "BAND": a human-readable tag that identifies this
+        # baseline's decision stream in traces and checkpoints.
         lifecycle_id: tuple[int, int] = (0x42414E44, 1),
     ):
         self._n_actions = _positive_int(n_actions, name="n_actions")
@@ -1402,6 +1416,10 @@ class PrototypeAgentControlAdapter:
             return False
         try:
             expected = self._jax_observation(observation)
+            # PrototypeAgent exposes no public checkpoint-validity predicate, so
+            # the adapter reuses the agent's own structural + numeric-leaf
+            # validator; "valid" here is exactly the invariant the agent
+            # enforces on its own checkpoints.
             return bool(
                 self._agent._checkpoint_state_valid(state)
                 & jnp.array_equal(state.current_raw_observation, expected)
@@ -1558,6 +1576,8 @@ class PrototypeAgentControlAdapter:
         )
         if _canonical_json(self.state_to_config(restored)) != _canonical_json(mapping):
             raise ValueError("PrototypeAgent control state numeric payload is not canonical")
+        # Same private validator as state_valid_for_observation; no public
+        # equivalent exists.
         if not bool(self._agent._checkpoint_state_valid(restored)):
             raise ValueError("reconstructed PrototypeAgent state is inconsistent")
         return restored
@@ -1801,6 +1821,7 @@ class ContinualControlEvaluator:
             raise ValueError(f"{learner.name}: config changed during control evaluation")
 
     def _environment_state_payload(self, state: Any) -> object:
+        """Serialize environment state; require idempotent and canonical round-trips."""
         payload = _json_clone(self._environment.state_to_config(state))
         if _json_clone(self._environment.state_to_config(state)) != payload:
             raise ValueError("environment state serialization is not idempotent")
@@ -1811,6 +1832,7 @@ class ContinualControlEvaluator:
 
     @staticmethod
     def _learner_state_payload(learner: ContinuingControlLearner, state: Any) -> object:
+        """Serialize learner state; require idempotent and canonical round-trips."""
         payload = _json_clone(learner.state_to_config(state))
         if _json_clone(learner.state_to_config(state)) != payload:
             raise ValueError(f"{learner.name}: state serialization is not idempotent")
@@ -1898,6 +1920,10 @@ class ContinualControlEvaluator:
         observation: tuple[float, ...],
         used_ids: tuple[DecisionId, ...],
     ) -> tuple[ControlDecision, int]:
+        # Fail-closed call pattern used for every learner/environment call in
+        # this class: serialize the live state, run the callee on a
+        # deserialized clone, then re-serialize both clone and live state to
+        # prove the call had no side effects.
         self._assert_learner_config_stable(learner)
         payload = self._learner_state_payload(learner, state)
         working = learner.state_from_config(_json_clone(payload))
@@ -2092,6 +2118,15 @@ class ContinualControlEvaluator:
         regime_id: str,
         completed_step: int,
     ) -> _ControlConditionState:
+        """Run one full transaction for a single condition.
+
+        The order is fixed: dispatch the pre-armed decision to the
+        environment, feed the owned transition to the learner, re-check the
+        resource ceilings, probe at checkpoint steps, then arm the next
+        decision.  Arming ahead of the next environment step is what makes
+        the return trace prequential — every action is committed before its
+        outcome exists.
+        """
         decision = condition.pending_decision
         if decision is None:
             raise ValueError(f"{learner.name}: no pending decision is available")
@@ -2173,7 +2208,12 @@ class ContinualControlEvaluator:
         *,
         steps: int = 1,
     ) -> ContinualControlRunState:
-        """Advance only complete decision/environment/update transactions."""
+        """Advance only complete decision/environment/update transactions.
+
+        Run-state invariants are re-validated after every completed step, so
+        a contract violation raises before the partial state can be observed
+        or checkpointed.
+        """
         self._validate_run_state(state)
         requested = _positive_int(steps, name="steps")
         if state.step + requested > len(self._protocol.regime_schedule):
@@ -2304,7 +2344,12 @@ class ContinualControlEvaluator:
         }
 
     def build_report(self, state: ContinualControlRunState) -> dict[str, object]:
-        """Build a versioned descriptive report after the complete schedule."""
+        """Build a versioned descriptive report after the complete schedule.
+
+        The freshly built report is immediately round-tripped through the
+        same strict reconstruction used for externally loaded reports, so the
+        evaluator cannot emit an artifact its own validator would reject.
+        """
         self._validate_run_state(state)
         if state.step != len(self._protocol.regime_schedule):
             raise ValueError("cannot build report from an incomplete control run")
@@ -2374,6 +2419,13 @@ class ContinualControlEvaluator:
         return canonical
 
     def _validate_run_state(self, state: ContinualControlRunState) -> None:
+        """Fail-closed invariant sweep over the complete run state.
+
+        Trace lengths, budget ceilings, decision-ID uniqueness, cached
+        observations, and resource high-water marks are all re-derived from
+        the protocol and cross-checked; any mismatch raises rather than being
+        repaired.
+        """
         self._assert_environment_config_stable()
         if not isinstance(state, ContinualControlRunState):
             raise TypeError("state must be a ContinualControlRunState")
@@ -2569,7 +2621,12 @@ class ContinualControlEvaluator:
         return {"step": state.step, "conditions": conditions}
 
     def save_checkpoint(self, state: ContinualControlRunState, path: str | Path) -> None:
-        """Save canonical JSON only between complete environment transactions."""
+        """Save canonical JSON only between complete environment transactions.
+
+        The write is atomic: the payload goes to a same-directory temporary
+        file, is fsynced, then renamed over the destination, so a crash can
+        never leave a truncated checkpoint behind.
+        """
         state_payload = self._state_payload(state)
         config = self.to_config()
         payload = {
@@ -2766,6 +2823,8 @@ class ContinualControlEvaluator:
             )
         state = ContinualControlRunState(step=step, conditions=tuple(conditions))
         self._validate_run_state(state)
+        # Round-trip: re-serializing the restored state must reproduce the
+        # stored payload exactly, or the checkpoint is rejected.
         if self._state_payload(state) != raw_state:
             raise ValueError("control checkpoint state is not canonical")
         return state

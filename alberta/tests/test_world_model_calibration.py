@@ -185,6 +185,9 @@ def test_ensemble_report_is_raw_reconstructable_nonmutating_and_not_assessed() -
     assert payload["scientific_promotion_allowed"] is False
     assert payload["calibration_claimed"] is False
     assert payload["performance_thresholds_applied"] is False
+    serialized = json.dumps(report).lower()
+    assert "state-of-the-art" not in serialized
+    assert "sota" not in serialized
     assert frozen_world_model_state_sha256(state) == before_hash
 
     raw = payload["raw_trace"]
@@ -234,7 +237,9 @@ def test_ensemble_report_is_raw_reconstructable_nonmutating_and_not_assessed() -
     assert validation.assessment_status == "not-assessed"
 
 
-def test_single_model_marks_member_epistemic_and_residual_fields_unavailable() -> None:
+def test_single_model_marks_member_epistemic_and_residual_fields_unavailable(
+    tmp_path: Path,
+) -> None:
     model, state = _single_snapshot()
     report = build_world_model_calibration_report(model, state, _config(), _probes(3))
     payload = report["payload"]
@@ -270,6 +275,13 @@ def test_single_model_marks_member_epistemic_and_residual_fields_unavailable() -
         probes=_probes(3),
     )
     assert validation.valid, validation.errors
+    checkpoint = tmp_path / "single-snapshot"
+    save_world_model_calibration_snapshot_checkpoint(model, state, checkpoint)
+    restored_model, restored_state = load_world_model_calibration_snapshot_checkpoint(
+        checkpoint
+    )
+    assert isinstance(restored_model, ActionConditionedWorldModel)
+    _assert_tree_equal(restored_state, state)
 
 
 def test_frozen_edge_bins_and_sparse_regions_remain_explicit_without_gates() -> None:
@@ -295,6 +307,20 @@ def test_frozen_edge_bins_and_sparse_regions_remain_explicit_without_gates() -> 
     assert empty["all_head_mean_squared_error"] is None
     assert summary["thresholds_applied"] is False
     assert validate_world_model_calibration_report(report).valid
+
+    pristine = ensemble.init(jr.key(99))
+    warmup_report = build_world_model_calibration_report(
+        ensemble,
+        pristine,
+        config,
+        _probes(3),
+    )
+    warmup = warmup_report["payload"]["summary"][
+        "residual_variance_proxy_diagnostics"
+    ]
+    assert warmup["available"] is True
+    assert warmup["ready"] is False
+    assert warmup["descriptive_applicable"] is False
 
 
 def test_open_loop_runs_only_with_grounded_exact_bounded_reconstruction() -> None:

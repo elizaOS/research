@@ -1,5 +1,19 @@
 """Topology specifications and gate-budget accounting for DiffEML.
 
+"DiffLogic-style" throughout refers to the randomly wired sparse binary-gate
+networks of Petersen, Borgelt, Kuehne & Deussen, "Deep Differentiable Logic
+Gate Networks" (NeurIPS 2022) — the reference family for the random sparse
+plan and for :class:`GateBudgetComparison`.
+
+The deterministic families exist because random wiring must store two
+explicit source indices per node, while pattern wiring is regenerable from a
+few integers (a butterfly layer from its stride, an affine-expander layer
+from four modular-affine coefficients); plans that exploit this record
+compressed ``wiring_storage_bytes`` metadata consumed by
+``deployed_layer_wiring_byte_count``.  Butterfly strides double each layer,
+so degree-2 nodes can propagate information across the full layer width in
+``log2(width)`` layers.
+
 The image demo can already instantiate several concrete wirings in
 ``diffeml_image.make_wiring``.  This module is deliberately narrower: it
 describes topology candidates and computes exact resource counts before a

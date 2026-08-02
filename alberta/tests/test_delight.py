@@ -1,4 +1,4 @@
-"""Focused tests for optimizer-level gradient joy and separate paper-specific DPG."""
+"""Candidate-update audit tests and separate paper-defined delight tests."""
 
 from __future__ import annotations
 
@@ -263,6 +263,7 @@ def test_gradient_joy_hand_calculation_and_eight_channel_separation() -> None:
     assert bool(result.accepted)
     assert bool(result.sparks_joy)
     assert result.sparks_joy is result.accepted
+    assert result.candidate_update_audit_passed is result.accepted
     chex.assert_trees_all_close(result.weight, expected_factor)
     chex.assert_trees_all_close(
         result.weighted_update["weights"],
@@ -1734,6 +1735,38 @@ def test_gradient_joy_fails_closed_on_unavailable_or_nonfinite_evidence() -> Non
         )
 
 
+def test_gradient_joy_requires_exact_paper_dg_delight_identity() -> None:
+    """A historical DG field mismatch cannot count as complete joy evidence."""
+    mismatched = _scalar_learning_value(
+        delight=jnp.nextafter(
+            jnp.asarray(0.5, dtype=jnp.float32),
+            jnp.asarray(1.0, dtype=jnp.float32),
+        )
+    )
+
+    result = assess_gradient_joy(
+        {"weights": jnp.array([-1.0, 0.0], dtype=jnp.float32)},
+        _gradient_joy_evidence(learning_value=mismatched),
+        GradientJoyConfig(candidate_semantics="update", max_update_norm=2.0),
+    )
+    compiled = jax.jit(
+        lambda value: assess_gradient_joy(
+            {"weights": jnp.array([-1.0, 0.0], dtype=jnp.float32)},
+            _gradient_joy_evidence(learning_value=value),
+            GradientJoyConfig(candidate_semantics="update", max_update_norm=2.0),
+        )
+    )(mismatched)
+
+    for assessment in (result, compiled):
+        assert not bool(assessment.channel_availability.delight)
+        assert not bool(assessment.diagnostics.learning_value_complete)
+        assert not bool(assessment.sparks_joy)
+        chex.assert_trees_all_close(
+            assessment.weight,
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+
+
 @pytest.mark.parametrize(
     ("probe_field", "finite_diagnostic"),
     (
@@ -1877,7 +1910,7 @@ def test_gradient_joy_rejects_ambiguous_shapes_and_non_scalar_channels() -> None
         )
 
 
-def test_delight_equations_match_definition() -> None:
+def test_paper_specific_dg_delight_equations_match_definition() -> None:
     log_probabilities = jnp.log(jnp.array([0.5, 0.1, 0.8], dtype=jnp.float32))
     advantages = jnp.array([2.0, -3.0, 0.5], dtype=jnp.float32)
     temperature = 0.7
@@ -1905,7 +1938,7 @@ def test_delight_equations_match_definition() -> None:
     chex.assert_trees_all_close(result.ordinary_actor_loss, expected_ordinary_loss)
 
 
-def test_delight_loss_jits_and_stops_gate_and_advantage_gradients() -> None:
+def test_paper_specific_dg_loss_jits_and_stops_gate_and_advantage_gradients() -> None:
     config = DelightfulPolicyGradientConfig(
         mode="delightful_pg",
         temperature=0.5,
@@ -2012,7 +2045,7 @@ def test_effective_sample_size_and_signed_gate_rates_are_auditable() -> None:
 
 
 def test_heteroskedastic_gambling_strata_expose_lucky_rare_action_pathology() -> None:
-    """A negative-mean rare gamble flips positive after delight weighting.
+    """A negative-mean rare gamble flips positive after paper-specific DG weighting.
 
     This deterministic finite-population diagnostic is intentionally a
     pathology probe, not benchmark evidence. The common action has low-variance
@@ -2071,7 +2104,7 @@ def test_heteroskedastic_gambling_strata_expose_lucky_rare_action_pathology() ->
     chex.assert_tree_all_finite(stratification)
 
 
-def test_delight_rejects_shape_mismatch_and_empty_batches() -> None:
+def test_paper_specific_dg_rejects_shape_mismatch_and_empty_batches() -> None:
     with pytest.raises(ValueError, match="same shape"):
         discrete_delightful_policy_gradient(
             jnp.zeros((2,), dtype=jnp.float32),

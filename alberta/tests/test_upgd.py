@@ -1,4 +1,24 @@
-"""Tests for the UPGD (Utility-based Perturbed Gradient Descent) learner."""
+"""Tests for the UPGD (Utility-based Perturbed Gradient Descent) learner.
+
+UPGD (Elsayed & Mahmood, ICLR 2024, "Addressing Loss of Plasticity and
+Catastrophic Forgetting in Continual Learning") augments SGD with
+utility-gated perturbation: each trunk weight carries a utility trace and
+low-utility ("dead") weights receive noise so they can drift back into a
+useful regime without destroying learned structure.  This implementation
+deliberately deviates from the paper (utility is the absolute product
+``|w * grad|`` with a power gate rather than the signed ``-grad * w``) and
+layers optional mechanisms on top — see
+:mod:`alberta_framework.core.upgd`; the paper-faithful implementation is
+:mod:`alberta_framework.core.canonical_upgd`.
+
+Fixture convention: the structural classes (shapes, validation, config
+round-trip) construct learners with ``sparsity=0.0,
+perturbation_sigma=0.0``, deliberately disabling sparse initialization and
+perturbation noise so those assertions are exact and deterministic.  The
+disabled mechanisms are exercised with nonzero values where they are the
+subject: ``TestUtilityTracking``/``TestPerturbation`` (up to ``sigma=1.0``
+so noise effects are unmistakable) and ``sparsity=0.5`` round-trips.
+"""
 
 import chex
 import jax.numpy as jnp

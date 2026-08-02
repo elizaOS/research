@@ -1,12 +1,34 @@
+"""Contract tests for :mod:`alberta_framework.benchmarks.forager_matched_qualification`.
+
+Qualification is the reward-blind first phase of the matched-current
+pipeline: it stages content-addressed source snapshots, runs seed-zero
+structural probes inside the already-qualified networkless CPU image, and
+emits content-only capability receipts (trust anchor
+``content_only_unendorsed_v1`` — no endorsement or performance claim).  The
+tests check that staging is deterministic and bounded (member/directory
+caps, symlink and hard-link rejection), probe commands are seed-zero,
+networkless, and pinned to the exact image, receipts stay reward-blind and
+unendorsed, and publication is atomic with bottom-up fsync.  Failures before
+publication leave no visible tree; failures after the atomic rename have a
+distinct published-but-uncertain outcome that forbids destination reuse.
+
+Probes and container invocations are stubbed via injected runners; nothing
+here executes a real container or a benchmark horizon.
+"""
+
 from __future__ import annotations
 
 import hashlib
 import os
+import re
+import stat
 import subprocess
 import tarfile
 import tempfile
+from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -22,6 +44,48 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def _sha(label: str) -> str:
     return hashlib.sha256(label.encode("ascii")).hexdigest()
+
+
+def _fresh_replay_fixture(
+    tmp_path: Path,
+) -> tuple[Path, Any, str, dict[str, Any]]:
+    qualification_root = tmp_path / "qualification"
+    module = (
+        qualification_root
+        / "sources"
+        / "alberta"
+        / "source"
+        / "alberta_framework"
+        / "benchmarks"
+        / "forager_matched_qualification.py"
+    )
+    module.parent.mkdir(parents=True)
+    module.write_bytes(b"# staged qualification fixture\n")
+    qualification._normalize_qualification_tree_permissions(  # noqa: SLF001
+        qualification_root
+    )
+    module_sha256 = hashlib.sha256(module.read_bytes()).hexdigest()
+    manifest_sha256 = _sha("fresh-manifest")
+    protocol_sha256 = _sha("fresh-protocol")
+    plan_sha256 = _sha("fresh-plan")
+    runtime = qualification._ProbeRuntimeIdentity(  # noqa: SLF001
+        executable=tmp_path / "docker",
+        executable_sha256=_sha("fresh-runtime"),
+        version={},
+        image_inspection={},
+    )
+    payload = {
+        "schema_version": qualification._FRESH_SNAPSHOT_REPLAY_SCHEMA,  # noqa: SLF001
+        "manifest_sha256": manifest_sha256,
+        "protocol_sha256": protocol_sha256,
+        "plan_sha256": plan_sha256,
+        "plan_qualification_manifest_sha256": manifest_sha256,
+        "qualification_module_path": (
+            "alberta_framework/benchmarks/forager_matched_qualification.py"
+        ),
+        "qualification_module_sha256": module_sha256,
+    }
+    return qualification_root, runtime, module_sha256, payload
 
 
 def _dummy_source(key: qualification.SourceKey, root: Path, binding: SourceBinding) -> Any:
@@ -161,17 +225,44 @@ def _artifact_tree_inputs(
 def _stub_qualification_stages(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         qualification,
+        "_bind_project_root",
+        lambda path: path.resolve(),
+    )
+    monkeypatch.setattr(
+        qualification,
         "_stage_executor_qualification_roots",
         lambda _root: object(),
     )
     monkeypatch.setattr(qualification, "_stage_sources", lambda *_args: {})
     monkeypatch.setattr(qualification, "_materialize_configurations", lambda *_args: {})
     monkeypatch.setattr(qualification, "_probe_invocations", lambda *_args: ())
+    runtime = qualification._ProbeRuntimeIdentity(  # noqa: SLF001
+        executable=Path("/stub/oci-runtime"),
+        executable_sha256=_sha("stub-runtime"),
+        version={},
+        image_inspection={},
+    )
+    monkeypatch.setattr(
+        qualification,
+        "_bind_probe_runtime",
+        lambda *_args: runtime,
+    )
 
     def assemble(root: Path, *_args: Any) -> None:
         (root / "staged.marker").write_bytes(b"staged")
 
     monkeypatch.setattr(qualification, "_assemble_and_write", assemble)
+    monkeypatch.setattr(
+        qualification,
+        "_verify_staged_bundle_in_fresh_process",
+        lambda *_args: qualification._FreshReplayClosure(  # noqa: SLF001
+            _sha("manifest"),
+            _sha("protocol"),
+            _sha("plan"),
+            _sha("qualification-module"),
+        ),
+        raising=False,
+    )
 
 
 def _resources(candidate_id: str) -> dict[str, int]:
@@ -523,25 +614,629 @@ def test_probe_commands_are_seed_zero_networkless_and_exact_image(tmp_path: Path
     assert f"sha256:{builder.MATCHED_CURRENT_REQUIRED_IMAGE_SHA256}" in command
     assert any(f"source={probe}" in item for item in command)
     assert f"--probe-sha256={invocation.probe_sha256}" in command
+    for variable in (
+        "ALL_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    ):
+        assert f"--env={variable}=" in command
     assert not any(str(seed) in command for seed in builder.MATCHED_CURRENT_TUNING_SEEDS)
     assert not any(str(seed) in command for seed in builder.MATCHED_CURRENT_EVALUATION_SEEDS)
 
 
-def test_default_runner_spools_then_rejects_oversized_output(
+def test_git_value_uses_a_bound_executable_sanitized_environment_and_active_caps(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(qualification, "_MAX_PROBE_OUTPUT_BYTES", 8)
+    identity = qualification._GitRuntimeIdentity(  # noqa: SLF001
+        executable=tmp_path / "git",
+        executable_sha256=_sha("git-executable"),
+    )
+    events: list[str] = []
+    observed: dict[str, Any] = {}
 
-    def fake_run(command: Any, **kwargs: Any) -> Any:
-        kwargs["stdout"].write(b"123456789")
-        return subprocess.CompletedProcess(command, 0)
+    def rebind(value: Any) -> None:
+        assert value is identity
+        events.append("rebind")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    def run(command: Any, **kwargs: Any) -> qualification.QualificationProcessResult:
+        events.append("run")
+        observed["command"] = tuple(command)
+        observed.update(kwargs)
+        return qualification.QualificationProcessResult(
+            0,
+            f"{qualification._QUALIFIED_UPSTREAM_COMMIT}\n".encode("ascii"),  # noqa: SLF001
+            b"",
+        )
+
+    monkeypatch.setattr(qualification, "_rebind_git_runtime", rebind)
+    monkeypatch.setattr(qualification, "_run_bounded_process", run)
+
+    assert qualification._git_value(  # noqa: SLF001
+        identity,
+        tmp_path,
+        "rev-parse",
+        "HEAD",
+    ) == qualification._QUALIFIED_UPSTREAM_COMMIT  # noqa: SLF001
+    assert events == ["rebind", "run", "rebind"]
+    assert observed["command"][0] == identity.executable.as_posix()
+    assert "--no-replace-objects" in observed["command"]
+    assert "tar.umask=0002" in observed["command"]
+    assert observed["maximum_stdout_bytes"] == qualification._MAX_GIT_METADATA_BYTES  # noqa: SLF001
+    assert observed["maximum_stderr_bytes"] == qualification._MAX_GIT_METADATA_BYTES  # noqa: SLF001
+    environment = observed["environment"]
+    assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert environment["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert not any("proxy" in name.lower() for name in environment)
+
+
+def test_default_git_binding_ignores_the_ambient_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "git"
+    executable.write_bytes(b"bound-system-git")
+    executable.chmod(0o755)
+    observed: dict[str, str] = {}
+
+    def which(requested: str, *, path: str | None = None) -> str:
+        observed["requested"] = requested
+        observed["path"] = cast(str, path)
+        return executable.as_posix()
+
+    monkeypatch.setattr(qualification.shutil, "which", which)
+    identity = qualification._bind_git_runtime()  # noqa: SLF001
+
+    assert observed == {"requested": "git", "path": os.defpath}
+    assert identity.executable == executable
+    assert identity.executable_sha256 == hashlib.sha256(
+        b"bound-system-git"
+    ).hexdigest()
+
+
+def test_exact_git_archive_streams_to_a_size_bounded_sink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = b"pinned-archive-bytes"
+    identity = qualification._GitRuntimeIdentity(  # noqa: SLF001
+        executable=tmp_path / "git",
+        executable_sha256=_sha("git-executable"),
+    )
+    values = iter(
+        (
+            qualification._QUALIFIED_UPSTREAM_COMMIT,  # noqa: SLF001
+            qualification._QUALIFIED_UPSTREAM_TREE,  # noqa: SLF001
+        )
+    )
+    observed: dict[str, Any] = {}
+
+    monkeypatch.setattr(qualification, "_bind_git_runtime", lambda: identity)
+    monkeypatch.setattr(qualification, "_rebind_git_runtime", lambda value: None)
+    monkeypatch.setattr(qualification, "_git_value", lambda *_args: next(values))
+    monkeypatch.setattr(
+        qualification,
+        "_QUALIFIED_UPSTREAM_ARCHIVE_SIZE_BYTES",
+        len(archive),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        qualification,
+        "_QUALIFIED_UPSTREAM_ARCHIVE_SHA256",
+        hashlib.sha256(archive).hexdigest(),
+    )
+
+    def run(command: Any, **kwargs: Any) -> qualification.QualificationProcessResult:
+        observed["command"] = tuple(command)
+        observed.update(kwargs)
+        assert kwargs["stdout_sink"].write(archive) == len(archive)
+        return qualification.QualificationProcessResult(0, b"", b"")
+
+    monkeypatch.setattr(qualification, "_run_bounded_process", run)
+    output = tmp_path / "source.tar"
+    qualification._build_exact_git_archive(tmp_path, output)  # noqa: SLF001
+
+    assert output.read_bytes() == archive
+    assert observed["command"][0] == identity.executable.as_posix()
+    assert observed["maximum_stdout_bytes"] == len(archive)
+    assert observed["maximum_stderr_bytes"] == qualification._MAX_GIT_METADATA_BYTES  # noqa: SLF001
+    assert observed["environment"] == qualification._git_environment()  # noqa: SLF001
+
+
+def test_probe_runtime_binding_uses_one_absolute_executable_and_exact_image(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "docker"
+    runtime.write_bytes(b"#!/bin/sh\nexit 0\n")
+    runtime.chmod(0o755)
+    commands: list[tuple[str, ...]] = []
+    version = {"Client": {"Version": "test"}, "Server": {"Version": "test"}}
+    inspection = {
+        "Id": f"sha256:{builder.MATCHED_CURRENT_REQUIRED_IMAGE_SHA256}",
+        "Config": {
+            "Labels": {
+                "io.elizaos.alberta.foragax.launcher-contract": (
+                    "oci-read-only-stdout-tar-v4"
+                )
+            }
+        },
+    }
+
+    def runner(command: Any) -> qualification.QualificationProcessResult:
+        materialized = tuple(command)
+        commands.append(materialized)
+        if materialized[1:3] == ("version", "--format={{json .}}"):
+            payload = version
+        elif materialized[1:4] == (
+            "image",
+            "inspect",
+            "--format={{json .}}",
+        ):
+            payload = inspection
+        else:
+            raise AssertionError(materialized)
+        return qualification.QualificationProcessResult(
+            0,
+            qualification._canonical_json_bytes(payload),  # noqa: SLF001
+            b"",
+        )
+
+    identity = qualification._bind_probe_runtime(runtime, runner)  # noqa: SLF001
+    qualification._rebind_probe_runtime(identity, runner)  # noqa: SLF001
+
+    assert identity.executable == runtime.resolve()
+    assert len(commands) == 4
+    assert all(command[0] == runtime.resolve().as_posix() for command in commands)
+    image_commands = [command for command in commands if command[1] == "image"]
+    assert len(image_commands) == 2
+    assert all(
+        command[-1] == f"sha256:{builder.MATCHED_CURRENT_REQUIRED_IMAGE_SHA256}"
+        for command in image_commands
+    )
+
+
+def test_probe_runtime_binding_rejects_wrong_image_executable_and_daemon_drift(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "docker"
+    runtime.write_bytes(b"#!/bin/sh\nexit 0\n")
+    runtime.chmod(0o755)
+    version = {"Client": {"Version": "test"}, "Server": {"Version": "test"}}
+
+    def result(value: Any) -> qualification.QualificationProcessResult:
+        return qualification.QualificationProcessResult(
+            0,
+            qualification._canonical_json_bytes(value),  # noqa: SLF001
+            b"",
+        )
+
+    wrong_inspection = {
+        "Id": f"sha256:{_sha('wrong-image')}",
+        "Config": {
+            "Labels": {
+                "io.elizaos.alberta.foragax.launcher-contract": (
+                    "oci-read-only-stdout-tar-v4"
+                )
+            }
+        },
+    }
+
+    def wrong_image_runner(command: Any) -> qualification.QualificationProcessResult:
+        return result(version if tuple(command)[1] == "version" else wrong_inspection)
+
     with pytest.raises(
         qualification.ForagerMatchedQualificationError,
-        match="output exceeds",
+        match="different image ID",
     ):
-        qualification._default_runner(("fake-runtime", "version"))  # noqa: SLF001
+        qualification._bind_probe_runtime(runtime, wrong_image_runner)  # noqa: SLF001
+
+    exact_inspection = {
+        "Id": f"sha256:{builder.MATCHED_CURRENT_REQUIRED_IMAGE_SHA256}",
+        "Config": {
+            "Labels": {
+                "io.elizaos.alberta.foragax.launcher-contract": (
+                    "oci-read-only-stdout-tar-v4"
+                )
+            }
+        },
+    }
+    current_version = version
+
+    def stable_runner(command: Any) -> qualification.QualificationProcessResult:
+        return result(current_version if tuple(command)[1] == "version" else exact_inspection)
+
+    identity = qualification._bind_probe_runtime(runtime, stable_runner)  # noqa: SLF001
+    runtime.write_bytes(b"#!/bin/sh\nexit 1\n")
+    runtime.chmod(0o755)
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="executable changed",
+    ):
+        qualification._rebind_probe_runtime(identity, stable_runner)  # noqa: SLF001
+
+    runtime.write_bytes(b"#!/bin/sh\nexit 0\n")
+    runtime.chmod(0o755)
+    identity = qualification._bind_probe_runtime(runtime, stable_runner)  # noqa: SLF001
+    current_version = {"Client": {"Version": "drift"}, "Server": {"Version": "test"}}
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="daemon version or image identity changed",
+    ):
+        qualification._rebind_probe_runtime(identity, stable_runner)  # noqa: SLF001
+
+
+def test_bound_probe_rechecks_runtime_and_transitive_source_on_both_sides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    probe_path = tmp_path / "probe.py"
+    probe_path.write_bytes(b"# probe\n")
+    configuration = tmp_path / "configuration.json"
+    configuration.write_bytes(b"{}")
+    invocation = qualification.ProbeInvocation(
+        candidate_id="external_dqn_plain",
+        source_key="upstream",
+        source_root=source_root,
+        probe_path=probe_path,
+        probe_sha256=hashlib.sha256(probe_path.read_bytes()).hexdigest(),
+        configuration=configuration,
+        configuration_sha256=hashlib.sha256(b"{}").hexdigest(),
+        entrypoint_path="src/continuing_main.py",
+        entrypoint_sha256=_sha("entrypoint"),
+        entrypoint_family="continuing_main",
+        implementation_kind="upstream_dqn_plain",
+        invocation_style="official_foragax_continuing_main_v4",
+        result_root="results/results/run/alberta/DQN",
+        seed_transport="top_level_seed",
+        expected_agent="DQN",
+        horizon=builder.MATCHED_CURRENT_HORIZON,
+    )
+    source = _dummy_source("upstream", source_root, _source_bindings()["upstream"])
+    runtime = qualification._ProbeRuntimeIdentity(  # noqa: SLF001
+        executable=tmp_path / "docker",
+        executable_sha256=_sha("runtime"),
+        version={},
+        image_inspection={},
+    )
+    events: list[str] = []
+    monkeypatch.setattr(
+        qualification,
+        "_rebind_probe_runtime",
+        lambda *_args: events.append("runtime"),
+    )
+    monkeypatch.setattr(
+        qualification,
+        "_reverify_staged_source",
+        lambda *_args: events.append("source"),
+    )
+
+    def run(*_args: Any) -> tuple[dict[str, bool], str]:
+        events.append("run")
+        return {"ok": True}, _sha("stderr")
+
+    monkeypatch.setattr(qualification, "_run_probe", run)
+    observed = qualification._run_bound_probe(  # noqa: SLF001
+        runtime,
+        invocation,
+        source,
+        lambda _command: qualification.QualificationProcessResult(1, b"", b""),
+    )
+    assert observed == ({"ok": True}, _sha("stderr"))
+    assert events == ["runtime", "source", "run", "source", "runtime"]
+
+
+def test_fresh_replay_command_uses_the_bound_networkless_readonly_image(
+    tmp_path: Path,
+) -> None:
+    qualification_root = tmp_path / "qualification"
+    qualification_root.mkdir()
+    qualification_root.chmod(0o755)
+    runtime = tmp_path / "docker"
+
+    command = qualification._fresh_snapshot_replay_command(  # noqa: SLF001
+        runtime,
+        qualification_root,
+        qualification_module_sha256=_sha("qualification-module"),
+    )
+
+    assert command[0] == runtime.as_posix()
+    assert command[1:4] == ["run", "--rm", "--pull=never"]
+    assert "--network=none" in command
+    assert "--read-only" in command
+    assert "--cap-drop=ALL" in command
+    assert "--security-opt=no-new-privileges" in command
+    assert "--user=65532:65532" in command
+    assert "--env=LD_PRELOAD=" in command
+    for variable in (
+        "ALL_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    ):
+        assert f"--env={variable}=" in command
+    assert not any("PYTHONHASHSEED" in item for item in command)
+    assert (
+        "--mount=type=bind,"
+        f"source={qualification_root},"
+        "destination=/qualification/bundle,readonly"
+    ) in command
+    assert f"sha256:{qualification._QUALIFIED_IMAGE_SHA256}" in command  # noqa: SLF001
+    python_index = command.index(qualification._QUALIFIED_PYTHON)  # noqa: SLF001
+    assert command[python_index + 1 : python_index + 4] == ["-I", "-B", "-c"]
+    assert command[-1] == _sha("qualification-module")
+
+
+def test_project_root_binding_rejects_a_foreign_source_tree(tmp_path: Path) -> None:
+    foreign = tmp_path / "foreign"
+    (foreign / "alberta_framework").mkdir(parents=True)
+
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="loaded Alberta project root",
+    ):
+        qualification._bind_project_root(foreign)  # noqa: SLF001
+
+    assert qualification._bind_project_root(_PROJECT_ROOT) == _PROJECT_ROOT  # noqa: SLF001
+
+
+@pytest.mark.parametrize("unsafe_character", [",", "\n", "\r"])
+def test_fresh_replay_command_rejects_unsafe_mount_paths(
+    tmp_path: Path,
+    unsafe_character: str,
+) -> None:
+    root = tmp_path / f"unsafe{unsafe_character}root"
+    root.mkdir()
+    root.chmod(0o755)
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="unsafe character",
+    ):
+        qualification._fresh_snapshot_replay_command(  # noqa: SLF001
+            tmp_path / "docker",
+            root,
+            qualification_module_sha256=_sha("module"),
+        )
+
+
+def test_fresh_replay_command_rejects_owner_only_root(tmp_path: Path) -> None:
+    root = tmp_path / "qualification"
+    root.mkdir()
+    root.chmod(0o700)
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="not OCI-readable",
+    ):
+        qualification._fresh_snapshot_replay_command(  # noqa: SLF001
+            tmp_path / "docker",
+            root,
+            qualification_module_sha256=_sha("module"),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("schema_version", "wrong.schema.v1"),
+        ("manifest_sha256", _sha("wrong-manifest")),
+        ("protocol_sha256", _sha("wrong-protocol")),
+        ("plan_sha256", _sha("wrong-plan")),
+        ("plan_qualification_manifest_sha256", _sha("wrong-plan-manifest")),
+        ("qualification_module_path", "alberta_framework/wrong.py"),
+        ("qualification_module_sha256", _sha("wrong-module")),
+    ],
+)
+def test_fresh_replay_rejects_every_child_closure_mismatch(
+    tmp_path: Path,
+    field: str,
+    replacement: str,
+) -> None:
+    root, runtime, module_sha256, payload = _fresh_replay_fixture(tmp_path)
+    changed = {**payload, field: replacement}
+
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="differs from the parent closure",
+    ):
+        qualification._run_fresh_snapshot_replay(  # noqa: SLF001
+            root,
+            runtime,
+            lambda _command: qualification.QualificationProcessResult(
+                0,
+                qualification._canonical_json_bytes(changed),  # noqa: SLF001
+                b"",
+            ),
+            expected_manifest_sha256=payload["manifest_sha256"],
+            expected_protocol_sha256=payload["protocol_sha256"],
+            expected_plan_sha256=payload["plan_sha256"],
+            expected_qualification_module_sha256=module_sha256,
+        )
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("wrong_type", "wrong result type"),
+        ("nonzero", "staged replay failed"),
+        ("stderr", "unexpected stderr"),
+        ("malformed", "staged replay"),
+        ("noncanonical", "not canonical JSON"),
+        ("extra_field", "fields drifted"),
+        ("oversized", "output exceeds"),
+    ],
+)
+def test_fresh_replay_rejects_invalid_runner_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    message: str,
+) -> None:
+    root, runtime, module_sha256, payload = _fresh_replay_fixture(tmp_path)
+    valid = qualification._canonical_json_bytes(payload)  # noqa: SLF001
+
+    def runner(_command: Any) -> Any:
+        if case == "wrong_type":
+            return object()
+        if case == "nonzero":
+            return qualification.QualificationProcessResult(7, b"", b"child failed")
+        if case == "stderr":
+            return qualification.QualificationProcessResult(0, valid, b"warning")
+        if case == "malformed":
+            return qualification.QualificationProcessResult(0, b"{", b"")
+        if case == "noncanonical":
+            return qualification.QualificationProcessResult(0, valid + b"\n", b"")
+        if case == "extra_field":
+            return qualification.QualificationProcessResult(
+                0,
+                qualification._canonical_json_bytes(  # noqa: SLF001
+                    {**payload, "unexpected": True}
+                ),
+                b"",
+            )
+        monkeypatch.setattr(qualification, "_MAX_JSON_BYTES", 1)
+        return qualification.QualificationProcessResult(0, valid, b"")
+
+    with pytest.raises(qualification.ForagerMatchedQualificationError, match=message):
+        qualification._run_fresh_snapshot_replay(  # noqa: SLF001
+            root,
+            runtime,
+            runner,
+            expected_manifest_sha256=payload["manifest_sha256"],
+            expected_protocol_sha256=payload["protocol_sha256"],
+            expected_plan_sha256=payload["plan_sha256"],
+            expected_qualification_module_sha256=module_sha256,
+        )
+
+
+def test_fresh_bundle_replay_rebinds_runtime_and_reloads_both_sides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "qualification"
+    staged_module = (
+        root
+        / "sources"
+        / "alberta"
+        / "source"
+        / "alberta_framework"
+        / "benchmarks"
+        / "forager_matched_qualification.py"
+    )
+    staged_module.parent.mkdir(parents=True)
+    staged_module.write_bytes(
+        Path(qualification.__file__).resolve(strict=True).read_bytes()
+    )
+    qualification._normalize_qualification_tree_permissions(root)  # noqa: SLF001
+    manifest = {
+        "schema_version": qualification.MATCHED_CURRENT_QUALIFICATION_SCHEMA_VERSION
+    }
+    manifest_bytes = qualification._canonical_json_bytes(manifest)  # noqa: SLF001
+    bundle = qualification.MatchedCurrentQualificationBundle(
+        output_root=root,
+        cpu_qualification_root=root / "cpu",
+        rng_parity_qualification_root=root / "rng",
+        runtime_qualification=object(),
+        candidate_qualifications={},
+        candidate_assets={},
+        manifest=manifest,
+        manifest_bytes=manifest_bytes,
+        manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+    )
+    protocol = SimpleNamespace(protocol_sha256=_sha("protocol"))
+    plan = SimpleNamespace(protocol=protocol, plan_sha256=_sha("plan"))
+    runtime = qualification._ProbeRuntimeIdentity(  # noqa: SLF001
+        executable=tmp_path / "docker",
+        executable_sha256=_sha("runtime"),
+        version={},
+        image_inspection={},
+    )
+    events: list[str] = []
+
+    def build(_bundle: Any) -> tuple[Any, Any]:
+        events.append("build")
+        return protocol, plan
+
+    monkeypatch.setattr(qualification, "build_open_protocol_and_execution_plan", build)
+    monkeypatch.setattr(
+        qualification,
+        "_rebind_probe_runtime",
+        lambda *_args: events.append("runtime"),
+    )
+    monkeypatch.setattr(
+        qualification,
+        "_run_fresh_snapshot_replay",
+        lambda *_args, **_kwargs: events.append("child"),
+    )
+
+    def reload(_root: Path) -> Any:
+        events.append("reload")
+        return bundle
+
+    monkeypatch.setattr(qualification, "load_matched_current_qualification_bundle", reload)
+
+    closure = qualification._verify_staged_bundle_in_fresh_process(  # noqa: SLF001
+        bundle,
+        runtime,
+        lambda _command: qualification.QualificationProcessResult(1, b"", b""),
+    )
+    assert closure.manifest_sha256 == bundle.manifest_sha256
+    assert events == ["build", "runtime", "child", "runtime", "reload", "build"]
+
+    events.clear()
+
+    def fail_child(*_args: Any, **_kwargs: Any) -> None:
+        events.append("child")
+        raise qualification.ForagerMatchedQualificationError("injected child failure")
+
+    monkeypatch.setattr(qualification, "_run_fresh_snapshot_replay", fail_child)
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="injected child failure",
+    ):
+        qualification._verify_staged_bundle_in_fresh_process(  # noqa: SLF001
+            bundle,
+            runtime,
+            lambda _command: qualification.QualificationProcessResult(1, b"", b""),
+        )
+    assert events == ["build", "runtime", "child", "runtime"]
+
+
+def test_default_runner_actively_rejects_oversized_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_id = "b" * 64
+    calls: list[tuple[str, ...]] = []
+
+    def exceed(command: Any, **_kwargs: Any) -> Any:
+        materialized = tuple(command)
+        calls.append(materialized)
+        cid_argument = next(item for item in materialized if item.startswith("--cidfile="))
+        Path(cid_argument.split("=", 1)[1]).write_text(container_id, encoding="ascii")
+        raise qualification._BoundedProcessOutputError("injected overflow")  # noqa: SLF001
+
+    def fake_cleanup(command: Any, **_kwargs: Any) -> Any:
+        calls.append(tuple(command))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(qualification, "_run_bounded_process", exceed)
+    monkeypatch.setattr(subprocess, "run", fake_cleanup)
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="output exceeds.*cleanup=force_removed",
+    ):
+        qualification._default_runner(("fake-runtime", "run", "image"))  # noqa: SLF001
+    assert calls[1] == ("fake-runtime", "rm", "--force", container_id)
 
 
 def test_default_runner_force_removes_probe_container_after_timeout(
@@ -550,25 +1245,212 @@ def test_default_runner_force_removes_probe_container_after_timeout(
     container_id = "a" * 64
     calls: list[tuple[str, ...]] = []
 
-    def fake_run(command: Any, **kwargs: Any) -> Any:
+    def timeout(command: Any, **kwargs: Any) -> Any:
         materialized = tuple(command)
         calls.append(materialized)
-        if len(calls) == 1:
-            cid_argument = next(item for item in materialized if item.startswith("--cidfile="))
-            Path(cid_argument.split("=", 1)[1]).write_text(container_id, encoding="ascii")
-            raise subprocess.TimeoutExpired(
-                materialized,
-                kwargs["timeout"],
-            )
-        return subprocess.CompletedProcess(materialized, 0)
+        cid_argument = next(item for item in materialized if item.startswith("--cidfile="))
+        Path(cid_argument.split("=", 1)[1]).write_text(container_id, encoding="ascii")
+        raise subprocess.TimeoutExpired(materialized, kwargs["timeout"])
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    def fake_cleanup(command: Any, **_kwargs: Any) -> Any:
+        calls.append(tuple(command))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(qualification, "_run_bounded_process", timeout)
+    monkeypatch.setattr(subprocess, "run", fake_cleanup)
     with pytest.raises(
         qualification.ForagerMatchedQualificationError,
         match="cleanup=force_removed",
     ):
         qualification._default_runner(("fake-runtime", "run", "image"))  # noqa: SLF001
     assert calls[1] == ("fake-runtime", "rm", "--force", container_id)
+
+
+def test_default_runner_force_removes_probe_by_name_before_cidfile_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    observed_name = ""
+
+    def timeout(command: Any, **kwargs: Any) -> Any:
+        nonlocal observed_name
+        materialized = tuple(command)
+        calls.append(materialized)
+        name_argument = next(item for item in materialized if item.startswith("--name="))
+        observed_name = name_argument.split("=", 1)[1]
+        assert re.fullmatch(r"alberta-matched-qualification-[0-9a-f]{32}", observed_name)
+        raise subprocess.TimeoutExpired(materialized, kwargs["timeout"])
+
+    def fake_cleanup(command: Any, **_kwargs: Any) -> Any:
+        materialized = tuple(command)
+        calls.append(materialized)
+        assert materialized == ("fake-runtime", "rm", "--force", observed_name)
+        return subprocess.CompletedProcess(materialized, 0)
+
+    monkeypatch.setattr(qualification, "_run_bounded_process", timeout)
+    monkeypatch.setattr(subprocess, "run", fake_cleanup)
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="cleanup=force_removed_by_name",
+    ):
+        qualification._default_runner(("fake-runtime", "run", "image"))  # noqa: SLF001
+    assert len(calls) == 2
+
+
+def test_probe_cleanup_uses_exact_name_for_a_partial_cidfile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cidfile = tmp_path / "container.cid"
+    cidfile.write_bytes(b"partial")
+    container_name = "alberta-matched-qualification-" + "a" * 32
+    observed: list[tuple[str, ...]] = []
+
+    def fake_cleanup(command: Any, **_kwargs: Any) -> Any:
+        materialized = tuple(command)
+        observed.append(materialized)
+        assert materialized == ("fake-runtime", "rm", "--force", container_name)
+        return subprocess.CompletedProcess(materialized, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_cleanup)
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="cidfile contract failed after cleanup=force_removed_by_name",
+    ):
+        qualification._cleanup_interrupted_probe_container(  # noqa: SLF001
+            ("fake-runtime", "run"),
+            cidfile,
+            container_name,
+        )
+    assert len(observed) == 1
+
+
+def test_default_runner_cleans_a_completed_nonzero_container_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    observed_name = ""
+
+    def completed(command: Any, **_kwargs: Any) -> Any:
+        nonlocal observed_name
+        materialized = tuple(command)
+        calls.append(materialized)
+        observed_name = next(
+            item.split("=", 1)[1]
+            for item in materialized
+            if item.startswith("--name=")
+        )
+        return qualification.QualificationProcessResult(125, b"", b"failed")
+
+    def cleanup(command: Any, **_kwargs: Any) -> Any:
+        materialized = tuple(command)
+        calls.append(materialized)
+        assert materialized == ("fake-runtime", "rm", "--force", observed_name)
+        return subprocess.CompletedProcess(materialized, 0)
+
+    monkeypatch.setattr(qualification, "_run_bounded_process", completed)
+    monkeypatch.setattr(subprocess, "run", cleanup)
+    result = qualification._default_runner(  # noqa: SLF001
+        ("fake-runtime", "run", "image")
+    )
+    assert result.returncode == 125
+    assert len(calls) == 2
+
+
+def test_probe_cleanup_accepts_bounded_proof_that_name_is_already_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_name = "alberta-matched-qualification-" + "c" * 32
+    commands: list[tuple[str, ...]] = []
+
+    def missing(command: Any, **_kwargs: Any) -> Any:
+        materialized = tuple(command)
+        commands.append(materialized)
+        return subprocess.CompletedProcess(materialized, 1)
+
+    def inspect(command: Any, **_kwargs: Any) -> Any:
+        materialized = tuple(command)
+        commands.append(materialized)
+        return qualification.QualificationProcessResult(0, b"", b"")
+
+    monkeypatch.setattr(subprocess, "run", missing)
+    monkeypatch.setattr(qualification, "_run_bounded_process", inspect)
+    state = qualification._cleanup_interrupted_probe_container(  # noqa: SLF001
+        ("fake-runtime", "run"),
+        tmp_path / "missing.cid",
+        container_name,
+    )
+    assert state == "already_absent_by_name"
+    assert commands == [
+        ("fake-runtime", "rm", "--force", container_name),
+        (
+            "fake-runtime",
+            "container",
+            "ls",
+            "--all",
+            "--quiet",
+            "--no-trunc",
+            f"--filter=name=^/{container_name}$",
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "caller_option",
+    ("--name=caller-owned", "--cidfile=/tmp/caller-owned.cid"),
+)
+def test_default_runner_rejects_caller_owned_cleanup_identifiers(
+    caller_option: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def run(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal called
+        called = True
+        raise AssertionError("rejected commands must not run")
+
+    monkeypatch.setattr(qualification, "_run_bounded_process", run)
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="already contains a name or cidfile",
+    ):
+        qualification._default_runner(  # noqa: SLF001
+            ("fake-runtime", "run", caller_option, "image")
+        )
+    assert called is False
+
+
+def test_probe_cleanup_fails_if_the_exact_name_still_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_name = "alberta-matched-qualification-" + "e" * 32
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 1),
+    )
+    monkeypatch.setattr(
+        qualification,
+        "_run_bounded_process",
+        lambda *_args, **_kwargs: qualification.QualificationProcessResult(
+            0,
+            b"f" * 64 + b"\n",
+            b"",
+        ),
+    )
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="did not remove or prove absent",
+    ):
+        qualification._cleanup_interrupted_probe_container(  # noqa: SLF001
+            ("fake-runtime", "run"),
+            tmp_path / "missing.cid",
+            container_name,
+        )
 
 
 def test_probe_result_accepts_only_reward_blind_unendorsed_payload(tmp_path: Path) -> None:
@@ -695,6 +1577,101 @@ def test_candidate_qualification_values_close_under_open_protocol(tmp_path: Path
         == qualification.MATCHED_CURRENT_AUTHORITY_IDENTITY
         for candidate in protocol.candidates
     )
+
+
+def test_bundle_preserves_exact_manifest_bytes_and_threads_one_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = {
+        "schema_version": qualification.MATCHED_CURRENT_QUALIFICATION_SCHEMA_VERSION,
+        "payload": {"first": 1, "second": 2, "label": "Alberta café"},
+    }
+    manifest_bytes = qualification._canonical_json_bytes(manifest)  # noqa: SLF001
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    caller_candidate_qualifications: dict[str, Any] = {}
+    caller_candidate_assets: dict[str, Any] = {"fixture": object()}
+    bundle = qualification.MatchedCurrentQualificationBundle(
+        output_root=tmp_path,
+        cpu_qualification_root=tmp_path / "cpu",
+        rng_parity_qualification_root=tmp_path / "rng-parity",
+        runtime_qualification=object(),
+        candidate_qualifications=caller_candidate_qualifications,
+        candidate_assets=caller_candidate_assets,
+        manifest=manifest,
+        manifest_bytes=manifest_bytes,
+        manifest_sha256=manifest_sha256,
+    )
+    built_protocol = object()
+    built_plan = object()
+    captured: dict[str, Any] = {}
+
+    def build_protocol(**kwargs: Any) -> object:
+        captured["protocol"] = kwargs
+        return built_protocol
+
+    def build_plan(protocol: object, assets: dict[str, Any], **kwargs: Any) -> object:
+        captured["plan_protocol"] = protocol
+        captured["plan_assets"] = assets
+        captured["plan"] = kwargs
+        return built_plan
+
+    monkeypatch.setattr(builder, "build_forager_matched_open_protocol", build_protocol)
+    monkeypatch.setattr(executor, "build_execution_plan", build_plan)
+
+    protocol, plan = qualification.build_open_protocol_and_execution_plan(bundle)
+
+    assert bundle.manifest_bytes is manifest_bytes
+    assert hashlib.sha256(bundle.manifest_bytes).hexdigest() == bundle.manifest_sha256
+    assert captured["plan"]["qualification_manifest_sha256"] == manifest_sha256
+    assert captured["plan_protocol"] is built_protocol
+    assert captured["plan_assets"] == dict(bundle.candidate_assets)
+    assert protocol is built_protocol
+    assert plan is built_plan
+
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="exact canonical content",
+    ):
+        replace(bundle, manifest_bytes=b"{}")
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="digest differs",
+    ):
+        replace(bundle, manifest_sha256=_sha("different-manifest"))
+    manifest["payload"]["first"] = 999
+    caller_candidate_qualifications["late"] = object()
+    caller_candidate_assets["late"] = object()
+    assert bundle.manifest["payload"]["first"] == 1
+    assert "late" not in bundle.candidate_qualifications
+    assert "late" not in bundle.candidate_assets
+    with pytest.raises(TypeError):
+        cast(Any, bundle.manifest["payload"])["first"] = 999
+    with pytest.raises(TypeError):
+        cast(Any, bundle.candidate_qualifications)["replacement"] = object()
+    with pytest.raises(TypeError):
+        cast(Any, bundle.candidate_assets)["replacement"] = object()
+
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="bounded canonical JSON",
+    ):
+        replace(
+            bundle,
+            manifest={
+                "schema_version": qualification.MATCHED_CURRENT_QUALIFICATION_SCHEMA_VERSION,
+                "nonfinite": float("nan"),
+            },
+        )
+    cyclic: dict[str, Any] = {
+        "schema_version": qualification.MATCHED_CURRENT_QUALIFICATION_SCHEMA_VERSION,
+    }
+    cyclic["cycle"] = cyclic
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="bounded canonical JSON",
+    ):
+        replace(bundle, manifest=cyclic)
 
 
 def test_capability_receipts_remain_content_only_and_patch_both_isolated_arms(
@@ -861,6 +1838,11 @@ def test_public_api_allows_intended_outputs_forager_sibling(
     output = forager_root / "matched-current-qualification"
     monkeypatch.setattr(executor, "DEFAULT_CPU_QUALIFICATION_ROOT", cpu_root)
     monkeypatch.setattr(executor, "DEFAULT_RNG_PARITY_QUALIFICATION_ROOT", rng_root)
+    monkeypatch.setattr(
+        qualification,
+        "_bind_project_root",
+        lambda path: path.resolve(),
+    )
 
     class StoppedBeforeStagingError(RuntimeError):
         pass
@@ -905,6 +1887,160 @@ def test_publication_is_atomic_and_never_replaces_existing_directory(tmp_path: P
         )
     assert second.is_dir()
     assert (destination / "manifest.json").read_bytes() == b"{}"
+
+
+def test_publication_parent_fsync_failure_is_published_uncertain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "partial"
+    source.mkdir()
+    (source / "manifest.json").write_bytes(b"{}")
+    destination = tmp_path / "final"
+    parent_identity = (tmp_path.stat().st_dev, tmp_path.stat().st_ino)
+    source_identity = (source.stat().st_dev, source.stat().st_ino)
+    real_fsync = os.fsync
+
+    def fail_parent_fsync(descriptor: int) -> None:
+        metadata = os.fstat(descriptor)
+        if (metadata.st_dev, metadata.st_ino) == parent_identity:
+            raise OSError("injected parent fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_parent_fsync)
+    with pytest.raises(
+        qualification.QualificationPublishedButUncertainError,
+        match="do not reuse this output root",
+    ):
+        qualification._publish_directory_no_replace(  # noqa: SLF001
+            source,
+            destination,
+            tmp_path,
+            expected_parent_identity=parent_identity,
+            expected_source_identity=source_identity,
+        )
+
+    assert not source.exists()
+    assert (destination / "manifest.json").read_bytes() == b"{}"
+
+
+def test_publication_rejects_parent_or_staging_inode_substitution(tmp_path: Path) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    source = parent / "partial"
+    source.mkdir()
+    parent_identity = (parent.stat().st_dev, parent.stat().st_ino)
+    source_identity = (source.stat().st_dev, source.stat().st_ino)
+
+    displaced = tmp_path / "displaced-parent"
+    parent.rename(displaced)
+    parent.mkdir()
+    replacement = parent / "partial"
+    replacement.mkdir()
+    destination = parent / "final"
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="parent changed before publication",
+    ):
+        qualification._publish_directory_no_replace(  # noqa: SLF001
+            replacement,
+            destination,
+            parent,
+            expected_parent_identity=parent_identity,
+            expected_source_identity=source_identity,
+        )
+    assert not destination.exists()
+
+    stable_parent = tmp_path / "stable-parent"
+    stable_parent.mkdir()
+    original = stable_parent / "partial"
+    original.mkdir()
+    original_identity = (original.stat().st_dev, original.stat().st_ino)
+    original.rename(stable_parent / "displaced-partial")
+    substituted = stable_parent / "partial"
+    substituted.mkdir()
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="staging directory changed before publication",
+    ):
+        qualification._publish_directory_no_replace(  # noqa: SLF001
+            substituted,
+            stable_parent / "final",
+            stable_parent,
+            expected_parent_identity=(
+                stable_parent.stat().st_dev,
+                stable_parent.stat().st_ino,
+            ),
+            expected_source_identity=original_identity,
+        )
+    assert not (stable_parent / "final").exists()
+
+
+def test_publication_detects_destination_inode_substitution_after_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "partial"
+    source.mkdir()
+    (source / "manifest.json").write_bytes(b"{}")
+    destination = tmp_path / "final"
+    parent_identity = (tmp_path.stat().st_dev, tmp_path.stat().st_ino)
+    source_identity = (source.stat().st_dev, source.stat().st_ino)
+    real_fsync = os.fsync
+
+    def substitute_after_rename(descriptor: int) -> None:
+        real_fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        if (metadata.st_dev, metadata.st_ino) == parent_identity:
+            destination.rename(tmp_path / "displaced-final")
+            destination.mkdir()
+
+    monkeypatch.setattr(os, "fsync", substitute_after_rename)
+    with pytest.raises(
+        qualification.QualificationPublishedButUncertainError,
+        match="do not reuse this output root",
+    ):
+        qualification._publish_directory_no_replace(  # noqa: SLF001
+            source,
+            destination,
+            tmp_path,
+            expected_parent_identity=parent_identity,
+            expected_source_identity=source_identity,
+        )
+
+    assert destination.is_dir()
+    assert (tmp_path / "displaced-final/manifest.json").read_bytes() == b"{}"
+
+
+def test_publication_detects_destination_replacement_inside_validator(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "partial"
+    source.mkdir()
+    (source / "manifest.json").write_bytes(b"{}")
+    destination = tmp_path / "final"
+    displaced = tmp_path / "displaced-final"
+
+    def replace_during_validation(path: Path) -> None:
+        assert path == destination
+        path.rename(displaced)
+        path.mkdir()
+
+    with pytest.raises(
+        qualification.QualificationPublishedButUncertainError,
+        match="do not reuse this output root",
+    ):
+        qualification._publish_directory_no_replace(  # noqa: SLF001
+            source,
+            destination,
+            tmp_path,
+            expected_parent_identity=(tmp_path.stat().st_dev, tmp_path.stat().st_ino),
+            expected_source_identity=(source.stat().st_dev, source.stat().st_ino),
+            post_publish_validator=replace_during_validation,
+        )
+
+    assert destination.is_dir()
+    assert (displaced / "manifest.json").read_bytes() == b"{}"
 
 
 def test_verified_tree_fsyncs_files_and_directories_bottom_up(
@@ -1004,6 +2140,61 @@ def test_verified_tree_rejects_link_and_detects_replacement_during_fsync(
         qualification._durably_sync_verified_tree(race_root)  # noqa: SLF001
 
 
+def test_qualification_permissions_are_fixed_nonroot_oci_readable(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "qualification"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    plain = nested / "plain.json"
+    executable = nested / "worker.py"
+    plain.write_bytes(b"{}")
+    executable.write_bytes(b"#!/usr/bin/env python\n")
+    root.chmod(0o700)
+    nested.chmod(0o700)
+    plain.chmod(0o600)
+    executable.chmod(0o700)
+
+    qualification._normalize_qualification_tree_permissions(root)  # noqa: SLF001
+
+    assert stat.S_IMODE(root.stat().st_mode) == 0o755
+    assert stat.S_IMODE(nested.stat().st_mode) == 0o755
+    assert stat.S_IMODE(plain.stat().st_mode) == 0o644
+    assert stat.S_IMODE(executable.stat().st_mode) == 0o755
+
+
+def test_permission_normalization_never_follows_a_swapped_intermediate_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "qualification"
+    inside = root / "inside"
+    inside.mkdir(parents=True)
+    (inside / "payload").write_bytes(b"inside")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_payload = outside / "payload"
+    outside_payload.write_bytes(b"outside")
+    outside_payload.chmod(0o600)
+    original_walk = qualification._bounded_tree_walk  # noqa: SLF001
+    calls = 0
+
+    def swap_after_first_walk(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        result = original_walk(*args, **kwargs)
+        calls += 1
+        if calls == 1:
+            inside.rename(root / "detached")
+            inside.symlink_to(outside, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(qualification, "_bounded_tree_walk", swap_after_first_walk)
+    with pytest.raises(qualification.ForagerMatchedQualificationError):
+        qualification._normalize_qualification_tree_permissions(root)  # noqa: SLF001
+
+    assert stat.S_IMODE(outside_payload.stat().st_mode) == 0o600
+
+
 def test_qualification_validates_then_fsyncs_before_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1029,20 +2220,49 @@ def test_qualification_validates_then_fsyncs_before_publication(
     def sync(path: Path) -> None:
         events.append(("fsync", path))
 
-    def publish(source: Path, destination: Path, _parent: Path) -> None:
+    def replay(path: Path, *_args: Any) -> Any:
+        events.append(("fresh-replay", path))
+        return qualification._FreshReplayClosure(  # noqa: SLF001
+            _sha("manifest"),
+            _sha("protocol"),
+            _sha("plan"),
+            _sha("qualification-module"),
+        )
+
+    def publish(
+        source: Path,
+        destination: Path,
+        _parent: Path,
+        *,
+        post_publish_validator: Any,
+        **_identity: Any,
+    ) -> Any:
         events.append(("publish", destination))
         source.rename(destination)
+        return post_publish_validator(destination)
 
     monkeypatch.setattr(qualification, "load_matched_current_qualification_bundle", load)
+    monkeypatch.setattr(
+        qualification,
+        "_verify_staged_bundle_in_fresh_process",
+        replay,
+    )
     monkeypatch.setattr(qualification, "_durably_sync_verified_tree", sync)
     monkeypatch.setattr(qualification, "_publish_directory_no_replace", publish)
 
     result: Any = qualification.qualify_matched_current_candidates(project, upstream, output)
     assert result == output
-    assert [event for event, _path in events] == ["validate", "fsync", "publish", "validate"]
-    assert events[0][1] == events[1][1]
-    assert events[2][1] == output
+    assert [event for event, _path in events] == [
+        "validate",
+        "fresh-replay",
+        "fsync",
+        "publish",
+        "validate",
+        "fresh-replay",
+    ]
+    assert events[0][1] == events[1][1] == events[2][1]
     assert events[3][1] == output
+    assert events[4][1] == events[5][1] == output
 
 
 def test_qualification_fsync_failure_cleans_staging_without_publication(
@@ -1085,6 +2305,209 @@ def test_qualification_fsync_failure_cleans_staging_without_publication(
     assert len(temporary_roots) == 1
     assert not temporary_roots[0].exists()
     assert not output.exists()
+
+
+def test_qualification_fresh_replay_failure_cleans_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    (project / "alberta_framework").mkdir(parents=True)
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    cpu_root = tmp_path / "cpu"
+    rng_root = tmp_path / "rng"
+    cpu_root.mkdir()
+    rng_root.mkdir()
+    output = tmp_path / "qualification"
+    monkeypatch.setattr(executor, "DEFAULT_CPU_QUALIFICATION_ROOT", cpu_root)
+    monkeypatch.setattr(executor, "DEFAULT_RNG_PARITY_QUALIFICATION_ROOT", rng_root)
+    _stub_qualification_stages(monkeypatch)
+    staged_roots: list[Path] = []
+
+    def load(path: Path) -> Path:
+        staged_roots.append(path)
+        return path
+
+    def fail_replay(*_args: Any) -> Any:
+        raise qualification.ForagerMatchedQualificationError(
+            "injected fresh replay failure"
+        )
+
+    def publish(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("publication must not run after fresh replay failure")
+
+    monkeypatch.setattr(qualification, "load_matched_current_qualification_bundle", load)
+    monkeypatch.setattr(
+        qualification,
+        "_verify_staged_bundle_in_fresh_process",
+        fail_replay,
+    )
+    monkeypatch.setattr(qualification, "_publish_directory_no_replace", publish)
+
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="injected fresh replay failure",
+    ):
+        qualification.qualify_matched_current_candidates(project, upstream, output)
+    assert len(staged_roots) == 1
+    assert not staged_roots[0].exists()
+    assert not output.exists()
+
+
+def test_qualification_final_loader_failure_is_published_uncertain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    (project / "alberta_framework").mkdir(parents=True)
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    cpu_root = tmp_path / "cpu"
+    rng_root = tmp_path / "rng"
+    cpu_root.mkdir()
+    rng_root.mkdir()
+    output = tmp_path / "qualification"
+    monkeypatch.setattr(executor, "DEFAULT_CPU_QUALIFICATION_ROOT", cpu_root)
+    monkeypatch.setattr(executor, "DEFAULT_RNG_PARITY_QUALIFICATION_ROOT", rng_root)
+    _stub_qualification_stages(monkeypatch)
+    calls: list[Path] = []
+
+    def load(path: Path) -> Path:
+        calls.append(path)
+        if len(calls) == 2:
+            raise qualification.ForagerMatchedQualificationError(
+                "injected final replay failure"
+            )
+        return path
+
+    monkeypatch.setattr(qualification, "load_matched_current_qualification_bundle", load)
+    with pytest.raises(
+        qualification.QualificationPublishedButUncertainError,
+        match="do not reuse this output root",
+    ):
+        qualification.qualify_matched_current_candidates(project, upstream, output)
+
+    assert len(calls) == 2
+    assert calls[0].name.startswith(f".{output.name}.partial-")
+    assert calls[1] == output
+    assert output.is_dir()
+    assert (output / "staged.marker").read_bytes() == b"staged"
+    assert not list(tmp_path.glob(f".{output.name}.partial-*"))
+
+
+def test_qualification_post_publish_replay_failure_is_published_uncertain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    (project / "alberta_framework").mkdir(parents=True)
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    cpu_root = tmp_path / "cpu"
+    rng_root = tmp_path / "rng"
+    cpu_root.mkdir()
+    rng_root.mkdir()
+    output = tmp_path / "qualification"
+    monkeypatch.setattr(executor, "DEFAULT_CPU_QUALIFICATION_ROOT", cpu_root)
+    monkeypatch.setattr(executor, "DEFAULT_RNG_PARITY_QUALIFICATION_ROOT", rng_root)
+    _stub_qualification_stages(monkeypatch)
+    replay_calls = 0
+
+    def replay(*_args: Any) -> Any:
+        nonlocal replay_calls
+        replay_calls += 1
+        if replay_calls == 2:
+            raise qualification.ForagerMatchedQualificationError(
+                "injected published replay failure"
+            )
+        return qualification._FreshReplayClosure(  # noqa: SLF001
+            _sha("manifest"),
+            _sha("protocol"),
+            _sha("plan"),
+            _sha("qualification-module"),
+        )
+
+    monkeypatch.setattr(
+        qualification,
+        "load_matched_current_qualification_bundle",
+        lambda path: path,
+    )
+    monkeypatch.setattr(
+        qualification,
+        "_verify_staged_bundle_in_fresh_process",
+        replay,
+    )
+
+    with pytest.raises(
+        qualification.QualificationPublishedButUncertainError,
+        match="do not reuse this output root",
+    ):
+        qualification.qualify_matched_current_candidates(project, upstream, output)
+    assert replay_calls == 2
+    assert output.is_dir()
+    assert (output / "staged.marker").read_bytes() == b"staged"
+    assert not list(tmp_path.glob(f".{output.name}.partial-*"))
+
+
+def test_qualification_post_publish_returned_closure_mismatch_is_uncertain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    (project / "alberta_framework").mkdir(parents=True)
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    cpu_root = tmp_path / "cpu"
+    rng_root = tmp_path / "rng"
+    cpu_root.mkdir()
+    rng_root.mkdir()
+    output = tmp_path / "qualification"
+    monkeypatch.setattr(executor, "DEFAULT_CPU_QUALIFICATION_ROOT", cpu_root)
+    monkeypatch.setattr(executor, "DEFAULT_RNG_PARITY_QUALIFICATION_ROOT", rng_root)
+    _stub_qualification_stages(monkeypatch)
+    closures = iter(
+        (
+            qualification._FreshReplayClosure(  # noqa: SLF001
+                _sha("manifest"),
+                _sha("protocol"),
+                _sha("plan"),
+                _sha("qualification-module"),
+            ),
+            qualification._FreshReplayClosure(  # noqa: SLF001
+                _sha("manifest"),
+                _sha("different-protocol"),
+                _sha("plan"),
+                _sha("qualification-module"),
+            ),
+        )
+    )
+    replay_calls = 0
+
+    def replay(*_args: Any) -> Any:
+        nonlocal replay_calls
+        replay_calls += 1
+        return next(closures)
+
+    monkeypatch.setattr(
+        qualification,
+        "load_matched_current_qualification_bundle",
+        lambda path: path,
+    )
+    monkeypatch.setattr(
+        qualification,
+        "_verify_staged_bundle_in_fresh_process",
+        replay,
+    )
+
+    with pytest.raises(
+        qualification.QualificationPublishedButUncertainError,
+        match="do not reuse this output root",
+    ):
+        qualification.qualify_matched_current_candidates(project, upstream, output)
+    assert replay_calls == 2
+    assert output.is_dir()
+    assert (output / "staged.marker").read_bytes() == b"staged"
 
 
 def test_artifact_tree_rejects_every_unreferenced_file(tmp_path: Path) -> None:
@@ -1141,6 +2564,22 @@ def test_cli_converts_protocol_validator_failure_to_clean_exit_two(
     assert "frozen protocol drift" in capsys.readouterr().err
 
 
+def test_cli_reports_published_uncertain_as_exit_three(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail(_arguments: Any) -> int:
+        raise qualification.QualificationPublishedButUncertainError(
+            "qualification was published; do not reuse this output root"
+        )
+
+    monkeypatch.setattr(qualification, "_cli", fail)
+    assert qualification.main(("qualify",)) == 3
+    error = capsys.readouterr().err
+    assert "PUBLISHED-UNCERTAIN" in error
+    assert "do not reuse this output root" in error
+
+
 def test_copy_tree_rejects_symlinks(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
@@ -1152,3 +2591,163 @@ def test_copy_tree_rejects_symlinks(tmp_path: Path) -> None:
         match="link or special",
     ):
         qualification._copy_tree(source, tmp_path / "staged", alberta_filter=True)  # noqa: SLF001
+
+
+def test_alberta_snapshot_copy_rejects_concurrent_live_tree_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "alberta_framework"
+    source.mkdir()
+    module = source / "module.py"
+    module.write_bytes(b"VALUE = 1\n")
+    cache = source / "__pycache__"
+    cache.mkdir()
+    (cache / "module.pyc").write_bytes(b"ignored")
+
+    stable = tmp_path / "stable"
+    qualification._copy_alberta_tree_stably(source, stable)  # noqa: SLF001
+    assert (stable / "module.py").read_bytes() == b"VALUE = 1\n"
+    assert not (stable / "__pycache__").exists()
+
+    real_copy = qualification._copy_tree  # noqa: SLF001
+
+    def copy_then_mutate(
+        source_root: Path,
+        destination: Path,
+        *,
+        alberta_filter: bool,
+    ) -> None:
+        real_copy(source_root, destination, alberta_filter=alberta_filter)
+        module.write_bytes(b"VALUE = 2\n")
+
+    monkeypatch.setattr(qualification, "_copy_tree", copy_then_mutate)
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="live Alberta source changed during snapshot staging",
+    ):
+        qualification._copy_alberta_tree_stably(source, tmp_path / "raced")  # noqa: SLF001
+
+
+def test_staged_source_reverification_covers_transitive_files(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    entrypoint = source / "entrypoint.py"
+    entrypoint.write_bytes(b"import helper\n")
+    helper = source / "helper.py"
+    helper.write_bytes(b"VALUE = 1\n")
+    inventory = executor.source_inventory(source)
+    normalized = executor.source_inventory_sha256(source)
+    binding = replace(_source_bindings()["alberta"], inventory_sha256=normalized)
+    staged = qualification._StagedSource(  # noqa: SLF001
+        key="alberta",
+        root=source,
+        archive=tmp_path / "source.tar",
+        inventory_path=tmp_path / "inventory.json",
+        inventory=inventory,
+        binding=binding,
+        descriptor_path=None,
+        patch_path=None,
+    )
+
+    qualification._reverify_staged_source(staged)  # noqa: SLF001
+    helper.write_bytes(b"VALUE = 2\n")
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="staged source changed",
+    ):
+        qualification._reverify_staged_source(staged)  # noqa: SLF001
+
+
+def test_fresh_snapshot_replay_accepts_only_the_exact_child_closure(
+    tmp_path: Path,
+) -> None:
+    qualification_root = tmp_path / "qualification"
+    source_root = qualification_root / "sources" / "alberta" / "source"
+    package = source_root / "alberta_framework" / "benchmarks"
+    package.mkdir(parents=True)
+    (source_root / "alberta_framework" / "__init__.py").write_bytes(b"")
+    (package / "__init__.py").write_bytes(b"")
+    manifest_sha256 = _sha("manifest")
+    protocol_sha256 = _sha("protocol")
+    plan_sha256 = _sha("plan")
+    module = package / "forager_matched_qualification.py"
+    module.write_text(
+        "\n".join(
+            (
+                "class Bundle:",
+                f"    manifest_sha256 = {manifest_sha256!r}",
+                "",
+                "class Protocol:",
+                f"    protocol_sha256 = {protocol_sha256!r}",
+                "",
+                "class Plan:",
+                f"    plan_sha256 = {plan_sha256!r}",
+                f"    qualification_manifest_sha256 = {manifest_sha256!r}",
+                "",
+                "def load_matched_current_qualification_bundle(_root):",
+                "    return Bundle()",
+                "",
+                "def build_open_protocol_and_execution_plan(_bundle):",
+                "    return Protocol(), Plan()",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    qualification._normalize_qualification_tree_permissions(  # noqa: SLF001
+        qualification_root
+    )
+    module_sha256 = hashlib.sha256(module.read_bytes()).hexdigest()
+    runtime = qualification._ProbeRuntimeIdentity(  # noqa: SLF001
+        executable=tmp_path / "docker",
+        executable_sha256=_sha("runtime"),
+        version={},
+        image_inspection={},
+    )
+    payload = {
+        "schema_version": qualification._FRESH_SNAPSHOT_REPLAY_SCHEMA,  # noqa: SLF001
+        "manifest_sha256": manifest_sha256,
+        "protocol_sha256": protocol_sha256,
+        "plan_sha256": plan_sha256,
+        "plan_qualification_manifest_sha256": manifest_sha256,
+        "qualification_module_path": (
+            "alberta_framework/benchmarks/forager_matched_qualification.py"
+        ),
+        "qualification_module_sha256": module_sha256,
+    }
+    commands: list[tuple[str, ...]] = []
+
+    def runner(command: Any) -> qualification.QualificationProcessResult:
+        commands.append(tuple(command))
+        return qualification.QualificationProcessResult(
+            0,
+            qualification._canonical_json_bytes(payload),  # noqa: SLF001
+            b"",
+        )
+
+    qualification._run_fresh_snapshot_replay(  # noqa: SLF001
+        qualification_root,
+        runtime,
+        runner,
+        expected_manifest_sha256=manifest_sha256,
+        expected_protocol_sha256=protocol_sha256,
+        expected_plan_sha256=plan_sha256,
+        expected_qualification_module_sha256=module_sha256,
+    )
+    assert len(commands) == 1
+    assert "--network=none" in commands[0]
+    assert f"sha256:{qualification._QUALIFIED_IMAGE_SHA256}" in commands[0]  # noqa: SLF001
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="fresh-process staged replay differs",
+    ):
+        qualification._run_fresh_snapshot_replay(  # noqa: SLF001
+            qualification_root,
+            runtime,
+            runner,
+            expected_manifest_sha256=manifest_sha256,
+            expected_protocol_sha256=protocol_sha256,
+            expected_plan_sha256=_sha("wrong-plan"),
+            expected_qualification_module_sha256=module_sha256,
+        )

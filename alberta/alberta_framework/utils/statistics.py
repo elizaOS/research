@@ -96,7 +96,10 @@ def compute_statistics(
         else:
             ci_lower = ci_upper = mean
     except ImportError:
-        # Fallback without scipy: use normal approximation
+        # Fallback without scipy: normal approximation.  Only two quantiles
+        # are wired in — 0.95 -> z=1.96; every other confidence level silently
+        # gets the 99% quantile z=2.576.  The normal approximation also
+        # understates the t-based interval width at small n.
         z_value = 1.96 if confidence_level == 0.95 else 2.576  # 95% or 99%
         margin = z_value * sem
         ci_lower = mean - margin
@@ -137,6 +140,8 @@ def compute_timeseries_statistics(
 
         t_value = stats.t.ppf((1 + confidence_level) / 2, n_seeds - 1)
     except ImportError:
+        # Same limitation as compute_statistics: 0.95 -> z=1.96, any other
+        # level silently gets the 99% quantile z=2.576.
         t_value = 1.96 if confidence_level == 0.95 else 2.576
 
     margin = t_value * sem
@@ -270,8 +275,7 @@ def mann_whitney_comparison(
     # Compute rank-biserial correlation as effect size (Kerby 2014):
     # r = 2*U1/(n_a*n_b) - 1, where scipy's statistic is U1 (pairs favoring a).
     # Positive means a > b, matching the cohens_d sign convention used by the
-    # parametric tests in this module. (A previous version computed
-    # 1 - 2*U1/(n_a*n_b), which inverted the direction of the effect.)
+    # parametric tests in this module.
     n_a, n_b = len(a), len(b)
     r = (2 * stat_val) / (n_a * n_b) - 1
 
@@ -295,6 +299,11 @@ def wilcoxon_comparison(
     method_b: str = "B",
 ) -> SignificanceResult:
     """Perform Wilcoxon signed-rank test (paired non-parametric).
+
+    Caveat: the reported ``effect_size`` is Cohen's d computed on the raw
+    values, not a rank-based effect size.  The standard companion to this
+    test is the matched-pairs rank-biserial correlation; interpret the
+    parametric d alongside a rank test with care.
 
     Args:
         values_a: Values for first method

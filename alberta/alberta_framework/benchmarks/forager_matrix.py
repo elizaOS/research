@@ -141,8 +141,9 @@ from alberta_framework.core.recurrent_trace_actor_critic import (
     RecurrentTraceActorCriticConfig,
 )
 
-# The historical public name remains the exact schema-2.2 identifier so
-# callers and persisted 2.2 configuration hashes do not silently migrate.
+# Persisted 2.2 configuration hashes bind this exact identifier, so this name
+# must stay "2.2" permanently; use FORAGER_MATRIX_LATEST_SCHEMA_VERSION for
+# the current default.
 FORAGER_MATRIX_SCHEMA_VERSION = "2.2"
 FORAGER_MATRIX_SCHEMA_VERSION_2_3 = "2.3"
 FORAGER_MATRIX_SCHEMA_VERSION_2_4 = "2.4"
@@ -170,14 +171,14 @@ SNAPSHOT_SOURCE_EXECUTION_MODE: Literal[
 ] = (
     "content_verified_snapshot_subprocess_unsealed"
 )
-# Historical public name retained only as an API alias.  Snapshot isolation is
-# not evidence of an immutable filesystem or runtime.
+# Alias of the snapshot mode.  Despite the name, snapshot isolation is not
+# evidence of an immutable filesystem or runtime.
 IMMUTABLE_SOURCE_EXECUTION_MODE = SNAPSHOT_SOURCE_EXECUTION_MODE
 LIVE_SOURCE_EXECUTION_MODE: Literal["live_tree_unsealed"] = "live_tree_unsealed"
 SOURCE_EXECUTION_MODES = frozenset(
     {SNAPSHOT_SOURCE_EXECUTION_MODE, LIVE_SOURCE_EXECUTION_MODE}
 )
-# Compatibility alias for callers that only need the development-mode label.
+# The unqualified name denotes the development (live-tree) mode.
 SOURCE_EXECUTION_MODE = LIVE_SOURCE_EXECUTION_MODE
 
 LOGGER = logging.getLogger("alberta.forager_matrix")
@@ -186,6 +187,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 _VARIANT_ID = re.compile(r"[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _GIT_OBJECT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+# Fail-closed resource/complexity bounds enforced on untrusted manifests and
+# artifacts before allocation or execution.  The values carry no scientific
+# meaning: each sits well above every published Forager protocol (largest
+# horizon: 500,000 steps x 30 seeds; see FORAGER_BENCHMARK.md) while keeping
+# worst-case memory, disk, and parse cost bounded for corrupt or adversarial
+# inputs.  _MAX_JAX_SEED is the exception — it is the int32 seed ceiling the
+# compiled runners require, not a sizing choice.
 _MAX_JAX_SEED = 2**31 - 1
 _MAX_MATRIX_STEPS = 100_000_000
 _MAX_BOOTSTRAP_RESAMPLES = 1_000_000
@@ -234,6 +242,12 @@ _PAPER_SELECTION_STATISTIC = "mean"
 _PAPER_BOOTSTRAP_RESAMPLES = 10_000
 _PAPER_BOOTSTRAP_SEED = 0
 _PAPER_TIE_BREAK = "variant_id_ascending"
+# Pinned digests of the frozen RNG contracts.  Resume/conformance validation
+# recomputes ``environment_rng_schedule_sha256()`` and
+# ``_json_sha256(_matrix_rng_contract(schema_version))`` (canonical sorted-key
+# JSON, SHA-256) and fails closed on mismatch, so any RNG-affecting source
+# change invalidates existing matrix artifacts instead of silently changing
+# their meaning.  Schema 2.4 keeps the 2.3 contract, hence the equal digests.
 _EXPECTED_ENVIRONMENT_RNG_SCHEDULE_SHA256 = (
     "51d811e6fccd2b015b1703f22775f880089bbca3fc8938421ad3e18526882cb0"
 )
@@ -246,10 +260,14 @@ _EXPECTED_MATRIX_RNG_CONTRACT_SHA256_2_3 = (
 _EXPECTED_MATRIX_RNG_CONTRACT_SHA256_2_4 = (
     "5e748169e2aad9cd4abf012293d6996392950341d8240d5c58f00e4268834ad7"
 )
-# Schema 2.2 and 2.3 froze this exact behavioral descriptor, and schema 2.4
-# explicitly retains the same RNG contract.  The causal-map checkpoint format
-# now records the equivalent default Threefry implementation explicitly, but
-# that serializer metadata must not rewrite an already frozen matrix contract.
+# This literal descriptor is frozen into every supported schema's RNG-contract
+# digest.  The namespace is causal_map_forager's ``_CAUSAL_MAP_RNG_NAMESPACE``,
+# an arbitrary tag folded into ``jax.random.key(seed)`` so the causal-map
+# agent's key stream never overlaps the untagged environment chain.  It is a
+# literal rather than an import: the causal-map checkpoint serializer records
+# equivalent metadata in a richer form (explicit Threefry implementation), and
+# following that representation would change the bytes under the pinned
+# digests without changing behavior.
 _FROZEN_CAUSAL_MAP_MATRIX_RNG_CONTRACT = MappingProxyType(
     {
         "root": "jax.random.fold_in(jax.random.key(seed), namespace)",
@@ -1671,6 +1689,8 @@ def validate_verifier_issued_tuning_envelope(
     authenticate the issuer/key/signature, enforce trust and revocation policy,
     and return the literal boolean ``True``. The host matrix runner never calls
     this function and does not accept this envelope as a manifest field.
+    ``FORAGER_BENCHMARK.md`` (immutable OCI evaluation adapter) specifies the
+    envelope's intended role in the evidence chain and what it must bind.
     """
     if not isinstance(expected_runtime_identity, EnvironmentRuntimeIdentity):
         raise TypeError(
@@ -5975,6 +5995,14 @@ def _selection_score(
     summary: Mapping[str, Any],
     rule: ForagerTuningRule,
 ) -> float:
+    """Return the scalar that ranks a variant within its selection group.
+
+    ``statistic == "mean"`` ranks by the bootstrap mean of the per-seed
+    metric.  The ``conservative_ci_endpoint`` statistic instead ranks by the
+    bootstrap CI endpoint least favorable to the variant (``ci_low`` when
+    maximizing, ``ci_high`` when minimizing), preferring the variant whose
+    worst plausible value is best.  Ties break on ascending variant id.
+    """
     if rule.statistic == "mean":
         value = summary.get("mean")
     elif rule.direction == "maximize":

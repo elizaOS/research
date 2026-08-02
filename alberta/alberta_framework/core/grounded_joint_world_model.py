@@ -1,18 +1,24 @@
 # mypy: disable-error-code="call-arg"
 """Grounded online joint-action prediction from a learned representation.
 
-This deliberately small L0 substrate predicts ordinary next-observation
-coordinates, reward, and continuation from the learner's current
-representation and the *observed joint action*.  The target observation width
-is independent of the representation width: a 24-dimensional learned state
-can therefore be trained against an 8-dimensional raw observation without
-using a moving learned-latent target.
+This deliberately small mechanism-level (L0, see ``RESEARCH_STATUS.md``)
+substrate predicts ordinary next-observation coordinates, reward, and
+continuation from the learner's current representation and the *observed
+joint action* — the (focal, partner) action pair of the hidden-partner
+setting (:mod:`alberta_framework.core.integrated_hidden_partner`).
+Conditioning on the partner's observed action lets the model attribute
+outcome variation to the partner's choice instead of absorbing it as
+environment noise.  The target observation width is independent of the
+representation width: a 24-dimensional learned state can therefore be
+trained against an 8-dimensional raw observation without using a moving
+learned-latent target.
 
 The model is a joint-action-indexed affine map.  Its only persistent
 feature-indexed leaf is ``GroundedJointWorldModelState.weights``, whose final
 axis is always ``representation_dim``.  There is no optimizer, eligibility
-trace, replay buffer, task id, phase id, or hidden feature-indexed state for a
-future identity-safe feature router to migrate.
+trace, replay buffer, task id, phase id, or hidden feature-indexed state, so
+feature-identity routing can relocate ``weights`` columns without leaving
+stale per-feature state behind.
 
 Every scored transition is predict-before-update.  Grounded targets are
 stop-gradient values.  The uniform all-head fit loss updates every prediction

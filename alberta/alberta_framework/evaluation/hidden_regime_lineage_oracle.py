@@ -5,6 +5,14 @@ configuration.  It does not call the evaluator's lineage, recurrence, or
 retention reconstruction helpers and never replays a learner or world.  The
 result is compared field-by-field with the serialized run summary so derived
 lineage claims cannot be made true by changing summary bytes or a digest.
+
+Two retention baselines coexist in the reconstructed records.  ``legacy_*``
+fields compare a recurrence's entry window against the regime's first-ever
+exposure segment, whether or not the pair committed anything usable there.
+The ``latest_qualified_acquisition_*`` fields instead baseline against the
+coalesced episode containing the most recent acquisition-qualified commit of
+the same regime (perfect, tie-free composed mapping at commit time), so that
+comparison is anchored to knowledge the pair verifiably held.
 """
 
 from __future__ import annotations
@@ -37,6 +45,13 @@ HIDDEN_REGIME_LINEAGE_ORACLE_SCHEMA = "alberta.hidden-regime.lineage-oracle.v2"
 type EventPhase = Literal["pre", "post"]
 type EntryActivity = Literal["active", "dormant", "mixed", "unavailable"]
 
+# Regime ids index rows of ``regime_permutations`` — cue-to-action permutations
+# over three symbols.  Labels mirror the schedule design in
+# :mod:`alberta_framework.streams.hidden_regime_signaling`: A and B recur
+# throughout; C-old fills the bank early and is then permanently superseded by
+# the incompatible C-new (same "C" schedule role, different permutation), which
+# separates retention of C-old generations from adaptation to C-new; D-short is
+# the schedule's single 16-step (one-lease) transient regime.
 _REGIME_LABELS = {
     0: "A",
     1: "B",
@@ -282,7 +297,13 @@ def _base_recurrence_records(
     trace: HiddenRegimePrimitiveTrace,
     config: HiddenRegimeDevelopmentConfig,
 ) -> tuple[RecurrenceRetentionRecord, ...]:
-    """Reconstruct legacy first-exposure and best-dormant fields."""
+    """Reconstruct legacy first-exposure and best-dormant fields.
+
+    The ``legacy_*`` baseline here is lineage-blind: every recurrence is
+    compared against the regime's first-ever exposure segment.  The
+    lineage-aware ``latest_qualified_acquisition_*`` baseline is filled in by
+    :func:`_enriched_recurrence_records`.
+    """
 
     rewards = np.asarray(trace.reward, dtype=np.float32)
     boundaries = np.asarray(trace.helper_lease_boundary, dtype=np.bool_)
@@ -424,6 +445,15 @@ def _base_recurrence_records(
         best_generation = None if best is None else best.generation
         segment_boundaries = np.flatnonzero(boundaries[start:end]) + start
         relock_step: int | None = None
+        # "Exact generation relock": at a learner lease boundary, both roles
+        # enter AND leave the step with the probed slot active, durable, and
+        # holding the exact committed generation, while both relevance
+        # trackers confirm the durable slot is currently rewarding
+        # (``durable_relevant``).  Requiring pre and post together rejects
+        # boundaries that merely switch into or out of the slot mid-step, and
+        # the generation equality rejects a table rebuilt in the same slot
+        # under a new generation.  The same predicate appears in
+        # ``_selected_relock``; keep the two in lockstep.
         if best_slot is not None and best_generation is not None:
             for step_value in segment_boundaries:
                 step = int(step_value)
@@ -629,6 +659,9 @@ def _selected_relock(
             selected_scratch_entered_before_relock_or_segment_end=None,
             selected_durable_retrieval_before_scratch=None,
         )
+    # "Immediate": both roles already have the selected lineage active at
+    # segment entry, so retrieval required no lease boundary at all; the
+    # relock is recorded at the entry step's pre phase with zero boundaries.
     immediate = selected.entry_activity_status == "active"
     slot = selected.slot
     generation = selected.generation
@@ -662,6 +695,9 @@ def _selected_relock(
     relock_step: int | None = start if immediate else None
     relock_phase: EventPhase | None = "pre" if immediate else None
     if not immediate:
+        # Same exact-generation-relock predicate as ``_base_recurrence_records``
+        # (see the prose there), evaluated only on joint boundaries — steps
+        # where helper AND beneficiary lease boundaries coincide.
         for step_value in boundary_steps:
             step = int(step_value)
             if (
@@ -701,6 +737,13 @@ def _selected_relock(
             first_scratch_step = step
             first_scratch_phase = "post"
             break
+    # Each trace step exposes a pre-update and a post-update snapshot; events
+    # within one step are ordered pre < post, so scratch entry and relock
+    # compare lexicographically as (step, phase) pairs.  An immediate relock
+    # sits at (start, "pre") and therefore precedes any scratch entry.  Both
+    # orderings below are strict: "scratch before relock" needs the scratch
+    # event strictly earlier (a missing relock counts as scratch-first), and
+    # "durable retrieval before scratch" needs the relock strictly earlier.
     phase_order = {"pre": 0, "post": 1}
     scratch_event = (
         None
@@ -748,6 +791,15 @@ def _enriched_recurrence_records(
     config: HiddenRegimeDevelopmentConfig,
     lineages: tuple[CommitGenerationLineage, ...],
 ) -> tuple[RecurrenceRetentionRecord, ...]:
+    """Fill lineage-aware fields onto the legacy records, per coalesced recurrence.
+
+    ``latest`` is the most recent acquisition-qualified commit of the regime
+    before the recurrence, whether or not its generation survived; it anchors
+    the ``latest_qualified_acquisition_*`` error-rate baseline.  ``selected``
+    is the most recent qualified commit whose synchronized generation still
+    survives at entry; it anchors the ``selected_*`` content and relock probes.
+    """
+
     base = {record.segment_index: record for record in _base_recurrence_records(trace, config)}
     recurrences = independent_lineage_recurrence_segments(config.world)
     records: list[RecurrenceRetentionRecord] = []

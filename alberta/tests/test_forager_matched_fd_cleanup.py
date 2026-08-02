@@ -1,3 +1,13 @@
+"""Descriptor-leak regressions for the executor and qualification tree walkers.
+
+Same before/after ``/proc/self/fd`` counting pattern as
+``test_forager_matched_container_hardening`` (see its module docstring),
+applied to :func:`forager_matched_executor.source_inventory` and
+``forager_matched_qualification._durably_sync_verified_tree``: an injected
+``os.fstat`` failure on the freshly opened root must not leak the root
+descriptor.
+"""
+
 from __future__ import annotations
 
 import os

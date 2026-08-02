@@ -1,9 +1,11 @@
 """Regression tests for Step 2 canonical results.
 
-Mirrors ``test_step1_replication.py``: load JSON, assert structural
-invariants and the headline scientific claims.  Historical exploratory
-artifacts may skip when absent, but promoted strict/risk artifacts are
-required canonical files.
+Mirrors ``test_step1_replication.py``: load JSON artifacts produced by the
+Step 2 experiment scripts, then assert structural invariants and the headline
+scientific claims.  The artifacts are not tracked in the repo, so every test
+skips when its artifact is absent (fresh checkouts and CI stay green); the
+two loader helpers differ only in what they mark, not in behavior — see
+:func:`_load_required_canonical_json`.
 """
 
 from __future__ import annotations
@@ -33,6 +35,14 @@ def _load_json_or_skip(filename: str) -> dict[str, Any]:
 
 
 def _load_required_canonical_json(filename: str) -> dict[str, Any]:
+    """Load a promoted strict/risk canonical artifact.
+
+    Behaviorally identical to :func:`_load_json_or_skip`; the separate name
+    marks call sites whose artifact is a promoted canonical result rather
+    than a historical exploratory one.  It still skips (not fails) when the
+    file is absent because the artifacts are generated locally and are not
+    tracked in the repo.
+    """
     path = CANONICAL_DIR / filename
     if not path.exists():
         pytest.skip(
@@ -737,7 +747,8 @@ class TestPublishedScaleOPMNISTBoundary:
 
 
 class TestUniversalPortfolioScaleChecks:
-    """30-seed scale checks for the rows that previously carried risk."""
+    """30-seed scale checks over the ``universal_portfolio_*_30seed`` artifacts
+    (compositional, frequency/class-blocked risk rows, non-blocked digits)."""
 
     def test_compositional_30_seed_mean_is_positive_vs_best_mlp(self) -> None:
         results = _load_required_canonical_json(

@@ -1,10 +1,27 @@
 # mypy: disable-error-code="call-arg"
 """Differentiable EML circuits.
 
-This module explores an EML analogue of differentiable logic networks:
-binary EML nodes are kept differentiable during training by learning soft
-source selections, while hard argmax routing can be inspected or used for a
-discrete circuit after training.
+The EML primitive is the single binary real operation
+``eml(x, y) = exp(x) - log(y)``.  All hidden computation in these circuits is
+repeated application of that one operation; learning selects only the wiring
+(source routing, leaf choices, or hard-gate selection) plus a small linear
+readout.  Restricted to Boolean inputs and thresholded outputs, depth-2 EML
+expressions already realize all 16 two-input Boolean gates
+(:func:`eml_threshold_gate_library`), so the operator is logically complete
+for two-input circuits.
+
+This module explores an EML analogue of differentiable logic-gate networks
+(Petersen et al. 2022): binary EML nodes are kept differentiable during
+training by learning soft source selections, while hard argmax routing can be
+inspected or used for a discrete circuit after training.
+
+This is an exploratory representation substrate on the same stream interfaces
+as the Step 1-2 learners; it is not registered as evidence for any Alberta
+Plan step.
+
+References:
+    Petersen, Borgelt, Kuehne, & Deussen (2022). "Deep Differentiable Logic
+        Gate Networks."
 """
 
 import functools
