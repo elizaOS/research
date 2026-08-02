@@ -2,3 +2,13 @@ WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a 
 2026-08-01 22:20:52,610 INFO loading MNIST from data_home=/home/shaw/milady/alberta/outputs/step2_published_mnist_openml_cache
 2026-08-01 22:20:58,791 INFO running upgd_idbd seed=0 for 200 tasks x 5000 steps (noise_mode=step)
 2026-08-01 22:39:16,598 INFO upgd_idbd seed=0 task 20/200 online_acc=0.7720 elapsed=1087.5s
+2026-08-01 23:00:08,575 INFO upgd_idbd seed=0 task 40/200 online_acc=0.7784 elapsed=2339.4s
+2026-08-01 23:24:25,385 INFO upgd_idbd seed=0 task 60/200 online_acc=0.7862 elapsed=3796.3s
+2026-08-01 23:48:13,175 INFO upgd_idbd seed=0 task 80/200 online_acc=0.7856 elapsed=5224.0s
+2026-08-02 00:13:42,334 INFO upgd_idbd seed=0 task 100/200 online_acc=0.7870 elapsed=6753.2s
+2026-08-02 00:38:14,948 INFO upgd_idbd seed=0 task 120/200 online_acc=0.7846 elapsed=8225.8s
+2026-08-02 01:02:53,874 INFO upgd_idbd seed=0 task 140/200 online_acc=0.7754 elapsed=9704.7s
+2026-08-02 01:29:12,692 INFO upgd_idbd seed=0 task 160/200 online_acc=0.7748 elapsed=11283.6s
+2026-08-02 01:55:24,009 INFO upgd_idbd seed=0 task 180/200 online_acc=0.7780 elapsed=12854.9s
+2026-08-02 02:19:56,470 INFO upgd_idbd seed=0 task 200/200 online_acc=0.7832 elapsed=14327.3s
+2026-08-02 02:19:58,249 INFO upgd_idbd seed=0 done: avg online acc 0.7789 (wall 14327.4s) -> outputs/ipmnist_screening/confirm_full/upgd_idbd_seed0.json

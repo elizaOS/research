@@ -1,0 +1,3 @@
+retrying upgd_ema_norm_sigma0 seed 2 with --noise-mode step (noise-free arm)
+retrying upgd_ema_norm_sigma0 seed 0 with --noise-mode step (noise-free arm)
+retrying upgd_ema_norm_sigma0 seed 1 with --noise-mode step (noise-free arm)

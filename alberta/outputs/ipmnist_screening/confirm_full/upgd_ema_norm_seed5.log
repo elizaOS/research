@@ -3,3 +3,12 @@ WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a 
 2026-08-01 22:23:44,139 INFO running upgd_ema_norm seed=5 for 200 tasks x 5000 steps (noise_mode=step)
 2026-08-01 22:36:11,939 INFO upgd_ema_norm seed=5 task 20/200 online_acc=0.8528 elapsed=742.0s
 2026-08-01 22:48:13,533 INFO upgd_ema_norm seed=5 task 40/200 online_acc=0.8530 elapsed=1463.6s
+2026-08-01 23:02:57,652 INFO upgd_ema_norm seed=5 task 60/200 online_acc=0.8460 elapsed=2347.7s
+2026-08-01 23:17:56,133 INFO upgd_ema_norm seed=5 task 80/200 online_acc=0.8534 elapsed=3246.2s
+2026-08-01 23:35:40,474 INFO upgd_ema_norm seed=5 task 100/200 online_acc=0.8540 elapsed=4310.5s
+2026-08-01 23:49:31,205 INFO upgd_ema_norm seed=5 task 120/200 online_acc=0.8512 elapsed=5141.2s
+2026-08-02 00:06:25,326 INFO upgd_ema_norm seed=5 task 140/200 online_acc=0.8544 elapsed=6155.4s
+2026-08-02 00:22:37,208 INFO upgd_ema_norm seed=5 task 160/200 online_acc=0.8538 elapsed=7127.2s
+2026-08-02 00:38:34,943 INFO upgd_ema_norm seed=5 task 180/200 online_acc=0.8600 elapsed=8085.0s
+2026-08-02 00:54:30,182 INFO upgd_ema_norm seed=5 task 200/200 online_acc=0.8496 elapsed=9040.2s
+2026-08-02 00:54:31,829 INFO upgd_ema_norm seed=5 done: avg online acc 0.8537 (wall 9040.2s) -> outputs/ipmnist_screening/confirm_full/upgd_ema_norm_seed5.json

@@ -1,3 +1,6 @@
 retrying upgd_ema_norm seed 5 with --noise-mode step (noise-free arm)
 retrying upgd_ema_norm seed 4 with --noise-mode step (noise-free arm)
 retrying upgd_ema_norm seed 3 with --noise-mode step (noise-free arm)
+retrying upgd_ema_norm seed 6 with --noise-mode step (noise-free arm)
+retrying upgd_ema_norm seed 7 with --noise-mode step (noise-free arm)
+retrying upgd_ema_norm seed 8 with --noise-mode step (noise-free arm)

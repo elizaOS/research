@@ -1,0 +1,3 @@
+upgd_ema_norm_sigma0 0
+upgd_ema_norm_sigma0 1
+upgd_ema_norm_sigma0 2

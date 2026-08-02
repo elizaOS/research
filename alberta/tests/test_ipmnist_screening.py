@@ -108,6 +108,10 @@ class TestRegistry:
             "adamw_cbp_r3e4",
             "adamw_cbp_m50",
             "adamw_cbp_m200",
+            "upgd_ema_norm_wd0005",
+            "upgd_ema_norm_lr003",
+            "upgd_ema_norm_lr0003",
+            "upgd_ema_norm_sigma0",
         }
         assert expected == set(SCREENING_REGISTRY)
 

@@ -46,3 +46,16 @@
 2026-08-01T20:48:46-07:00 shards=63 jobs4=yes (waiting for jobs4.txt + 66 shards)
 2026-08-01T20:53:46-07:00 shards=66 jobs4=yes (waiting for jobs4.txt + 66 shards)
 2026-08-01T20:53:46-07:00 running jobs4 arms
+skip adamw_cbp_ema_norm seed 0 (shard exists)
+skip adamw_cbp_ema_norm seed 1 (shard exists)
+skip adamw_cbp_ema_norm seed 2 (shard exists)
+2026-08-02T00:46:30-07:00 jobs4 shards missing=0
+WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-08-02 00:46:34,333 INFO merged 97 shards -> outputs/ipmnist_screening/summary.json
+confirmation candidates (wave-4 final): ['upgd_ema_norm', 'upgd_ema_norm_wd0005', 'adamw_cbp_ema_norm', 'adamw_cbp_r3e4', 'adamw_cbp', 'adamw_cbp_m50', 'adamw_cbp_m200', 'adamw_cbp_noreset', 'adamw_cbp_r3e5', 'upgd_w_wd0005']
+NEW confirmation jobs to launch: 21
+2026-08-02T00:46:35-07:00 launching new confirmations (idempotent per shard)
+retrying upgd_ema_norm_wd0005 seed 1 with --noise-mode step (noise-free arm)
+retrying adamw_cbp_ema_norm seed 0 with --noise-mode step (noise-free arm)
+retrying upgd_ema_norm_wd0005 seed 2 with --noise-mode step (noise-free arm)
+retrying upgd_ema_norm_wd0005 seed 0 with --noise-mode step (noise-free arm)

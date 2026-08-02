@@ -1797,6 +1797,58 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             factory=_make_upgd_cbp_learner,
             description="UPGD-W with CBP-style dormant-unit recycling.",
         ),
+        # --- Wave 5: star around the confirmed upgd_ema_norm result (0.85357
+        # at 200 tasks).  Its UPGD-W hyperparameters were tuned for RAW pixel
+        # inputs; under EMA-normalized inputs the effective gradient scale,
+        # the noise-to-gradient ratio, and the decay pressure all change, so
+        # the published values are unlikely to remain optimal.  One axis per
+        # arm, same factory.
+        ScreeningSpec(
+            name="upgd_ema_norm_wd0005",
+            base_learner="upgd_w",
+            mechanism="input_normalization",
+            hyperparameters=_upgd_hp(
+                norm_decay=0.999, norm_epsilon=1e-8, weight_decay=0.005
+            ),
+            factory=_make_upgd_ema_norm_learner,
+            description=(
+                "upgd_ema_norm with the independently confirmed better weight "
+                "decay 0.005 (composition of the two confirmed wins)."
+            ),
+        ),
+        ScreeningSpec(
+            name="upgd_ema_norm_lr003",
+            base_learner="upgd_w",
+            mechanism="input_normalization",
+            hyperparameters=_upgd_hp(
+                norm_decay=0.999, norm_epsilon=1e-8, step_size=0.03
+            ),
+            factory=_make_upgd_ema_norm_learner,
+            description="upgd_ema_norm at 3x step size (normalized inputs change scale).",
+        ),
+        ScreeningSpec(
+            name="upgd_ema_norm_lr0003",
+            base_learner="upgd_w",
+            mechanism="input_normalization",
+            hyperparameters=_upgd_hp(
+                norm_decay=0.999, norm_epsilon=1e-8, step_size=0.003
+            ),
+            factory=_make_upgd_ema_norm_learner,
+            description="upgd_ema_norm at 1/3 step size.",
+        ),
+        ScreeningSpec(
+            name="upgd_ema_norm_sigma0",
+            base_learner="upgd_w",
+            mechanism="input_normalization",
+            hyperparameters=_upgd_hp(
+                norm_decay=0.999, norm_epsilon=1e-8, noise_std=0.0
+            ),
+            factory=_make_upgd_ema_norm_learner,
+            description=(
+                "upgd_ema_norm without the perturbation: is the noise "
+                "load-bearing once inputs are conditioned?"
+            ),
+        ),
         ScreeningSpec(
             name="adamw_cbp",
             base_learner="adamw",
