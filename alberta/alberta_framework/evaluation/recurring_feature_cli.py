@@ -56,8 +56,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         type=Path,
-        default=DEFAULT_OUTPUT,
-        help="new output path; existing files and the pinned default are never overwritten",
+        default=None,
+        help=(
+            "required for generation; must be a new path (the pinned canonical "
+            f"artifact {DEFAULT_OUTPUT} and existing files are never overwritten)"
+        ),
     )
     parser.add_argument(
         "--verify",
@@ -116,6 +119,19 @@ def main(
     args = _parser().parse_args(argv)
     if args.verify is not None:
         return _verify(args.verify)
+    if args.output is None:
+        _emit(
+            {
+                "accepted": False,
+                "artifact": None,
+                "errors": [
+                    "generation requires --output with a new path; pinned "
+                    "artifacts are immutable; pass --output with a new path"
+                ],
+                "valid": False,
+            }
+        )
+        return 2
 
     try:
         output_path = _resolved_new_output(args.output)

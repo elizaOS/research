@@ -373,7 +373,7 @@ def test_operational_metadata_is_outside_digest_but_still_validated(
     assert not validation.accepted
 
 
-def test_cli_refuses_default_pinned_output_before_running(
+def test_cli_requires_explicit_output_before_running(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -392,7 +392,7 @@ def test_cli_refuses_default_pinned_output_before_running(
 
     assert status == 2
     assert emitted["valid"] is False
-    assert "pinned canonical artifact" in emitted["errors"][0]
+    assert "generation requires --output with a new path" in emitted["errors"][0]
     assert pinned.read_bytes() == original
 
 
@@ -409,7 +409,7 @@ def test_cli_refuses_missing_reserved_canonical_path_before_running(
         raise AssertionError("the reserved canonical path must never be regenerated")
 
     monkeypatch.setattr(recurring_cli_module, "run_recurring_feature_gate", forbidden_run)
-    status = recurring_cli_module.main([])
+    status = recurring_cli_module.main(["--output", str(reserved)])
     emitted = json.loads(capsys.readouterr().out)
 
     assert status == 2

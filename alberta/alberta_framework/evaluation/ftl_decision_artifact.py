@@ -24,6 +24,7 @@ import hashlib
 import importlib.metadata
 import json
 import math
+import os
 import platform
 import subprocess
 from collections.abc import Mapping
@@ -1401,8 +1402,19 @@ def write_ftl_decision_artifact(
     evaluation_wall_seconds: float,
     generated_at: datetime | None = None,
 ) -> dict[str, object]:
-    """Build, validate, and write accepted or validly rejected evidence."""
+    """Build, validate, and write accepted or validly rejected evidence.
 
+    Existing files — including the pinned canonical artifact — are immutable:
+    a path that already exists is refused before any bytes are written.
+    """
+
+    expanded = path.expanduser()
+    destination = expanded.resolve()
+    if os.path.lexists(expanded) or os.path.lexists(destination):
+        raise FileExistsError(
+            f"refusing to overwrite existing evidence artifact path: {path}; "
+            "reruns must write to a new path"
+        )
     artifact = build_ftl_decision_artifact(
         report,
         evaluation_wall_seconds=evaluation_wall_seconds,
@@ -1413,8 +1425,15 @@ def write_ftl_decision_artifact(
         raise ValueError(
             "refusing to write invalid evidence artifact: " + "; ".join(validation.errors)
         )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(artifact_json(artifact), encoding="utf-8")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with destination.open("x", encoding="utf-8") as handle:
+            handle.write(artifact_json(artifact))
+    except FileExistsError as error:
+        raise FileExistsError(
+            f"refusing to overwrite existing evidence artifact path: {destination}; "
+            "reruns must write to a new path"
+        ) from error
     return artifact
 
 

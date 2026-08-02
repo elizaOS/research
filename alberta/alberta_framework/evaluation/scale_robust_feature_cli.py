@@ -50,10 +50,15 @@ def _resolved_new_output(path: Path) -> Path:
     canonical = DEFAULT_OUTPUT.expanduser().resolve()
     if resolved == canonical:
         raise FileExistsError(
-            f"refusing to write pinned canonical artifact path: {resolved}"
+            f"refusing to write pinned canonical artifact path: {resolved}; "
+            "pass --output with a new path — reruns are reproducibility "
+            "evidence and never overwrite the promoted artifact"
         )
     if os.path.lexists(expanded) or os.path.lexists(resolved):
-        raise FileExistsError(f"refusing to overwrite existing output path: {resolved}")
+        raise FileExistsError(
+            f"refusing to overwrite existing output path: {resolved}; "
+            "pass --output with a new path"
+        )
     return resolved
 
 
@@ -90,8 +95,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         type=Path,
-        default=DEFAULT_OUTPUT,
-        help="new output path; existing files and the pinned default are never overwritten",
+        default=None,
+        help=(
+            "required for generation; must be a new path (the pinned canonical "
+            f"artifact {DEFAULT_OUTPUT} and existing files are never overwritten)"
+        ),
     )
     parser.add_argument(
         "--verify",
@@ -155,6 +163,19 @@ def main(
     args = _parser().parse_args(argv)
     if args.verify is not None:
         return _verify(args.verify)
+    if args.output is None:
+        _emit(
+            {
+                "accepted": False,
+                "artifact": None,
+                "errors": [
+                    "generation requires --output with a new path; pinned "
+                    "artifacts are immutable; pass --output with a new path"
+                ],
+                "valid": False,
+            }
+        )
+        return 2
 
     try:
         output_path = _resolved_new_output(args.output)

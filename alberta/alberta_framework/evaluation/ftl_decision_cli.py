@@ -9,9 +9,8 @@ path::
     python -m alberta_framework.evaluation.ftl_decision_cli \
         --output /new/path/ftl-decision-evidence.json
 
-Caveat: unlike ``recurring_feature_cli``, ``--output`` defaults to the pinned
-canonical path and generation has no overwrite guard — it clobbers whatever
-the target path holds.  Callers must supply a fresh path themselves.
+Generation refuses the pinned canonical path and any already-existing file
+before the protocol runs, matching ``recurring_feature_cli``.
 
 Generation exposes no seed, learner, bootstrap, or threshold tuning flags.
 Verification validates an existing artifact without rerunning JAX.
@@ -24,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Sequence
 from datetime import datetime
@@ -40,9 +40,27 @@ from alberta_framework.evaluation.ftl_decision_fidelity import (
     run_ftl_decision_fidelity_evaluation,
 )
 
-# The sha-pinned immutable promoted artifact.  Nothing in this CLI refuses to
-# overwrite it; pass --output with a new path for any rerun.
+# The sha-pinned immutable promoted artifact.  Generation refuses this path
+# (and any existing file) before running; pass --output with a new path.
 DEFAULT_OUTPUT = Path("outputs/ftl_decision/evidence.v1.json")
+
+
+def _resolved_new_output(path: Path) -> Path:
+    expanded = path.expanduser()
+    resolved = expanded.resolve()
+    canonical = DEFAULT_OUTPUT.expanduser().resolve()
+    if resolved == canonical:
+        raise FileExistsError(
+            f"refusing to write pinned canonical artifact path: {resolved}; "
+            "pass --output with a new path — reruns are reproducibility "
+            "evidence and never overwrite the promoted artifact"
+        )
+    if os.path.lexists(expanded) or os.path.lexists(resolved):
+        raise FileExistsError(
+            f"refusing to overwrite existing output path: {resolved}; "
+            "pass --output with a new path"
+        )
+    return resolved
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -52,7 +70,15 @@ def _parser() -> argparse.ArgumentParser:
             "known-reward open-loop decision-fidelity gate."
         )
     )
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help=(
+            "required for generation; must be a new path (the pinned canonical "
+            f"artifact {DEFAULT_OUTPUT} and existing files are never overwritten)"
+        ),
+    )
     parser.add_argument(
         "--verify",
         type=Path,
@@ -116,6 +142,32 @@ def main(
     args = _parser().parse_args(argv)
     if args.verify is not None:
         return _verify(args.verify)
+    if args.output is None:
+        _emit(
+            {
+                "accepted": False,
+                "artifact": None,
+                "errors": [
+                    "generation requires --output with a new path; pinned "
+                    "artifacts are immutable; pass --output with a new path"
+                ],
+                "valid": False,
+            }
+        )
+        return 2
+
+    try:
+        output_path = _resolved_new_output(args.output)
+    except OSError as error:
+        _emit(
+            {
+                "accepted": False,
+                "artifact": str(args.output),
+                "errors": [str(error)],
+                "valid": False,
+            }
+        )
+        return 2
 
     try:
         if report is None:
@@ -126,7 +178,7 @@ def main(
             evidence_report = report
             elapsed = 0.0 if evaluation_wall_seconds is None else evaluation_wall_seconds
         artifact = write_ftl_decision_artifact(
-            args.output,
+            output_path,
             evidence_report,
             evaluation_wall_seconds=elapsed,
             generated_at=generated_at,

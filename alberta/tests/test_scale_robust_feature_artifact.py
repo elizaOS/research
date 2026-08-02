@@ -1149,7 +1149,7 @@ def test_strict_loader_rejects_duplicate_keys_and_nonstandard_constants(
         load_evidence_artifact(nonfinite)
 
 
-def test_cli_refuses_default_pinned_output_before_running_protocol(
+def test_cli_requires_explicit_output_before_running_protocol(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1172,7 +1172,7 @@ def test_cli_refuses_default_pinned_output_before_running_protocol(
 
     assert status == 2
     assert emitted["valid"] is False
-    assert "pinned canonical artifact" in emitted["errors"][0]
+    assert "generation requires --output with a new path" in emitted["errors"][0]
     assert pinned.read_bytes() == original
 
 
@@ -1193,7 +1193,7 @@ def test_cli_refuses_missing_reserved_canonical_path_before_running_protocol(
         "run_scale_robust_feature_evaluation",
         forbidden_run,
     )
-    status = scale_robust_feature_cli.main([])
+    status = scale_robust_feature_cli.main(["--output", str(reserved)])
     emitted = json.loads(capsys.readouterr().out)
 
     assert status == 2
