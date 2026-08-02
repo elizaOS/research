@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+import tomllib
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import cast
 
 import pytest
 
+from alberta_framework import cli as framework_cli
 from alberta_framework.evaluation import evidence_manifest_cli
 from alberta_framework.evaluation.evidence_manifest import (
     CLAIM_CONTRACT_VERSION,
@@ -351,3 +353,67 @@ def test_cli_emits_manifest_and_propagates_nonzero_status(
 
     assert evidence_manifest_cli.main(["--root", str(tmp_path)]) == 1
     assert json.loads(capsys.readouterr().out) == fake_manifest
+
+
+@pytest.mark.parametrize("status", (0, 1, 2))
+@pytest.mark.unit
+def test_deprecated_evidence_gate_delegates_without_corrupting_json_stdout(
+    status: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    delegated_argv: list[tuple[str, ...]] = []
+    payload = {"schema_version": MANIFEST_SCHEMA_VERSION, "overall_status": "fixture"}
+
+    def fake_status_main(argv: Sequence[str] | None = None) -> int:
+        assert argv is not None
+        delegated_argv.append(tuple(argv))
+        print(json.dumps(payload))
+        return status
+
+    monkeypatch.setattr(evidence_manifest_cli, "main", fake_status_main)
+
+    argv = ["--root", str(tmp_path)]
+    assert framework_cli.evidence_gate_main(argv) == status
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == payload
+    assert "alberta-evidence-gate is deprecated" in captured.err
+    assert "alberta-evidence-status" in captured.err
+    assert delegated_argv == [tuple(argv)]
+
+
+@pytest.mark.parametrize("argv", (["--step", "1"], ["--step=all"]))
+@pytest.mark.unit
+def test_deprecated_evidence_gate_rejects_legacy_step_selector(
+    argv: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    delegated = False
+
+    def fake_status_main(_argv: Sequence[str] | None = None) -> int:
+        nonlocal delegated
+        delegated = True
+        return 0
+
+    monkeypatch.setattr(evidence_manifest_cli, "main", fake_status_main)
+
+    assert framework_cli.evidence_gate_main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "--step belonged to the retired" in captured.err
+    assert "alberta-evidence-status" in captured.err
+    assert delegated is False
+
+
+@pytest.mark.unit
+def test_deprecated_and_canonical_evidence_entrypoints_are_packaged() -> None:
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    scripts = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["scripts"]
+
+    assert scripts["alberta-evidence-gate"] == "alberta_framework.cli:evidence_gate_main"
+    assert (
+        scripts["alberta-evidence-status"]
+        == "alberta_framework.evaluation.evidence_manifest_cli:main"
+    )

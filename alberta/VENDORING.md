@@ -54,15 +54,17 @@ under active campaign development, so exact counts move:
   `recurring_multiagent`, `hidden_partner_mapping`,
   `hidden_partner_world_feedback`, and `hidden_regime_signaling`.
 - **`tests/`** — 325 `test_*.py` files (~6,900 tests collected).
-  `tests/conftest.py` collect-ignores 39 vendored test modules whose imports
-  require upstream-only trees (the root `benchmarks/` scripts tree and
-  `examples/`), so the suite here is a strict superset of upstream logic but
-  not of upstream's own test list.
+  `tests/conftest.py` and focused import adapters report visible module-level
+  skips when tests require the upstream-only root `benchmarks/` scripts tree
+  or `examples/`; those omissions are no longer hidden by `collect_ignore`.
+  The suite here is therefore a strict superset of upstream logic but not of
+  upstream's own runnable test list.
 - **Top level**: `RESEARCH_STATUS.md`, `CONTINUAL_LEARNING_EVIDENCE.md`,
   `FORAGER_BENCHMARK.md`, the execution runbooks and campaign audits, the
   `outputs/` evidence artifacts, and this file are fork-local.
   `CHANGELOG.md` continues upstream numbering (0.27.0 was cut here);
-  `pyproject.toml` registers 15 console scripts.
+  `pyproject.toml` registers 15 console scripts, including the deprecated
+  `alberta-evidence-gate` compatibility alias for `alberta-evidence-status`.
 
 Because of this, "re-sync from upstream" is no longer a patch-reapplication
 exercise; treat any future sync as a merge between diverged development lines.

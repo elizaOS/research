@@ -4,15 +4,23 @@ from __future__ import annotations
 
 import json
 import tempfile
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+BSUITE_ADAPTER_ROOT = Path(__file__).resolve().parents[1] / "benchmarks" / "bsuite"
+if not BSUITE_ADAPTER_ROOT.is_dir():
+    pytest.skip(
+        "benchmarks/bsuite adapters are not shipped in the standalone checkout "
+        "(see VENDORING.md)",
+        allow_module_level=True,
+    )
+
 dm_env = pytest.importorskip("dm_env", reason="dm_env not installed (install with bsuite extra)")
 pytest.importorskip("bsuite", reason="bsuite not installed")
-from dm_env import specs  # noqa: E402
-
 from benchmarks.bsuite.wrappers import ContinuingWrapper  # noqa: E402
+from dm_env import specs  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Minimal deterministic environment for unit tests.

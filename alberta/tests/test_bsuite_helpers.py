@@ -8,12 +8,20 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from benchmarks.bsuite._bsuite_path import (
+BSUITE_ADAPTER_ROOT = Path(__file__).resolve().parents[1] / "benchmarks" / "bsuite"
+if not BSUITE_ADAPTER_ROOT.is_dir():
+    pytest.skip(
+        "benchmarks/bsuite adapters are not shipped in the standalone checkout "
+        "(see VENDORING.md)",
+        allow_module_level=True,
+    )
+
+from benchmarks.bsuite._bsuite_path import (  # noqa: E402
     add_bsuite_to_path,
     candidate_bsuite_paths,
     import_root_for_bsuite_checkout,
 )
-from benchmarks.bsuite.analysis import (
+from benchmarks.bsuite.analysis import (  # noqa: E402
     compare_sarsa_vs_q,
     compare_sarsa_vs_q_preferred_metric,
     compare_step4_control,
@@ -21,7 +29,7 @@ from benchmarks.bsuite.analysis import (
     format_step4_control_report,
     load_results,
 )
-from benchmarks.bsuite.run_sweep import (
+from benchmarks.bsuite.run_sweep import (  # noqa: E402
     build_sweep_jobs,
     experiment_names_from_bsuite_ids,
     get_bsuite_ids_for_experiment,

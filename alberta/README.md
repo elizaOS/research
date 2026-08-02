@@ -32,6 +32,13 @@ the repository checkout: the wheel and sdist deliberately exclude `outputs/`,
 so from a pip-installed environment every claim reports missing and the
 command exits `1`. Run it from a checkout.
 
+`alberta-evidence-gate` is retained temporarily as a deprecated compatibility
+alias for `alberta-evidence-status` and has the same manifest and exit-code
+contract. Its former `--step` selector is rejected: the upstream Step 1/2
+artifact generators and narrative-document tree are intentionally not shipped
+in this fork, so there is no current Step 1-only or Step 2-only registry claim
+to validate.
+
 Pinned historical evidence includes a narrow L2 scale-robust pair-feature
 package comparison on 30 exact namespace-derived fresh seeds. Its immutable
 artifact is `outputs/scale_robust_feature/evidence.v2.json`, with scientific

@@ -15,77 +15,61 @@ for import_path in (PROJECT_ROOT,):
         sys.path.insert(0, str(import_path))
 
 
-# The standalone research repo vendors ``alberta_framework`` (the library) and
-# its unit tests, but deliberately omits the ``benchmarks/`` and
-# ``examples/The Alberta Plan/`` script trees (large experiment drivers, not part
-# of the published package — see VENDORING.md). These modules ``load_script`` or
-# ``import benchmarks.*`` at import time, so pytest cannot even collect them here;
-# they fail with FileNotFoundError / ModuleNotFoundError before any assertion
-# runs. Skip them at collection time when — and only when — those trees are
-# absent, so a checkout that DOES vendor them (or upstream) still runs the full
-# suite unchanged.
-_VENDORED_OUT_TREES_PRESENT = (PROJECT_ROOT / "benchmarks").is_dir() and (
-    PROJECT_ROOT / "examples"
-).is_dir()
+# The standalone repository deliberately omits the upstream ``benchmarks/`` and
+# ``examples/`` script trees. Tests that depend on those trees remain collectable:
+# ``load_script`` below reports a visible skip only when the containing tree is
+# absent. A missing script inside a present tree remains a hard failure.
+_OPTIONAL_SCRIPT_ROOTS = (PROJECT_ROOT / "benchmarks", PROJECT_ROOT / "examples")
 
-# Authoritative list of test modules whose module body reaches into the omitted
-# benchmarks/examples trees. Regenerate by running the suite and collecting every
-# file that fails with FileNotFoundError/ModuleNotFoundError for a
-# benchmarks/ or examples/ path.
-_BENCHMARK_EXAMPLE_DEPENDENT_TESTS = (
-    "test_alberta_plan_remaining_todo_gate.py",
-    "test_bsuite_helpers.py",
-    "test_continuous_diffeml_performance.py",
-    "test_d18_groupwise_decay.py",
-    "test_d18_opmnist_bridge.py",
-    "test_d20_multiprototype_opmnist.py",
-    "test_diffeml_ablation_suite.py",
-    "test_diffeml_hard_synthesis_suite.py",
-    "test_diffeml_logic_benchmark.py",
-    "test_diffeml_pure_eml_scale_suite.py",
-    "test_production_steps.py",
-    "test_rlsecd_external_acceptance_spec.py",
-    "test_security_gym_oracle_experience_export.py",
-    "test_step2_associative_evidence_gate.py",
-    "test_step2_associative_memory_theory.py",
-    "test_step2_associative_opmnist_confirmation.py",
-    "test_step2_cifar_stream.py",
-    "test_step2_completion_criteria.py",
-    "test_step2_compositional_no_regret.py",
-    "test_step2_conclusive_learner.py",
-    "test_step2_context_disentanglement.py",
-    "test_step2_context_inference.py",
-    "test_step2_distribution_free_limits.py",
-    "test_step2_expert_mixture.py",
-    "test_step2_external_suite.py",
-    "test_step2_formal_recursive_feature_discovery.py",
-    "test_step2_new_direction_pilots.py",
-    "test_step2_opmnist_protocol.py",
-    "test_step2_published_stressors.py",
-    "test_step2_resource_manager_stateful_external.py",
-    "test_step2_scr_router_search.py",
-    "test_step2_theory_falsification.py",
-    "test_step2_universal_portfolio.py",
-    "test_step2_universal_sieve_probe.py",
-    "test_step2_upgd_ablation_configs.py",
-    "test_step2_upgd_memory_opmnist.py",
-    "test_step2_upgd_recursive_feature_discovery_theory.py",
-    "test_step3_feature_discovery_eval.py",
-    "test_throughput_smoke.py",
-)
 
-collect_ignore = (
-    [] if _VENDORED_OUT_TREES_PRESENT else list(_BENCHMARK_EXAMPLE_DEPENDENT_TESTS)
-)
+def pytest_terminal_summary(
+    terminalreporter: object, exitstatus: int, config: pytest.Config
+) -> None:
+    """Surface how many 'replication' tests skipped.
+
+    The historical Step 1/Step 2 replication suites gate every test on
+    optional upstream JSON artifacts. This fork ships neither the artifacts
+    nor their generator trees, so a standalone checkout skips 100% unless
+    compatible historical artifacts are supplied. This hook makes that
+    visible without treating the optional regression replays as current
+    scientific evidence.
+    """
+    reporter = terminalreporter  # pytest's TerminalReporter (untyped here)
+    skipped = reporter.stats.get("skipped", [])  # type: ignore[attr-defined]
+    replication_skips = [
+        rep
+        for rep in skipped
+        if getattr(rep, "keywords", None) is not None and "replication" in rep.keywords
+    ]
+    if replication_skips:
+        reporter.write_sep(  # type: ignore[attr-defined]
+            "-",
+            f"replication suites: {len(replication_skips)} test(s) skipped "
+            "because optional historical upstream artifacts are absent "
+            "(outputs/step1_canonical/, outputs/step2_canonical/)",
+        )
 
 
 def load_script(path: Path, name: str) -> ModuleType:
     """Load a Python script by filesystem path (works with paths containing spaces).
 
-    Used by tests that exercise example scripts under
-    ``examples/The Alberta Plan/`` whose directory name cannot be imported
-    with the normal ``import`` statement.
+    Used by tests that exercise example and benchmark scripts whose paths
+    cannot be imported with a normal ``import`` statement. Standalone-checkout
+    omissions are visible skips; an unexpectedly missing script still fails.
     """
+    if not path.is_file():
+        resolved_path = path.resolve(strict=False)
+        for root in _OPTIONAL_SCRIPT_ROOTS:
+            resolved_root = root.resolve(strict=False)
+            if resolved_path.is_relative_to(resolved_root) and not root.is_dir():
+                relative_path = resolved_path.relative_to(PROJECT_ROOT.resolve())
+                pytest.skip(
+                    f"{relative_path} unavailable because the standalone checkout "
+                    f"omits {root.name}/ (see VENDORING.md)",
+                    allow_module_level=True,
+                )
+        raise FileNotFoundError(path)
+
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

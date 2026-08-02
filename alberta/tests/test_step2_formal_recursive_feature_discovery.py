@@ -8,6 +8,7 @@ from pathlib import Path
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
+import pytest
 from numpy.typing import NDArray
 
 from alberta_framework.core.associative_memory import AssociativeMemoryConfig
@@ -22,7 +23,13 @@ from alberta_framework.core.compositional_features import (
 from alberta_framework.core.feature_discovery import FixedBudgetFeatureLearner
 from alberta_framework.core.upgd import UPGDLearner
 
-DOC_PATH = Path("docs/research/step2_formal_recursive_feature_discovery.md")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DOC_ROOT = REPO_ROOT / "docs"
+DOC_PATH = DOC_ROOT / "research" / "step2_formal_recursive_feature_discovery.md"
+pytestmark = pytest.mark.skipif(
+    not DOC_ROOT.is_dir(),
+    reason="docs/ is not shipped in the standalone checkout (see VENDORING.md)",
+)
 
 
 def _least_squares_mse(

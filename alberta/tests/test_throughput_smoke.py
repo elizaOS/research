@@ -17,6 +17,12 @@ from typing import Any
 
 import pytest
 
+BENCHMARK_ROOT = Path(__file__).resolve().parents[1] / "benchmarks"
+pytestmark = pytest.mark.skipif(
+    not BENCHMARK_ROOT.is_dir(),
+    reason="benchmarks/ is not shipped in the standalone checkout (see VENDORING.md)",
+)
+
 
 @pytest.fixture
 def tiny_horde(monkeypatch: pytest.MonkeyPatch) -> Any:

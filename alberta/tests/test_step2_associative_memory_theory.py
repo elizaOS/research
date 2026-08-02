@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-DOC_PATH = Path("docs/research/step2_associative_memory_theory.md")
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DOC_ROOT = REPO_ROOT / "docs"
+DOC_PATH = DOC_ROOT / "research" / "step2_associative_memory_theory.md"
+pytestmark = pytest.mark.skipif(
+    not DOC_ROOT.is_dir(),
+    reason="docs/ is not shipped in the standalone checkout (see VENDORING.md)",
+)
 
 
 def _read_doc() -> str:

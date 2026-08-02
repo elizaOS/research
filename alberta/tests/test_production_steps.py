@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import pytest
 
-from alberta_framework.cli import evidence_gate_main, step1_smoke_main, step2_smoke_main
+from alberta_framework.cli import step1_smoke_main, step2_smoke_main
 from alberta_framework.steps import (
     Step1KernelConfig,
     Step2HybridConfig,
@@ -28,6 +28,9 @@ from alberta_framework.steps import (
     run_step1_smoke,
     run_step2_smoke,
 )
+
+# The module is ~40 seconds serial on the supported development environment.
+pytestmark = pytest.mark.slow
 
 
 def test_step1_kernel_factory_and_smoke_are_finite() -> None:
@@ -228,36 +231,3 @@ def test_documented_cli_scripts_are_packaged() -> None:
     assert scripts["alberta-step1-smoke"] == "alberta_framework.cli:step1_smoke_main"
     assert scripts["alberta-step2-smoke"] == "alberta_framework.cli:step2_smoke_main"
     assert scripts["alberta-evidence-gate"] == "alberta_framework.cli:evidence_gate_main"
-
-
-def test_evidence_gate_reports_present_artifacts(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    step1_dir = Path(__file__).resolve().parents[1] / "outputs" / "step1_canonical"
-    required = [
-        step1_dir / "multi_baseline_results.json",
-        step1_dir / "normalization_ablation_results.json",
-        step1_dir / "robustness_study_results.json",
-    ]
-    if not all(p.exists() for p in required):
-        pytest.skip("Step 1 canonical outputs not present — run Step 1 experiments first.")
-    status = evidence_gate_main(["--step", "1"])
-    output = capsys.readouterr().out
-    assert status == 0
-    assert '"passed": true' in output
-
-
-def test_step2_evidence_gate_requires_formal_closure_artifacts(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    status = evidence_gate_main(["--step", "2"])
-    output = capsys.readouterr().out
-
-    assert status == 0
-    assert '"required_count": 10' in output
-    assert "step2_upgd_recursive_feature_discovery_theory.md" not in output
-    assert "step2_associative_memory_theory.md" not in output
-    assert "step2_distribution_free_limits.md" not in output
-    assert "step2_compositional_no_regret.md" not in output
-    assert "step2_completion_criteria.md" not in output
-    assert '"passed": true' in output

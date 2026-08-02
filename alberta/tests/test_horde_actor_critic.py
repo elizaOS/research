@@ -1,5 +1,7 @@
 """Tests for Horde-backed actor-critic integration."""
 
+from pathlib import Path
+
 import chex
 import jax
 import jax.numpy as jnp
@@ -23,6 +25,12 @@ from alberta_framework.core.types import (
     DemonType,
     GVFSpec,
     create_horde_spec,
+)
+
+BSUITE_ADAPTER_ROOT = Path(__file__).resolve().parents[1] / "benchmarks" / "bsuite"
+BSUITE_ADAPTER_REASON = (
+    "benchmarks/bsuite adapters are not shipped in the standalone checkout "
+    "(see VENDORING.md)"
 )
 
 
@@ -283,6 +291,7 @@ def test_horde_actor_critic_actor_bounder_hook_runs() -> None:
     chex.assert_tree_all_finite((result.state.actor_weights, result.bound_metric))
 
 
+@pytest.mark.skipif(not BSUITE_ADAPTER_ROOT.is_dir(), reason=BSUITE_ADAPTER_REASON)
 def test_bsuite_horde_ac_pairwise_feature_lift_values() -> None:
     """The adapter's pairwise lift should expose relational actor features."""
     pytest.importorskip("dm_env", reason="dm_env not installed")
@@ -299,6 +308,7 @@ def test_bsuite_horde_ac_pairwise_feature_lift_values() -> None:
     )
 
 
+@pytest.mark.skipif(not BSUITE_ADAPTER_ROOT.is_dir(), reason=BSUITE_ADAPTER_REASON)
 def test_bsuite_horde_ac_pairwise_feature_dim_reaches_actor() -> None:
     """Pairwise lift should initialize the core actor on the lifted feature dim."""
     dm_env = pytest.importorskip("dm_env", reason="dm_env not installed")
@@ -322,6 +332,7 @@ def test_bsuite_horde_ac_pairwise_feature_dim_reaches_actor() -> None:
     assert 0 <= action < 3
 
 
+@pytest.mark.skipif(not BSUITE_ADAPTER_ROOT.is_dir(), reason=BSUITE_ADAPTER_REASON)
 def test_bsuite_qhorde_ac_pairwise_feature_dim_reaches_actor() -> None:
     """Q-Horde adapter should initialize core actor on lifted features."""
     dm_env = pytest.importorskip("dm_env", reason="dm_env not installed")

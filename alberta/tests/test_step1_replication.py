@@ -1,9 +1,10 @@
 """Regression tests for Step 1 canonical replication results.
 
-These tests load the JSON files written by ``examples/The Alberta Plan/Step1/
-step1_full_baselines.py`` (and friends) and assert that the canonical Step 1
-claims still hold.  They auto-skip when the JSON has not been generated yet,
-so a fresh checkout that never ran the experiments still passes the suite.
+These tests can replay JSON files historically written by the upstream
+``examples/The Alberta Plan/Step1/`` experiment scripts. This fork ships
+neither those scripts nor the artifacts, so a normal standalone checkout
+skips the suite. Supplying compatible historical artifacts enables these
+regression checks but does not create current scientific evidence.
 
 Each numeric threshold is intentionally generous: the goal is to catch
 silent regressions in IDBD / Autostep correctness, not to encode brittle
@@ -17,6 +18,11 @@ from pathlib import Path
 
 import pytest
 
+# Every test in this module gates on optional historical upstream artifacts;
+# the marker makes the (potentially 100%) skip count visible — conftest.py's
+# terminal summary reports skipped 'replication' tests explicitly.
+pytestmark = pytest.mark.replication
+
 CANONICAL_DIR = (
     Path(__file__).resolve().parents[1]
     / "outputs"
@@ -29,8 +35,9 @@ def _load_json_or_skip(filename: str) -> dict:
     path = CANONICAL_DIR / filename
     if not path.exists():
         pytest.skip(
-            f"{path} not generated yet; run "
-            "'examples/The Alberta Plan/Step1/step1_full_baselines.py' first."
+            f"optional historical Step 1 artifact {path} is absent; this fork "
+            "ships neither the artifact nor its upstream examples/ generator "
+            "tree (see VENDORING.md)"
         )
     with path.open() as f:
         return json.load(f)

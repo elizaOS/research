@@ -62,6 +62,10 @@ from alberta_framework.streams.hidden_partner_mapping import (
     HiddenPartnerMappingWorld,
 )
 
+# ~6 min serial (eager/jit/scan parity arms compile repeatedly); keep out of
+# the fast per-PR CI lane (-m "not slow").
+pytestmark = pytest.mark.slow
+
 # Same values as V6_INITIAL_ACTIVE_DESCRIPTORS in the frozen v6 design
 # manifest (evaluation.hidden_partner_lifecycle_world_v6).  Deliberately
 # different from the kernel's default INITIAL_ACTIVE_DESCRIPTORS, so the

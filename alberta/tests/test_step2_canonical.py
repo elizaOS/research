@@ -1,11 +1,11 @@
 """Regression tests for Step 2 canonical results.
 
-Mirrors ``test_step1_replication.py``: load JSON artifacts produced by the
-Step 2 experiment scripts, then assert structural invariants and the headline
-scientific claims.  The artifacts are not tracked in the repo, so every test
-skips when its artifact is absent (fresh checkouts and CI stay green); the
-two loader helpers differ only in what they mark, not in behavior — see
-:func:`_load_required_canonical_json`.
+Mirrors ``test_step1_replication.py``: replay JSON artifacts historically
+produced by upstream Step 2 experiment scripts. This fork ships neither those
+scripts nor the artifacts, so standalone checkouts skip the suite. Supplying
+compatible historical artifacts enables regression checks but does not create
+current scientific evidence. The two loader helpers differ only in what they
+mark, not in behavior — see :func:`_load_required_canonical_json`.
 """
 
 from __future__ import annotations
@@ -15,6 +15,11 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+
+# Every test in this module gates on optional historical upstream artifacts;
+# the marker makes the (potentially 100%) skip count visible — conftest.py's
+# terminal summary reports skipped 'replication' tests explicitly.
+pytestmark = pytest.mark.replication
 
 CANONICAL_DIR = (
     Path(__file__).resolve().parents[1]
@@ -27,27 +32,28 @@ def _load_json_or_skip(filename: str) -> dict[str, Any]:
     path = CANONICAL_DIR / filename
     if not path.exists():
         pytest.skip(
-            f"{path} not generated yet; run "
-            "the corresponding Step 2 experiment script first."
+            f"optional historical Step 2 artifact {path} is absent; this fork "
+            "ships neither the artifact nor its upstream examples/ generator "
+            "tree (see VENDORING.md)"
         )
     with path.open() as f:
         return cast(dict[str, Any], json.load(f))
 
 
 def _load_required_canonical_json(filename: str) -> dict[str, Any]:
-    """Load a promoted strict/risk canonical artifact.
+    """Load an artifact historically labeled strict/risk canonical upstream.
 
     Behaviorally identical to :func:`_load_json_or_skip`; the separate name
-    marks call sites whose artifact is a promoted canonical result rather
-    than a historical exploratory one.  It still skips (not fails) when the
-    file is absent because the artifacts are generated locally and are not
-    tracked in the repo.
+    marks call sites that upstream treated differently from exploratory
+    artifacts. It does not promote a claim in this fork and skips when the
+    optional historical artifact is absent.
     """
     path = CANONICAL_DIR / filename
     if not path.exists():
         pytest.skip(
-            f"{path} not generated yet; run "
-            "the corresponding Step 2 experiment script first."
+            f"optional historical Step 2 artifact {path} is absent; this fork "
+            "ships neither the artifact nor its upstream examples/ generator "
+            "tree (see VENDORING.md)"
         )
     with path.open() as f:
         return cast(dict[str, Any], json.load(f))

@@ -14,11 +14,9 @@ name: alberta
 #
 # Both lanes run a python matrix of 3.12 + 3.13: the robot lane consumes this
 # package in-process on 3.12 (brax/mujoco pin numpy<2 there), while upstream
-# targets 3.13. The tests that import the vendored-out benchmarks/ and
-# "examples/The Alberta Plan/" trees — which this standalone repo does not
-# ship — are excluded via tests/conftest.py (collect_ignore) and pyproject
-# [tool.ruff]; the shipped alberta_framework library itself lints and tests
-# clean.
+# targets 3.13. Tests for upstream-only benchmarks/, examples/, and docs/
+# trees remain visible as skips in this standalone repository. The full lane
+# installs the supported Gymnasium and Foragax extras so those gated tests run.
 on:
   push:
     branches: [develop, main]
@@ -69,7 +67,7 @@ jobs:
         run: ruff check .
 
       - name: Test (fast lane, -m "not slow")
-        run: python -m pytest tests/ -q -o addopts="" -m "not slow" -n auto --dist loadfile --durations=25
+        run: python -m pytest tests/ -q -rs -o addopts="" -m "not slow" -n auto --dist loadfile --durations=25
 
   # Full suite: push to main + manual dispatch (mirrors the e1-chip heavy lane).
   full:
@@ -93,13 +91,13 @@ jobs:
           cache: pip
           cache-dependency-path: alberta/pyproject.toml
 
-      - name: Install (editable, with dev extras)
+      - name: Install (editable, with full-suite extras)
         run: |
           python -m pip install -U pip
-          pip install -e '.[dev]' pytest-xdist
+          pip install -e '.[dev,gymnasium,forager]' pytest-xdist
 
       - name: Lint
         run: ruff check .
 
       - name: Test (full suite)
-        run: python -m pytest tests/ -q -o addopts="" -n auto --dist loadfile --durations=25
+        run: python -m pytest tests/ -q -rs -o addopts="" -n auto --dist loadfile --durations=25

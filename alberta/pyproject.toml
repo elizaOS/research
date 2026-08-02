@@ -142,13 +142,10 @@ extend-exclude = [
     "output",
     "outputs",
     "site",
-    # These three test modules import from the vendored-out ``benchmarks/`` tree
-    # (via the ``bsuite`` extra or a bare ``import benchmarks.*``), which the
-    # standalone research repo does not ship (see VENDORING.md and the
-    # ``collect_ignore`` in tests/conftest.py). Their only lint findings are
-    # import-ordering (I001) around those unresolvable ``benchmarks.*`` imports,
-    # so linting them standalone is noise; exclude them here to match the
-    # collection scoping.
+    # These three test modules import from the upstream-only ``benchmarks/``
+    # tree. Pytest reports them as explicit skips when its adapters are absent;
+    # their only lint findings are import-ordering around imports that cannot be
+    # resolved in this standalone checkout, so linting them here is noise.
     "tests/test_bsuite_agents.py",
     "tests/test_bsuite_helpers.py",
     "tests/test_horde_actor_critic.py",
@@ -357,4 +354,5 @@ markers = [
     "scientific: frozen promoted-evidence protocols; may be expensive and require preregistered seeds",
     "development: calibration or exploratory protocols that must never promote scientific claims",
     "slow: wall-clock heavy modules (>~30s serial); excluded from the fast per-PR CI lane",
+    "replication: historical Step 1/Step 2 regression replays that skip when optional upstream artifacts are absent",
 ]

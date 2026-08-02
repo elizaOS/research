@@ -7,6 +7,7 @@ from pathlib import Path
 
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from numpy.typing import NDArray
 
 from alberta_framework.core.compositional_features import CompositionalFeatureLearner
@@ -16,7 +17,13 @@ from alberta_framework.core.resource_manager import (
     optimal_hedge_learning_rate,
 )
 
-DOC_PATH = Path("docs/research/step2_compositional_no_regret.md")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DOC_ROOT = REPO_ROOT / "docs"
+DOC_PATH = DOC_ROOT / "research" / "step2_compositional_no_regret.md"
+pytestmark = pytest.mark.skipif(
+    not DOC_ROOT.is_dir(),
+    reason="docs/ is not shipped in the standalone checkout (see VENDORING.md)",
+)
 
 
 def _mixture_loss(

@@ -10,7 +10,12 @@ from typing import Any, cast
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+DOC_ROOT = REPO_ROOT / "docs"
 DOC_PATH = REPO_ROOT / "docs" / "research" / "step2_associative_evidence_gate.md"
+pytestmark = pytest.mark.skipif(
+    not DOC_ROOT.is_dir(),
+    reason="docs/ is not shipped in the standalone checkout (see VENDORING.md)",
+)
 ASSOCIATIVE_HYBRID_PATH = (
     REPO_ROOT
     / "outputs"
