@@ -1,0 +1,12 @@
+sigma0_ndecay09 0
+sigma0_ndecay09 1
+sigma0_ndecay09 2
+sigma0_ndecay095 0
+sigma0_ndecay095 1
+sigma0_ndecay095 2
+sigma0_ndecay098 0
+sigma0_ndecay098 1
+sigma0_ndecay098 2
+ema_norm_ndecay099 0
+ema_norm_ndecay099 1
+ema_norm_ndecay099 2

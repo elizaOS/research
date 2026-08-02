@@ -140,6 +140,10 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     load_mnist_train,
     mlp_logits,
 )
+from alberta_framework.benchmarks.upgd_ipmnist_v3 import (
+    _preflight_new_output,
+    atomic_write_new,
+)
 from alberta_framework.evaluation.recurring_ipmnist_retention import (
     RecurringIPMNISTPhase,
     RecurringIPMNISTProtocol,
@@ -2358,7 +2362,13 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 noise_update=lean_upgd_w_update,
             )
         )
-    for value, tag in ((0.99, "ndecay099"), (0.9999, "ndecay09999")):
+    for value, tag in (
+        (0.99, "ndecay099"),
+        (0.9999, "ndecay09999"),
+        (0.9, "ndecay09"),
+        (0.95, "ndecay095"),
+        (0.98, "ndecay098"),
+    ):
         specs.append(
             ScreeningSpec(
                 name=f"sigma0_{tag}",
@@ -2373,6 +2383,20 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 ),
             )
         )
+    specs.append(
+        ScreeningSpec(
+            name="ema_norm_ndecay099",
+            base_learner="upgd_w",
+            mechanism="input_normalization",
+            hyperparameters=_sigma0_ext_hp(norm_decay=0.99, noise_std=0.1),
+            factory=_make_upgd_ema_norm_ext_learner,
+            frozen_probe_input=_ema_frozen_probe_input,
+            description=(
+                "upgd_ema_norm (full sigma=0.1 champion) with normalizer decay 0.99 "
+                "(fast-decay winner transplanted onto the noisy champion)."
+            ),
+        )
+    )
     for value, tag in ((1e-6, "eps1e6"), (1e-4, "eps1e4")):
         specs.append(
             ScreeningSpec(
@@ -3397,11 +3421,15 @@ def validate_proxy(
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=1, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    """Publish one immutable JSON result without a shared-temp race.
+
+    Screening workers may run concurrently, so both the temporary name and
+    final publication must be exclusive.  Refusing an occupied destination
+    keeps a duplicate launch from silently replacing another worker's shard.
+    """
+
+    encoded = (json.dumps(payload, indent=1, sort_keys=True) + "\n").encode("utf-8")
+    atomic_write_new(Path(path), encoded)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -3442,6 +3470,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True
     )
 
+    # Refuse an already-published destination before loading data or processing
+    # shards.  This is intentionally only a preflight: a claim file or advisory
+    # lock could strand the output after a crashed worker.  The exclusive
+    # publication in ``_atomic_write_json`` remains authoritative when two
+    # workers pass this check concurrently.
+    output_path = _preflight_new_output(
+        args.out if args.command == "run" else args.output
+    )
+
     if args.command == "run":
         spec = screening_spec(args.config_name)
         config = IPMNISTConfig(n_tasks=args.n_tasks, task_length=args.task_length)
@@ -3458,7 +3495,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             noise_mode=args.noise_mode,
             noise_pool_steps=args.noise_pool_steps,
         )
-        _atomic_write_json(args.out, shard_payload(result))
+        _atomic_write_json(output_path, shard_payload(result))
         logger.info(
             "%s seed=%d done: avg online acc %.4f (wall %.1fs) -> %s",
             spec.name,
@@ -3471,11 +3508,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         summary = merge_shards(
             args.shards, control_name=args.control_name, slope_window=args.slope_window
         )
-        _atomic_write_json(args.output, summary)
+        _atomic_write_json(output_path, summary)
         logger.info("merged %d shards -> %s", summary["n_shards"], args.output)
     elif args.command == "validate-proxy":
         report = validate_proxy(args.shards, args.partials_dir, atol=args.atol)
-        _atomic_write_json(args.output, report)
+        _atomic_write_json(output_path, report)
         logger.info(
             "proxy_validated=%s (prefix_match=%s ordering=%s) -> %s",
             report["proxy_validated"],

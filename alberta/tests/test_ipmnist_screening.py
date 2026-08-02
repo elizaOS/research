@@ -7,6 +7,9 @@ test shard/merge/validation plumbing. Benchmark executions never run here.
 
 import json
 import math
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -23,6 +26,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     CBPState,
     EMANormState,
     ScreeningSpec,
+    _atomic_write_json,
     _hidden_rms_normalize,
     _make_adamw_cbp_ema_norm_learner,
     _make_adamw_cbp_learner,
@@ -40,6 +44,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     ema_normalize,
     guarded_adam_update,
     load_shard,
+    main,
     merge_shards,
     run_screening_config,
     screening_spec,
@@ -120,6 +125,10 @@ class TestRegistry:
             "sgd_ema_norm",
             "sigma0_ndecay099",
             "sigma0_ndecay09999",
+            "sigma0_ndecay09",
+            "sigma0_ndecay095",
+            "sigma0_ndecay098",
+            "ema_norm_ndecay099",
             "sigma0_eps1e6",
             "sigma0_eps1e4",
             "sigma0_hidden_norm",
@@ -719,6 +728,93 @@ class TestShardsAndMerge:
         assert isinstance(l2["paired_vs_control"]["confirmation_candidate"], bool)
         control = next(e for e in summary["results"] if e["config_name"] == "upgd_w_control")
         assert "paired_vs_control" not in control
+
+    def test_atomic_writer_refuses_duplicate_without_mutating_first_result(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "one-result.json"
+        first = {"config_name": "first", "seed": 0}
+        second = {"config_name": "second", "seed": 0}
+
+        _atomic_write_json(path, first)
+        published = path.read_bytes()
+        with pytest.raises(FileExistsError, match="refusing to overwrite immutable output"):
+            _atomic_write_json(path, second)
+
+        assert path.read_bytes() == published
+        assert published == (json.dumps(first, indent=1, sort_keys=True) + "\n").encode("utf-8")
+        assert json.loads(published) == first
+        assert list(tmp_path.iterdir()) == [path]
+
+    def test_simultaneous_atomic_publishers_produce_one_complete_result(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "contended-result.json"
+        contenders = 8
+        barrier = threading.Barrier(contenders)
+
+        def publish(index: int) -> bool:
+            payload = {"config_name": f"candidate-{index}", "seed": index}
+            barrier.wait()
+            try:
+                _atomic_write_json(path, payload)
+            except FileExistsError:
+                return False
+            return True
+
+        with ThreadPoolExecutor(max_workers=contenders) as executor:
+            successes = list(executor.map(publish, range(contenders)))
+
+        assert successes.count(True) == 1
+        published = json.loads(path.read_bytes())
+        assert published == {
+            "config_name": f"candidate-{published['seed']}",
+            "seed": published["seed"],
+        }
+        assert 0 <= published["seed"] < contenders
+        assert list(tmp_path.iterdir()) == [path]
+
+    @pytest.mark.parametrize(
+        ("argv", "guarded_function"),
+        [
+            (
+                ["run", "--config-name", "upgd_w_control", "--seed", "0", "--out"],
+                "load_mnist_train",
+            ),
+            (["merge", "--shards", "unused-shard", "--output"], "merge_shards"),
+            (
+                [
+                    "validate-proxy",
+                    "--shards",
+                    "unused-shard",
+                    "--output",
+                ],
+                "validate_proxy",
+            ),
+        ],
+    )
+    def test_cli_refuses_occupied_output_before_expensive_work(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        argv: list[str],
+        guarded_function: str,
+    ) -> None:
+        import alberta_framework.benchmarks.ipmnist_screening as screening
+
+        output = tmp_path / "occupied.json"
+        original = b"already complete\n"
+        output.write_bytes(original)
+
+        def must_not_run(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError(f"{guarded_function} ran before output preflight")
+
+        monkeypatch.setattr(screening, guarded_function, must_not_run)
+        with pytest.raises(FileExistsError, match="refusing to overwrite immutable output"):
+            main([*argv, str(output)])
+
+        assert output.read_bytes() == original
+        assert list(tmp_path.iterdir()) == [output]
 
     def test_merge_rejects_duplicate_seed(self, tmp_path, small_data):
         p1 = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)

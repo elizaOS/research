@@ -21,6 +21,32 @@ Pool64 upgd_w_control: {1: 0.7787729776000001, 2: 0.77910898075, 0: 0.7786109820
 - upgd_l2init: mean 0.78042 seeds [0.7801939792, 0.7800519805499999, 0.78101797995] -> BEATS-SOTA
 - upgd_w_wd0005: mean 0.78431 seeds [0.78418497905, 0.7842689812499999, 0.7844669820500001, 0.7839469789, 0.7847349790500001, 0.7835629804500001, 0.7840389796000001, 0.7841219829499999, 0.7848029797000001, 0.7849659790000001] -> BEATS-SOTA
 
+## Frontier wave (sigma0 extensions) — NEW CHAMPION
+
+Round-1 screen (60 tasks, seeds 0-2, paired vs `upgd_ema_norm_sigma0`):
+`sigma0_ndecay099` (normalizer decay 0.999 → 0.99) +0.00962 paired delta,
+all seeds positive; every other extension (epsilon floors, gate temperature,
+local gate, hidden-RMS norm, slower decay 0.9999) flat or negative —
+`sigma0_hidden_norm` −0.0186 (hidden-layer normalization actively hurts),
+`sigma0_ndecay09999` −0.0073 (slower conditioning hurts symmetrically).
+
+Full-protocol 200-task confirmation (pool64, seeds 0-2):
+
+- **sigma0_ndecay099: mean 0.86245 seeds [0.86229, 0.86196, 0.86311] -> NEW BEST**
+  (+0.0119 vs its 0.85051 base, +0.0088 vs the 10-seed 0.85362 champion,
+  +0.083 vs the 0.7791 SOTA reproduction — with **zero perturbation noise**,
+  ~1/7 the champion's compute)
+
+Interpretation: the permutation boundary shifts input statistics
+instantaneously; a 100-step EMA (decay 0.99) re-conditions ~10x faster after
+each switch than the 1000-step default, and the symmetric loss from slower
+decay confirms the mechanism is tracking speed, not smoothing. Round-2
+(decay 0.9/0.95/0.98 neighborhood + `ema_norm_ndecay099` noisy transplant)
+runs under `frontier2_pipeline.sh` → `frontier2_results.json`.
+
+All frontier numbers are development-grade (`development_screening_diagnostic`),
+seeds 0-2, nonpromoting.
+
 ## Screening ranked table (proxy, 60 tasks, all arms)
 
 ```json

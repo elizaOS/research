@@ -36,6 +36,7 @@ Full-horizon (200-task) confirmed improvements over that baseline
 | `adamw_cbp` (AdamW + continual-backprop recycling) | 10 | 0.79876 ± 0.00009 | protocol-pure |
 | `upgd_w_wd0005` (published method, tuned decay) | 10 | 0.78431 ± 0.00014 | protocol-pure (tuned) |
 | `upgd_l2init` | 3 | 0.78042 ± 0.00030 | protocol-pure |
+| `sigma0_ndecay099` (EMA norm decay 0.99, no perturbation) | 3 | **0.86245 ± 0.00034** | protocol-extended |
 | `upgd_ema_norm` (UPGD-W + online EMA input normalization) | 10 | 0.8536 ± 0.0001 | protocol-extended |
 | `upgd_ema_norm_sigma0` (same, perturbation off) | 3 | 0.85051 ± 0.00025 | protocol-extended |
 | `upgd_ema_norm_wd0005` | 3 | 0.84745 ± 0.00008 | protocol-extended |
@@ -55,6 +56,13 @@ mechanism contributions (stable across the 60→200-task horizon extension):
 published configuration (`upgd_w_sigma0`, 60-task proxy) *costs* −0.035 —
 the noise IS load-bearing without normalization, and input conditioning
 substitutes for it.
+
+The frontier wave sharpened the conditioning mechanism further: dropping the
+normalizer's EMA decay from 0.999 to 0.99 (`sigma0_ndecay099`) adds another
++0.012 — the permutation boundary shifts input statistics instantly, and a
+100-step EMA re-conditions ~10x faster after each switch. The symmetric
+result (decay 0.9999 *loses* 0.007; hidden-layer normalization loses 0.019)
+confirms the mechanism is input-tracking speed specifically.
 
 Mechanism analysis and the pre-registered outcome matrix are in
 [CONTINUAL_LEARNING_THEORY.md](CONTINUAL_LEARNING_THEORY.md); the complete

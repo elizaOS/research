@@ -218,6 +218,7 @@ completion, and held-out gates remain part of the promotion boundary.
   | `upgd_w_wd0005` | 10 | `0.78431 ± 0.00014` | protocol-pure (tuned) |
   | `upgd_l2init` | 3 | `0.78042 ± 0.00030` | protocol-pure |
   | `upgd_idbd` | 3 | `0.77895 ± 0.00020` | tie with control |
+  | `sigma0_ndecay099` | 3 | `0.86245 ± 0.00034` | protocol-extended, campaign best |
   | `upgd_ema_norm` | 10 | `0.8536 ± 0.0001` | protocol-extended |
   | `upgd_ema_norm_sigma0` | 3 | `0.85051 ± 0.00025` | protocol-extended |
   | `upgd_ema_norm_wd0005` | 3 | `0.84745 ± 0.00008` | protocol-extended |

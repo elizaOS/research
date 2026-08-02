@@ -40,6 +40,23 @@
 > the published-config baseline's 0.7791.  Every rung of the cascade —
 > including bare normalize+SGD+decay — beats the published SOTA method
 > at full protocol length.
+>
+> **Frontier wave (conditioning-speed star):** on the champion's σ=0
+> form, dropping the normalizer's EMA decay 0.999 → 0.99 is worth a
+> further consistent +0.0096 on screen and **0.86245 ± 0.00034 at 200
+> tasks** (`sigma0_ndecay099`, seeds 0-2) — the best number of the
+> whole campaign, at ~1/7 UPGD-W's compute. The star is symmetric:
+> slower decay 0.9999 loses 0.0073, hidden-layer RMS normalization
+> loses 0.0186, epsilon floors and gate temperature are flat. The
+> conditioning mechanism is therefore specifically *input-statistics
+> tracking speed*: the permutation switch moves input statistics
+> instantaneously, and a 100-step EMA re-conditions ~10x faster than
+> the 1000-step default while still averaging enough to be stable
+> within a 5000-step task. This sharpens conclusion (1): the dominant
+> mechanism is not "normalization" generically but *fast tracking of
+> nonstationary input statistics* — decay is a knob trading
+> re-conditioning speed against within-task estimator variance, and
+> the task length sets its optimum.
 
 Status: development analysis (never promotable evidence). Every number below
 is from our own protocol-exact runs — the ICLR-2024 online Input-permuted

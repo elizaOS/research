@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Frontier sigma0-extension wave (development screening lane, nonpromoting):
+  `sigma0_ndecay099` — the perturbation-free normalized-gated champion with
+  the input normalizer's EMA decay dropped 0.999 → 0.99 — confirmed at the
+  full 200-task protocol at **0.86245 ± 0.00034** (seeds 0-2), the campaign's
+  best number, +0.0088 over the 10-seed `upgd_ema_norm` champion at ~1/7 the
+  compute. The extension star is symmetric (slower decay −0.0073, hidden-RMS
+  norm −0.0186, epsilon/gate-temperature/local-gate flat), pinning the
+  dominant mechanism to input-statistics tracking speed. Round-2 arms
+  (`sigma0_ndecay09/095/098`, `ema_norm_ndecay099` noisy transplant) added to
+  the screening registry (103 tests).
+
 - Added the L0 shared control/linear-Horde extension to the bounded Prototype
   pair-feature lifecycle. Channel zero is the owner-bound control target and
   later channels are `HordeUpdateResult.td_targets` in declared demon order;
