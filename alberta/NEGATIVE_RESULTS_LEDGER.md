@@ -58,6 +58,20 @@ here** (or in a doc this file points to).
    jitter. Paired within-runner comparisons cancel the artifact; the AdamW
    prefixes match bitwise. Explains shipped `proxy_validated=false`.
 
+20. **Wave-A 60-task verdicts (all three update-rule arms lose to the
+    champion; the adversarial control supports the input-statistics
+    thesis).** With calibrated learning rates and the champion's
+    conditioning held fixed: `muon_gate` (gradient orthogonalization —
+    the pre-registered gradient-vs-input whitening adversarial control)
+    0.8404, −0.021 vs the 0.8616 champion on every seed ⇒ conditioning
+    location matters and the input side wins. `colnorm_gate` 0.7764
+    (−0.085): per-column RMS scaling on top of an already-conditioned
+    input is harmful at horizon despite winning the 2-task cold-start —
+    early-transient speed does not predict 60-task rank. `lion_gate`
+    0.6551 (−0.206): sign updates discard magnitude information this
+    regime needs. Record: `outputs/ipmnist_screening/waveA_results.json`,
+    shards in `shards/`.
+
 ## Evidence / campaign closures
 
 9. **Continual-IA v1 is a valid rejection** at the frozen 10% gate: reward
@@ -104,4 +118,12 @@ here** (or in a doc this file points to).
     load-bearing where labels permute; input conditioning does not fix
     output-side non-stationarity. (Direction confirmed as pre-registered;
     magnitude partially missed the 0.2–0.4 collapse band — recorded
-    honestly. Full ema-arm verdict pending `results.v2.json`.)
+    honestly.)
+21. **The conditioning-equivalence prediction was REFUTED (v2 merge,
+    `results.v2.json`)**: pre-registered |`upgd_ema_norm` − 0.6715| ≤ 0.02
+    failed — measured 0.7162, +0.045 above the raw-input baseline under
+    label permutation with stationary inputs. EMA input conditioning is a
+    *general* stream-optimization conditioner, not only an
+    input-nonstationarity fix; the tracking-speed component (decay 0.99
+    star) is the part specific to input shift. `upgd_ema_norm_sigma0`
+    0.7155 — perturbation again contributes nothing under conditioning.

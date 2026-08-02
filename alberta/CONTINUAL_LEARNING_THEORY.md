@@ -1,8 +1,19 @@
 # Continual learning on streaming supervision: a mechanistic theory from the IPMNIST campaign
 
-> **2026-08-02 addendum — the completed dissection cascade.**  The
-> follow-up ablations fully decomposed the top result (`upgd_ema_norm`,
-> 0.85359 at 200 tasks) into mechanism contributions (60-task proxy):
+> **2026-08-02 provenance audit (supersedes outcome-strength language
+> below).** The stored curves reproduce the numerical means in this document,
+> but the campaign is not source-authenticated or generator-reconstructable.
+> Its own proxy receipt rejects all three UPGD prefix comparisons (maximum
+> per-task discrepancies `0.0084`–`0.0096`), the aggregate omits 12 current
+> shards, and the round-2 driver fails against the actual shard schema. Treat
+> every decomposition and causal conclusion below as a hypothesis generated
+> from historical development observations. A fresh source-bound lifecycle is
+> required before claiming cross-horizon stability or a completed mechanism
+> dissection.
+
+> **2026-08-02 addendum — recorded dissection hypothesis.** The stored
+> follow-up ablations suggest a decomposition of the top result (`upgd_ema_norm`,
+> 0.85362 at 200 tasks, n=10) into mechanism contributions (60-task proxy):
 >
 > | component removed | arm | mean | contribution |
 > |---|---|---|---|
@@ -11,7 +22,7 @@
 > | − utility gate | `sgd_ema_norm` | 0.8406 | gate ≈ **+0.012** (real, modest) |
 > | − normalization (raw UPGD-W) | `upgd_w_control` | 0.7778 | conditioning ≈ **+0.062** (dominant) |
 >
-> Three conclusions.  (1) **Input conditioning dominates**: bare
+> Three hypotheses.  (1) **Input conditioning dominates**: bare
 > normalize+SGD+decay (0.8406) beats the published SOTA method run as
 > published (0.7791) by +0.06 — much of what the plasticity-method
 > literature fights on this benchmark dissolves under the Alberta Plan's
@@ -32,11 +43,11 @@
 > does not compose — tuning wins and conditioning wins are alternatives,
 > not additive.
 >
-> **Full-horizon confirmation (200 tasks, 3 seeds each):** the
-> decomposition is stable across the 3.3× horizon extension —
+> **Stored full-horizon observations (200 tasks, 3 seeds each):** the
+> numerical decomposition is similar across the recorded 3.3× horizon extension —
 > `upgd_ema_norm_sigma0` 0.85051 and `sgd_ema_norm` 0.83991 (seed
 > spread ≤ 0.0008 on both), giving conditioning **+0.061**, gate
-> **+0.011**, noise **+0.003** against the full method's 0.85359 and
+> **+0.011**, noise **+0.003** against the full method's 0.85362 (n=10) and
 > the published-config baseline's 0.7791.  Every rung of the cascade —
 > including bare normalize+SGD+decay — beats the published SOTA method
 > at full protocol length.
@@ -45,10 +56,10 @@
 > form, dropping the normalizer's EMA decay 0.999 → 0.99 is worth a
 > further consistent +0.0096 on screen and **0.86245 ± 0.00034 at 200
 > tasks** (`sigma0_ndecay099`, seeds 0-2) — the best number of the
-> whole campaign, at ~1/7 UPGD-W's compute. The star is symmetric:
+> stored campaign, at ~1/7 UPGD-W's reported compute. The star is symmetric:
 > slower decay 0.9999 loses 0.0073, hidden-layer RMS normalization
 > loses 0.0186, epsilon floors and gate temperature are flat. The
-> conditioning mechanism is therefore specifically *input-statistics
+> resulting hypothesis is specifically *input-statistics
 > tracking speed*: the permutation switch moves input statistics
 > instantaneously, and a 100-step EMA re-conditions ~10x faster than
 > the 1000-step default while still averaging enough to be stable
@@ -56,12 +67,41 @@
 > mechanism is not "normalization" generically but *fast tracking of
 > nonstationary input statistics* — decay is a knob trading
 > re-conditioning speed against within-task estimator variance, and
-> the task length sets its optimum.
+> the task length sets its optimum.  Round-2 closed the star: the
+> optimum is a plateau at decay 0.98–0.99 (0.98 ties within +0.0008;
+> 0.95 −0.0035; 0.9 −0.0138), and transplanting the fast normalizer
+> onto the noisy champion *hurts* (−0.0019, all seeds) — the
+> perturbation's role is now fully mapped: load-bearing on raw inputs
+> (−0.035), neutral under slow conditioning (+0.003), harmful under
+> fast conditioning (−0.002).  Noise was a crude substitute for
+> conditioning all along.
+>
+> **Wave-A + tracking-control verdicts (2026-08-02, development
+> observations).**  (1) The designated adversarial control came back in
+> favor of the input-statistics thesis: gradient orthogonalization
+> (`muon_gate`, 0.8404) loses to input conditioning (0.8616) on every
+> seed — conditioning location matters, and the input side wins.
+> Column-RMS weight scaling and sign updates both hurt (−0.085/−0.206).
+> (2) **A no-backprop tracker is second place overall**: frozen random
+> Fourier features + streaming RLS (`rff_rls`) confirmed 0.84834 at 200
+> tasks — above every published deep method by +0.07 with zero gradient
+> descent.  The deep champion's true edge over closed-form tracking is
+> +0.014, not +0.08: most of what this benchmark rewards is input
+> tracking, which our decomposition already said.  (3) The EMNIST
+> equivalence prediction was REFUTED upward: conditioning helps +0.045
+> even with stationary inputs under label permutation
+> (`results.v2.json`) — EMA input normalization is a *general* stream
+> conditioner; only its tracking-speed component (the decay star) is
+> specific to input shift.  Updated mechanism statement: conditioning =
+> stationary optimization benefit (~+0.045) + input-shift tracking
+> benefit (~+0.02 on IPMNIST, the decay-0.99 delta), with the utility
+> gate handling output-side non-stationarity.
 
-Status: development analysis (never promotable evidence). Every number below
-is from our own protocol-exact runs — the ICLR-2024 online Input-permuted
-MNIST protocol (`alberta_framework/benchmarks/upgd_ipmnist.py`), its 60-task
-exact-prefix screening proxy
+Status: development hypothesis synthesis (never promotable evidence). Every
+number below is reconstructable from stored v1 development curves, but those
+curves are not an authenticated protocol-exact campaign for current source.
+The intended task is the ICLR-2024 online Input-permuted MNIST protocol
+(`alberta_framework/benchmarks/upgd_ipmnist.py`) and its 60-task screening proxy
 (`alberta_framework/benchmarks/ipmnist_screening.py`,
 `outputs/ipmnist_screening/shards/`), the 200-task confirmations
 (`outputs/ipmnist_screening/confirm_full/`), and the label-permuted EMNIST
@@ -74,8 +114,8 @@ update.
 
 This document does three things:
 
-- **(a)** reads the completed per-task curves and says *why* each mechanism
-  worked or failed;
+- **(a)** reads the stored per-task curves and proposes why each mechanism
+  may have worked or failed;
 - **(b)** states the three-orthogonal-failure-modes theory precisely and maps
   every method we measured onto it, with coupling costs;
 - **(c)** derives the wave-4 novel arms (implemented in

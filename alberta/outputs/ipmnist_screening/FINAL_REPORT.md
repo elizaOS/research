@@ -1,10 +1,34 @@
 # Beat-SOTA screening: final report (all arms incl. wave-4)
 
-Proxy validation: {"all_prefixes_match": false, "atol": 1e-06, "checks": [{"config_name": "upgd_w_control", "max_abs_per_task_diff": 0.009199980408630348, "prefix_match": false, "reference_partial": "outputs/upgd_ipmnist/partials/upgd_w_seed0.json", "seed": 0}, {"config_name": "upgd_w_control", "max_abs_per_task_diff": 0.00959998573562626, "prefix_match": false, "reference_partial": "outputs/upgd_ipmnist/partials/u
+Proxy validation (`proxy_validation.json`): `all_prefixes_match=false` —
+AdamW control prefixes match the full-lane partials bitwise (max per-task
+diff ~5e-9 = shard rounding); the three `upgd_w_control` prefixes do NOT
+(max per-task diff 0.0084–0.0096). **Audit diagnosis (2026-08-02,
+`AUDIT.md`):** this is a harness float artifact, not a protocol
+difference — `run_ipmnist` executes vmap-batched while the screening
+runner is unbatched, and the two XLA compilations of the identical
+UPGD-W step diverge by 1-2 ulp within 10 steps (init params, schedule,
+noise key, and first noise draw verified bitwise-equal; params bitwise
+equal after step 1), which chaotic amplification turns into ±0.01
+per-task jitter and ~+0.0004 mean over 60 tasks (screen 0.77776 vs
+partials prefix 0.77737). The AdamW bitwise match proves the two runners
+share data, schedules, init, and forward/backward exactly. Ordering
+preservation (UPGD-W > AdamW) holds in both. Within the screening
+runner, every 60-task shard is a bitwise prefix of its 200-task
+`confirm_full/` shard (max diff 0.0, checked for the ema_norm/sigma0
+family). Paired arm-vs-control comparisons are all within-runner, so
+this artifact cancels there.
 
-## Full-protocol pool64 confirmations (200 tasks, seeds 0-2)
+## Full-protocol confirmations (200 tasks; seeds 0-2 unless listed n=10)
 
-Pool64 upgd_w_control: {1: 0.7787729776000001, 2: 0.77910898075, 0: 0.7786109820999999} (exact controls {0: 0.77906, 1: 0.77903, 2: 0.77932}, known pool-vs-exact delta -0.00012)
+Noise-mode note (audit 2026-08-02): despite the pool64 design of
+`worker_confirm.sh`, only `upgd_w_control` and `upgd_w_wd0005` shards
+actually ran pool64 — every other arm declares no pool `noise_update`, so
+the worker fell back to the exact per-step noise path (`noise_mode="step"`
+recorded in each shard; strictly closer to protocol than pool64, and
+identical for the σ=0 / noise-free arms).
+
+Pool64 upgd_w_control: {1: 0.7787729776000001, 2: 0.77910898075, 0: 0.7786109820999999} (exact batched-lane controls from `outputs/upgd_ipmnist/partials/` {0: 0.77906, 1: 0.77903, 2: 0.77932}; measured pool64+harness-vs-batched-exact delta at 200 tasks, seeds 0-2: -0.0003 — the "-0.00012" previously quoted here is not reproducible from the shipped artifacts)
 
 - adamw_cbp: mean 0.79876 seeds [0.7986989801, 0.7991469797, 0.7989199793999999, 0.7988729805999999, 0.79886197865, 0.7983859769, 0.7982899786500001, 0.79915698075, 0.798724981, 0.7985119803499999] -> BEATS-SOTA
 - adamw_cbp_ema_norm: mean 0.76895 seeds [0.7690859817500001, 0.7649679803000001, 0.7727819801499999] -> BELOW
@@ -30,7 +54,10 @@ local gate, hidden-RMS norm, slower decay 0.9999) flat or negative —
 `sigma0_hidden_norm` −0.0186 (hidden-layer normalization actively hurts),
 `sigma0_ndecay09999` −0.0073 (slower conditioning hurts symmetrically).
 
-Full-protocol 200-task confirmation (pool64, seeds 0-2):
+Full-protocol 200-task confirmation (exact `step` mode — the arm is
+noise-free, so pool64 does not apply; seeds 0-2, the same seeds used for
+selection, so this is a development-grade tuned estimate — seeds 3-9
+remain unconsumed for this arm):
 
 - **sigma0_ndecay099: mean 0.86245 seeds [0.86229, 0.86196, 0.86311] -> NEW BEST**
   (+0.0119 vs its 0.85051 base, +0.0088 vs the 10-seed 0.85362 champion,
@@ -44,8 +71,51 @@ decay confirms the mechanism is tracking speed, not smoothing. Round-2
 (decay 0.9/0.95/0.98 neighborhood + `ema_norm_ndecay099` noisy transplant)
 runs under `frontier2_pipeline.sh` → `frontier2_results.json`.
 
+Round-2 verdict (`frontier2_results.json`): the decay star closes as a
+plateau at 0.98–0.99 — `sigma0_ndecay098` +0.0008 (statistical tie, below
+the +0.002 gate), 0.95 −0.0035, 0.9 −0.0138, completing the symmetric curve
+around the 0.99 optimum (effective ~100–200-step window vs 5000-step tasks).
+The noisy transplant `ema_norm_ndecay099` is *worse* than its σ=0 twin
+(−0.0019, all seeds): perturbation noise is load-bearing on raw inputs
+(−0.035 to remove), neutral under slow conditioning (+0.003), and harmful
+under fast conditioning (−0.002). **`sigma0_ndecay099` (0.86245) stands as
+the campaign champion.**
+
 All frontier numbers are development-grade (`development_screening_diagnostic`),
 seeds 0-2, nonpromoting.
+
+## Update-rule wave (wave A) + tracking controls — verdicts
+
+60-task screen, seeds 0-2, paired vs `sigma0_ndecay099` (0.8616 screen),
+calibrated learning rates (`waveA_results.json`; the champion's raw-gradient
+lr 0.01 scored chance on all three — see NEGATIVE_RESULTS_LEDGER.md #20):
+
+- `muon_gate` 0.8404 (−0.021, all seeds) — **the pre-registered
+  gradient-vs-input whitening adversarial control: input-side conditioning
+  wins.** Orthogonalizing the gradient does not substitute for conditioning
+  the input.
+- `colnorm_gate` 0.7764 (−0.085) — per-column RMS on top of a conditioned
+  input is harmful at horizon despite winning the 2-task cold-start.
+- `lion_gate` 0.6551 (−0.206) — sign updates discard needed magnitude
+  information.
+
+Tracking controls (no backprop):
+
+- **`rff_rls` 200-task confirmation: 0.84834** (seeds 0-2: 0.84792 /
+  0.84837 / 0.84873) — frozen random Fourier features (m=1024, gamma
+  0.001, clip ±3) + streaming RLS (forgetting 0.999) over the champion's
+  normalizer **beats every published deep method on this protocol by
+  +0.07 with zero gradient descent**. The deep champion retains +0.014.
+  Screen: 0.8490. (`lin_rls` linear floor: ~0.70–0.75 screen.)
+
+## Label-permuted EMNIST transfer (`outputs/upgd_label_emnist/results.v2.json`)
+
+Pre-registered prediction |`upgd_ema_norm` − 0.6715| ≤ 0.02 **REFUTED**:
+`upgd_ema_norm` 0.7162 (+0.045 over the raw-input `upgd_w` baseline) with
+stationary inputs and permuting labels — EMA input conditioning is a
+general stream-optimization conditioner, not only an input-shift fix.
+`upgd_ema_norm_sigma0` 0.7155 (noise again inert); `sgd_ema_norm` 0.5037
+(gate load-bearing where labels permute, as pre-registered).
 
 ## Screening ranked table (proxy, 60 tasks, all arms)
 
