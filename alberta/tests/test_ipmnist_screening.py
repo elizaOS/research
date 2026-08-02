@@ -37,6 +37,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     _make_guarded_cbp_adam_learner,
     _make_lion_gate_learner,
     _make_muon_gate_learner,
+    _make_rff_rls_learner,
     _make_sgd_ema_norm_learner,
     _make_upgd_alpha_utility_learner,
     _make_upgd_ema_norm_ext_learner,
@@ -46,6 +47,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     _make_upgd_w_wclip_learner,
     _make_upgd_warmnorm_learner,
     _newton_schulz_orthogonalize,
+    _rff_frozen_probe_input,
     adam_elem_step,
     adam_elem_update,
     cbp_maybe_replace_layer,
@@ -153,6 +155,7 @@ class TestRegistry:
             "colnorm_gate",
             "muon_gate",
             "lion_gate",
+            "rff_rls",
         }
         assert expected == set(SCREENING_REGISTRY)
 
@@ -2188,4 +2191,136 @@ class TestGatePlus:
             )
             np.testing.assert_array_equal(
                 np.asarray(new_params[name]), np.asarray(expected), err_msg=name
+            )
+
+
+class TestRFFRLS:
+    """Pre-registered existential control: frozen random Fourier features +
+    streaming RLS behind the champion's EMA input normalizer — no backprop,
+    no MLP."""
+
+    EXPECTED_HP = {
+        "rff_m": 1024.0,
+        "rff_gamma": 0.05,
+        "rls_lambda": 0.999,
+        "rls_ridge_init": 1.0,
+        "norm_decay": 0.99,
+        "norm_epsilon": 1e-8,
+        "noise_std": 0.0,
+    }
+
+    def _learnable_stream(self, n_examples=400, seed=88):
+        """Deterministically learnable labels (argmax of a fixed linear map)
+        so a short smoke run can rise above chance."""
+        kx, kw = jr.split(jr.key(seed))
+        x = jr.uniform(kx, (n_examples, SMALL.input_dim), jnp.float32, -1.0, 1.0)
+        w_true = jr.normal(kw, (SMALL.input_dim, SMALL.n_classes), jnp.float32)
+        y = jnp.argmax(x @ w_true, axis=1).astype(jnp.int32)
+        return np.asarray(x), np.asarray(y)
+
+    def test_registry_arm(self):
+        spec = screening_spec("rff_rls")
+        assert spec.base_learner == "upgd_w"  # reporting bucket only
+        assert spec.mechanism == "random_features"
+        assert spec.noise_update is None
+        assert spec.factory is _make_rff_rls_learner
+        assert spec.frozen_probe_input is _rff_frozen_probe_input
+        assert spec.hyperparameters == self.EXPECTED_HP
+
+    def test_state_shapes_init_and_symmetry(self):
+        """Omega/phase/P/Wout shapes; P starts at (1/ridge)*I, Wout at zero;
+        one step keeps P exactly symmetric."""
+        spec = screening_spec("rff_rls")
+        init_fn, step_fn = spec.factory(spec.hyperparameters)
+        params = init_mlp_params(jr.key(5), SMALL)
+        state = init_fn(params)
+        m = int(self.EXPECTED_HP["rff_m"])
+        assert state.omega.shape == (m, SMALL.input_dim)
+        assert state.phase.shape == (m,)
+        assert state.p.shape == (m, m)
+        assert state.wout.shape == (m, SMALL.n_classes)
+        assert state.omega.dtype == jnp.float32
+        assert state.p.dtype == jnp.float32
+        np.testing.assert_array_equal(
+            np.asarray(state.p), np.eye(m, dtype=np.float32)
+        )
+        assert not np.any(np.asarray(state.wout))
+        x = jr.normal(jr.key(3), (SMALL.input_dim,))
+        y = jnp.array(2, jnp.int32)
+        _, new_state, _ = step_fn(params, state, x, y, jr.key(0))
+        np.testing.assert_array_equal(
+            np.asarray(new_state.p), np.asarray(new_state.p).T
+        )
+        assert bool(jnp.all(jnp.isfinite(new_state.p)))
+        assert bool(jnp.all(jnp.isfinite(new_state.wout)))
+
+    def test_no_backprop_params_and_projection_frozen(self):
+        """The MLP params pass through untouched and the random projection is
+        never updated; the harness RNG key is unused (identical step for
+        different keys)."""
+        spec = screening_spec("rff_rls")
+        init_fn, step_fn = spec.factory(spec.hyperparameters)
+        params = init_mlp_params(jr.key(11), SMALL)
+        state = init_fn(params)
+        x = jr.normal(jr.key(42), (SMALL.input_dim,))
+        y = jnp.array(1, jnp.int32)
+        new_params, new_state, _ = step_fn(params, state, x, y, jr.key(0))
+        for name in params:
+            np.testing.assert_array_equal(
+                np.asarray(new_params[name]), np.asarray(params[name]), name
+            )
+        np.testing.assert_array_equal(
+            np.asarray(new_state.omega), np.asarray(state.omega)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(new_state.phase), np.asarray(state.phase)
+        )
+        _, state_b, metrics_a = step_fn(params, state, x, y, jr.key(987654))
+        np.testing.assert_array_equal(
+            np.asarray(new_state.wout), np.asarray(state_b.wout)
+        )
+        assert all(bool(jnp.isfinite(value)) for value in metrics_a)
+
+    def test_deterministic_given_seed(self):
+        """Same seed twice gives the bitwise-identical trajectory; different
+        seeds draw different frozen projections."""
+        x, y = self._learnable_stream(n_examples=64)
+        spec = screening_spec("rff_rls")
+        a = run_screening_config(x, y, spec, seed=2, config=SMALL)
+        b = run_screening_config(x, y, spec, seed=2, config=SMALL)
+        np.testing.assert_array_equal(a.per_task_accuracy, b.per_task_accuracy)
+        np.testing.assert_array_equal(a.per_task_loss, b.per_task_loss)
+        init_fn, _ = spec.factory(spec.hyperparameters)
+        omega_0 = init_fn(init_mlp_params(jr.key(0), SMALL)).omega
+        omega_1 = init_fn(init_mlp_params(jr.key(1), SMALL)).omega
+        assert not np.array_equal(np.asarray(omega_0), np.asarray(omega_1))
+
+    def test_smoke_runs_above_chance(self):
+        """2 tasks x 200 steps on a learnable stream: finite metrics, online
+        accuracy above the 1/n_classes = 0.2 chance floor."""
+        x, y = self._learnable_stream()
+        config = IPMNISTConfig(
+            n_tasks=2, task_length=200, input_dim=12, hidden1=8, hidden2=6, n_classes=5
+        )
+        result = run_screening_config(
+            x, y, screening_spec("rff_rls"), seed=2, config=config
+        )
+        acc = np.asarray(result.per_task_accuracy)
+        assert np.all(np.isfinite(acc))
+        assert np.all(np.isfinite(np.asarray(result.per_task_loss)))
+        assert np.all(np.isfinite(np.asarray(result.per_task_plasticity)))
+        assert np.all(np.asarray(result.per_task_plasticity) >= 0.0)
+        assert np.all(np.asarray(result.per_task_plasticity) <= 1.0)
+        assert float(acc.mean()) > 0.2
+
+    def test_frozen_probe_fails_closed(self):
+        """No trained protocol MLP exists — sentinel probes must refuse, like
+        the _hidden_rms_frozen_probe_input precedent, so merge/reporting can
+        never emit a meaningless probe number."""
+        spec = screening_spec("rff_rls")
+        init_fn, _ = spec.factory(spec.hyperparameters)
+        state = init_fn(init_mlp_params(jr.key(0), SMALL))
+        with pytest.raises(NotImplementedError, match="rff_rls"):
+            spec.frozen_probe_input(
+                state, jnp.zeros((3, SMALL.input_dim)), spec.hyperparameters
             )

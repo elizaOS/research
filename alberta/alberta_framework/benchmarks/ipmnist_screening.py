@@ -99,6 +99,13 @@ identical seeds):
   SGD (activation conditioning at the weight level), Nesterov momentum +
   Newton-Schulz orthogonalized 2-D updates (Muon), and gated Lion
   (sign of the interpolated momentum at ~0.1x step size, decay 0.05).
+- ``rff_rls``: the pre-registered existential control — no backprop, no MLP.
+  The champion's EMA input normalizer feeds frozen random Fourier features
+  (``sqrt(2/m) * cos(Omega x + b)``, m=1024) into a streaming one-vs-all
+  recursive-least-squares readout with forgetting factor 0.999. If a fixed
+  random projection + exponential-window RLS matches the deep arms, the
+  benchmark measures tracking rather than learning. Sentinel probes fail
+  closed (there is no trained protocol MLP to probe).
 
 Everything here is a development screening diagnostic — never promotable
 scientific evidence. Benchmark executions happen through the CLI
@@ -2404,6 +2411,134 @@ def _make_lion_gate_learner(
 
 
 # =============================================================================
+# (r) rff_rls — no-backprop random-features + RLS tracking control
+# =============================================================================
+
+
+#: Fixed domain constant for deriving the frozen random-feature draw (the
+#: screening init contract passes no RNG key, so the draw is folded from the
+#: seed-dependent protocol init weights; see :func:`_make_rff_rls_learner`).
+_RFF_KEY_DOMAIN = 0x52464601
+
+
+@chex.dataclass(frozen=True)
+class RFFRLSState:
+    """Frozen random-Fourier projection plus streaming-RLS readout state.
+
+    ``omega`` (m, input_dim) and ``phase`` (m,) are drawn once at init and
+    never updated. ``p`` is the (m, m) inverse feature-correlation matrix and
+    ``wout`` the (m, n_classes) one-vs-all readout — the only learned
+    quantities. ``norm`` is the champion's EMA input normalizer.
+    """
+
+    omega: Array
+    phase: Array
+    p: Array
+    wout: Array
+    norm: EMANormState
+
+
+def _make_rff_rls_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Random Fourier features + exponential-window recursive least squares.
+
+    The pre-registered *existential control* for the screening lane: NO
+    backprop, NO MLP — the protocol MLP parameters passed in by the harness
+    are returned untouched every step (inert ballast kept only for harness
+    shape compatibility). If a fixed random projection with a
+    forgetting-factor linear readout matches the deep arms, the benchmark
+    measures tracking rather than learning.
+
+    Pipeline per step (predict-then-update, matching the harness ordering):
+
+    1. ``x_norm = ema_normalize(x)`` with the champion's conditioning
+       (``norm_decay`` 0.99, ``norm_epsilon`` 1e-8).
+    2. ``phi = sqrt(2/m) * cos(Omega @ x_norm + b)`` with frozen
+       ``Omega ~ N(0, rff_gamma * I)`` and ``b ~ Uniform[0, 2pi)``.
+    3. Pre-update prediction ``argmax(Wout.T @ phi)`` scores the protocol's
+       online accuracy.
+    4. Sherman-Morrison RLS with forgetting factor ``rls_lambda``:
+       ``Pp = P @ phi``; ``k = Pp / (lam + phi @ Pp)``;
+       ``err = onehot(y) - Wout.T @ phi``; ``Wout += outer(k, err)``;
+       ``P = (P - outer(k, Pp)) / lam``, then symmetrized
+       (``P = (P + P.T)/2``) against float32 drift.
+
+    The reported loss is the pre-update squared error ``0.5 * ||err||^2``
+    (there is no cross-entropy here; per-task losses are NOT comparable with
+    the MLP arms' CE — accuracy is the protocol metric). Plasticity is the
+    protocol's own post-update one-step improvement ratio computed on the
+    same squared-error loss. The RNG key threaded by the harness is
+    deliberately unused (the step consumes no randomness).
+
+    Init-key deviation (documented): the screening ``LearnerInitFn`` receives
+    only the protocol init params, not the seed key, so the frozen
+    ``Omega``/``b`` draw folds the raw float32 bits of the seed-dependent
+    ``w1`` init into a fixed domain key — deterministic given the seed,
+    distinct across seeds.
+    """
+    m = int(hp["rff_m"])
+    gamma = hp["rff_gamma"]
+    rls_lambda = hp["rls_lambda"]
+    ridge_init = hp["rls_ridge_init"]
+    norm_decay = hp["norm_decay"]
+    norm_epsilon = hp["norm_epsilon"]
+    feature_scale = math.sqrt(2.0 / m)
+
+    def init_fn(params: dict[str, Array]) -> RFFRLSState:
+        input_dim = params["w1"].shape[0]
+        n_classes = params["w3"].shape[1]
+        w1_bits = jax.lax.bitcast_convert_type(
+            params["w1"].astype(jnp.float32).reshape(-1), jnp.uint32
+        )
+        key = jr.fold_in(jr.key(jnp.uint32(_RFF_KEY_DOMAIN)), w1_bits[0])
+        key = jr.fold_in(key, w1_bits[-1])
+        key_omega, key_phase = jr.split(key)
+        omega = jr.normal(key_omega, (m, input_dim), jnp.float32) * math.sqrt(gamma)
+        phase = jr.uniform(
+            key_phase, (m,), jnp.float32, 0.0, 2.0 * math.pi
+        )
+        return RFFRLSState(  # type: ignore[call-arg]
+            omega=omega,
+            phase=phase,
+            p=jnp.eye(m, dtype=jnp.float32) / ridge_init,
+            wout=jnp.zeros((m, n_classes), dtype=jnp.float32),
+            norm=_init_input_norm_state(params),
+        )
+
+    def full_step(
+        params: dict[str, Array], state: RFFRLSState, x: Array, y: Array, key: Array
+    ) -> tuple[dict[str, Array], RFFRLSState, StepMetrics]:
+        del key  # no randomness: the projection is frozen, RLS is closed-form
+        x_norm, new_norm = ema_normalize(state.norm, x, norm_decay, norm_epsilon)
+        phi = feature_scale * jnp.cos(state.omega @ x_norm + state.phase)
+        logits = state.wout.T @ phi
+        accuracy = (jnp.argmax(logits) == y).astype(jnp.float32)
+        y_onehot = jax.nn.one_hot(y, state.wout.shape[1], dtype=jnp.float32)
+        err = y_onehot - logits
+        loss = 0.5 * jnp.sum(err * err)
+        pp = state.p @ phi
+        gain = pp / (rls_lambda + phi @ pp)
+        new_wout = state.wout + jnp.outer(gain, err)
+        new_p = (state.p - jnp.outer(gain, pp)) / rls_lambda
+        new_p = 0.5 * (new_p + new_p.T)
+        err_after = y_onehot - new_wout.T @ phi
+        loss_after = 0.5 * jnp.sum(err_after * err_after)
+        plasticity = jnp.clip(
+            1.0 - loss_after / jnp.maximum(loss, _PLASTICITY_LOSS_FLOOR), 0.0, 1.0
+        )
+        return params, RFFRLSState(  # type: ignore[call-arg]
+            omega=state.omega,
+            phase=state.phase,
+            p=new_p,
+            wout=new_wout,
+            norm=new_norm,
+        ), (accuracy, loss, plasticity)
+
+    return init_fn, full_step
+
+
+# =============================================================================
 # Config registry
 # =============================================================================
 
@@ -2453,6 +2588,27 @@ def _hidden_rms_frozen_probe_input(
     raise NotImplementedError(
         "sentinel probes are unsupported for hidden-RMS-normalized arms: the "
         "deployed forward pass is not the plain protocol MLP"
+    )
+
+
+def _rff_frozen_probe_input(
+    state: Any, observation: Array, hyperparameters: Mapping[str, float]
+) -> Array:
+    """Refuse sentinel probes for the no-backprop random-features arm.
+
+    ``rff_rls`` never trains the protocol MLP — its deployed model is the
+    frozen random projection plus the RLS readout.  The probe harness scores
+    ``mlp_logits`` on the (untouched, randomly initialized) MLP params, so
+    any input transform here would silently probe a model that does not
+    exist.  Fail closed, exactly like :func:`_hidden_rms_frozen_probe_input`,
+    so merge/reporting can never emit a meaningless plasticity/retention
+    number for this arm.
+    """
+    del state, observation, hyperparameters
+    raise NotImplementedError(
+        "sentinel probes are unsupported for the rff_rls arm: there is no "
+        "trained protocol MLP to probe (the deployed model is the frozen "
+        "random-features + RLS readout)"
     )
 
 
@@ -3093,6 +3249,36 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 "sigma0_ndecay099 champion with the two near-flat gate "
                 "refinements composed: per-tensor gate normalization AND "
                 "temperature beta=2 on the conditioned-gradient utilities."
+            ),
+        )
+    )
+    # --- Pre-registered existential control: no backprop, no MLP.
+    specs.append(
+        ScreeningSpec(
+            name="rff_rls",
+            # Reporting/cost bucket only (the schema allows upgd_w|adamw and
+            # every candidate arm is paired against upgd_w_control); no
+            # gradient plumbing is engaged — the arm ignores the MLP.
+            base_learner="upgd_w",
+            mechanism="random_features",
+            hyperparameters={
+                "rff_m": 1024.0,
+                "rff_gamma": 0.05,
+                "rls_lambda": 0.999,
+                "rls_ridge_init": 1.0,
+                "norm_decay": 0.99,
+                "norm_epsilon": 1e-8,
+                "noise_std": 0.0,
+            },
+            factory=_make_rff_rls_learner,
+            frozen_probe_input=_rff_frozen_probe_input,
+            description=(
+                "No-backprop tracking control: champion EMA input normalizer "
+                "(decay 0.99) into frozen random Fourier features (m=1024, "
+                "Omega ~ N(0, 0.05*I), phase ~ U[0, 2pi)) with a streaming "
+                "one-vs-all RLS readout (forgetting 0.999, ridge init 1.0). "
+                "If this matches the deep arms, the benchmark measures "
+                "tracking rather than learning."
             ),
         )
     )
