@@ -14,7 +14,19 @@ folds the task index into per-seed keys, a 60-task run is an **exact prefix**
 of the 200-task run for the same seed. Validation therefore checks
 bit-level prefix agreement of the control shards against the completed
 full-horizon shards in `outputs/upgd_ipmnist/partials/` (read-only), plus
-ordering preservation (UPGD-W > AdamW). From the completed 10-seed full runs,
+ordering preservation (UPGD-W > AdamW). **Audit note (2026-08-02,
+`AUDIT.md`):** the bit-level prefix holds exactly WITHIN the screening
+runner (every 60-task shard is a bitwise prefix of its 200-task
+`confirm_full/` shard, max diff 0.0) and across runners for AdamW
+(max diff 5e-9 = shard rounding), but NOT across runners for UPGD-W:
+`run_ipmnist` executes vmap-batched, the screening runner unbatched, and
+the two XLA compilations of the same UPGD-W step diverge by 1-2 ulp
+within 10 steps (bitwise-equal inputs/keys/noise verified), which chaos
+amplifies to ≤0.0096 per-task accuracy jitter (~+0.0004 60-task mean).
+`proxy_validation.json` therefore reports `all_prefixes_match=false` for
+`upgd_w_control` — a harness float-reassociation artifact, not a
+protocol or schedule difference (the AdamW bitwise match proves
+data/schedule/init/forward/backward identity across the two runners). From the completed 10-seed full runs,
 at 60 tasks: UPGD-W 0.7777 vs AdamW 0.7553 (paired +0.0224, all 10 seeds
 ordered; per-seed stderr ~0.0004). Do not shrink task_length below 5000.
 
@@ -40,8 +52,12 @@ ordered; per-seed stderr ~0.0004). Do not shrink task_length below 5000.
 
 Seeds 0-2 per arm; identical seeds across arms => paired comparison. All
 screening shards (including the wclip/localgate wave) use the exact per-step
-noise path — the screening runner has no pool mode; pool64 is reserved for
-full-protocol confirmations through the `upgd_ipmnist` lane.
+noise path. (Stale as of the confirmation waves: the screening runner
+gained `--noise-mode pool` and `confirm_full/worker_confirm.sh` uses it —
+but only for arms that declare a pool `noise_update`. In practice only
+`upgd_w_control` and `upgd_w_wd0005` confirm shards are pool64; every
+other `confirm_full/` shard fell back to exact `step` mode — check the
+`noise_mode` field in each shard.)
 
 ## Execution
 
@@ -176,7 +192,7 @@ different control).
 ## Wave 6 (`jobs6.txt`, 2026-08-02): `sgd_ema_norm` — the gate ablation
 
 - Motivation: `upgd_ema_norm` leads the screen (0.8529; 0.85357 confirmed at
-  200 tasks) and `upgd_ema_norm_sigma0` TIES it (0.8520), so under input
+  200 tasks with the n=3 then available — 0.85362 at the final n=10) and `upgd_ema_norm_sigma0` TIES it (0.8520), so under input
   conditioning the method is normalize + utility-GATED SGD + decay. This arm
   closes the dissection: does the gate itself matter?
 - `sgd_ema_norm` — plain SGD with decoupled weight decay

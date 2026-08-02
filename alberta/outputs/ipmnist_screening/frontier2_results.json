@@ -1,0 +1,53 @@
+{
+ "evidence_class": "development_screening_diagnostic",
+ "protocol": "60-task screen, seeds 0-2, paired vs sigma0_ndecay099",
+ "arms": {
+  "sigma0_ndecay09": {
+   "screen_mean": 0.8477433121111111,
+   "per_seed": [
+    0.847806644,
+    0.8475733166666668,
+    0.8478499756666665
+   ]
+  },
+  "sigma0_ndecay095": {
+   "screen_mean": 0.8580510912777778,
+   "per_seed": [
+    0.8578933158333333,
+    0.8580633116666666,
+    0.8581966463333333
+   ]
+  },
+  "sigma0_ndecay098": {
+   "screen_mean": 0.8624233131666665,
+   "per_seed": [
+    0.8621466441666665,
+    0.8628199801666666,
+    0.8623033151666666
+   ]
+  },
+  "sigma0_ndecay099": {
+   "screen_mean": 0.8615877539444444,
+   "per_seed": [
+    0.8614766431666665,
+    0.8614599760000001,
+    0.8618266426666668
+   ]
+  },
+  "ema_norm_ndecay099": {
+   "screen_mean": 0.8597288649444442,
+   "per_seed": [
+    0.8590266415,
+    0.8603199776666666,
+    0.8598399756666665
+   ]
+  }
+ },
+ "verdict": {
+  "champion": "sigma0_ndecay099",
+  "decay_star": "0.9:-0.0138 0.95:-0.0035 0.98:+0.0008(tie) 0.99:champion 0.999:-0.0119 0.9999:-0.019 (200-task-equivalent deltas mixed scales)",
+  "noisy_transplant": "ema_norm_ndecay099 -0.0019 all seeds: perturbation harmful under fast conditioning",
+  "confirmation_launched": false,
+  "reason": "no arm cleared +0.002 paired gate"
+ }
+}
