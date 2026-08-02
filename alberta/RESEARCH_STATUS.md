@@ -10,6 +10,17 @@ a fail-closed, end-to-end demonstration of one bounded agent learning through
 an uninterrupted nonstationary life while retaining recurring critical
 knowledge.
 
+Registry snapshot (2026-08-01): `alberta-evidence-status` reports **all five
+registered claims `invalid`** (overall `invalid`, exit `2`). The recurring
+pair-feature, scale-robust pair-feature, and two-agent coadaptation claims
+fail current-registered-source validation, and the FTL decision-fidelity and
+intelligence-amplification historical compatibility chains fail, because
+registered source files were edited after the artifacts were pinned. The
+pinned artifacts remain immutable historical records; none certifies this
+working tree. This is the fail-closed design working as intended: renewal
+requires rerunning each frozen protocol to a new artifact path and schema
+version with untouched preregistered seeds, never a consumed-seed replay.
+
 ## Evidence levels
 
 - **L0 — mechanism:** API, shape, finite-value, serialization, or local update
@@ -30,21 +41,26 @@ the evidence command; it must not skip.
 | Step | Required outcome | Current strongest evidence | Status |
 |---|---|---|---|
 | 1 | Track nonstationary affine prediction with online normalization, relevance-sensitive step sizes, robustness, and bounded computation | LMS, IDBD, Autostep, normalizer, and bounder mechanism/learning tests | Partial |
-| 2 | Generate nonlinear features, estimate future utility, and replace them under a fixed budget without losing recurring useful structure | Two immutable narrow L2 pair-feature artifacts, now source-invalidated against the evolved current learner | Partial; historical narrow outcomes do not certify current source, and general feature finding plus L3 links remain open |
+| 2 | Generate nonlinear features, estimate future utility, and replace them under a fixed budget without losing recurring useful structure | Two immutable narrow L2 pair-feature artifacts, now source-invalidated against the evolved current learner, plus current-source generated-AST schedule/twin/scrub/expanded-lineage infrastructure and a negative reachability audit | Partial; historical narrow outcomes do not certify current source, the generated substrate has no complete runner or outcome, and its actual D birth/reacquisition probability remains unidentified |
 | 3 | Learn many continuing, possibly off-policy GVFs with history and feature finding | Horde, TD/GTD, traces, history, and working-memory component tests | Partial |
 | 4 | Progress from bandits through contextual and sequential actor-critic control with feature finding | SARSA and actor-critic mechanisms plus small control tests | Partial |
 | 5 | Learn both differential average-reward GVFs and conventional value-plus-expected-duration predictions | Differential TD/GTD/Horde tests plus a deterministic online two-head option return/duration diagnostic | Partial; the defining mechanism reaches L1, but no promoted comparison or integrated option-control result exists |
-| 6 | Reproducible continuing control suite, including RiverSwim, access control, Jellybean, GARNET, and continuing conversions | Closed-loop micro-MDPs, a pinned Foragax protocol runner, a completed five-seed field-of-view tuning stage, and an unsealed four-seed RTU-RTRL/DQN development comparison; the old selected 30-seed evaluation produced no batch or report | Partial; the named suite and a completed paper-length admissible paired Alberta comparison are not present |
+| 6 | Reproducible continuing control suite, including RiverSwim, access control, Jellybean, GARNET, and continuing conversions | Closed-loop micro-MDPs, a pinned Foragax protocol runner, a completed five-seed field-of-view tuning stage, an unsealed four-seed RTU-RTRL/DQN development comparison, and a qualified matched-current campaign whose open-tuning cells are entirely unexecuted; the old selected 30-seed evaluation produced no batch or report | Partial; the named suite and a completed paper-length admissible paired Alberta comparison are not present |
 | 7 | Validate incremental average-reward planning, then function approximation and adaptive features | Bounded Dyna mechanisms and an eight-seed development RiverSwim planning diagnostic | Partial; no frozen held-out artifact |
-| 8 | Close the perception → model → feature ranking → feature replacement → model feedback loop | Accepted historical held-out decision-fidelity comparison for a lifetime-statistics transition model, recovered through an exact consumed-seed source-compatibility chain, plus a causal development path from trainable state through a bounded ensemble gradient | Partial; the narrow FTL comparison reaches L2 and the model-to-state mechanism is integrated, but balanced objectives, feature ranking/replacement feedback, and outcome evidence remain open |
+| 8 | Close the perception → model → feature ranking → feature replacement → model feedback loop | Historical held-out decision-fidelity acceptance for a lifetime-statistics transition model (immutable artifact; its compatibility chain no longer validates against the current tree), a causal development path from trainable state through a bounded ensemble gradient, and one opt-in owner-bound pair-feature-to-linear-OaK lifecycle | Partial; the narrow FTL comparison reached L2 under its frozen source only, the new pair lifecycle is L0 and excludes the world-model lane; balanced multi-consumer objectives, deletion tests, the full feedback cycle, and outcome evidence remain open |
 | 9 | Improve exploration and planning order under matched real-transition and backup budgets | Prioritized, surprise, utility, and guarded-dream mechanisms plus development-only planning diagnostics | Partial; no promoted matched-budget search-control result |
 | 10 | Discover reward-respecting subtasks, learn options and option models, and consume those models in planning | STOMP now separates task reward from pseudo-reward and consumes option models in bounded backups | Partial; mechanism corrected, defining outcome evidence missing |
 | 11 | Track causal utility and safely replace features, subtasks, options, and models; compose an option keyboard | OaK transition ownership, active-option-safe curation, utility tracking, and keyboard mechanics | Partial; causal lifecycle outcome evidence missing |
-| 12 | Measurably increase another learning agent's capability in a closed interaction loop | The frozen v1 IA run is a historical valid rejection: reward uplift and both augmentation controls passed, while action-changing intervention prevalence missed its threshold; a separate exact-297-byte development kernel now composes two learning roles with online behavior/world prediction, one-step planning, causal channel/freeze controls, and trace-reconstructed phase diagnostics | Partial; the historical v1 threshold still fails, current-source compatibility is invalid, and the new kernel has no default-life outcome, calibration, held-out partner-benefit result, or promotion authority |
+| 12 | Measurably increase another learning agent's capability in a closed interaction loop | The frozen v1 IA run is a historical valid rejection: reward uplift and both augmentation controls passed, while action-changing intervention prevalence missed its threshold; a separate exact-297-byte development kernel now composes two learning roles with online behavior/world prediction, one-step planning, causal channel/freeze controls, and trace-reconstructed phase diagnostics, with an unexecuted 11-condition paired-scan declaration | Partial; the historical v1 threshold still fails, current-source compatibility is invalid, and the new kernel still lacks its matched runner, cross-arm RNG audit, default-life outcome, calibration, held-out partner-benefit result, and promotion authority |
 
 No row currently satisfies the completion rule.
 
-## Verified narrow probes
+## Pinned narrow results
+
+Each result below was produced once under a frozen protocol and is pinned
+immutably. As of 2026-08-01, none of them validates against the current
+working tree (see the registry snapshot above); they are historical evidence
+for their frozen sources.
 
 ### Recurring pair-feature allocation
 
@@ -84,6 +100,26 @@ memory. The result does not establish autonomous or general feature discovery,
 continual control, indefinite memory, or general catastrophic-forgetting
 resistance.
 
+### Narrow Prototype pair-feature lifecycle
+
+An opt-in `PrototypeFeatureLifecycle` now supplies one deliberately restricted
+L0 path from a fixed-width base representation through bounded pair products to
+the linear OaK control loop. It trains the pair bank from one exact
+owner-bound behavior TD target: base-Q while idle or the current intra-option
+target while an option executes. Any builder gradient through the augmented
+representation is pulled back against the exact pre-route semantic generation.
+At a safe idle/cached-base boundary, descriptor changes route atomically through
+the linear OaK consumers; otherwise curation is deferred by restoring the
+pre-curation proposal state rather than queuing the mutation.
+
+The lifecycle has explicit allocation ceilings, fixed resource accounting, and
+versioned config/checkpoint contracts. Its Prototype compatibility boundary
+deliberately excludes world models, Horde, replay, dreaming, IA, partner
+fusion, experiential memory, and GRU perception. Consequently it is not the
+multi-consumer feature loop required by the Plan. The tests establish no
+control benefit, causal deletion utility, automatic cumulant/subtask or option
+discovery, scientific promotion, WP7 completion, or L3 integration claim.
+
 ### Lifetime-statistics world model
 
 A one-dimensional LoSSE-style active-block model learns action-conditioned
@@ -105,12 +141,14 @@ but nonzero: `0.000252 [0.000015, 0.000578]`.
 These measurements remain the historical scientific result. Its original
 artifact bytes and scientific digest are pinned, and its acceptance is
 reconstructed from primitive rows after projecting only the changed
-artifact-builder hash. A current-source replay on the already-consumed seeds
-30–59 validates and matches the historical artifact exactly after excluding
-only operational metadata, that builder hash, and its digest derivative. The
-replay is nonpromoting. Because the exact historical artifact-builder source
-was not archived, this establishes deterministic scientific compatibility,
-not complete historical source recoverability.
+artifact-builder hash. A consumed-seed replay on seeds 30–59 once validated
+and matched the historical artifact exactly after excluding only operational
+metadata, that builder hash, and its digest derivative; the replay was
+nonpromoting, and subsequent registered-source drift means the live registry
+now reports this compatibility chain `invalid` for the current tree. Because
+the exact historical artifact-builder source was not archived, even a passing
+replay establishes deterministic scientific compatibility, not complete
+historical source recoverability.
 
 This is still a synthetic deterministic, fully observed, one-dimensional
 known-reward ranking probe over a hand-designed open-loop action menu. It is
@@ -135,6 +173,9 @@ read-only recurrent-A probe was 1.0.
 The artifact schema is `alberta.continual_multiagent_evidence.v1`; the frozen
 run's scientific digest was
 `6d09b796f6c4bbd8332c5f6089c186b0d675217cde6653c283a683a34a8cbeda`.
+The live registry now marks this claim `invalid` because registered source
+hashes have drifted from the frozen run; the pinned artifact remains the
+immutable historical record.
 The Wilson lower bound for 30/30 observed recoveries is only 0.886, so the run
 does not establish a population recovery probability of 0.95. More
 fundamentally, the controller is a tiny contextual bandit with visible regime
@@ -560,6 +601,34 @@ exhaustive 66-pair archive. It therefore establishes an L0 integrated
 development and falsification rung, not learning-partner coadaptation, general
 feature finding, an L2 comparison, or L3 Alberta integration.
 
+### Hidden-regime and hidden-partner protocol machinery (design-only)
+
+Several evaluation lanes are complete as fail-closed validators but have
+never executed an outcome. The hidden-regime factorial track
+(`evaluation/hidden_regime_factorial_*` plus its governance, readiness,
+checkpoint, trace-audit, and oracle modules) defines a 240-case calibration
+design, threshold freeze, and protected evaluation plan with
+`PROTOCOL_STATUS = "calibration_design_frozen_outcomes_unexecuted"`; no
+hidden-regime artifact exists under `outputs/`, the protected plan is
+`preregistered_unexecuted`, and no execution issuer is available. The older
+six-condition signaling evidence draft is execution-disabled
+(`draft_execution_disabled_pending_factorial_boundary_protocol`): its CLI can
+validate pre-existing files but its plan and run commands always fail. The
+three protected structural-generalization manifests in
+`streams/hidden_regime_signaling.py` record that no protected-candidate
+learner outcome has ever been executed, and the signaling development runner
+hard-codes `SCIENTIFIC_PROMOTION_ALLOWED = False`.
+
+On the hidden-partner side, both reserved lifecycle namespaces — v4 lease
+tuning and the frozen v5 confirmation candidate — are `FORBIDDEN/UNEXECUTED`;
+their run and verify tooling fails closed on every path, so that grid and
+confirmation plan are retired protocol machinery, not pending work. The v6
+lifecycle-world lane has runner, runtime, validator, matched-suite, and
+source-replay modules plus 18 bound control arms, but its certification gate
+lists every open prerequisite as `NOT_CERTIFIED` and no v6 life, calibration,
+threshold, or artifact has been produced. All of this is pre-evidence
+infrastructure, not results.
+
 ### Pinned scale-robust pair-feature result (current source invalidated)
 
 The broader gauntlet's exhaustive pairwise learner now has an opt-in
@@ -648,6 +717,22 @@ consumed. Operator reservation cannot independently attest seed freshness, so
 v3 remains permanently nonpromoting. Launch prerequisites and commands are in
 `UPGD_IPMNIST_V3_RUNBOOK.md`; all sealed v1/v2 records remain unchanged.
 
+Two sibling development lanes are likewise nonpromoting by construction. The
+IPMNIST mechanism-combination screen (`benchmarks/ipmnist_screening.py`,
+`outputs/ipmnist_screening/`) merged 22 arms × 3 paired seeds on a validated
+60-task proxy that is a bit-exact prefix of the 200-task protocol; three arms
+exceeded the `+0.005` confirmation threshold over the UPGD-W control
+(EMA input normalization `+0.0751`, AdamW+CBP `+0.0188`, weight decay 0.005
+`+0.0056`), and exact-noise 200-task confirmation shards for two of them sit
+under `confirm_full/` with no merged confirmation verdict at this snapshot.
+The Label-permuted EMNIST diagnostic (`benchmarks/upgd_label_emnist.py`,
+`outputs/upgd_label_emnist/results.v1.json`, 3 seeds versus the paper's 20)
+reproduces the published qualitative separation — UPGD-W online accuracy
+rises to a `0.728` last-quarter mean while AdamW collapses to a `0.201`
+whole-run mean — with both whole-run gaps against approximate figure
+read-offs explicitly flagged. Both lanes declare
+`scientific_promotion_allowed: false`.
+
 ### Forager benchmark lane
 
 The repository now contains a pinned `continual-foragax==0.55.0` integration,
@@ -698,6 +783,29 @@ trust resolver, and explicitly has `promotion_authorized: false`. Thus the
 screens and parity probe close operational diagnostics only; they support no
 inferential, superiority, SOTA, or WP3 claim.
 
+The matched-current campaign toward a paired Alberta-versus-baseline
+comparison is frozen but has not executed past qualification. Its frozen
+candidate universe (SHA-256 `2c3b214c…`, 23 registered arms: 14 Alberta
+candidates, 7 external inferential comparators, and 2 descriptive references)
+passed executor qualification
+(`outputs/forager/matched_current_qualification_2c3b214c_v1`), and the
+open-tuning stage (`matched_current_open_tuning_2c3b214c_v1`) publishes its
+complete immutable manifests — but its `runs/` and `completions/` directories
+are empty: zero tuning cells have executed. The sealed held-out stage (seal,
+6×30 evaluation schedule, final analysis, and statistics modules) is
+implemented and contract-tested but has never run, has no console script, and
+has produced no artifact. Every authority-bearing path terminates at an
+external trust resolver that does not exist in-tree, so in-tree code alone
+cannot produce promoted evidence. The 2026-07-31 internal candidate audit
+(`FORAGER_ALBERTA_CANDIDATE_AUDIT.md`) recorded implementation GO but
+campaign authority NOT CLEARED, and its recommended seed-0 q-grid divergence
+probe (`forager_causal_grid_divergence_probe.py`) is built but unrun.
+`FORAGER_COMPARATOR_AUDIT.md` records that the panel is a matched-panel
+comparison — several comparator arms are explicit task adaptations, not exact
+upstream replays — and that frozen v1 cannot support its own descriptor's
+"best among the panel" wording: an immutable claim-scope defect, not a
+license to reinterpret the protocol.
+
 The causal-map variant uses only observation/action/reward history, but it is
 specific to the stationary 15×15 toroidal field-of-view task and incorporates
 that public movement structure. It has mechanism and runner tests but no
@@ -712,10 +820,11 @@ The frozen hidden-phase Step-12 micro-benchmark was run on seeds 30–59 after
 calibration on seeds 0–11 and produced a **valid scientific rejection**, not
 a passing artifact. A later consumed-seed compatibility replay once reproduced
 every v1 scientific field exactly, but it is nonpromoting and no longer
-validates against the current checkout: subsequent drift in
-`alberta_framework/core/average_reward.py` makes the live evidence-registry
-compatibility chain `invalid`. This does not alter the archived historical v1
-rejection, and v1 does not certify the current implementation.
+validates against the current checkout: registered-source drift (first
+observed in `alberta_framework/core/average_reward.py`) makes the live
+evidence-registry compatibility chain `invalid`. This does not alter the
+archived historical v1 rejection, and v1 does not certify the current
+implementation.
 
 Recommendation acceptance at probability 0.5 improved mean reward by
 `0.26703 [0.25505, 0.27839]` over the bitwise-identical observe-only control,
@@ -804,7 +913,8 @@ runtime provenance, and distinguishes `accepted`, `valid-rejection`,
 `not-run`, and `invalid`. Exit codes are `0`, `1`, and `2`, respectively, with
 both valid rejections and missing runs mapped to `1`. Even an all-accepted
 manifest supports only its listed narrow claims; it is not an Alberta Plan
-completion certificate.
+completion certificate. At this snapshot it exits `2` with all five claims
+`invalid`, per the registry snapshot at the top of this document.
 
 ## Relation to LeWorldModel
 
@@ -872,8 +982,10 @@ for other agents.
    disjoint seeds, paired intervals, matched budgets, and versioned artifacts.
 4. Integrate adaptive optimization, learned state, autonomous feature targets,
    bounded lifecycle, and model/planning feedback in one uninterrupted agent.
-5. Start a new versioned Forager evaluation only after the hardened source
-   settles, run its matched official baseline under the same accepted runtime
-   contract, and import both into one paired comparison before the isolated
-   resource-scaling lane. Never resume the quarantined directories or promote
-   from execution manifests, development receipts, or incomplete reports.
+5. Resolve the matched-current campaign's external authority blockers (trust
+   resolver and executor-receipt verification) and run the seed-0 q-grid
+   divergence probe before spending the open-tuning budget; only then execute
+   open tuning and the sealed held-out stage under the frozen manifests, with
+   the matched official baseline under the same accepted runtime contract.
+   Never resume the quarantined directories or promote from execution
+   manifests, development receipts, or incomplete reports.

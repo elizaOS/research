@@ -990,6 +990,13 @@ class SecondaryComparisonResult:
 
 @dataclass(frozen=True, slots=True)
 class DescriptiveDiagnosticExclusion:
+    """Result-side record that a fixed descriptive candidate stayed outside inference.
+
+    ``input_sha256`` binds the contract's :class:`DescriptiveDiagnosticScores`
+    payload; result replay re-derives it and the exclusion reasons, so a
+    diagnostic cannot silently migrate into a superiority test.
+    """
+
     candidate_id: str
     input_sha256: str
     exclusion_reasons: tuple[str, ...]
@@ -1340,6 +1347,8 @@ def _monte_carlo_sign_flip_extreme_count(values: tuple[int, ...], draws: int, se
     rng = np.random.Generator(np.random.PCG64(seed))
     chunk_size = max(1, min(draws, _SIGN_FLIP_CHUNK_ELEMENTS // n_pairs))
     extreme = 0
+    # The vectorized matmul path is exact only if no subset sum can overflow int64;
+    # sum(|v|) bounds every subset sum.  Otherwise fall back to Python big-int arithmetic.
     int64_safe = sum(abs(value) for value in values) <= np.iinfo(np.int64).max
     int64_values = np.asarray(values, dtype=np.int64) if int64_safe else None
     for start in range(0, draws, chunk_size):

@@ -11,7 +11,8 @@ ABA-swapped score files — all must fail closed — while selection itself must
 be deterministic, replayable, and able to reverse a mean ranking under the
 conservative CI-endpoint statistic.
 
-Fixture helpers used by sibling suites (``test_forager_matched_seal``):
+Fixture helpers used by sibling suites (``test_forager_matched_seal``,
+``test_forager_matched_sealed_evaluation_campaign_adversarial``):
 ``_open_fixture()`` returns ``(open payload, parsed protocol, score bundle)``
 for a two-group panel with hand-picked score vectors, and ``_sealed_fixture()``
 extends it through selection and the sealed transition.

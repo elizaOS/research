@@ -190,10 +190,10 @@ _GIT_OBJECT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 # Fail-closed resource/complexity bounds enforced on untrusted manifests and
 # artifacts before allocation or execution.  The values carry no scientific
 # meaning: each sits well above every published Forager protocol (largest
-# horizon: 500,000 steps x 30 seeds; see FORAGER_BENCHMARK.md) while keeping
-# worst-case memory, disk, and parse cost bounded for corrupt or adversarial
-# inputs.  _MAX_JAX_SEED is the exception — it is the int32 seed ceiling the
-# compiled runners require, not a sizing choice.
+# horizon: 10,000,000 steps x 30 seeds; see FORAGER_BENCHMARK.md) while
+# keeping worst-case memory, disk, and parse cost bounded for corrupt or
+# adversarial inputs.  _MAX_JAX_SEED is the exception — it is the int32 seed
+# ceiling the compiled runners require, not a sizing choice.
 _MAX_JAX_SEED = 2**31 - 1
 _MAX_MATRIX_STEPS = 100_000_000
 _MAX_BOOTSTRAP_RESAMPLES = 1_000_000
@@ -5997,11 +5997,12 @@ def _selection_score(
 ) -> float:
     """Return the scalar that ranks a variant within its selection group.
 
-    ``statistic == "mean"`` ranks by the bootstrap mean of the per-seed
-    metric.  The ``conservative_ci_endpoint`` statistic instead ranks by the
-    bootstrap CI endpoint least favorable to the variant (``ci_low`` when
-    maximizing, ``ci_high`` when minimizing), preferring the variant whose
-    worst plausible value is best.  Ties break on ascending variant id.
+    ``statistic == "mean"`` ranks by the sample mean of the per-seed metric.
+    The ``conservative_ci_endpoint`` statistic instead ranks by the
+    percentile-bootstrap CI endpoint least favorable to the variant
+    (``ci_low`` when maximizing, ``ci_high`` when minimizing), preferring the
+    variant whose worst plausible value is best.  Ties break on ascending
+    variant id.
     """
     if rule.statistic == "mean":
         value = summary.get("mean")

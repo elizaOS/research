@@ -257,11 +257,13 @@ class UPGDMemoryLearner:
         _validate_config(config)
         self._config = config
         # The UPGD sub-configuration is frozen here; UPGDMemoryConfig exposes
-        # only step-size and head-plasticity knobs.  Relative to UPGDLearner
-        # defaults this variant perturbs far more gently (sigma 1e-4 every 16
-        # steps vs 1e-3 every step), keeps more weights at init (sparsity 0.5
-        # vs 0.9), bounds updates more loosely (ObGD kappa 0.5 vs 2.0), and
-        # uses target-structure loss normalization for one-hot targets.
+        # only step-size and head-plasticity knobs.  The fixed values match
+        # ``UPGDLearner.step2_default``: ObGD bounding at kappa 0.5, init
+        # sparsity 0.5, layer norm, Rademacher perturbation of sigma 1e-4
+        # every 16 steps, and target-structure loss normalization for one-hot
+        # targets.  Relative to raw ``UPGDLearner`` defaults (sigma 1e-3 every
+        # step, sparsity 0.9, no update bounding) this perturbs far more
+        # gently and keeps more weights alive at init.
         self._upgd = UPGDLearner(
             n_heads=config.n_heads,
             hidden_sizes=config.hidden_sizes,

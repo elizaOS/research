@@ -27,26 +27,42 @@ which is why `requires-python` is `>=3.12` and the numpy floor is `>=1.26`
 
 ## Divergence from the fork point
 
-Measured against `lalalune/alberta@2ac3533` (excluding `__pycache__`):
+The fork-point commit is not present in this repository's history (the tree
+arrived already diverged), so the divergence is described by current
+inventory rather than a recomputed diff. Measured 2026-08-01; the tree is
+under active campaign development, so exact counts move:
 
-- **`alberta_framework/`**: 34 modified files plus 25 new top-level
-  modules/subpackages — 59 changed entries in total. The two new subpackages
-  are `alberta_framework/evaluation/` (27 modules: strict evidence artifacts,
-  validators, and the six evaluation CLIs) and `alberta_framework/benchmarks/`
-  (6 modules: the forager family and `official_foragax`). New core modules
-  include `swift_td`, `stacked_horde`, `context_inference`, `state_builder`,
-  `learning_signals`, `experiential_memory`, `canonical_upgd`,
-  `option_value_duration`, `ftl_world_model`, `behavior_model`,
-  `joint_partner_world`, `feature_bank_router`, and
-  `integrated_hidden_partner`; new streams include `gauntlet`, `closed_loop`,
-  `opponent`, `matrix_game`, `recurring_multiagent`, and
-  `hidden_partner_mapping`.
-- **`tests/`**: 83 new test files and 18 modified ones. 27 upstream test
-  files are intentionally not carried (they exercise upstream-only trees).
+- **`alberta_framework/evaluation/`** — fork-local subpackage, 74 modules:
+  strict evidence artifacts and validators, the evidence-registry manifest
+  (`evidence_manifest.py` / `alberta-evidence-status`), and the evidence
+  CLIs.
+- **`alberta_framework/benchmarks/`** — fork-local subpackage, 40 modules:
+  the Forager family (matched-current campaign machinery, RNG parity,
+  `official_foragax`/OCI, open screen, historical reconstruction), the
+  published-protocol replication lanes (`upgd_ipmnist` + v3,
+  `upgd_label_emnist`, `ipmnist_screening`), and
+  `slowly_changing_regression` v1/v2.
+- **`alberta_framework/core/`** — 89 modules; the additions since the fork
+  point include `swift_td`, `stacked_horde`, `context_inference`,
+  `state_builder`, `learning_signals`, `experiential_memory`,
+  `canonical_upgd`, `option_value_duration`, `ftl_world_model`,
+  `behavior_model`, `joint_partner_world`, `feature_bank_router`,
+  `integrated_hidden_partner`, and the world-model/hidden-partner/delight
+  substrates.
+- **`alberta_framework/streams/`** — 17 modules; fork-local additions include
+  `gauntlet`, `closed_loop`, `opponent`, `matrix_game`,
+  `recurring_multiagent`, `hidden_partner_mapping`,
+  `hidden_partner_world_feedback`, and `hidden_regime_signaling`.
+- **`tests/`** — 325 `test_*.py` files (~6,900 tests collected).
+  `tests/conftest.py` collect-ignores 39 vendored test modules whose imports
+  require upstream-only trees (the root `benchmarks/` scripts tree and
+  `examples/`), so the suite here is a strict superset of upstream logic but
+  not of upstream's own test list.
 - **Top level**: `RESEARCH_STATUS.md`, `CONTINUAL_LEARNING_EVIDENCE.md`,
-  `FORAGER_BENCHMARK.md`, the `outputs/` evidence artifacts, and this file are
-  fork-local. `CHANGELOG.md` continues upstream numbering (0.27.0 was cut
-  here).
+  `FORAGER_BENCHMARK.md`, the execution runbooks and campaign audits, the
+  `outputs/` evidence artifacts, and this file are fork-local.
+  `CHANGELOG.md` continues upstream numbering (0.27.0 was cut here);
+  `pyproject.toml` registers 15 console scripts.
 
 Because of this, "re-sync from upstream" is no longer a patch-reapplication
 exercise; treat any future sync as a merge between diverged development lines.
@@ -74,7 +90,10 @@ subpackage still resolves.
 
 ## Continual-RL subset used by the robot package
 
-`alberta_framework.core`: `sarsa`, `actor_critic`, `average_reward`,
-`optimizers`, `learners`, `normalizers`, `types`, `upgd`, `continual_backprop`;
-plus `alberta_framework.streams`. The full 12-step / `diffeml_*` / prototype
-modules are present but not required by the robot integration.
+The robot tree's direct imports are `alberta_framework.core.actor_critic`,
+`core.continual_backprop`, `core.initializers`, `core.normalizers`,
+`core.optimizers`, and the top-level re-exports `SARSAAgent`, `SARSAConfig`,
+and `ObGDBounding`. Because the top-level import triggers the package's eager
+module imports, the whole `alberta_framework` package must remain importable
+from the robot environment — but the 12-step / `diffeml_*` / prototype /
+campaign machinery is otherwise not required by the robot integration.

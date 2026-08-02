@@ -15,6 +15,8 @@ default construction does not exercise every mechanism on every transition.
 See [RESEARCH_STATUS.md](RESEARCH_STATUS.md) for the evidence matrix and
 fail-closed completion criteria.
 
+## Evidence status at a glance
+
 Registered scientific artifacts can be checked without rerunning their
 protocols:
 
@@ -25,11 +27,15 @@ alberta-evidence-status
 The command invokes each artifact's strict validator and returns `0` only when
 every registered narrow claim is accepted, `1` for missing or valid rejected
 evidence, and `2` for invalid evidence. Its manifest is an operational index,
-not an Alberta Plan completion certificate.
+not an Alberta Plan completion certificate. It resolves artifacts relative to
+the repository checkout: the wheel and sdist deliberately exclude `outputs/`,
+so from a pip-installed environment every claim reports missing and the
+command exits `1`. Run it from a checkout.
 
 Pinned historical evidence includes a narrow L2 scale-robust pair-feature
-package comparison on 30 exact namespace-derived fresh seeds. Its immutable artifact is
-`outputs/scale_robust_feature/evidence.v2.json`, with scientific digest
+package comparison on 30 exact namespace-derived fresh seeds. Its immutable
+artifact is `outputs/scale_robust_feature/evidence.v2.json`, with scientific
+digest
 `c2fee922c04a59fe26b4b8c9cfa77ddd9198cfa2bc923f54fec14b649bd3bb2c`.
 Median final-C savings was 5.933 and final-C tail MSE was 0.0387, with no
 non-finite step. The result uses visible context, one fixed learner
@@ -37,31 +43,34 @@ initialization, and an exhaustive finite pair archive; primary versus legacy
 also changes scale normalization and ObGD and adds 464 persistent bytes, so it
 is a package comparison rather than causal attribution.
 
-The live registry currently marks both pair-feature claims `invalid`: multiple
-registered implementation, artifact-builder, and CLI source hashes have
-evolved since the pinned artifacts were produced. The artifacts remain
+The live registry currently reports **all five registered claims `invalid`**
+(overall `invalid`, exit `2`): registered implementation, artifact-builder,
+and CLI source hashes have evolved since the pinned artifacts were produced.
+That is the fail-closed design working as intended. The artifacts remain
 immutable historical results and do not certify the current implementation.
-Consumed-seed reruns are
-nonpromoting; renewed promotion requires a new artifact path/schema and an
-untouched preregistered seed schedule.
+Consumed-seed reruns are nonpromoting; renewed promotion requires rerunning
+each frozen protocol to a new artifact path/schema with an untouched
+preregistered seed schedule.
 
 The IA v1 result remains a historical valid rejection at its frozen 10%
 action-changing intervention threshold. Its prior consumed-seed compatibility
-replay record is nonpromoting, and the live registry now marks current-source
-compatibility `invalid` because `average_reward.py` drifted after that replay.
-The archived v1 result is unchanged; it does not certify the current source.
-The exact p=0.75/seeds-60–89 v2 lifecycle is an **unissued,
-permanently development-only contract**: no plan, reservation, shard, run, or
-v2 artifact has been produced. Its self-issued plan has no trusted external
-pre-run chronology, so even a gate-passing run cannot become accepted
-evidence. A future acceptance attempt needs a new schema, untouched seeds, and
-an external chronology anchor. The original
-narrow FTL decision-fidelity result is accepted
-through a strict historical-artifact/current-source compatibility chain: its
-consumed-seed replay is also nonpromoting, and the chain establishes
-deterministic scientific compatibility rather than full recovery of the
-unarchived historical artifact-builder source. None of these narrow results is
-an end-to-end Alberta Plan completion.
+replay record is nonpromoting, and the live registry marks current-source
+compatibility `invalid` after registered-source drift (initially
+`average_reward.py`, since joined by further edits). The archived v1 result
+is unchanged; it does not certify the current source.
+The exact p=0.75/seeds-60–89 v2 lifecycle is an **unissued, permanently
+development-only contract**: no plan, reservation, shard, run, or v2 artifact
+has been produced. Its self-issued plan has no trusted external pre-run
+chronology, so even a gate-passing run cannot become accepted evidence. A
+future acceptance attempt needs a new schema, untouched seeds, and an external
+chronology anchor.
+
+The original narrow FTL decision-fidelity result is accepted through a strict
+historical-artifact/current-source compatibility chain: its consumed-seed
+replay is also nonpromoting, and the chain establishes deterministic
+scientific compatibility rather than full recovery of the unarchived
+historical artifact-builder source. None of these narrow results is an
+end-to-end Alberta Plan completion.
 
 ## Install
 
@@ -72,8 +81,9 @@ pip install 'alberta-framework[forager]'   # Forager continual-RL testbed
 pip install alberta-framework[dev]         # tests, lint
 ```
 
-Requires Python 3.12+, JAX 0.4+. The suite currently collects 3,284 tests
-(`pytest tests`; markers `unit`, `integration`, `scientific`, `development`).
+Requires Python 3.12+, JAX 0.4+. The suite currently collects roughly 6,900
+tests (`pytest tests`; markers `unit`, `integration`, `scientific`,
+`development`).
 
 Key documents:
 
@@ -86,6 +96,9 @@ Key documents:
 - [CONTINUAL_IA_V2_RUNBOOK.md](CONTINUAL_IA_V2_RUNBOOK.md) — the unissued,
   development-only p=0.75/seeds-60–89 plan/reservation/shard/merge contract and
   its nonpromotion boundary.
+- [UPGD_IPMNIST_V3_RUNBOOK.md](UPGD_IPMNIST_V3_RUNBOOK.md) — the strict
+  namespaced UPGD IP-MNIST v3 execution contract (unissued; permanently
+  nonpromoting).
 
 ## What's here
 
@@ -105,115 +118,102 @@ This framework provides the following implementation surfaces:
 | 11 | OaK option keyboard (utility tracking + curation) | `OaKAgent` |
 | 12 | Prototype-IA (exo-cerebellum + exo-cortex) | `PrototypeAgent` |
 
-Cross-cutting mechanism surfaces include causal `StateBuilder` variants,
-`LearningSignalEstimator`, the candidate-update safety audit retained under
-the historical `assess_gradient_joy` API, its effective-delta-audited atomic
-`apply_gradient_joy_update` boundary, the paper-defined `KondoGate`,
-the fixed-state `LearningValueRouter`, fixed-capacity `DualReplayMemory` and
-`ExperientialMemory`, and the explicit `PrototypeTransition` boundary. The
-router keeps all eight channels independently validated and causally
-normalized, exposes only named consumer routes, and isolates safety. In the
-paper's terminology, delight is advantage times selected-action surprisal and
-“sparks joy” means that the Kondo gate selects a sample for a backward pass.
-`KondoGate` performs a detached forward screen and fixed-capacity sparse gather;
-it does not yet have an integrated learner or measured compute-saving result. A bounded
-`ShallowRidgeWorldModel` supplies the
-interpretable action-conditioned regularized-FTL reference with grounded
-one-step targets and a diagnostic planner; it has no efficacy claim. A separate
-bounded recurrent latent ensemble supplies member-specific trainable GRUs,
-heteroscedastic grounded heads, exact transition ownership, and atomic
-checkpointable online NLL updates. It is also available as an opt-in fourth
-Prototype world-model lane with one decision-bound cache, transactional causal
-signals, and a real-NLL-only representation gradient. It still has no
-calibration, replay, planning, or efficacy claim. The
-Prototype path now consumes an opt-in identity, fixed-trace, or online-gated
-builder causally, caches the dispatched decision, and rejects stale transition
-generations atomically. An opt-in bounded ensemble now produces one causal
-world-model representation gradient. A successor opt-in mixer combines it with
-the current control-loss semi-gradient: base-Q on idle primitive transitions
-and the current intra-option objective while an option executes. The mixer logs
-source norms, weights, clipping, cosine/conflict, and failures; delayed
-option-start credit and replay gradients are excluded. The online-gated builder
-proposes from the exact source sensitivity before committing into the advanced
-recurrent state. An optional decision-bound candidate-update audit stores that
-mixed delta only when its formed-candidate and effective finite-precision
-checks both pass. `PrototypeUpdateResult.candidate_update_audit_passed` and
-`audited_candidate_update_applied` expose those facts. Its `sparks_joy` and
-`joyful_gradient_applied` properties are historical compatibility aliases, not
-the paper's Kondo semantics.
-An alternative opt-in `ModelReplayRehearsal` world-model lane atomically joins
-the real ensemble update to fixed-capacity dual replay and model-member-only
-rehearsal. Its replay updates have isolated RNG/counters and cannot train the
-actor, critic, builder, signal calibrator, or candidate-update audit; only the real causal
-gradient is exposed downstream.
-Development-only evaluators make these lanes inspectable without promoting
-them. The feed-forward snapshot path uses evaluator-owned grounded probes and
-reconstructs raw disagreement/error, ID/OOD, state/action-region, and optional
-exact open-loop summaries while keeping residual variance explicitly
-non-probabilistic. A recurrent adapter starts from a hash-bound frozen snapshot,
-scores cached member distributions before each isolated update, and retains
-reconstructable means, heteroscedastic variances, NLLs, warm-up applicability,
-regions, sources, resources, and final isolated-state counters. A recurrent
-retention companion reuses exact ordered cases after an intervening context and
-recurrent reset, then reconstructs descriptive phase, recurrence-entry, and
-within-occurrence NLL summaries without mutating its supplied snapshot. A
-third harness runs the shallow reference, plain ensemble, and model-only rehearsal on one
-tiny matched A/B/A plus noisy-TV stream. All are `not-assessed`; the recurrent
-Gaussian objective is not a calibrated-likelihood claim, and none supplies a
-retention, control, or SOTA result.
-A separate actor/critic companion runs one fixed continuing A/B/A stream with
-all phase labels, reward tables, preferred actions, and value targets owned by
-the evaluator. It records exact cached target/epsilon-mixture behavior
-policies, critic error, actor margin, churn, return/recovery, and component
-plasticity. The underlying actor/critic now samples each successor only after
-the current update commits. This one-seed probe is also `not-assessed`; its raw
-target/behavior ratio is diagnostic, and its behavior-score chain-rule scale
-is not an off-policy target-policy correction.
-The separate bounded `ContinuousAverageRewardActorCriticAgent` closes the L0
-continuous mechanism gap with direct affine-`tanh` actions, cached pre-`tanh`
-ownership, stable transformed target/behavior densities, and an exact
-per-decision action likelihood ratio. It never clips the Gaussian draw or
-post-adjusts the transformed action; actor/critic traces and optimizer states
-are separate, and the successor is sampled once from committed parameters.
-The correction does not address behavior-state-distribution mismatch, and no
-continuous retention or control benefit is claimed. A strict 12-event A/B/A
-development evaluator starts from an immutable source-bound snapshot and
-reconstructs cached actions, latent and transformed densities, the exact latent
-ratio, rewards, same-state centered critic error, actor churn/error,
-plasticity/activity, successor ownership, counters, resources, final state,
-and live replay. Its reports/checkpoints fail closed and never overwrite; the
-result remains `not-assessed` with no efficacy or retention threshold.
-An opt-in `PrototypeAgent` path now composes the bounded `PartnerPolicyFusion`
-L0 surface with real OaK dispatch. It binds messages and realized feedback to
-the full Prototype lifecycle identity, derives the counterfactual base and
-keyboard scores internally, logs base and effective actions, rewrites the
-correct base-or-option credit cache, and keeps the recurrent action cache in
-sync. Hard safety or post-state failure rolls back the whole transition;
-missing, stale, duplicate, or misattributed sidecars fail closed. Cold-start
-acceptance remains uncalibrated development exploration, and there is no
-reliability-calibration, partner-benefit, or WP8 completion claim.
-The continuing-control evaluation lane also has a strict privileged-reference
-companion. It retains one separately initialized learner per evaluator regime
-identity, trains a stationary-multitask reference on an exactly counted frozen
-extra stream, and queries an exact frozen counterfactual outcome for every
-action. Those roles remain outside ordinary candidate/baseline conditions and
-report every extra identity, datum, callback, and incompatibility; they are
-descriptive context bounds, not resource-matched results.
-This is integration evidence, not evidence that the online-gated representation
-improves control. The first two-source world/control mechanism exists, but
-empirical objective balancing, GVF/inverse/feature-utility sources, causal
-feature selection, and the matched Forager result remain absent. A separate
-`DelightfulActorCriticAgent` development
-surface provides matched ordinary and paper-specific DG categorical
-policy-gradient modes plus nonpromoting contextual-gambling and RiverSwim A/B/A
-diagnostics; it has no validated control-benefit claim.
-L0 integration substrates now also include `BehaviorModel`, a bounded
-external-belief joint outcome model, `FeatureBankRouter`, and an uncued
-recurring hidden-partner stream. A bounded L0 kernel composes these with
-learned state, online pair discovery, joint-model planning, and differential
-SARSA in one causal update, with shape-matched component and retention
-ablations. Its mechanism tests are not promoted completion evidence; the
-stream's partner is scripted, so it is not learning-partner coadaptation.
+### Mechanism surfaces (development status)
+
+Everything in this section is mechanism-level work — L0/L1 in the vocabulary
+of [RESEARCH_STATUS.md](RESEARCH_STATUS.md) — with contract tests but no
+promoted evidence. Several of these mechanisms serialize development-only
+markers (`SCIENTIFIC_PROMOTION_ALLOWED = False` or equivalent) into their
+config and checkpoint schemas and reject any payload claiming otherwise, so
+promoting them requires new preregistered protocols and code, not just new
+runs.
+
+- **Composition and routing.** Causal `StateBuilder` variants (identity,
+  fixed-trace, and online trainable gated recurrent) under one fixed-budget
+  contract; the predict-before-update `LearningSignalEstimator`; the
+  fixed-state `LearningValueRouter`, which keeps all eight learning-value
+  channels independently validated and causally normalized and exposes only
+  named consumer routes (no default sum); fixed-capacity `DualReplayMemory`
+  and `ExperientialMemory`; and the explicit `PrototypeTransition` boundary.
+  `DualReplayMemory` has no training or control integration of its own — its
+  only consumer is the model-only rehearsal lane below.
+- **Candidate-update safety audit.** The multi-probe audit retained under the
+  historical `assess_gradient_joy` API, plus its effective-delta-audited
+  atomic `apply_gradient_joy_update` application boundary. In the paper's
+  terminology, delight is advantage times selected-action surprisal and
+  "sparks joy" means that the Kondo gate selects a sample for a backward pass.
+  `PrototypeUpdateResult.sparks_joy` and `joyful_gradient_applied` are
+  historical compatibility aliases, not the paper's Kondo semantics.
+- **`KondoGate`.** A detached forward screen with a fixed-capacity sparse
+  gather. It has no integrated learner and no measured compute-saving result,
+  and the `kondo_enabled` flag on the separate Delightful Policy Gradient
+  config is reserved and fail-closed: passing `True` raises because that
+  full-batch helper cannot skip compiled backward work.
+- **World-model lanes.** Four mutually exclusive Prototype lanes: the legacy
+  single `OneStepWorldModel`/`ActionConditionedWorldModel` lane, a bounded
+  bootstrap ensemble, `ModelReplayRehearsal` (ensemble plus fixed-capacity
+  dual replay and model-member-only rehearsal with isolated RNG and counters —
+  replay never trains the actor, critic, builder, or signal calibrator), and a
+  bounded recurrent latent ensemble with member-specific trainable GRUs,
+  heteroscedastic grounded heads, and atomic checkpointable online NLL
+  updates. A bounded `ShallowRidgeWorldModel` supplies an interpretable
+  action-conditioned regularized-FTL reference with a diagnostic planner.
+  **Dyna dreaming currently runs only on the legacy lane**:
+  `PrototypeAgentConfig` rejects `n_dreams_per_step > 0` combined with the
+  ensemble, replay-rehearsal, or recurrent lanes until their uncertainty and
+  rollout-validity gates are calibrated. None of these lanes carries a
+  calibration, retention, planning-benefit, or efficacy claim.
+- **Learned state in Prototype.** The opt-in builder path consumes an
+  identity, fixed-trace, or online-gated builder causally, caches the
+  dispatched decision, and rejects stale transition generations atomically.
+  The opt-in ensemble produces one causal world-model representation
+  gradient; a successor opt-in mixer combines it with the current control-loss
+  semi-gradient (base-Q on idle primitive transitions, the intra-option
+  objective while an option executes), logging source norms, weights,
+  clipping, cosine/conflict, and failures; delayed option-start credit and
+  replay gradients are excluded. An optional decision-bound candidate-update
+  audit stores the mixed delta only when its formed-candidate and effective
+  finite-precision checks both pass. This is integration evidence, not
+  evidence that the online-gated representation improves control.
+- **Continuing-control companions.** The separate bounded
+  `ContinuousAverageRewardActorCriticAgent` closes the L0 continuous mechanism
+  gap: direct affine-`tanh` actions with cached pre-`tanh` ownership, stable
+  transformed target/behavior densities, an exact per-decision latent
+  likelihood ratio, and one successor sampled only after an atomic commit. It
+  does not address behavior-state-distribution mismatch, and no continuous
+  retention or control benefit is claimed. A separate
+  `DelightfulActorCriticAgent` development surface provides matched ordinary
+  and paper-specific DG categorical policy-gradient modes plus nonpromoting
+  contextual-gambling and RiverSwim A/B/A diagnostics; it has no validated
+  control-benefit claim.
+- **Partner and multi-agent substrates.** `PartnerPolicyFusion` is a bounded
+  L0 surface that an opt-in `PrototypeAgent` path composes with real OaK
+  dispatch: it binds messages and realized feedback to the full lifecycle
+  identity, rewrites the correct base-or-option credit cache, and rolls the
+  whole transition back on hard safety or post-state failure; missing, stale,
+  duplicate, or misattributed sidecars fail closed. `BehaviorModel` (a bounded
+  external-belief joint outcome model), `FeatureBankRouter`, and an uncued
+  recurring hidden-partner stream complete the substrate set, and a bounded
+  L0 kernel composes them with learned state, online pair discovery,
+  joint-model planning, and differential SARSA in one causal update, with
+  shape-matched component and retention ablations. The stream's partner is
+  scripted, so none of this is learning-partner coadaptation, and no
+  reliability-calibration, partner-benefit, or WP8 completion claim is made.
+- **Development-only evaluators.** Strict, hash-bound, `not-assessed`
+  evaluators make the lanes above inspectable without promoting them:
+  feed-forward and recurrent world-model snapshot evaluators, a recurrent
+  retention companion, a matched A/B/A-plus-noisy-TV three-way world-model
+  harness, discrete and continuous actor/critic A/B/A companions, an
+  experiential-memory transfer evaluator, and a privileged-reference
+  continuing-control suite (per-regime retained learners, a
+  stationary-multitask reference on an exactly counted frozen extra stream,
+  and an exact frozen counterfactual outcome bound — descriptive context, not
+  resource-matched baselines). None supplies a retention, control,
+  calibration, or SOTA result, and the recurrent Gaussian objective is not a
+  calibrated-likelihood claim.
+
+Empirical objective balancing, GVF/inverse/feature-utility gradient sources,
+causal feature selection, and the matched Forager result remain absent.
 
 ## Quick start
 
@@ -322,19 +322,20 @@ from alberta_framework import (
 ### Prototype composition surface (Steps 1–12)
 
 `PrototypeAgent` can compose GRU perception, average-reward Horde learning,
-Dyna planning with guarded dreaming, STOMP options, OaK option curation, an IA
-companion, and opt-in partner-policy fusion. The legacy IA recommendation
-remains diagnostic, while the separate fusion path can safely replace the next
-OaK primitive and its exact credit owner. These optional mechanisms do not yet
-constitute an empirically complete Alberta Plan agent. The atomic feature router and hidden-partner
-substrates now compose in an L0 integrated continual-control kernel, but its
-partner is scripted and its robustness artifact is structurally nonpromoting.
-An opt-in value-only option search controller now ranks completion-supported
-option-model backups by recomputed differential semi-MDP Bellman residual under
-a fixed budget. It preserves the already cached action and can affect only a
-later extended-action selection; it is not combined primitive/option search or
-a benefit result. Option-model planning benefit and closed-loop
-learning-partner benefit still lack promoted evidence.
+Dyna planning with guarded dreaming (legacy world-model lane only, see above),
+STOMP options, OaK option curation, an IA companion, and opt-in partner-policy
+fusion. The legacy IA recommendation remains diagnostic, while the separate
+fusion path can safely replace the next OaK primitive and its exact credit
+owner. These optional mechanisms do not yet constitute an empirically complete
+Alberta Plan agent. The atomic feature router and hidden-partner substrates
+now compose in an L0 integrated continual-control kernel, but its partner is
+scripted and its robustness artifact is structurally nonpromoting. An opt-in
+value-only option search controller ranks completion-supported option-model
+backups by recomputed differential semi-MDP Bellman residual under a fixed
+budget; it preserves the already cached action and can affect only a later
+extended-action selection, so it is not combined primitive/option search or a
+benefit result. Option-model planning benefit and closed-loop learning-partner
+benefit still lack promoted evidence.
 
 ```python
 from alberta_framework import (
@@ -479,9 +480,9 @@ registered source file invalidates persisted evidence until the frozen
 protocol is rerun.
 
 The table records each immutable artifact's frozen outcome. In the current
-working tree, the recurring- and scale-pair claims are source-invalidated and
-the command exits `2`; that live result takes precedence over the historical
-outcome column.
+working tree, registered source hashes have drifted for all five claims, so
+each reports `invalid` and the command exits `2`; that live result takes
+precedence over the historical outcome column.
 
 | Claim | Frozen outcome | Artifact | CLI |
 |---|---|---|---|
@@ -527,6 +528,36 @@ alberta-forager-benchmark --preset relearning --steps 10000 --seeds 0 \
 See [FORAGER_BENCHMARK.md](FORAGER_BENCHMARK.md) for the paper protocols,
 fairness boundary, and the attested RTU-PPO/DQN/PPO comparison workflow.
 
+#### Matched-current campaign (frozen before execution)
+
+The matched-current pipeline (the `forager_matched_*` modules, console
+scripts `alberta-forager-matched-qualification` and
+`alberta-forager-matched-campaign`) qualifies a live networkless OCI runtime,
+freezes a 21-candidate open-tuning protocol, and defines a sealed held-out
+evaluation stage. Its current state, verifiable under `outputs/forager/`:
+
+- `matched_current_qualification_2c3b214c_v1` — qualification completed.
+- `matched_current_open_tuning_2c3b214c_v1` — the open-tuning campaign is
+  prepared and frozen, but its `runs/` and `completions/` directories are
+  empty: **zero tuning cells have been executed**.
+- The sealed stage (`forager_matched_seal`,
+  `forager_matched_sealed_evaluation_campaign`,
+  `forager_matched_final_analysis`, `forager_matched_statistics`) is
+  implemented and contract-tested but has no console script and has never
+  been executed; no seal, sealed-evaluation, or final-analysis artifact
+  exists.
+
+Every authority-bearing path in the pipeline terminates at a caller-supplied
+external trust resolver that does not exist in-tree; the only in-tree anchor
+is content-only/unendorsed, and the shipped RNG-parity receipt records
+`promotion_authorized: false`. The campaign is therefore content-identity
+machinery, not performance evidence.
+[FORAGER_ALBERTA_CANDIDATE_AUDIT.md](FORAGER_ALBERTA_CANDIDATE_AUDIT.md)
+records the internal implementation review (GO) alongside the uncleared
+campaign authority, and
+[FORAGER_COMPARATOR_AUDIT.md](FORAGER_COMPARATOR_AUDIT.md) records comparator
+provenance and claim-scope limitations of the frozen v1 protocol.
+
 ### Online Permuted MNIST (OPMNIST)
 
 Step-2 lanes exercise the online permuted-MNIST protocol from the
@@ -539,18 +570,35 @@ and D20 multi-prototype lanes.
 
 ### Publication-shaped development runners
 
-Two further runners target published task constructions and horizons. Their
-strict artifact checks are development infrastructure, not scientific
-promotion:
+These runners target published task constructions and horizons. Their strict
+artifact checks are development infrastructure, not scientific promotion:
 
 - `upgd_ipmnist` — the input-permuted-MNIST protocol from the UPGD paper
   (Elsayed & Mahmood, ICLR 2024);
-- `slowly_changing_regression` — a publication-shaped implementation of the
-  slowly-changing regression testbed from the loss-of-plasticity line of work.
+- `ipmnist_screening` — a beat-SOTA *screening* lane: 30 registered
+  mechanism-combination arms (UPGD×IDBD, UPGD×Autostep, UPGD+CBP, weight
+  clipping, per-layer gate normalization, FADE-style meta-learned decay,
+  SwiftTD-stabilized UPGD×IDBD, and others) on a validated 60-task proxy that
+  is an exact bit-prefix of the 200-task protocol, with plan/run/
+  validate-proxy/merge CLI and full-protocol confirmation pipelines
+  (`outputs/ipmnist_screening/`). Screening results are permanently
+  nonpromoting;
+- `upgd_label_emnist` — label-permuted EMNIST (balanced 47-class, labels
+  permuted every 2,500 steps, 400 tasks), pinned to the audited upstream
+  commit. The first 3-seed artifact
+  (`outputs/upgd_label_emnist/results.v1.json`) reproduces the qualitative
+  separation: UPGD-W online accuracy rises across tasks (first-quarter mean
+  0.5616 → last-quarter 0.7284; whole-run mean 0.67151 versus the ~0.74
+  figure read-off, gap flagged) while AdamW collapses (whole-run mean 0.20081
+  versus the ~0.35 read-off, gap flagged). Descriptive only;
+- `slowly_changing_regression` / `slowly_changing_regression_v2` — a
+  publication-shaped implementation of the slowly-changing regression testbed
+  from the loss-of-plasticity line of work, with a strict namespaced v2
+  sharded contract.
 
-The UPGD lane has completed a matched 10-seed, one-million-step development
-diagnostic: UPGD-W mean online accuracy was `0.7791470803916454` (SE
-`0.000055690729820870456`) versus AdamW `0.7190002817213534` (SE
+The UPGD IP-MNIST lane has completed a matched 10-seed, one-million-step
+development diagnostic: UPGD-W mean online accuracy was `0.7791470803916454`
+(SE `0.000055690729820870456`) versus AdamW `0.7190002817213534` (SE
 `0.0005943125024635892`), with a descriptive paired difference of
 `0.06014679867029188` (10/10 positive). The canonical structurally valid
 artifact and its current audit addendum are
@@ -567,23 +615,23 @@ namespaced v3 plan/one-learner-one-seed-shard/exact-merge contract in
 `alberta_framework/benchmarks/upgd_ipmnist_v3.py`. No v3 plan has been issued,
 no v3 shards or artifact exist, and no fresh v3 seed has been consumed. V3
 binds the exact run specification, exactly 20 fresh operator-reserved seed
-IDs, selected hyperparameters, data bytes,
-runtime, source import closure, commands, and complete Cartesian shard bytes,
-but remains permanently nonpromoting because its execution envelope is not
-externally attested. See [UPGD_IPMNIST_V3_RUNBOOK.md](UPGD_IPMNIST_V3_RUNBOOK.md).
-The slowly-changing-regression lane now
-has a strict namespaced v2 development contract and a selected ReLU/SGD
-ordinary-BP path with Kaiming initialization and true-MSE gradients. Its CBP
-and UPGD arms are explicitly Alberta-local extensions. The full 100-seed ×
-three-method run has not been launched; no pre-run plan has been issued and no
-result artifact exists. Any future v2 self-recorded plan permanently forbids
-promotion and reports descriptive curves without post-hoc pass/fail
-thresholds. Merge and ordinary validation require exact deterministic replay
-of every shard; structural-only diagnostics are explicitly nonvalid. Neither
-lane supports an inferential, SOTA, or Alberta Plan
-completion claim; see
-[CONTINUAL_LEARNING_EVIDENCE.md](CONTINUAL_LEARNING_EVIDENCE.md) for the complete
-descriptive record and limitations.
+IDs, selected hyperparameters, data bytes, runtime, source import closure,
+commands, and complete Cartesian shard bytes, but remains permanently
+nonpromoting because its execution envelope is not externally attested. See
+[UPGD_IPMNIST_V3_RUNBOOK.md](UPGD_IPMNIST_V3_RUNBOOK.md).
+
+The slowly-changing-regression lane has a strict namespaced v2 development
+contract and a selected ReLU/SGD ordinary-BP path with Kaiming initialization
+and true-MSE gradients. Its CBP and UPGD arms are explicitly Alberta-local
+extensions. The full 100-seed × three-method run has not been launched; no
+pre-run plan has been issued and no result artifact exists. Any future v2
+self-recorded plan permanently forbids promotion and reports descriptive
+curves without post-hoc pass/fail thresholds. Merge and ordinary validation
+require exact deterministic replay of every shard; structural-only diagnostics
+are explicitly nonvalid. Neither lane supports an inferential, SOTA, or
+Alberta Plan completion claim; see
+[CONTINUAL_LEARNING_EVIDENCE.md](CONTINUAL_LEARNING_EVIDENCE.md) for the
+complete descriptive record and limitations.
 
 ## Core abstractions
 

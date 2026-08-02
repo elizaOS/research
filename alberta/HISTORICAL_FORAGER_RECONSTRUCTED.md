@@ -8,6 +8,16 @@ of the paper-era mutable NumPy environment. Its environment family ID is:
 It is a separate environment family from `current_foragax_0_55`. Results from
 the two families must not be seed-paired or pooled.
 
+Execution status: the runner, behavior preflight, artifact validator, and
+pairing contracts are implemented in
+`alberta_framework.benchmarks.historical_forager` and covered by
+`tests/test_historical_forager_reconstructed.py` and
+`tests/test_historical_forager_cli_package.py`, but **no verified
+reconstructed-environment run artifact exists under `outputs/` in this
+repository**. Only the explicitly ineligible development-adapter path runs in
+tests, so the lane's cross-family orientation comparison remains unexercised
+in-repo.
+
 ## Provenance boundary
 
 The paper agents declared this dependency without a revision:
@@ -185,3 +195,17 @@ versioned codecs that atomically capture the mutable environment, next action,
 algorithm state, Collector state, and raw-sidecar offset together. Until those
 codecs exist, restart a failed seed in a new output directory rather than
 claiming a partial checkpoint is equivalent.
+
+## CLI
+
+`alberta-historical-forager` inspects and verifies this lane without ever
+launching a run:
+
+```bash
+alberta-historical-forager provenance          # audited provenance + SHA-256
+alberta-historical-forager validate OUTPUT_DIR # strict completed-artifact check
+alberta-historical-forager pair LEFT RIGHT     # strict pairing-identity check
+```
+
+Every payload it emits repeats `environment_resolution_attested: false` and
+`pairable_with_current_foragax: false`.

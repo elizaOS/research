@@ -2245,6 +2245,8 @@ class ContinualControlEvaluator:
             return {"p50_ms": None, "p95_ms": None, "p99_ms": None}
         ordered = sorted(value / 1_000_000.0 for value in values)
 
+        # Nearest-rank (ceiling) quantiles: every reported percentile is an
+        # observed sample, never an interpolation between samples.
         def quantile(fraction: float) -> float:
             return ordered[math.ceil(fraction * len(ordered)) - 1]
 
@@ -2437,6 +2439,10 @@ class ContinualControlEvaluator:
             raise ValueError("state condition count does not match evaluator")
         completed_checkpoints = sum(value <= step for value in self._protocol.checkpoint_steps)
         probes_per_checkpoint = sum(len(values) for values in self._probes.values())
+        # Decisions run one ahead of transitions (prequential arming): the
+        # first is armed at construction and each transaction arms the next,
+        # so `step` transitions imply ``step + 1`` decision calls — except
+        # after the final transition, when no further decision is armed.
         expected_decisions = min(step + 1, transition_count)
         expected_probes = completed_checkpoints * probes_per_checkpoint
         for learner, condition in zip(self._learners, state.conditions, strict=True):

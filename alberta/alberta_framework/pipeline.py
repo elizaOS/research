@@ -4,10 +4,12 @@
 The production pipeline composes the existing packaged pieces conservatively:
 
 1. Step 1 enters through the adaptive optimizers used by later learners.
-2. Step 2 supplies feature augmentation via either the lightweight temporal
-   context featurizer or the promoted nonlinear UPGD learner whose penultimate
-   hidden activations become the feature vector for downstream Step 3 and
-   Step 4 learners.
+2. Step 2 supplies feature augmentation in one of four modes: the lightweight
+   temporal-context featurizer, the promoted nonlinear UPGD learner (whose
+   penultimate hidden activations become the feature vector for downstream
+   Step 3 and Step 4 learners), the associative-memory learner (whose
+   next-token probability vector becomes the features), or raw identity
+   passthrough.
 3. Step 3 learns GVF/Horde predictions on those features. Cumulants are
    either supplied through a caller-provided callable or fall back to the
    observation-channel cumulant function used by the legacy smoke API.
@@ -535,8 +537,9 @@ class AlbertaPipelineState:
     ``feature_state`` stores the temporal-context state when ``step2`` is
     ``"temporal_context"``; otherwise it is None. ``upgd_state`` stores the
     UPGD learner state when ``step2`` is ``"upgd"``; otherwise it is None.
-    ``control_state`` is either a SARSA state or a HordeActorCritic state
-    depending on ``control_mode``.
+    ``associative_state`` stores the associative-memory state when ``step2``
+    is ``"associative"``; otherwise it is None. ``control_state`` is either
+    a SARSA state or a HordeActorCritic state depending on ``control_mode``.
     """
 
     feature_state: TemporalContextState | None

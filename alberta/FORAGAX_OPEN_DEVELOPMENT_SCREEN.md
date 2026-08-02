@@ -158,3 +158,24 @@ The stateful screen also has a runtime-level fairness limitation: its hash-bound
 disjoint environment-key stream in `continuing_main`. Preflight source binding makes that behavior
 auditable but does not remove the confound; paired, superiority, SOTA, official, and causal claims
 remain forbidden.
+
+## Completed executions in this repository
+
+Three immutable executions of the v3 protocols exist under `outputs/forager/`, all produced
+by the v4 harness/aggregate contract (`alberta.foragax_open_development_screen_aggregate.v4`)
+on the two consumed open-development seeds 2,000,001 and 2,000,002:
+
+- `fov_baseline_screening_cpu_v3_execution` — complete; all eleven candidates eligible.
+  `DQN_LN-common-control` ranked first (two-seed mean FOV tail-EMA AUC `1.49084`); the three
+  DQN common controls advanced for later open development.
+- `fov_stateful_baseline_screening_cpu_v3_execution` — complete under its frozen contract,
+  with the two PPO-family candidates ineligible (`raw_reward_validation`: unexpected or
+  missing result directory). The attempt is immutable and was not resumed or rerun in place.
+- `fov_stateful_baseline_screening_cpu_v3_corrected_v4_execution` — the corrected
+  re-execution in a new output root; all eight candidates eligible.
+  `PPO-RTU_LN_128_1_relu` ranked first (two-seed mean `1.78110`).
+
+These rankings are open-development candidate-generation provenance for the frozen
+matched-current candidate universe (see `FORAGER_BENCHMARK.md` and
+`FORAGER_COMPARATOR_AUDIT.md`). They are nonpromoting, use consumed seeds and unmatched
+candidate budgets, and support no comparison between the two screens.

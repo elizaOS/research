@@ -2,10 +2,10 @@
 
 This module isolates one narrow Step 2 question: can a fixed-budget online
 learner retain three recurring pair products while evicting a fourth pair
-that appeared once from its deployed bank?  A single learner state experiences the uninterrupted
-sequence ``A, B, A, D, A, C, A, B, C``.  Predictions are scored before each
-update, and final scores use a separately generated held-out set that never
-updates the learner.
+that appeared once from its deployed bank?  A single learner state
+experiences the uninterrupted sequence ``A, B, A, D, A, C, A, B, C``.
+Predictions are scored before each update, and final scores use a separately
+generated held-out set that never updates the learner.
 
 The probe is deliberately small.  It uses Gaussian vectors, supplied task
 identities, pair-product targets, and squared error.  Passing it is evidence

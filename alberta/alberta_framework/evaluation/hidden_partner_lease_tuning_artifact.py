@@ -4,8 +4,9 @@ The v4 grid (``LEASE_TUNING_GRID`` in
 :mod:`alberta_framework.evaluation.hidden_partner_lifecycle_v2`) tunes the
 evidence-gated confirmed-memory lease of
 :class:`~alberta_framework.core.integrated_hidden_partner.IntegratedHiddenPartnerAgent`:
-eight immutable cells over retention grace steps {2048, 3072, 4096} crossed
-with active-utility evidence thresholds 0.075–0.40, each to be run on eight
+eight immutable cells pairing retention grace steps {2048, 3072, 4096} with
+active-utility evidence thresholds 0.075–0.40 (a curated subset of the full
+cross), each to be run on eight
 seed pairs derived from ``LEASE_TUNING_NAMESPACE`` and ranked by the frozen
 lexicographic ``TUNING_SELECTION_RULE``.
 

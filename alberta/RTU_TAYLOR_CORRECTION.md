@@ -2,7 +2,8 @@
 
 ## Scope and source status
 
-`RecurrentTraceActorCriticConfig.rtrl_taylor_correction` enables the
+`RecurrentTraceActorCriticConfig.rtrl_taylor_correction` (in
+`alberta_framework/core/recurrent_trace_actor_critic.py`) enables the
 parameter-wise diagonal Taylor trace from Appendix C.2 of
 [Farr et al., arXiv:2605.24709v2](https://arxiv.org/abs/2605.24709). It is
 disabled by default. The result is a **Taylor-corrected approximate

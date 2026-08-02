@@ -18,18 +18,24 @@ alberta_framework/
                state_builder, learning_signals, experiential_memory,
                context_inference, hidden-partner substrates
   streams/     synthetic prediction streams + gauntlet, closed_loop, opponent,
-               matrix_game, recurring_multiagent, hidden_partner_mapping
-  evaluation/  strict evidence artifacts, validators, and the evaluation CLIs
-  benchmarks/  forager family, official_foragax, published-protocol runners
+               matrix_game, recurring_multiagent, hidden_partner_mapping,
+               hidden_regime_signaling
+  evaluation/  strict evidence artifacts, validators, the evidence registry,
+               and the evaluation CLIs
+  benchmarks/  forager family (incl. matched-current campaign machinery),
+               official_foragax, published-protocol replication lanes
   utils/       multi-seed experiments, statistics, metrics, export
-  steps/       Step 1/2 smoke kernels
+  steps/       Step 1–12 production kernels (smoke CLIs for Steps 1–2)
 outputs/       pinned evidence artifacts — see immutability rules below
-tests/         ~3,200+ tests; marker lanes below
+tests/         325 test files, ~6,900 collected (2026-08-01); marker lanes below
 ```
 
 Key documents: `RESEARCH_STATUS.md` (evidence levels L0–L3, completion
 gates), `CONTINUAL_LEARNING_EVIDENCE.md` (property-by-property evidence map),
-`FORAGER_BENCHMARK.md` (Foragax protocols), `CHANGELOG.md`.
+`FORAGER_BENCHMARK.md` (Foragax protocols), `VENDORING.md` (fork status),
+the execution runbooks (`CONTINUAL_IA_V2_RUNBOOK.md`,
+`UPGD_IPMNIST_V3_RUNBOOK.md`, `OPMNIST_DEVELOPMENT_INGESTION.md`), and
+`CHANGELOG.md`.
 
 ## Running things
 
@@ -56,6 +62,8 @@ explicitly registered as a scientific lane.
   require preregistered seeds.
 - `development` — calibration/exploratory protocols; must never promote
   scientific claims.
+- `slow` — wall-clock heavy modules (>~30s serial); excluded from the fast
+  per-PR CI lane (`-m "not slow"`).
 
 ## Evidence-promotion rules (fail-closed)
 
@@ -88,7 +96,14 @@ explicitly registered as a scientific lane.
 missing), `2` (invalid). Each claim's CLI is also
 `python -m alberta_framework.evaluation.<module>`.
 
-| Claim | Frozen outcome | Artifact | CLI |
+**Live status (2026-08-01): the registry reports all five claims `invalid`
+(overall `invalid`, exit 2)** because registered source files were edited
+after the artifacts were pinned. That is the fail-closed design working as
+intended, not a bug; the frozen outcomes recorded in the pinned artifacts are
+listed below. Renewing a claim requires rerunning its frozen protocol to a
+NEW artifact path and schema version with untouched preregistered seeds.
+
+| Claim | Frozen artifact outcome | Artifact | CLI |
 |---|---|---|---|
 | `recurring_pair_features` | accepted (narrow L2) | `outputs/recurring_feature/evidence.v1.json` | `alberta-recurring-feature-evidence` |
 | `scale_robust_pair_features` | accepted (narrow L2) | `outputs/scale_robust_feature/evidence.v2.json` | `alberta-scale-robust-evidence` |

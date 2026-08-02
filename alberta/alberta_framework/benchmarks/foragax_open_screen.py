@@ -618,6 +618,16 @@ def _load_cpu_protocol(
     protocol_sha256: str,
     schema: str,
 ) -> FrozenProtocol:
+    """Validate one frozen CPU overlay protocol against its lineage and contracts.
+
+    A CPU overlay must chain to its frozen GPU-era base protocol by schema and
+    digest; a v3 protocol must additionally supersede its exact v2 predecessor
+    (and a v2 must not claim one).  The runtime block has to reproduce the
+    module's frozen environment/sandbox contracts verbatim, the scoring block
+    must pin the in-image scorer and the exact EMA arithmetic string, and the
+    protocol must declare itself nonpromoting with SOTA claims forbidden —
+    any drift fails closed before a plan can be built.
+    """
     if raw.get("status") != "configuration_frozen_execution_pending":
         raise ScreenError("CPU protocol is not execution-pending")
     if raw.get("evidence_class") != "open_development":
@@ -1158,6 +1168,16 @@ def build_candidate_command(
 
 
 def _run_preflight(protocol: FrozenProtocol, docker: str) -> tuple[dict[str, Any], bytes, bytes]:
+    """Run the no-reward OCI preflight and cross-check its probe against the protocol.
+
+    The in-container probe echoes back every identity it can observe —
+    protocol/base/predecessor/scorer digests, the full source-file and
+    configuration inventories, per-configuration seeds and entrypoints, and
+    (for stateful protocols) the scorer-equivalence cases — and each echo
+    must match the frozen protocol exactly.  The probe only invokes
+    entrypoint ``--help``; it must attest that no environment or transition
+    construction happened, keeping the preflight reward-blind.
+    """
     command = build_preflight_command(protocol, docker)
     capture = _capture_process(command)
     if capture.returncode != 0:
@@ -2629,6 +2649,17 @@ def _execute_candidate(
     docker: str,
     plan: Mapping[str, Any],
 ) -> dict[str, Any]:
+    """Execute one candidate under the staged-attempt discipline.
+
+    Everything happens under ``.incomplete/<run_id>`` — exclusive attempt
+    record, process logs, payload validation, in-image scoring — and only a
+    fully manifested attempt is atomically renamed into ``runs/``.  A crash
+    leaves the staging directory behind as a non-resumable failure.  A
+    candidate that exits nonzero or fails validation is not an error: it
+    becomes a ``completed_ineligible`` run with its failures recorded, so one
+    bad candidate cannot block the panel.  The bound runtime identity is
+    re-verified after the candidate process and again before scoring.
+    """
     incomplete_parent = output / ".incomplete"
     runs_parent = output / "runs"
     incomplete_parent.mkdir(exist_ok=True)
@@ -2771,6 +2802,16 @@ def _validate_completed_run(
     plan: Mapping[str, Any],
     docker: str,
 ) -> dict[str, Any]:
+    """Re-validate a previously completed run before a resumed harness accepts it.
+
+    Resume never re-executes: an existing run is either byte-exact —
+    manifest keys and classification, input contract and its digest,
+    artifact/directory inventories, canonical ``attempt.json``, and the
+    recorded scoring all re-verified against the current protocol and plan —
+    or the whole resume fails.  This is what makes completed attempts
+    immutable: any tampering or contract drift is indistinguishable from
+    corruption and rejected the same way.
+    """
     if run_root.is_symlink() or not run_root.is_dir():
         raise ScreenError(f"completed run must be a non-symlink directory: {run_root}")
     manifest = _validate_manifest_pair(run_root / "run_manifest.json", RUN_SCHEMA)

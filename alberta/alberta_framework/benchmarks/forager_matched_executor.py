@@ -1308,6 +1308,13 @@ def _container_source_path(relative: str) -> str:
 
 
 def _read_stable_file(path: Path, label: str, *, maximum: int) -> bytes:
+    """Read one bounded, single-link regular file with stat-identity race checks.
+
+    The full identity (dev, inode, mode, nlink, size, mtime, ctime) must
+    agree before open, after open, and after the last byte, so a file that
+    mutates mid-read — or a symlink/hardlink alias — fails closed instead of
+    yielding bytes that never existed as a single stable snapshot.
+    """
     try:
         path_before = os.lstat(path)
     except OSError as exc:
@@ -2281,6 +2288,17 @@ def _prepare_candidate(
     candidate: MatchedCandidate,
     assets: CandidateExecutionAssets,
 ) -> PreparedCandidate:
+    """Cross-bind one candidate's local assets to the protocol before anything runs.
+
+    Re-verifies, from bytes on disk: pairing/stratum invariants, the runtime
+    binding digests, the source archive and inventory, both configuration
+    digests plus an offline replay of the declared byte-preserving transforms
+    (``original`` must reproduce ``derived`` exactly), and the capability
+    receipt — including that the receipt's entrypoint and import root exist
+    in the verified inventory.  The returned :class:`PreparedCandidate`
+    therefore carries only identities that were just re-checked, never
+    caller-supplied claims.
+    """
     if assets.candidate_id != candidate.candidate_id:
         raise ForagerMatchedExecutorError("candidate asset key/ID mismatch")
     if candidate.stratum == "historical_orientation":
@@ -2884,7 +2902,7 @@ def _cleanup_interrupted_container(
                 maximum_stdout_bytes=_MAX_CLEANUP_INSPECTION_BYTES,
                 maximum_stderr_bytes=_MAX_CLEANUP_INSPECTION_BYTES,
             )
-        except (OSError, subprocess.SubprocessError) as exc:
+        except (OSError, subprocess.SubprocessError, _BoundedProcessOutputError) as exc:
             raise ForagerMatchedExecutorError(
                 "OCI cleanup could not prove the exact name absent"
             ) from exc
@@ -3450,6 +3468,14 @@ def _parse_scorer_output(
     candidate: PreparedCandidate,
     seed: int,
 ) -> dict[str, Any]:
+    """Validate one qualified scorer emission against the plan's frozen metric layout.
+
+    The EMA sample count and tail window are recomputed here from the horizon
+    (one sample per 100 steps, tail starting at 90% of the samples) and must
+    match the record exactly, so a scorer cannot silently change the FOV
+    last-10%-EMA-AUC window.  Output must be canonical JSON with exactly one
+    seed record and finite built-in floats for every metric field.
+    """
     if len(raw) > _MAX_JSON_BYTES:
         raise ForagerMatchedExecutorError("scorer output exceeds the byte bound")
     payload = _object(decode_strict_json(raw), "qualified scorer output")

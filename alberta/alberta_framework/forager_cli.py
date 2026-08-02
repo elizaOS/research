@@ -1,4 +1,15 @@
-"""Command-line entry point for the Forager/Foragax benchmark."""
+"""Console entry points for the Forager/Foragax benchmark comparison.
+
+``alberta-forager-benchmark`` (:func:`main`) runs the in-tree agents
+(Alberta actor-critic, causal-map planner, random, oracle-search) on the
+Foragax testbed, optionally imports paired seed-level NPZ archives from the
+official DQN/PPO/RTU-PPO repository, and emits one JSON payload carrying
+per-method summaries, the paired comparison report, protocol-conformance
+checks, and git/runtime provenance sealed by a payload SHA-256.
+
+``alberta-historical-forager`` (:func:`historical_main`) only inspects or
+validates reconstructed paper-era NumPy artifacts; it never launches a run.
+"""
 
 from __future__ import annotations
 

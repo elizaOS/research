@@ -445,7 +445,16 @@ def butterfly_topology_spec(
     permuted: bool = False,
     head_mode: HeadMode = "linear",
 ) -> TopologySpec:
-    """Return a butterfly or Benes fixed-pattern sparse topology plan."""
+    """Return a butterfly or Benes fixed-pattern sparse topology plan.
+
+    Butterfly wiring pairs each node with a partner at a power-of-two stride
+    that doubles every layer, so degree-2 gates can mix information across
+    the full layer width in ``log2(width)`` layers.  ``benes=True`` extends
+    the stride schedule with its mirror image (a butterfly followed by an
+    inverse butterfly — the Benes network pattern), and ``permuted=True``
+    applies one random relabeling of the wires before laying down the
+    pattern.  The wiring itself is realized by ``diffeml_image.make_wiring``.
+    """
     if layers <= 0:
         raise ValueError("layers must be positive")
     family = "benes" if benes else "butterfly"

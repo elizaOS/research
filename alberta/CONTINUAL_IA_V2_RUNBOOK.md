@@ -1,10 +1,13 @@
 # Continual-IA v2 development-only contract
 
-Status: **unissued and nonpromoting**. No v2 plan, seed reservation, shard, or
-artifact exists in the repository. V2 is a reproducible development diagnostic,
-not held-out or preregistered evidence: its plan is self-issued and has no
-trusted external pre-run chronology anchor. Passing every scientific gate can
-only set `scientific_gates_passed=true`; `internally_accepted` is always false.
+Status (2026-08-01): **unissued and nonpromoting**. No v2 plan, seed
+reservation, shard, or artifact exists in the repository —
+`outputs/continual_ia/` holds only the immutable v1 chain. V2 is a
+reproducible development diagnostic, not held-out or preregistered evidence:
+its plan is self-issued and has no trusted external pre-run chronology anchor.
+Passing every scientific gate can only set `scientific_gates_passed=true`;
+`internally_accepted` and `internal_l2_candidate_if_all_gates_pass` are
+hard-coded false in the schema.
 
 Seeds 60–89 remain unexecuted for this protocol. If an authorized operator runs
 v2, each started seed becomes consumed development data. A future promotion
@@ -17,6 +20,9 @@ archived source: p=0.5 passed the reward and secondary controls but missed the
 frozen action-changing intervention-rate gate. Current checkout drift in
 `average_reward.py` invalidates the former current-source compatibility replay;
 it does not rewrite the historical result or authorize a consumed-seed replay.
+`alberta-evidence-status` accordingly reports the IA claim as invalid against
+the current source until a frozen-protocol renewal — designed fail-closed
+behavior, while the archived rejection itself stands.
 
 ## Frozen scientific protocol
 
@@ -34,9 +40,12 @@ shard.
 
 ## Lifecycle and invariants
 
-The separate entrypoint is
-`python -m alberta_framework.evaluation.continual_ia_v2_cli`. The public
-`alberta-ia-evidence` command remains v1-only.
+The contract is implemented in
+`alberta_framework/evaluation/continual_ia_v2.py`; the separate entrypoint is
+`python -m alberta_framework.evaluation.continual_ia_v2_cli` with subcommands
+`plan`, `shard`, `merge`, `verify-plan`, `verify-shard`, and `verify-artifact`
+(no default subcommand). The public `alberta-ia-evidence` command remains
+v1-only.
 
 The lifecycle is self-issued plan → 30 reserved one-seed shards → merge:
 
@@ -130,6 +139,9 @@ Verification is explicit and computationally expensive:
 ```bash
 .venv/bin/python -m alberta_framework.evaluation.continual_ia_v2_cli verify-plan \
   --plan "$PWD/outputs/continual_ia_v2/plan.v2.json"
+.venv/bin/python -m alberta_framework.evaluation.continual_ia_v2_cli verify-shard \
+  --plan "$PWD/outputs/continual_ia_v2/plan.v2.json" \
+  --shard "$PWD/outputs/continual_ia_v2/shards/seed-060.v2.json"
 .venv/bin/python -m alberta_framework.evaluation.continual_ia_v2_cli verify-artifact \
   --artifact "$PWD/outputs/continual_ia_v2/evidence.v2.json"
 ```

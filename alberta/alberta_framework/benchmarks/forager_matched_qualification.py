@@ -2016,6 +2016,12 @@ def _probe_invocations(
     sources: Mapping[SourceKey, _StagedSource],
     configurations: Mapping[str, _MaterializedConfiguration],
 ) -> tuple[ProbeInvocation, ...]:
+    """Build the per-candidate probe matrix: source tree, entrypoint, style, and seed transport.
+
+    Every digest an invocation carries (probe module, entrypoint, derived
+    configuration) is hashed from the staged bytes here, so the container
+    can re-verify exactly what the host claims to have mounted.
+    """
     from alberta_framework.benchmarks import forager_matched_open_protocol as builder
 
     probe_path = (
@@ -2619,6 +2625,16 @@ def _probe_result_root(
 
 
 def _container_probe(argv: Sequence[str]) -> int:
+    """In-container half of one structural probe (the ``container-probe`` CLI operation).
+
+    Re-verifies every identity the host claims to have mounted (this module's
+    own bytes, image digest, configuration, entrypoint), resolves the
+    candidate's agent and effective seed from the configuration, and derives
+    the agent RNG provenance key words — with exactly one environment reset
+    and zero transitions or reward reads, as the emitted
+    ``reward_blind_boundary`` block attests.  The canonical JSON payload on
+    stdout is the only channel back to the host.
+    """
     parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--candidate-id", required=True)
     parser.add_argument(
@@ -2861,7 +2877,7 @@ def _cleanup_interrupted_probe_container(
                 maximum_stdout_bytes=_MAX_CLEANUP_INSPECTION_BYTES,
                 maximum_stderr_bytes=_MAX_CLEANUP_INSPECTION_BYTES,
             )
-        except (OSError, subprocess.SubprocessError) as exc:
+        except (OSError, subprocess.SubprocessError, _BoundedProcessOutputError) as exc:
             raise ForagerMatchedQualificationError(
                 "OCI probe cleanup could not prove the exact name absent"
             ) from exc
@@ -3409,6 +3425,7 @@ def _assemble_and_write(
     probes: Mapping[str, Mapping[str, Any]],
     probe_stderr: Mapping[str, str],
 ) -> None:
+    """Assemble the bundle: receipts, two-pass protocol build, and the canonical manifest."""
     from alberta_framework.benchmarks import forager_matched_executor as executor
     from alberta_framework.benchmarks import forager_matched_open_protocol as builder
 
@@ -4400,6 +4417,14 @@ def _verify_probe_payload(
     payload: Mapping[str, Any],
     invocation: ProbeInvocation,
 ) -> None:
+    """Re-verify a persisted probe payload field-by-field against its invocation.
+
+    The verifier accepts only exact expected values — fixed key sets, frozen
+    parser identities per implementation kind, required entrypoint literals,
+    and a zero-transition, zero-reward-read boundary block — so a probe
+    payload that drifted in any dimension fails closed rather than being
+    partially trusted.
+    """
     from alberta_framework.benchmarks import forager_matched_open_protocol as builder
 
     expected_top_level = {

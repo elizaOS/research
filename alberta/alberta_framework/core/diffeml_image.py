@@ -4,10 +4,11 @@
 
 This module supports a small DiffEML logic-circuit classifier on image datasets.
 It is intended for research demos, not as a claim of competitive image
-performance.  EML (exp-minus-log) is the two-input operator
-``exp(x) - log(y)`` implemented in :mod:`alberta_framework.core.diffeml`; a
-DiffEML circuit is a differentiable-logic-style network whose Boolean gates
-are realised by EML-threshold expressions instead of truth tables.
+performance.  The EML primitive is the two-input real operation
+``eml(x, y) = exp(x) - log(y)`` implemented in
+:mod:`alberta_framework.core.diffeml`; a DiffEML circuit is a
+differentiable-logic-style network whose Boolean gates are realised by
+EML-threshold expressions instead of truth tables.
 
 The default mode executes depth-2 EML-threshold gate templates from
 ``core.diffeml`` and learns a DiffLogic-style soft gate selector at every
@@ -134,9 +135,9 @@ class DatasetSplit:
 class DemoConfig:
     """Configuration for the DiffEML image demo.
 
-    Fields map one-to-one onto the demo runner's CLI flags (built by
-    :func:`build_config`, range-checked before construction) and fall into
-    seven groups:
+    Fields map one-to-one onto CLI flags: :func:`build_config` constructs
+    the config from a parsed ``argparse.Namespace`` and :func:`validate_args`
+    range-checks the values.  The fields fall into seven groups:
 
     * **Data** — ``datasets``, ``seed``, ``train_fraction``, ``max_train``,
       ``max_test``: dataset selection plus deterministic stratified

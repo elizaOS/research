@@ -18,6 +18,11 @@ engineering-only and permanently nonpromoting. A valid rejection may motivate ab
 v1, but it cannot retroactively amend the frozen protocol or turn seed 0 into an evidence
 gate.
 
+Execution status (2026-08-01): unchanged since this audit. The open-tuning campaign root
+`outputs/forager/matched_current_open_tuning_2c3b214c_v1` still has empty `runs/` and
+`completions/` directories — zero of its 210 tuning cells have executed — and the q-grid
+divergence probe has not been run (no probe output artifact exists in the repository).
+
 ## Scope and boundaries
 
 The audit traced the 14 Alberta configurations through frozen configuration parsing,

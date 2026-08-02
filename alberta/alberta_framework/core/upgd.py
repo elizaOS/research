@@ -2720,9 +2720,11 @@ class UPGDLearner:
 
         # ---- Utility update --------------------------------------------------
         # u <- decay * u + (1 - decay) * |w * grad|
-        # Use the *pre-SGD* weights here (matches Dohare et al.: utility
-        # reflects how much the current weights contribute to the loss
-        # gradient, not the post-SGD weights).
+        # Computed with the *pre-SGD* weights, as in the paper's first-order
+        # utility (Elsayed & Mahmood, ICLR 2024): utility measures how much
+        # the current weights contribute to the loss gradient, not the
+        # post-SGD weights. The absolute-product form itself is this
+        # learner's extension -- see the module docstring.
         new_utilities: list[Array] = []
         new_unit_utilities: list[Array] = []
         new_unit_long_utilities: list[Array] = []

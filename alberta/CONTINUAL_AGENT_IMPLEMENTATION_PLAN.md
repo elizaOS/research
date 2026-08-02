@@ -1,6 +1,8 @@
 # Implementation Plan for a Continual Experiential Alberta Agent
 
 - **Planning snapshot:** 2026-07-30
+- **Status refresh:** 2026-08-01 — the dated implementation-status passages
+  below reflect the current working tree
 - **Companion review:**
   [CONTINUAL_AGENT_RESEARCH.md](CONTINUAL_AGENT_RESEARCH.md)
 
@@ -150,6 +152,19 @@ artifact before changing algorithms.
 
 No ambiguous `complete`, `production`, or `validated` claims remain, and every
 current benchmark claim either has a reproducible artifact or is downgraded.
+
+**Implementation status (2026-08-01):** the mechanism deliverables exist. The
+machine-readable registry (`alberta_framework/evaluation/evidence_manifest.py`,
+CLI `alberta-evidence-status`) binds five claims to commands, artifact hashes,
+registered source hashes, seeds, and scope limits, and is verified fail-closed:
+a missing promoted artifact yields `not-run` (exit 1), never a pass.
+`RESEARCH_STATUS.md` carries the human evidence matrix with L0–L3 levels. As
+of 2026-08-01 the registry reports overall `invalid` (exit 2) with all five
+claims source-invalidated, because registered source files were edited after
+the artifacts were pinned — designed fail-closed behavior; renewal requires
+frozen-protocol reruns to new artifact paths and schema versions. The exit
+gate's traceability requirement is met; the registry's current state is a
+visible rejection, not a silent pass.
 
 ## WP1 — Build the continual evaluation harness
 
@@ -310,6 +325,21 @@ stack into JAX before first-order results justify it.
 - optimizer/checkpoint serialization; and
 - all-parameter versus trunk-only masks.
 
+**Implementation status (2026-08-01):** 2.1–2.3 are substantially landed.
+`alberta_framework/core/canonical_upgd.py` implements first-order protecting
+and non-protecting UPGD and UPGD-W as a small JAX PyTree transform with named
+source profiles (`paper_global`, `official_readme_global`,
+`official_experiment_global`, `official_experiment_local`,
+`paper_local_literal`, `safe_extended`) that keep the paper/README/experiment
+discrepancies of the pinned MIT reference visible; AdaUPGD and second-order
+utility remain future work. The historical `upgd.py` learner keeps its exact
+semantics with corrected attribution and documented deviations, so existing
+checkpoints and results stay valid. `tests/test_canonical_upgd.py` pins each
+profile with supplied fixed perturbations; PyTorch-reference parity rests on
+a source audit of the pinned official commit rather than executing the aged
+PyTorch stack. The 2.4 baseline comparisons and 2.5 experiment matrix have
+not been run as a preregistered campaign, so WP2's exit gate remains open.
+
 ### 2.4 Baseline matrix
 
 Start with inexpensive, licensed, mechanistically different comparators:
@@ -464,6 +494,17 @@ RTU-PPO route retains an upstream RNG confound. Exact content parity in the
 fixed-action direct/wrapper probe remains externally unverified and
 nonpromoting. Use these rankings only to choose later open development work,
 never as the required matched held-out comparison.
+
+The matched-current Forager campaign contract likewise remains execution
+status, not evidence. As of 2026-08-01, `outputs/forager/` contains a
+completed executor qualification and a prepared open-tuning campaign with
+published manifests but zero executed tuning cells; the sealed held-out
+evaluation stage
+(`alberta_framework/benchmarks/forager_matched_sealed_evaluation_campaign.py`)
+has no console script and has never run; and every authority-bearing path
+terminates at an
+external trust resolver that does not exist in-tree, so the shipped parity
+receipt is recorded as unverified with `promotion_authorized: false`.
 
 ### Exit gate
 
@@ -979,7 +1020,14 @@ has eager/JIT/scan coverage; the config-bound gather is intentionally a
 validated host orchestration boundary. Checkpoint, resource, and invalid-input
 contracts are also covered. No actor/replay/dream consumer, measured
 wall-clock or memory saving, DG reproduction, or learning/safety benefit has
-been established, so the WP5 exit gate remains open.
+been established, so the WP5 exit gate remains open. Two adjacent boundaries
+are deliberately fail-closed rather than functional: the DG development
+core's `kondo_enabled` config flag is reserved and raises when set, because
+the helper cannot actually skip compiled backward work, and the separate
+development benchmark lane
+(`alberta_framework/benchmarks/delightful_policy_gradient_development.py`)
+hard-codes `KONDO_IMPLEMENTED = False`, is exercised only by tests, and has
+produced no run artifacts under `outputs/`.
 
 ### 5.6 Delightful exploration
 
@@ -1100,6 +1148,22 @@ Turn the extensive lifecycle modules into the causal loop required by Steps
 - Prevent one head with large target scale from owning the feature budget.
 - Version feature semantics so replay and model memories can detect stale
   encodings.
+
+**Implementation status (2026-08-01):** one narrow opt-in Prototype lane now
+maps a fixed builder base through bounded pair products into the linear OaK
+loop. A single owner-bound behavior TD target trains the bank (base-Q while
+idle, current intra-option target while executing), and builder gradients are
+pulled back against the exact pre-route semantic generation. At a safe
+idle/cached-base boundary, descriptor routing is atomic; otherwise the
+curation proposal is rolled back and deferred rather than queued. Allocation
+ceilings, exact resource declarations, and versioned checkpoints bound the
+lane.
+
+This is L0 mechanism integration, not completion of 7.1 or 7.2. Compatibility
+deliberately excludes world models, Horde, replay, dreaming, IA, partner
+fusion, experiential memory, and GRU perception. It provides no multi-consumer
+utility or causal deletion result, automatic cumulant/subtask or option
+discovery, benefit result, promotion authority, WP7 completion, or L3 claim.
 
 ### 7.2 Cumulant and subtask discovery
 

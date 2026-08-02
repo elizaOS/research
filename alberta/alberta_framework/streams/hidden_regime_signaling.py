@@ -135,6 +135,10 @@ DEFAULT_SEGMENT_LENGTHS: tuple[int, ...] = (
 # the deliberately transient D occurrence remains sixteen steps (exactly one
 # lease).  Perturbations below are applied after this expansion; scaling a
 # shorter jittered schedule would erase all of its lease-phase variation.
+# The perturbations are load-bearing: every default segment length is a
+# multiple of eight, so an unperturbed schedule only ever places a change
+# point at lease phase 0 or 8.  Manifest validation therefore requires the
+# perturbed boundaries to cover at least eight distinct nonzero phases.
 STRUCTURAL_GENERALIZATION_LEASE_STEPS = 16
 STRUCTURAL_GENERALIZATION_BASELINE_SEGMENT_LENGTHS: tuple[int, ...] = tuple(
     length if regime == 4 else length * STRUCTURAL_GENERALIZATION_LEASE_STEPS

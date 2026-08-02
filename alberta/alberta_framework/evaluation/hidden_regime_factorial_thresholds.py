@@ -1949,8 +1949,9 @@ def canonical_threshold_freeze_receipt_bytes(
     return canonical_json_bytes(validated)
 
 
-# Compact public aliases.  Currently unconsumed in-repo: the calibration
-# runner (``hidden_regime_factorial_calibration``) imports the long names.
+# Compact public aliases.  Framework code imports the long names (the
+# calibration runner ``hidden_regime_factorial_calibration``); the aliases are
+# exercised only by the unit tests.
 freeze_hidden_regime_factorial_thresholds = (
     materialize_hidden_regime_factorial_threshold_freeze_receipt
 )

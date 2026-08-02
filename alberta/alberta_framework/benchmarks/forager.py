@@ -712,7 +712,7 @@ def _unadjusted_ema_chunk(
 
 
 def _fov_last_tenth_ema_auc(samples: Sequence[float]) -> float:
-    """Return the exact historical FOV last-10%-of-sampled-EMA statistic."""
+    """Return the paper's FOV statistic: mean of the final 10% of EMA samples."""
     values = np.asarray(samples, dtype=np.float64)
     if values.ndim != 1 or values.size == 0:
         raise ValueError("FOV EMA samples must be a non-empty one-dimensional sequence")
@@ -878,7 +878,9 @@ class AlbertaForagerConfig:
     the ordinary features; only the downstream actor and critic are trained.
 
     ``autostep_tau`` keeps the Autostep normalizer time constant at the
-    Mahmood et al. (2012) default of 10^4 samples.  For the reservoir,
+    Mahmood et al. (2012) default of 10^4 samples.  ``bounder_kappa = 0.5``
+    is looser than the kappa = 2 of Elsayed et al. (2024) — larger kappa
+    engages the ObGD update shrinkage sooner.  For the reservoir,
     ``recurrent_scale < 1`` gives the Gaussian recurrent kernel an expected
     spectral radius below one (fading memory), and the negative
     ``recurrent_update_bias`` starts the GRU update gate mostly closed

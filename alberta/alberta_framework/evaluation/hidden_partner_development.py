@@ -1190,8 +1190,8 @@ class HiddenPartnerDevelopmentRunner:
                 realized_counterfactual_regret=(
                     jnp.max(transition.oracle.counterfactual_rewards) - transition.reward
                 ),
-                # Disagreeing with the intended sign costs E[r] = 0.95 - 0.05
-                # = 0.9 in expectation under the 0.05 partner-flip rate.
+                # Disagreeing with the intended sign drops E[r] from 0.95 to
+                # 0.05, a fixed regret of 0.9 under the 0.05 partner-flip rate.
                 expected_greedy_regret=jnp.where(
                     planner_action == intended_action,
                     jnp.asarray(0.0, dtype=jnp.float32),

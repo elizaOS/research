@@ -1,12 +1,23 @@
 # UPGD IPMNIST v3 execution runbook
 
-Status as of 2026-07-31: **no v3 plan has been issued, no v3 shard has been
-executed, no v3 artifact exists, and no fresh v3 seed has been consumed.**
-The completed v1 development diagnostic, its reconciled artifacts, receipts,
-sealed runbooks, validator snapshot, and reconstructed source bundle remain
-historical and unchanged. This document governs only a future v3 execution.
+Status as of 2026-08-01: **no v3 plan has been issued, no v3 shard has been
+executed, no v3 artifact exists, and no fresh v3 seed has been consumed**
+(verified: no `alberta.upgd_ipmnist.*.v3` payload exists under `outputs/`
+beyond frozen source snapshots). The completed v1 development diagnostic, its
+reconciled artifacts, receipts, sealed runbooks, validator snapshot, and
+reconstructed source bundle remain historical and unchanged under
+`outputs/upgd_ipmnist/`. This document governs only a future v3 execution.
+
+The lifecycle is implemented in
+`alberta_framework/benchmarks/upgd_ipmnist_v3.py` (the plan/shard/merge
+runner; `python -m alberta_framework.benchmarks.upgd_ipmnist` dispatches to
+it) and validated by `alberta_framework/evaluation/upgd_ipmnist_v3.py` (the
+standalone plan/partial/artifact validator). Until a plan is issued, this
+machinery is exercised only by its tests.
 
 ## Evidence boundary
+
+### Schemas and promotion status
 
 The v3 schemas are:
 
@@ -22,6 +33,8 @@ attested, and the schema requires `scientific_promotion_allowed=false` and
 claim would require a separately governed, externally attested protocol; a v3
 artifact cannot be upgraded in place.
 
+### Plan, shard, and merge bindings
+
 The plan always names the exact `upgd_w`/`adamw` learner pair, selected
 hyperparameters, configuration, exact seed IDs, closed deviation codes,
 dataset content identity and locators, prescribed command templates, runtime
@@ -36,12 +49,16 @@ The issued plan locator, artifact output locator, and data-cache locators in an
 artifact's merge/replay provenance are exact lifecycle bindings and must match
 the external files and cache used for public artifact validation.
 
+### Prescribed commands
+
 Command arrays embedded in v3 records are explicitly **prescribed** argv,
 recomputed from the bound payload. Caller-supplied argv is retained only as
 an unattested diagnostic and is named accordingly. Plan and merge invocation
 origins are derived by their CLI/direct-API entry points; shard origins are
 derived by the benchmark-runner or supplied-result entry point. None is
 misrepresented as an independently observed process attestation.
+
+### Dataset and filesystem identity
 
 The one accepted OpenML archive is exactly 15,469,256 bytes with SHA-256
 `fe4410d8dbb50f6db6482b187557c5cb8bccfbcec74eeb6abc47c858f4ffab78`.
@@ -63,6 +80,8 @@ the descriptor-owned inode. Temporary-name cleanup is identity-gated on every
 success and failure path as well; an unknown concurrent replacement is never
 deleted.
 
+### Seed reservations
+
 Before a benchmark runner loads data or consumes compute, it atomically
 publishes an immutable plan-scoped reservation for the exact `(learner,
 seed)` identity. The reservation locator is independent of the requested
@@ -75,6 +94,8 @@ reservation deliberately survives runner or shard-publication failure: that
 seed is consumed and must not be retried. Every later reservation read requires
 the original canonical JSON bytes, exact plan-scoped locator, raw byte binding,
 and semantic digest binding.
+
+### Accepted configuration and descriptives
 
 The active contract accepts only the selected paper configuration: 200 tasks,
 5,000 updates per task, 784 inputs, hidden widths 300 and 150, ten classes,
@@ -111,7 +132,8 @@ Before issuing a plan, the operator must:
    `data_home`. A relocated cache is acceptable only when every pinned cache
    member and both materialized arrays match exactly.
 4. Reserve exactly 20 fresh seed IDs in an external operator ledger before
-   plan issuance. V3 rejects any smaller or larger schedule. IDs `0` through
+   plan issuance. V3 rejects any smaller or larger schedule; the IDs must be
+   unique uint32 values supplied in ascending order. IDs `0` through
    `9` are also rejected because the completed v1 diagnostic consumed them.
    The plan records the supplied reservation but cannot prove that those IDs
    were unused elsewhere.

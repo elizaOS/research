@@ -2,8 +2,10 @@
 
 - **Research snapshot:** 2026-07-30
 - **Repository snapshot:** elizaOS research commit `c28144b`; Alberta Framework
-  vendored from `lalalune/alberta` commit
+  forked from `lalalune/alberta` commit
   `2ac35333efae45cf969ce02ec1f2703476fed6c2`
+- **Working-tree status refresh:** 2026-08-01 — the dated status passages
+  below reflect the current tree, not the committed snapshot
 - **Scope:** continual learning, continual reinforcement learning, world
   models, state construction, plasticity, forgetting, surprise, curiosity,
   paper-defined delight/Kondo gating, candidate-update auditing, experience reuse, temporal
@@ -49,16 +51,20 @@ The most important findings are:
    accurately.
 2. **The nominal full agent is only partially integrated.** World-model,
    dreaming, Horde, IA, and recurrent-perception paths are optional and disabled
-   by default. Feature and cumulant discovery are not in its learning loop,
-   and IA recommendations are returned as diagnostics rather than affecting
-   `PrototypeAgent` action selection. Bounded option-model planning now exists,
-   but lacks a promoted matched-resource benefit result.
-3. **The current `UPGDLearner` is not canonical protecting UPGD.** It uses
+   by default. One mutually restricted opt-in pair-feature lifecycle now reaches
+   the linear OaK loop, but it excludes those consumers and does not discover
+   cumulants, subtasks, or options. The legacy IA recommendation remains
+   diagnostic, while separate partner fusion can affect action selection.
+   Bounded option-model planning now exists, but lacks a promoted
+   matched-resource benefit result.
+3. **The historical `UPGDLearner` is not canonical protecting UPGD.** It uses
    `|w g|`, takes an ordinary SGD update, then adds utility-scaled perturbation
    to trunk weights. Canonical UPGD uses signed Taylor utility and gates both
-   gradient and noise. Existing results must be preserved under an honest
-   variant name; a faithful reference implementation should be added
-   separately.
+   gradient and noise. The working tree has since resolved this honestly:
+   `upgd.py` keeps the historical semantics, now with corrected attribution
+   and its deviations documented, and
+   [`canonical_upgd.py`](alberta_framework/core/canonical_upgd.py) provides a
+   separate source-profiled faithful implementation (details below).
 4. **Plasticity and forgetting are different failures.** Resetting or
    perturbing unused capacity can keep an agent trainable without preserving
    old behavior. Replay or parameter protection can preserve old behavior
@@ -105,20 +111,29 @@ correctness and evidence-contract gaps without changing the overall verdict:
   in bounded planning backups;
 - OaK transition ownership, option-start accounting, active-option curation,
   Prototype primitive-action credit, and dream isolation have focused
-  regressions; and
+  regressions;
 - a pinned Foragax runner and protocol importer are present, and a
   stage-conformant five-seed field-of-view tuning stage selected `step3e3`;
   the 30-seed evaluation lane remains incomplete: the Alberta worker has no
   completed batch or report and is no longer active, while its matched
   official-DQN and relearning companions are quarantined and there is no
-  completed comparison report; and
+  completed comparison report;
 - a separate four-seed RTU-RTRL GPU development run completed 500,000 steps
   with FOV tail-EMA AUC 1.550 mean and 0.324 sample SD, but its exact receipt
   is explicitly nonpromoting because selection was not preregistered and
   source closure is incomplete. A reconciled unsealed DQN receipt gives a
   descriptive +0.331 matched-seed mean difference, but it was configured after
   RTU output and has unmatched runtime, representation, resources, and update
-  work, so no admissible paired baseline exists.
+  work, so no admissible paired baseline exists; and
+- a matched-current Forager campaign contract now exists through its
+  qualification stage only: `outputs/forager/` holds a completed executor
+  qualification and a prepared open-tuning campaign with published manifests
+  but zero executed tuning cells, the sealed held-out evaluation stage
+  (`alberta_framework/benchmarks/forager_matched_sealed_evaluation_campaign.py`)
+  has no console script and has never run, and every
+  authority-bearing path terminates at an
+  external trust resolver that does not exist in-tree, so the shipped parity
+  receipt remains unverified with `promotion_authorized: false`.
 
 These are narrow advances, not an integrated completion result. The broader
 legacy/default pairwise discovery path still fails a 10× scale-shock gate. An
@@ -130,7 +145,16 @@ discovery or control. State construction in the full prototype is still fixed
 rather than learned, the representation/model/planning lifecycle is not
 closed, and no single bounded agent life exercises and ablates all required
 links.
-[RESEARCH_STATUS.md](RESEARCH_STATUS.md) is the live evidence matrix.
+
+As of 2026-08-01 the fail-closed evidence registry
+(`alberta-evidence-status`) reports overall `invalid` (exit 2) with all five
+registered claims invalid: registered source files were edited after the
+artifacts were pinned, so no persisted claim is currently supported against
+the working tree. That is designed behavior, not a defect to silence; the
+frozen outcomes recorded inside the pinned artifacts are unchanged, and
+renewal requires frozen-protocol reruns to new artifact paths and schema
+versions. [RESEARCH_STATUS.md](RESEARCH_STATUS.md) is the live evidence
+matrix.
 
 ## How evidence was evaluated
 
@@ -202,9 +226,11 @@ steps, while the integrated continual-learning result and reproducible
 evidence remain incomplete. That correction should be retained and committed
 with the evidence-status work.
 
-[VENDORING.md](VENDORING.md) explicitly says that `benchmarks/`, `docs/`,
-`examples/`, `outputs/`, and `scripts/` were not vendored. Consequently,
-[tests/conftest.py](tests/conftest.py) excludes 39 test modules whose import-time
+[VENDORING.md](VENDORING.md) records that the upstream root-level
+`benchmarks/` scripts tree, `docs/`, `examples/`, and `scripts/` were not
+carried over (the local `outputs/` tree is this fork's own pinned evidence,
+not the upstream one). Consequently, [tests/conftest.py](tests/conftest.py)
+collect-ignores 39 test modules in this checkout because their import-time
 dependencies reach those omitted trees. The exclusions include Step 2
 completion/evidence gates, external suites, performance suites, production-step
 tests, throughput checks, and the remaining-plan gate. A passing local suite
@@ -229,12 +255,16 @@ surfaces, but completion evidence remains open.**
 
 ### Validation snapshot
 
-The complete test collection available during the review finished successfully
-on Python 3.12.3: **1,519 passed and 55 skipped in 1,302.94 seconds**. Ruff also
-reported clean. This is strong implementation-health evidence. It is not the
-missing scientific evidence: all 51 canonical Step 1/2 evidence tests skipped
-because their required output artifacts were absent, and the collection hook
-excluded the 39 benchmark/example-dependent modules described above.
+At the committed snapshot, the complete test collection available during the
+review finished successfully on Python 3.12.3: **1,519 passed and 55 skipped
+in 1,302.94 seconds**. Ruff also reported clean. This is strong
+implementation-health evidence. It is not the missing scientific evidence:
+all 51 canonical Step 1/2 evidence tests skipped because their required
+output artifacts were absent, and the collection hook excluded the 39
+benchmark/example-dependent modules described above. The working tree has
+since grown far past this figure (6,958 tests collected on 2026-08-01); the
+snapshot numbers above are historical, and the Step 1/2 canonical-artifact
+skips still apply in this checkout.
 
 ### Current strengths
 
@@ -268,7 +298,7 @@ them, not replace them wholesale.
 
 ### Step-by-step status
 
-| Step | Kernel status | Integration status | Evidence in this vendor | Assessment |
+| Step | Kernel status | Integration status | Evidence in this tree | Assessment |
 |---|---|---|---|---|
 | 1 | Strong linear/adaptive optimizer coverage | Used by later learners | Unit and smoke coverage; full replication artifacts omitted | **Implemented; re-establish benchmark evidence** |
 | 2 | Extensive nonlinear and feature-lifecycle machinery | Several alternative paths, no single accepted lifecycle | Critical benchmark and theory gates omitted; upstream evidence mixed | **Active research, not complete** |
@@ -277,7 +307,7 @@ them, not replace them wholesale.
 | 5 | Average-reward prediction machinery | Available to later components | Small gates | **Kernel implemented** |
 | 6 | Differential continuing control | Used by STOMP/OaK | Small/surrogate environments | **Kernel implemented; benchmark breadth missing** |
 | 7 | One-step planning/Dyna helpers | Optional guarded dreams and fixed-budget option-model backups can update control | Small gates; no matched-budget planning gain | **Mechanism integrated; planning evidence open** |
-| 8 | Trainable state builders plus bounded feed-forward/recurrent world-model lanes | Opt-in Prototype paths return committed real model gradients to learned state; ranking/replacement feedback is incomplete | Narrow historical FTL result plus nonpromoting development diagnostics | **First causal feedback lane integrated; full lifecycle open** |
+| 8 | Trainable state builders plus bounded feed-forward/recurrent world-model lanes | Opt-in Prototype paths return committed real model gradients to learned state; a separate restricted lane discovers/routes pair features into linear OaK | Narrow historical FTL result plus nonpromoting L0 diagnostics | **Separate causal edges integrated; balanced full lifecycle open** |
 | 9 | Dream guards, typed priorities, replay rehearsal, and candidate scoring | Prototype dreams still use random anchors/actions and do not consume a learned search controller | No promoted matched search-control result | **Guarded planning/replay, not learned search control** |
 | 10 | Subtasks, options, outcome models, extended actions | STOMP executes options and consumes learned option models in bounded backups | No promoted matched-budget planning benefit | **Mechanism implemented; defining control evidence missing** |
 | 11 | Utility EMA, bounded curation, keyboard proposal and owner-correct dispatch | Explicit consumers can dispatch; automatic chord discovery remains absent | Small gates; no matched option-lifecycle benefit | **Mechanism implemented; lifecycle evidence open** |
@@ -300,10 +330,13 @@ continuous retention or control result.
 
 #### 1. The full-agent label is misleading
 
-[`PrototypeAgent`](alberta_framework/core/prototype_agent.py) describes itself
-as integrating all twelve steps, but its default configuration instantiates
-only a small OaK/STOMP path. The world model, dreaming, Horde, IA, and GRU are
-all optional and disabled by default. The separate
+At the audited snapshot,
+[`PrototypeAgent`](alberta_framework/core/prototype_agent.py) described itself
+as integrating all twelve steps; its docstring now scopes it as an
+experimental integration of mechanisms mapped to the Plan. Either way, its
+default configuration instantiates only a small OaK/STOMP path. The world
+model, dreaming, Horde, IA, and GRU are all optional and disabled by default.
+The separate
 [`AlbertaPipeline`](alberta_framework/pipeline.py) explicitly covers Steps 1–4
 only. Neither object is the complete feedback system described by the Plan.
 
@@ -343,14 +376,28 @@ deletion, and matched mixer ablations remain absent. Until those tests and the
 matched Forager gate exist, the builder must not be called a learned-state
 success.
 
-#### 3. Representation discovery is not in the prototype loop
+#### 3. Prototype has one narrow pair lifecycle, not the required shared loop
 
-The repository contains sophisticated feature discovery, compositional
-features, resource managers, future utility, and cumulant discovery. The full
-prototype does not instantiate or update them. It therefore lacks Step 8's
-required cycle:
+An opt-in Prototype lane now augments a fixed-width builder base with a bounded
+pair-product bank and trains it from one owner-bound behavior TD target: base-Q
+while idle or the executing option's intra-option target. The augmented
+gradient is pulled back to builder coordinates against the exact pre-route
+semantic generation. A descriptor change routes atomically through every
+linear OaK feature axis at a safe idle/cached-base boundary; otherwise the
+proposal is rolled back and curation is deferred rather than queued. Static
+allocation ceilings, exact resource declarations, and versioned checkpoints
+bound the mechanism.
+
+This configuration deliberately excludes world models, Horde, replay,
+dreaming, IA, partner fusion, experiential memory, and GRU perception. Thus it
+corrects the older claim that Prototype feature discovery is wholly absent,
+but it still does not close Step 8's required cycle:
 
 `features → world-model quality → planning/control utility → feature ranking → features`.
+
+There is no multi-consumer utility balance, causal deletion result, automatic
+cumulant/subtask or option discovery, control benefit, scientific promotion,
+WP7 completion, or L3 claim.
 
 #### 4. The world-model ensemble is integrated but not externally calibrated
 
@@ -378,8 +425,10 @@ and counter. In the prototype:
   discount to real control, world-model, and IA exo-cortex targets, while the
   old `update` wrapper retains its configured-gamma compatibility behavior;
 - legacy dream proposals receive no ensemble disagreement and therefore
-  default uncertainty to zero; dreaming is deliberately disabled for the
-  ensemble lane until uncertainty and rollout-validity gates are calibrated;
+  default uncertainty to zero; dreaming is deliberately disabled for all
+  three modern model lanes — ensemble, replay-rehearsal, and recurrent
+  latent — until uncertainty and rollout-validity gates are calibrated, so
+  guarded dreaming runs only on the legacy single-model lane;
 - random anchors and uniformly random actions drive imagined updates;
 - accepted dream backups consume the predicted discount; and
 - aggregate error EMA is thresholded without calibration by state/action
@@ -599,10 +648,9 @@ intrinsically beneficial.
 
 ### What the local learner does
 
-The local [`upgd.py`](alberta_framework/core/upgd.py):
+The local [`upgd.py`](alberta_framework/core/upgd.py) deliberately extends the
+paper algorithm rather than reproducing it. It:
 
-- attributes UPGD to the continual-backpropagation line rather than Elsayed and
-  Mahmood;
 - tracks \(|w_i g_i|\), discarding the sign needed by first-order Taylor
   utility;
 - normalizes utility per layer by its maximum and applies a power schedule;
@@ -615,23 +663,38 @@ The local [`upgd.py`](alberta_framework/core/upgd.py):
 It also includes useful original machinery—ObGD, warm-up/ramp/interval
 schedules, Rademacher noise, meta-plasticity, readout variants, and unit
 recycling. Those additions make it more important, not less, to give the
-algorithm an honest identity. Existing results should not be invalidated by a
-silent semantic rewrite.
+algorithm an honest identity, and existing results should not be invalidated
+by a silent semantic rewrite. At the audited snapshot the module also
+misattributed UPGD to the continual-backpropagation (Dohare et al.) line; its
+docstring now attributes Elsayed and Mahmood correctly, documents each
+deviation, and points to the canonical reference below.
 
-### Required resolution
+### Resolution status
 
-1. Preserve the current implementation under a name such as
-   `UtilityPerturbedSGD` or a documented `nonprotecting_power` mode.
-2. Correct its literature attribution.
-3. Add a small faithful JAX implementation of first-order protecting and
-   non-protecting UPGD, UPGD-W, and optionally AdaUPGD.
-4. Establish tiny-tree numerical parity against a hand implementation and the
-   official PyTorch update.
-5. Compare signed versus absolute utility, global sigmoid versus local power
-   scaling, protecting versus non-protecting, Gaussian/Rademacher/no noise, and
-   trunk-only versus all eligible parameters.
-6. Report plasticity and forgetting separately. A single final accuracy number
-   cannot show which problem was solved.
+1. **Done — preserved.** The historical learner keeps its name and exact
+   update; its docstring labels it a deliberate extension (absolute
+   \(|wg|\) utility, power gate, unprotected task gradient) rather than the
+   paper algorithm.
+2. **Done — attribution corrected** in the `upgd.py` module docstring.
+3. **Done —**
+   [`canonical_upgd.py`](alberta_framework/core/canonical_upgd.py) implements
+   first-order protecting and non-protecting UPGD and UPGD-W as a small JAX
+   PyTree transform with named source profiles (`paper_global`,
+   `official_readme_global`, `official_experiment_global`,
+   `official_experiment_local`, `paper_local_literal`, `safe_extended`) that
+   keep the published paper/README/experiment-code discrepancies visible.
+   AdaUPGD and second-order utility remain future work.
+4. **Partially done.** Fixed-perturbation tests in
+   `tests/test_canonical_upgd.py` pin each profile's update numerically;
+   parity against the official PyTorch process itself was established by
+   source audit of the pinned MIT commit, not by running the aged PyTorch
+   stack.
+5. **Open.** Compare signed versus absolute utility, global sigmoid versus
+   local power scaling, protecting versus non-protecting,
+   Gaussian/Rademacher/no noise, and trunk-only versus all eligible
+   parameters.
+6. **Open.** Report plasticity and forgetting separately. A single final
+   accuracy number cannot show which problem was solved.
 
 ### Completed Input-permuted MNIST development diagnostic
 
@@ -1203,8 +1266,8 @@ The clearest explicit trails are:
   elaborate the vision but do not provide a canonical complete implementation;
 - [`j-klawson/alberta-framework`](https://github.com/j-klawson/alberta-framework),
   the public framework lineage;
-- [`lalalune/alberta`](https://github.com/lalalune/alberta), the direct source
-  of this vendor;
+- [`lalalune/alberta`](https://github.com/lalalune/alberta), the upstream this
+  tree forked from;
 - [`epicgamer17/modular-rl`](https://github.com/epicgamer17/modular-rl), a
   separate implementation/ablation effort with useful tests and candid
   negative results, but no declared license; and

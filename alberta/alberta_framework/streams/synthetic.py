@@ -98,11 +98,9 @@ class RandomWalkStream:
         del idx  # unused
         key, k_drift, k_x, k_noise = jr.split(state.key, 4)
 
-        # Drift weights
         drift = jr.normal(k_drift, state.true_weights.shape, dtype=jnp.float32)
         new_weights = state.true_weights + self._drift_rate * drift
 
-        # Generate observation and target
         x = self._feature_std * jr.normal(k_x, (self._feature_dim,), dtype=jnp.float32)
         noise = self._noise_std * jr.normal(k_noise, (), dtype=jnp.float32)
         target = jnp.dot(new_weights, x) + noise
@@ -309,7 +307,6 @@ class AbruptChangeStream:
         del idx  # unused
         key, key_weights, key_x, key_noise = jr.split(state.key, 4)
 
-        # Determine if we should change weights
         should_change = state.step_count % self._change_interval == 0
 
         # Generate new weights (always generated but only used if should_change)
@@ -318,10 +315,8 @@ class AbruptChangeStream:
         # Use jnp.where to conditionally update weights (JIT-compatible)
         new_weights = jnp.where(should_change, new_random_weights, state.true_weights)
 
-        # Generate observation
         x = self._feature_std * jr.normal(key_x, (self._feature_dim,), dtype=jnp.float32)
 
-        # Compute target
         noise = self._noise_std * jr.normal(key_noise, (), dtype=jnp.float32)
         target = jnp.dot(new_weights, x) + noise
 
@@ -445,10 +440,8 @@ class SuttonExperiment1Stream:
         # Determine if we should flip a sign (not at step 0)
         should_flip = (state.step_count > 0) & (state.step_count % self._change_interval == 0)
 
-        # Select which sign to flip
         idx_to_flip = jr.randint(key_which, (), 0, self._num_relevant)
 
-        # Create flip mask
         flip_mask = jnp.where(
             jnp.arange(self._num_relevant) == idx_to_flip,
             jnp.array(-1.0, dtype=jnp.float32),
@@ -573,14 +566,11 @@ class CyclicStream:
         del idx  # unused
         key, key_x, key_noise = jr.split(state.key, 3)
 
-        # Get current configuration index
         config_idx = (state.step_count // self._cycle_length) % self._num_configurations
         true_weights = state.configurations[config_idx]
 
-        # Generate observation
         x = self._feature_std * jr.normal(key_x, (self._feature_dim,), dtype=jnp.float32)
 
-        # Compute target
         noise = self._noise_std * jr.normal(key_noise, (), dtype=jnp.float32)
         target = jnp.dot(true_weights, x) + noise
 
@@ -694,10 +684,8 @@ class PeriodicChangeStream:
         oscillation = self._amplitude * jnp.sin(2.0 * jnp.pi * t / self._period + state.phases)
         true_weights = state.base_weights + oscillation
 
-        # Generate observation
         x = self._feature_std * jr.normal(key_x, (self._feature_dim,), dtype=jnp.float32)
 
-        # Compute target
         noise = self._noise_std * jr.normal(key_noise, (), dtype=jnp.float32)
         target = jnp.dot(true_weights, x) + noise
 
@@ -804,7 +792,6 @@ class ScaledStreamWrapper:
         """
         timestep, new_inner_state = self._inner_stream.step(state.inner_state, idx)
 
-        # Scale the observation
         scaled_observation = timestep.observation * self._feature_scales
 
         scaled_timestep = TimeStep(
@@ -963,7 +950,6 @@ class DynamicScaleShiftStream:
         del idx  # unused
         key, k_weights, k_scales, k_x, k_noise = jr.split(state.key, 5)
 
-        # Check if scales should change
         should_change_scales = state.step_count % self._scale_change_interval == 0
         new_log_scales = jr.uniform(
             k_scales,
@@ -974,15 +960,12 @@ class DynamicScaleShiftStream:
         new_random_scales = jnp.exp(new_log_scales).astype(jnp.float32)
         new_scales = jnp.where(should_change_scales, new_random_scales, state.current_scales)
 
-        # Check if weights should change
         should_change_weights = state.step_count % self._weight_change_interval == 0
         new_random_weights = jr.normal(k_weights, (self._feature_dim,), dtype=jnp.float32)
         new_weights = jnp.where(should_change_weights, new_random_weights, state.true_weights)
 
-        # Generate raw features (unscaled)
         raw_x = jr.normal(k_x, (self._feature_dim,), dtype=jnp.float32)
 
-        # Apply scaling to observation
         x = raw_x * new_scales
 
         # Target from true weights using RAW features (for consistent difficulty)
@@ -1100,7 +1083,6 @@ class ScaleDriftStream:
         del idx  # unused
         key, k_w_drift, k_s_drift, k_x, k_noise = jr.split(state.key, 5)
 
-        # Drift target weights
         weight_drift = self._weight_drift_rate * jr.normal(
             k_w_drift, (self._feature_dim,), dtype=jnp.float32
         )
@@ -1113,10 +1095,8 @@ class ScaleDriftStream:
         new_log_scales = state.log_scales + scale_drift
         new_log_scales = jnp.clip(new_log_scales, self._min_log_scale, self._max_log_scale)
 
-        # Generate raw features (unscaled)
         raw_x = jr.normal(k_x, (self._feature_dim,), dtype=jnp.float32)
 
-        # Apply scaling to observation
         scales = jnp.exp(new_log_scales)
         x = raw_x * scales
 

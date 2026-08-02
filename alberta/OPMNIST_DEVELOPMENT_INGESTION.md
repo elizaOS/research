@@ -5,6 +5,14 @@ This repository has a strict ingestion surface for the detached three-seed,
 otherwise interact with benchmark workers. Synthetic tests validate the
 ingestion code; they are not benchmark evidence.
 
+Status as of 2026-08-01: **nothing has been ingested.** No bundle exists under
+`outputs/opmnist_published_scale_development/` (the directory is absent). The
+surface is implemented in
+`alberta_framework/evaluation/opmnist_development_ingest.py` and exercised
+only by `tests/test_opmnist_development_ingest.py`; the upstream 3-seed x
+48M-update run it is waiting for has not produced a merged result in this
+tree.
+
 The current execution is permanently classified as a
 `development_published_scale_confirmation`. It had no externally issued
 pre-run manifest binding the complete source/import closure, exact commands,

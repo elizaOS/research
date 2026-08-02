@@ -7,7 +7,8 @@ durable structure while a per-step-decayed fast readout absorbs transients,
 in the spirit of fast-weight memory (Hinton & Plaut 1987, "Using Fast Weights
 to Deblur Old Memories").  The module distills the exploratory Step 2 runner
 (``d18_simple_universal_resource_basis.py`` under ``examples/The Alberta
-Plan/Step2/new_directions/``) down to this core hypothesis, deliberately
+Plan/Step2/new_directions/``, a tree vendored out of this checkout — see
+``VENDORING.md``) down to this core hypothesis, deliberately
 omitting that runner's portfolio machinery — kernel banks, Fourier features,
 polynomial caps, hand-routed experts.  What remains is one trainable tanh
 encoder, one slow readout, one fast decayed readout, and a learned gate, in a

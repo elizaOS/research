@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added an opt-in bounded `PrototypeFeatureLifecycle` and its narrow
+  `PrototypeAgent` composition. A fixed-width base is augmented with pair
+  products and trained from one owner-bound behavior TD target before the
+  linear OaK consumers are descriptor-routed. Builder gradients use an exact
+  semantic-generation-bound pullback; unsafe curation is deferred by proposal
+  rollback, while safe routing is atomic. Allocation ceilings, exact resource
+  declarations, strict config/state checks, and versioned checkpoints are
+  public. The compatible lane deliberately excludes world models, Horde,
+  replay, dreaming, IA, partner fusion, experiential memory, and GRU
+  perception. This is L0 mechanism coverage only: it proves no benefit,
+  promotion eligibility, WP7 completion, multi-consumer/deletion utility, or
+  autonomous cumulant, subtask, or option discovery.
 - Added an opt-in, stateless `OptionSearchControl` for Prototype's learned
   STOMP option models. It recomputes completion-supported differential
   semi-MDP targets and absolute Bellman residuals after each accepted backup,
@@ -18,6 +30,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not refreshed, so value effects begin only at a later extended-action
   selection boundary. This is L0 value-backup prioritization, not calibrated
   or combined primitive/option search and not evidence of control benefit.
+- **Matched-current Forager campaign machinery** (the `forager_matched_*`
+  benchmark modules): OCI runtime/executor qualification, a frozen
+  21-candidate open-tuning protocol and resumable campaign runner, RNG-parity
+  qualification, and the sealed stage (seal, sealed-evaluation schedule,
+  final analysis, paired statistics). Registered two console scripts:
+  `alberta-forager-matched-qualification` and
+  `alberta-forager-matched-campaign`. Execution status at the time of
+  writing: qualification completed
+  (`outputs/forager/matched_current_qualification_2c3b214c_v1`); the
+  open-tuning campaign is prepared and frozen with **zero executed cells**
+  (`outputs/forager/matched_current_open_tuning_2c3b214c_v1` has empty
+  `runs/` and `completions/`); the sealed stage is implemented and
+  contract-tested but has no console script and has never been executed.
+  Every authority-bearing path terminates at an external trust resolver that
+  does not exist in-tree, so all outputs remain content-only, unendorsed, and
+  nonpromoting (`promotion_authorized: false`).
 - **Matched-current Forager qualification provenance v2**: the exact canonical
   UTF-8 qualification-manifest bytes and SHA-256 now flow into the execution
   plan/executor manifest, score evidence, execution closure, verification
@@ -51,30 +79,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assign collision-resistant container names and fall back to exact-name force removal if an
   interruption lands before the cidfile is materialized. Completed nonzero clients are cleaned
   too; an unsuccessful removal is accepted only after a separate actively bounded daemon query
-  proves the exact random name absent. Malformed nested caches retain layer-specific error
-  contracts. The added provenance remains content
+  proves the exact random name absent, and an overflow while making that proof is normalized to
+  each runner's public fail-closed error instead of leaking a private process exception. Malformed
+  nested caches retain layer-specific error contracts. The added provenance remains content
   identity—not endorsement, promotion authority, or a performance claim.
-- **Beat-SOTA screening lane** (`benchmarks/ipmnist_screening.py`, 47 tests):
-  22 mechanism-combination arms on a validated 60-task proxy (an exact
-  bit-prefix of the 200-task protocol; control parity pinned bitwise) —
-  UPGD×IDBD, UPGD×Autostep, UPGD+CBP, AdamW+CBP, UPGD+L2-Init,
+- **Beat-SOTA screening lane** (`benchmarks/ipmnist_screening.py`, 51 tests):
+  30 registered mechanism-combination arms on a validated 60-task proxy (an
+  exact bit-prefix of the 200-task protocol; control parity pinned bitwise),
+  including UPGD×IDBD, UPGD×Autostep, UPGD+CBP, AdamW+CBP, UPGD+L2-Init,
   UPGD+EMA-input-norm, a UPGD-W hyperparameter star, weight clipping
   (Elsayed et al. RLC 2024, ±κ/√fan_in, 4 configs), per-layer gate
   normalization, FADE-style meta-learned per-parameter head decay
   (arXiv 2604.27063, sign conventions derived and unit-pinned), and a
   SwiftTD-stabilized UPGD×IDBD (overshoot bound + persistent step-size
-  decay).  Includes plan/run/validate-proxy/merge CLI, idempotent shard
+  decay). Includes plan/run/validate-proxy/merge CLI, idempotent shard
   workers, and autonomous endgame pipelines with full-protocol pool64
   confirmation and a strict paired BEATS/TIES/BELOW verdict
-  (`outputs/ipmnist_screening/`).  Screening results are permanently
+  (`outputs/ipmnist_screening/`). Screening results are permanently
   nonpromoting.
 - **Label-permuted EMNIST protocol-exact lane**
   (`benchmarks/upgd_label_emnist.py`, 21 tests): EMNIST balanced 47-class,
   labels permuted every 2,500 steps, 400 tasks, pinned to the audited
   upstream commit; first artifact (`outputs/upgd_label_emnist/results.v1.json`,
-  3 seeds) reproduces the published qualitative picture — UPGD-W online
-  accuracy RISES 0.40→0.737 (published plateau ~0.74) while AdamW collapses
-  to 0.20; whole-run-mean vs figure-readoff gaps honestly flagged.
+  3 seeds) reproduces the published qualitative separation — UPGD-W online
+  accuracy rises across the 400 tasks (first-quarter mean 0.5616 →
+  last-quarter 0.7284; whole-run mean 0.67151 vs the ~0.74 figure read-off,
+  gap flagged) while AdamW collapses (whole-run mean 0.20081 vs the ~0.35
+  read-off, gap flagged). Descriptive only; both reproduction gaps are
+  recorded in the artifact.
 - **Slowly-Changing Regression v2 sharded protocol** (plan/run-shard/merge/
   validate with immutable self-issued plans and exact-replay validation;
   300 shards = 3 methods × 100 seeds).
@@ -94,7 +126,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both learners, and existing shards/artifacts are unaffected. Full-protocol
   200-task pool-validation runs are recorded under
   `outputs/upgd_ipmnist_runner_opt/`.
-
 - Added the strict, namespaced continual-IA v2 development-only contract and
   `CONTINUAL_IA_V2_RUNBOOK.md`. It freezes treatment `recommendation_p075`,
   exact acceptance probability 0.75, the old gates with seed start 60, and
@@ -141,6 +172,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   results from size/SHA-bound shards. The self-recorded envelope is not
   external attestation, so every valid v2 artifact remains permanently
   nonpromoting.
+
+### Changed
+
+- The live evidence registry currently reports all five registered claims
+  `invalid` (overall `invalid`, exit `2`): the post-0.27.0 source and
+  documentation waves edited registered source files after their artifacts
+  were pinned. This is the fail-closed design working as intended. The pinned
+  `outputs/` artifacts themselves are unchanged; renewing a claim requires
+  rerunning its frozen protocol to a new artifact path and schema version
+  with untouched preregistered seeds.
 
 ## [0.27.0] - 2026-07-31
 

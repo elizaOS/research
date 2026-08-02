@@ -230,7 +230,6 @@ class LinearLearner:
         Returns:
             UpdateResult with new state, prediction, error, and metrics
         """
-        # Handle normalization
         new_normalizer_state = state.normalizer_state
         obs = observation
         if self._normalizer is not None and state.normalizer_state is not None:
@@ -1224,7 +1223,6 @@ class MLPLearner:
         """
         target_scalar = jnp.squeeze(target)
 
-        # Handle normalization
         obs = observation
         new_normalizer_state = state.normalizer_state
         if self._normalizer is not None and state.normalizer_state is not None:
@@ -1293,7 +1291,6 @@ class MLPLearner:
             )
             all_steps = list(bounded_steps)
 
-        # Apply updates: param += error * step
         new_weights = []
         new_biases = []
         for i in range(n_layers):
@@ -1678,11 +1675,9 @@ class TDLinearLearner:
         Returns:
             TDUpdateResult with new state, prediction, TD error, and metrics
         """
-        # Compute predictions
         prediction = self.predict(state, observation)
         next_prediction = self.predict(state, next_observation)
 
-        # Compute TD error: delta = R + gamma*V(s') - V(s)
         gamma_scalar = jnp.squeeze(gamma)
         td_error = (
             jnp.squeeze(reward)
@@ -1690,7 +1685,6 @@ class TDLinearLearner:
             - jnp.squeeze(prediction)
         )
 
-        # Get update from TD optimizer
         opt_update = self._optimizer.update(
             state.optimizer_state,
             td_error,
@@ -1699,7 +1693,6 @@ class TDLinearLearner:
             gamma,
         )
 
-        # Apply updates
         new_weights = state.weights + opt_update.weight_delta
         new_bias = state.bias + opt_update.bias_delta
 

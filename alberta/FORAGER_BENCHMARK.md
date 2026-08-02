@@ -9,6 +9,19 @@ The paper contributes a testbed and evaluation protocol, not a new agent
 algorithm. Alberta uses the authors' official JAX environment at runtime and
 keeps the environment state opaque to learning policies.
 
+Companion documents for this lane:
+
+- `FORAGAX_OPEN_DEVELOPMENT_SCREEN.md` — the strict OCI harness for the frozen
+  nonpromoting FOV development screens.
+- `FORAGER_ALBERTA_CANDIDATE_AUDIT.md` and `FORAGER_COMPARATOR_AUDIT.md` —
+  read-only audits of the frozen matched-current campaign (see the
+  matched-current section below).
+- `HISTORICAL_FORAGER_RECONSTRUCTED.md` — the separate reconstructed
+  paper-era NumPy environment family.
+- `RESEARCH_STATUS.md` ("Forager benchmark lane") — the canonical
+  evidence-status statement; no Forager performance result is registered in
+  the scientific evidence manifest.
+
 ## Install
 
 Use the optional dependency group:
@@ -364,6 +377,52 @@ The paper-time Big-v5 “PPO Simple Memory” config is ambiguous: it nested its
 reward-trace flag where the checked-in code did not read it. The manifest and
 digitized target retain that warning.
 
+## Matched-current campaign (frozen v1)
+
+The matched-current pipeline is the lane's only path toward an eventual
+matched-panel comparison on the exact stationary task
+(`ForagaxTwoBiomeLarge-v1`, aperture 9, color, 499,712 steps). Its stages, in
+order, are:
+
+1. **Qualification** — `alberta-forager-matched-qualification`
+   (`forager_matched_qualification.py`) binds sources, configurations, the
+   OCI runtime, and per-candidate probes.
+2. **Open tuning** — `alberta-forager-matched-campaign`
+   (`forager_matched_campaign.py`, subcommands `prepare`/`run`/`verify`/
+   `status`) executes the 21 inferential candidates on ten fresh tuning seeds
+   (2,300,001–2,300,010; 210 cells).
+3. **Seal and held-out evaluation** — `forager_matched_seal.py` freezes the
+   selection; `forager_matched_sealed_evaluation_campaign.py` runs the
+   6-candidate × 30-seed held-out grid; `forager_matched_final_analysis.py`
+   and `forager_matched_statistics.py` produce the final analysis.
+
+Execution status in this tree:
+
+- Qualification **completed**:
+  `outputs/forager/matched_current_qualification_2c3b214c_v1` (candidate
+  universe SHA-256 `2c3b214c…`, status
+  `structurally_qualified_external_trust_resolution_required`,
+  classification `content_only_unendorsed_nonpromoting`).
+- Open tuning is **prepared but unexecuted**:
+  `outputs/forager/matched_current_open_tuning_2c3b214c_v1` holds the frozen
+  manifests, but its `runs/` and `completions/` directories are empty — zero
+  of the 210 cells have run.
+- The sealed stages are **implemented and tested but never executed**: no
+  seal bundle, sealed-evaluation artifact, or final-analysis bundle exists
+  under `outputs/`, and the sealed campaign module has no console script.
+
+Every in-tree authority is `content_only_unendorsed_v1`. The external trust
+resolver that authority-bearing paths require does not exist in this
+repository, the fixed-action RNG-parity receipt
+(`outputs/forager/rng_parity_live_qualification_v1_execution/receipt.json`)
+remains `content_complete_external_executor_receipt_unverified` with
+`promotion_authorized: false`, and no `forager_matched` claim is registered
+in the evidence manifest. In-tree code alone therefore cannot produce a
+promoted matched-current result. `FORAGER_ALBERTA_CANDIDATE_AUDIT.md` records
+the internal GO/authority-NOT-CLEARED review of the 14 Alberta candidates;
+`FORAGER_COMPARATOR_AUDIT.md` records comparator provenance and the frozen
+protocol's statistical scope limits.
+
 ## Development receipts
 
 `outputs/forager/rtu_rtrl_500k_dev4/receipt.v1.json` preserves an exact
@@ -416,12 +475,12 @@ sampling and the corresponding environment transition. Exact-upstream PPO and
 RTU-PPO are therefore descriptive shared-key reproductions, not admissible
 paired baselines for Alberta's dedicated environment-key runners.
 `forager_rtu_ppo_rng_isolation.py` defines a separately labelled correction
-for a future matched-current suite. It accepts only upstream source SHA-256
+for the matched-current suite. It accepts only upstream source SHA-256
 `e75a6762690832067a24a649559a55e0aa89abba005d600f090b1bf284b3fc24`
-at commit `9710f60fa30da5badc451ad7ce3ff296d5070830`, applies seven exact
-single-occurrence transformations, validates the derived AST, and freezes the
-derived source SHA-256 as
-`c47f3e087cb01722e824efc1d62c2e5880e75a2d937ae8fc122af24ce8967f2d`.
+at commit `9710f60fa30da5badc451ad7ce3ff296d5070830`, applies eight exact
+single-occurrence byte replacements, validates the derived AST, and freezes
+the derived source SHA-256 as
+`70bbdd0943d82570c1dc0d28494cf93f9c1b208ef67b3a547585fe5897cdf409`.
 The derived runner keeps the canonical reset/transition environment split
 chain and roots all agent randomness under a separate fixed namespace. It must
 be named an **isolated-RNG reproduction**, never unaltered upstream code.
@@ -443,7 +502,7 @@ observed package-tree hashes.
 Run the focused integration suite:
 
 ```bash
-pytest -q \
+.venv/bin/python -m pytest -q -o addopts="" \
   tests/test_forager_benchmark.py \
   tests/test_causal_map_forager.py \
   tests/test_forager_rtu_rtrl.py \
@@ -455,4 +514,6 @@ privilege isolation, host/scan lifecycle parity, bounded compiled runners,
 causal-map reward/respawn learning, state serialization, chunk and batch
 parity, negative-cell avoidance, official NPZ metric import, strict paired
 statistics, task-specific protocols, and the installed official environment
-API.
+API. The matched-current campaign machinery has its own contract suite in
+`tests/test_forager_matched_*.py`; passing tests are mechanism validation
+only and never promote evidence.

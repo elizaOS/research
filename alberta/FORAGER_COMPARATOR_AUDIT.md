@@ -1,8 +1,12 @@
 # Forager Comparator Completeness Audit
 
+Date: 2026-07-31
+
 > **Frozen-v1 status:** `matched_current_open_tuning_2c3b214c_v1` is immutable and
 > nonmodifiable. This audit records comparator provenance and limitations. It does not
-> authorize edits to v1, evidence promotion, or performance claims.
+> authorize edits to v1, evidence promotion, or performance claims. As of 2026-08-01 no
+> open-tuning cell and no held-out evaluation has been executed; every limitation below
+> is therefore prospective, constraining how a future v1 result may be interpreted.
 
 ## Technical summary
 
@@ -220,8 +224,8 @@ These are protocol-bound counts, not general properties of the methods.
 | `isolated_ppo` | 305,381 | 31,232 | 0 | 0 |
 | `isolated_rtu` | 452,069 | 15,616 | 0 | 288,768 |
 
-The table now includes all 14 Alberta inferential arms, but its columns are not a complete
-or cross-method memory/compute census. Parameter counts exclude optimizer state and target
+The table covers all 14 Alberta inferential arms (the causal-map row spans its nine
+q-grid arms), but its columns are not a complete or cross-method memory/compute census. Parameter counts exclude optimizer state and target
 snapshots. PPO's replay value of zero excludes 2,048/128-step rollout storage, and causal
 optimizer updates of zero exclude 499,712 non-gradient state updates. Recurrent64 Horde
 also has a 61,248-element fixed substrate outside its 49,477 trainable parameters. The

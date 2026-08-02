@@ -21,11 +21,15 @@ property shown in a closed-loop or multi-component agent; **autonomous** = no
 oracle machinery, discovered by the learner itself.  Known gaps are listed at
 the end — this is an evidence map, not a completion certificate.
 
-At this snapshot the live registry exits `2`: the immutable recurring- and
-scale-pair artifacts retain their historical narrow L2 outcomes, but their
-registered implementation, artifact-builder, and CLI source hashes include
-mismatches against the evolved current tree. They therefore do not certify
-this working tree.
+At this snapshot (2026-08-01) the live registry exits `2` with **all five
+registered claims `invalid`**: the recurring pair-feature, scale-robust
+pair-feature, and two-agent coadaptation claims fail
+current-registered-source validation, and the FTL decision-fidelity and
+intelligence-amplification historical compatibility chains fail, because
+registered source files were edited after the artifacts were pinned. The
+immutable artifacts retain their historical outcomes; none certifies this
+working tree. Renewal requires rerunning each frozen protocol to a new
+artifact path and schema version with untouched preregistered seeds.
 
 ## Property → evidence
 
@@ -40,6 +44,7 @@ this working tree.
 | Pair-feature finding → memory | exhaustive degree-two learner on raw observations plus a visible context cue reconstructs context gating (≥15/24 slots are ctx×x products) and finds all four supplied-family nonlinear pairs on 8/8 calibration seeds | development mechanism (finite all-pairs archive; not general/autonomous) | `test_gauntlet_discovery.py` |
 | Recurring pair-bank held-out result | the immutable v1 artifact retained A/B/C in 30/30 held-out lives and evicted obsolete D from the active bank, but current registered source hashes no longer match it | historical narrow L2 result, currently source-invalidated; supplied heads and a counted exhaustive 15-pair archive | `outputs/recurring_feature/evidence.v1.json` |
 | Pair features under a scale shock | the immutable v2 artifact passed on 30 namespace-derived fresh seeds, but current registered source hashes no longer match it | historical narrow L2 package result, currently source-invalidated; visible context, finite exhaustive pair archive, one fixed learner initialization, and primary vs legacy changes normalization/ObGD while adding 464 frozen-artifact bytes | `outputs/scale_robust_feature/evidence.v2.json` |
+| Generated compositional recurrence lifecycle substrate | a finite canonical depth-three AST grammar, exact 4,559-step recurrence schedule, five declared controls, a D-mapping twin, a fixed-shape scrub that resets slot-local state, and an expanded-tree compiler that closes target, descendant, and candidate lineage and validates the exact scrub transaction. A negative analytic audit finds that the counterfactual candidate-only/no-cascade second-D channel has an optimistic D-proposal ceiling of `1 - (15/16)^12 = 0.5390484106` | L0/development infrastructure only; targets A–D and the finite grammar are supplied, structural absence is not behavioral erasure, the 53.9% ceiling does not apply to the current promotion/cascade lifecycle, and actual D birth/reacquisition probability remains unidentified. There is no complete refresh-head-zero/fresh-epoch/event-ledger runner, outcome, threshold, artifact, or promotion authority | `test_generated_class_recurrence.py`, `test_generated_class_d_mapping_twin.py`, `test_generated_class_lifecycle_scrub.py`, `test_generated_expression_lineage.py`, `test_generated_class_reachability.py` |
 | Long-horizon single life (64k steps, no resets) | final-cycle savings 19x (highest of the whole life — memory consolidates, never erodes); fresh-task adaptation flat with age; raw twin stuck at 0.2–0.5 savings forever; 0 NaN | mechanism (oracle features) | `test_lifetime_demonstration.py` |
 | Stability under 10x input-scale shift | Autostep 0.014 MSE, SwiftTD 0.011, both 0 NaN; IDBD's divergence *detected* by the same stream | mechanism | `test_gauntlet_certification.py` (P6 + SwiftTD) |
 | Off-policy soundness | Baird star: semi-gradient diverges, GTD/ETD converge (linear + horde level); per-decision IS trace verified to closed form | mechanism | `test_baird.py`, `test_baird_horde.py` |
@@ -50,9 +55,11 @@ this working tree.
 | Option value plus duration (Step 5) | online TD heads recover returns `(6, 4)` and durations `(10, 2)` in a deterministic renewal problem; value-only picks the slow option while predicted return/duration picks the optimal fast option | L1 development mechanism; supplied options/features, same successor state, no held-out control comparison | `test_option_value_duration.py` |
 | Support-aware option-model value search | An opt-in stateless controller recomputes completion-supported differential semi-MDP option targets and Bellman residuals after every accepted backup, stably prioritizes the largest magnitude under a fixed budget, and commits only the base learner while preserving traces, action/lifecycle ownership, OaK counters, models, and RNG | L0 mechanism only; completion count is not calibration, the already cached action is not refreshed, effects are deferred to a later extended-action selection, and there is no shared primitive/option budget or control-benefit result | `test_option_search_control.py` |
 | Causal state construction | identity, fixed-trace, and online gated recurrent builders satisfy fixed-budget/JIT/checkpoint contracts; a small write/hold POMDP confirms the trainable plumbing changes parameters and can be scored | L0/development mechanism; resource-unmatched supervised probe, not integrated control | `test_state_builder.py`, `test_state_builder_pomdp.py` |
+| Prototype pair-feature lifecycle | An opt-in fixed-width base/pair bank consumes one owner-bound behavior TD target and routes descriptor changes through every linear OaK feature axis; pullback is bound to the pre-route semantic generation, unsafe curation defers by rollback, safe routing is atomic, and resources/checkpoints are fixed and versioned | L0 mechanism/integration only; the compatible lane excludes world models, Horde, replay, dreaming, IA, partner fusion, experiential memory, and GRU perception, and proves no benefit, promotion, WP7 completion, multi-consumer/deletion utility, or automatic subtask/option discovery | `test_prototype_feature_lifecycle.py`, `test_prototype_feature_lifecycle_integration.py` |
 | Hidden-partner integration kernel | focused tests cover the causal composed transition; eight uninterrupted development lives add matched state, memory, lifecycle, carry, retention, planning, partner-belief, and curation ablations, with all full lives finite and mean reward 0.89335 | L0/development integration only; artifact is structurally nonpromoting and fails its obsolete-D forgetting check because D is absent at life end in 0/8 full lives; partner is scripted and the candidate archive is closed | `test_integrated_hidden_partner.py`, `outputs/hidden_partner_development/robustness.v1.json` |
-| Hidden-partner v6 execution contract | fixed-shape runner, 15 primary plus 3 diagnostic controls, exact source/runtime payload closure, intervention witnesses, stream/RNG reconstruction, deterministic initial state, strict per-run structural validation, matched-suite validation, and a separate canonical source-replay verifier | development infrastructure only; no complete v6 life, source replay, 18-arm outcome suite, calibration, threshold, artifact, efficacy result, or promotion authority has been produced | `test_hidden_partner_lifecycle_world_v6_runner.py`, `test_hidden_partner_lifecycle_world_v6_runtime.py`, `test_hidden_partner_lifecycle_world_v6_intervention_audit.py`, `test_hidden_partner_lifecycle_world_v6_validator.py`, `test_hidden_partner_lifecycle_world_v6_matched_suite.py`, `test_hidden_partner_lifecycle_world_v6_source_replay.py` |
-| Hidden co-learning world-and-agent planning kernel | two online signaling roles learn on one shared physical row while a behavior model predicts the beneficiary and a grounded joint model predicts next cue, reward, and discount; a one-step helper planner marginalizes both models under randomized consumption and causal channel/freeze controls. Primitive traces reconstruct reward, model error, switch cost, and same-context recurrence diagnostics; persistent state is exactly 297 bytes with zero replay | L0/development mechanism only; oracle context and target stay evaluator-only, but no default 3,072-step outcome, efficacy, retention, calibration, threshold, artifact, held-out result, or promotion claim exists | `test_hidden_learning_partner_planning_development.py` |
+| Hidden-partner v6 execution contract | fixed-shape runner, 15 primary plus 3 diagnostic controls, exact source/runtime payload closure, intervention witnesses, stream/RNG reconstruction, deterministic initial state, strict per-run structural validation, matched-suite validation, and a separate canonical source-replay verifier | development infrastructure only; every open certification prerequisite remains `NOT_CERTIFIED`, and no complete v6 life, source replay, 18-arm outcome suite, calibration, threshold, artifact, efficacy result, or promotion authority has been produced | `test_hidden_partner_lifecycle_world_v6_runner.py`, `test_hidden_partner_lifecycle_world_v6_runtime.py`, `test_hidden_partner_lifecycle_world_v6_intervention_audit.py`, `test_hidden_partner_lifecycle_world_v6_validator.py`, `test_hidden_partner_lifecycle_world_v6_matched_suite.py`, `test_hidden_partner_lifecycle_world_v6_source_replay.py` |
+| Hidden-regime signaling and factorial calibration | a 240-case factorial calibration design, threshold-freeze and protected-plan validators, execution governance, readiness receipts, trace audit, and summary/lineage oracles are implemented fail-closed; the six-condition evidence draft is execution-disabled and the three protected structural-generalization worlds record zero executed learner outcomes | design-only; `outputs/` contains no hidden-regime artifact, the protected plan is `preregistered_unexecuted` with no execution issuer, and the development runner hard-codes promotion disallowed | `test_hidden_regime_factorial_calibration.py`, `test_hidden_regime_factorial_thresholds.py`, `test_hidden_regime_signaling_evidence.py`, `test_hidden_regime_signaling.py` |
+| Hidden co-learning world-and-agent planning kernel | two online signaling roles learn on one shared physical row while a behavior model predicts the beneficiary and a grounded joint model predicts next cue, reward, and discount; a one-step helper planner marginalizes both models under randomized consumption and causal channel/freeze controls. Primitive traces reconstruct reward, model error, switch cost, and same-context recurrence diagnostics; persistent state is exactly 297 bytes with zero replay. A separate nonexecuting declaration binds all 11 bridge conditions to four paired exploratory seeds, common-random-number obligations, raw outputs, phase diagnostics, and proposal-versus-committed-write accounting | L0/development infrastructure only; oracle context and target stay evaluator-only, but the matched suite runner and cross-arm RNG audit do not exist, host quiescence has not been verified, and no default 3,072-step outcome, efficacy, retention, calibration, threshold, artifact, held-out result, or promotion claim exists | `test_hidden_learning_partner_planning_development.py`, `test_hidden_learning_partner_planning_scan_plan.py` |
 | Stationary Forager causal map | observation/action/reward history builds a relative toroidal map and learns channel rewards and respawn timings; privilege isolation, serialization, JIT, chunk, batch, and short installed-environment mechanics are tested | L0 task-specific mechanism; uses public 15×15 movement structure, has no performance artifact, and is not learned recurrent state, nonstationary retention, or a SOTA result | `test_causal_map_forager.py` |
 | Forager field-of-view protocol | a stage-conformant 10k-step tuning matrix on five disjoint seeds selected `step3e3`; the old 30×500k evaluation produced no batch or report and is inactive, while its official-DQN and relearning companions are explicitly quarantined | benchmark execution only; no registered performance claim, paired comparison, or promotion | `outputs/forager/fov_tuning_10k_seeds1000000_1000004/report.json` |
 | Forager RTU-RTRL development run | four open development seeds completed 500k GPU steps with FOV tail-EMA AUC mean 1.550, sample SD 0.324, and range 1.167–1.936; an unsealed DQN comparator gives a descriptive RTU-minus-DQN mean of +0.331 on the same four seeds | nonpromoting development receipts; no preregistered selection, held-out seeds, admissible paired baseline, matched runtime/resources, complete source closure, or SOTA claim | `outputs/forager/rtu_rtrl_500k_dev4/receipt.v1.json`, `outputs/forager/dqn_fov_500k_dev_seeds2000001_2000004_reconciled/receipt.v1.json`, `test_forager_development_receipts.py` |
@@ -61,12 +68,13 @@ this working tree.
 | Candidate-update safety audit and application (historical gradient-joy API) | `candidate_update_audit_passed` reports the formed-candidate verdict after complete finite objective/retention/safety evidence, fresh roundoff-resolved dot/norm certificates for both the candidate and actual elementwise-rounded tentative tree, conservative magnitude/alignment endpoints, and a certified trust-bound pass; the effective stored delta is re-audited after dtype cast/addition, while `applied`/`audited_candidate_update_applied` separately reports that a finite-precision parameter change was actually committed; `sparks_joy` and `joyful_gradient_applied` remain compatibility aliases, not paper terminology | L0 mechanism; detached local first-order probes and fail-closed application boundary, not realized improvement or a DG/Kondo reproduction | `test_delight.py`, `test_prototype_gradient_joy.py` |
 | Paper-defined Kondo screen/gather | Computes delight exactly as advantage times selected-action surprisal in a detached forward screen; “sparks joy” means selected for a backward pass; finite-temperature Bernoulli-price and deterministic fixed-rate top-k modes preserve caller-declared forced samples and flag caller-managed over-capacity fallback. When configured capacity is below batch size, the config-bound host gather yields a fixed smaller PyTree whose backward JAXPR has the sparse shape; only the screen has eager/JIT/scan coverage | L0 mechanism; no integrated learner consumer, measured wall-clock/memory saving, DG reproduction, or quality/safety evidence | `test_kondo_gate.py` |
 | Bounded experiential retrieval and policy integration | Fixed-capacity query-before-write memory rejects stale/wrong-version, unsafe, uncertain, distant, and non-finite entries; deterministic eviction and exact byte/checkpoint parity hold. A stateless categorical policy boundary and opt-in Prototype composition query before write, bind full lifecycle IDs, store the primitive action actually executed with its grounded outcome, compose memory before partner fusion, preserve no-memory shapes, and roll a required unsafe/corrupt event back atomically | L0 mechanism/integration; no held-out forward-transfer or control benefit | `test_experiential_memory.py`, `test_experiential_memory_policy.py`, `test_prototype_experiential_memory.py` |
-| Sparse-world-model decision fidelity | historical held-out normalized six-step regret 0.000877 vs 0.294800 untrained and 0.049557 raw ridge | accepted narrow L2 historical result through an immutable-artifact plus exact consumed-seed compatibility chain; replay is nonpromoting and the unarchived old builder source prevents a full source-recoverability claim | `test_ftl_decision_artifact.py`, `test_historical_ftl_evidence_chain.py` |
+| Sparse-world-model decision fidelity | historical held-out normalized six-step regret 0.000877 vs 0.294800 untrained and 0.049557 raw ridge | historical narrow L2 acceptance; its consumed-seed compatibility chain no longer validates against the current tree (registry `invalid`), replay is nonpromoting, and the unarchived old builder source prevents a full source-recoverability claim | `test_ftl_decision_artifact.py`, `test_historical_ftl_evidence_chain.py` |
 | Planning diagnostic (Steps 7/9) | Dyna planning=4: +965 cumulative reward vs planning=0 on eight calibration seeds; guarded dreaming: +798; corruption gate closes ≤4 steps | development integration diagnostic; no held-out artifact or matched update-count claim | `test_planning_benefit.py` |
 | Prototype composition diagnostic | selected PrototypeAgent composition improves post-switch reward by +0.05–0.12 over one flat configuration on eight calibration seeds | development integration diagnostic; supplied options and unmatched compute | `test_prototype_nonsaturating.py` |
-| Intelligence amplification (Step 12) | historical v1 uplift was `0.267 [0.255, 0.278]` and both augmentation controls passed, but intervention prevalence was 8.73% vs the frozen 10% minimum; the prior consumed-seed compatibility record is nonpromoting and current-source validation is now invalid after `average_reward.py` drift; p=0.75/seeds-60–89 v2 is unissued and permanently development-only because its self-issued plan lacks external chronology | historical valid scientific rejection; no current-source compatibility claim and no v2 plan, reservation, run, shard, or artifact; v2 cannot yield an acceptance result | `test_historical_ia_evidence_chain.py`, `test_continual_ia_v2_contract.py` |
+| Intelligence amplification (Step 12) | historical v1 uplift was `0.267 [0.255, 0.278]` and both augmentation controls passed, but intervention prevalence was 8.73% vs the frozen 10% minimum; the prior consumed-seed compatibility record is nonpromoting and current-source validation is now invalid after registered-source drift (first observed in `average_reward.py`); p=0.75/seeds-60–89 v2 is unissued and permanently development-only because its self-issued plan lacks external chronology | historical valid scientific rejection; no current-source compatibility claim and no v2 plan, reservation, run, shard, or artifact; v2 cannot yield an acceptance result | `test_historical_ia_evidence_chain.py`, `test_continual_ia_v2_contract.py` |
 | Learner-generated non-stationarity | learning-opponent stream (drift = another learner's learning curve; IDBD's α tracks the opponent's learning phase); adversarial pursuit drives a frozen predictor to 1771 MSE (48x growth) while continual learners hold ≤0.12 | development mechanism; not a result from two simultaneously acting, co-learning agents | `test_multiagent_sim.py` |
 | Multi-agent: convention memory | two learning agents recall joint conventions instantly on rule recurrence with context (t=20 floor, reward 0.94) vs relearning forever without (t≈50, 0.78); conventions are emergent (≥3 distinct across seeds) | development toy dyad with visible context and separate table cells; not hidden-context or general forgetting evidence | `test_multiagent_sim.py` |
+| Recurring two-agent coadaptation (held-out) | the immutable artifact's held-out joint-minus-frozen paired uplift was `0.3358 [0.2991, 0.3738]`, all 30 lives recovered the recurring regime (mean 13.4 steps), and measured interference forgetting was zero, but current registered source hashes no longer match | historical narrow L2 result, currently source-invalidated; tiny contextual bandit with visible regime cues and separate value cells, and 30/30 recoveries bound population recovery probability only at 0.886 | `outputs/continual_multiagent/evidence.json`, `test_continual_multiagent_benchmark.py` |
 | Statistics machinery is itself validated | CI coverage 0.944–0.957 empirical vs 95% nominal; Holm ⊇ Bonferroni on 2000/2000 draws; a real rank-biserial sign bug found and fixed | meta | `test_statistics_validation.py` |
 
 ## Recurring design law (found independently three times)
@@ -118,6 +126,8 @@ input-loss gradient) ·
 partner-belief marginalization) ·
 `core/feature_bank_router.py` (fail-closed atomic descriptor-identity routing
 for every downstream feature consumer) ·
+`core/prototype_feature_lifecycle.py` (fixed-resource pair discovery plus
+semantic-generation-bound gradient pullback and atomic linear-OaK routing) ·
 `core/integrated_hidden_partner.py` (bounded composed hidden-partner
 development kernel) ·
 `benchmarks/causal_map_forager.py` (stationary observation-causal relative-map
@@ -132,7 +142,7 @@ development world) ·
 `streams/closed_loop.py` (2-state switching MDP + RiverSwim with analytic
 optima).
 
-## Published-protocol replication lanes and current execution status (2026-07-31)
+## Published-protocol replication lanes and current execution status (2026-08-01)
 
 The repository carries runners designed around published configurations. A
 runner, or even a completed development diagnostic, is not by itself a
@@ -189,6 +199,27 @@ completion, and held-out gates remain part of the promotion boundary.
   bytes. No v3 plan has been issued, no v3 result exists, and no fresh v3 seed
   has been consumed. V3 is permanently nonpromoting without independent
   execution attestation; see `UPGD_IPMNIST_V3_RUNBOOK.md`.
+- **IPMNIST mechanism-combination screening** (development, never promotable)
+  — `benchmarks/ipmnist_screening.py`, `outputs/ipmnist_screening/`. 22 arms ×
+  3 paired seeds on a validated 60-task proxy that is a bit-exact prefix of
+  the 200-task protocol (control shards verified bitwise against the completed
+  full-horizon shards). Three arms exceeded the `+0.005` confirmation
+  threshold over `upgd_w_control`: `upgd_ema_norm` `+0.0751`, `adamw_cbp`
+  `+0.0188`, and `upgd_w_wd0005` `+0.0056`. Exact-noise 200-task confirmation
+  shards for `adamw_cbp` and `upgd_w_wd0005` (10 seeds each) sit under
+  `confirm_full/` with no merged confirmation verdict at this snapshot.
+  Screening results support development ranking only; the runbook is
+  `outputs/ipmnist_screening/RUNBOOK.md`.
+- **Label-permuted EMNIST, UPGD protocol** (Elsayed & Mahmood ICLR 2024:
+  EMNIST balanced 47 classes, labels permuted every 2,500 steps, 400 tasks,
+  1M online examples) — `benchmarks/upgd_label_emnist.py`; first artifact
+  `outputs/upgd_label_emnist/results.v1.json` (3 seeds versus the paper's 20,
+  a documented deviation). It reproduces the published qualitative
+  separation: UPGD-W online accuracy rises through the life (last-quarter
+  mean `0.728`, whole-run `0.672` versus a ~`0.74` figure read-off) while
+  AdamW collapses (whole-run `0.201` versus a ~`0.35` read-off); both
+  whole-run gaps are flagged as reproduction gaps. Development-only,
+  `scientific_promotion_allowed: false`.
 - **Slowly-Changing Regression** (Dohare et al. Nature 2024: m=20 bits,
   f=15 flipping, T=10,000, 100-LTU target net, 3M examples, 100 runs) —
   `benchmarks/slowly_changing_regression.py` and
@@ -204,12 +235,17 @@ completion, and held-out gates remain part of the promotion boundary.
   Structural-only diagnostics are explicitly nonvalid. Any future
   self-recorded plan is not externally attested, so promotion is permanently
   forbidden. An earlier reduced pilot was not archived; its values remain
-  excluded. The
-  historical `replication.v1.json` is absent and is not retrofitted. The full
-  100-seed × three-method run has not been launched, no pre-run plan has been
-  issued, no result is claimed, and the future launch sequence is specified in
-  `outputs/slowly_changing_regression/RUNBOOK.md`.
-- **Foragax (Forager) field-of-view lane** (Tang et al. 2026 protocol,
+  excluded. The historical `replication.v1.json` is absent and is not
+  retrofitted. Execution status (2026-08-01): an immutable v2 pre-run plan
+  was issued on 2026-07-31 (`outputs/slowly_changing_regression/plan.v2.json`,
+  3 methods × 100 seeds = 300 shards) and the sharded run was launched. 49
+  `publication_bp_relu_sgd` shards completed; every remaining shard attempt
+  then failed closed with `current source bytes differ from the pre-run plan`
+  after working-tree edits diverged from the plan's bound source bytes.
+  Completing the lane requires issuing a fresh plan against a quiet source
+  tree; no merged artifact exists and no result is claimed. The launch
+  procedure is in `outputs/slowly_changing_regression/RUNBOOK.md`.
+- **Foragax (Forager) field-of-view lane** (Tang et al. 2026 protocol):
   tuning stage complete (winner `step3e3`, CI-based selection, tuning→eval
   hash link). The old 500k×30-seed evaluation produced no batch or report and
   is inactive. Its official-DQN and relearning companion directories are
@@ -222,13 +258,28 @@ completion, and held-out gates remain part of the promotion boundary.
   RTU-minus-DQN mean, but the comparator was configured post-output and has
   unmatched runtime, representation, resources, and update work. It is not an
   admissible pair and neither receipt has promotion standing.
+  The frozen matched-current campaign (candidate universe SHA-256
+  `2c3b214c…`, 23 registered arms) has completed executor qualification
+  (`outputs/forager/matched_current_qualification_2c3b214c_v1`), but the
+  prepared open-tuning stage
+  (`outputs/forager/matched_current_open_tuning_2c3b214c_v1`) has executed
+  zero cells — its `runs/` and `completions/` are empty — and the sealed
+  held-out stage (seal, 6×30 schedule, final analysis, statistics) is
+  implemented and tested but has never run and has no console script. Every
+  authority path requires an external trust resolver that does not exist
+  in-tree; the 2026-07-31 audits recorded implementation GO but campaign
+  authority NOT CLEARED (`FORAGER_ALBERTA_CANDIDATE_AUDIT.md`,
+  `FORAGER_COMPARATOR_AUDIT.md`).
 - **OPMNIST 800-task closure** (the ROADMAP's published-scale multi-seed
   boundary): 3 seeds × 48M updates running detached in the upstream tree
-  with per-chunk checkpoints and status sidecars. The workers are advancing,
-  but no merged result or gate outcome exists. Merge and gate commands are
-  recorded in the upstream runbook. Neither
-  `multi_seed_full_scale` nor `solved_opmnist_step2` is predicted or claimed
-  before the completed artifacts are validated.
+  with per-chunk checkpoints and status sidecars. As of 2026-07-31 the
+  workers were advancing, but no merged result or gate outcome exists and
+  nothing has been ingested here: the fail-closed ingestion/validation
+  contract is defined in `OPMNIST_DEVELOPMENT_INGESTION.md` and no bundle
+  exists under `outputs/`. Merge and gate commands are recorded in the
+  upstream runbook. Neither `multi_seed_full_scale` nor
+  `solved_opmnist_step2` is predicted or claimed before the completed
+  artifacts are validated.
 
 ## Exploratory longevity and scaling observations
 
@@ -425,8 +476,10 @@ resistance, or L3.
 2. **Compositional next steps** (research program, not gaps in the
    demonstrated claims): context inference feeding PrototypeAgent end-to-end
    (both are only separate development diagnostics); TD-target discovery under
-   *hidden* context; richer regime models beyond per-(state, action) reward
-   tables; and integration of the existing learning-partner rung into the
+   *hidden* context; multi-consumer feature utility and causal deletion beyond
+   the narrow owner-bound pair bank; automatic cumulant/subtask and option
+   discovery; richer regime models beyond per-(state, action) reward tables;
+   and integration of the existing learning-partner rung into the
    hidden-context/world-model stack. Seeds 46–59 were not
    part of the older confirmation, but v2 excludes the whole 30–59 namespace
    rather than treating a partially exposed range as fresh.

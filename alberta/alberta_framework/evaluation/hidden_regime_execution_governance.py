@@ -2081,6 +2081,8 @@ def validate_completed_calibration_ledger_snapshot(
     completed_by_case: dict[int, dict[str, object]] = {}
     finalized_by_case: dict[int, dict[str, object]] = {}
     attempt_by_case: dict[int, dict[str, object]] = {}
+    # Each 239 bound below must stay equal to N_MATCHED_CASES - 1
+    # (30 seed pairs x 8 conditions).
     for expected_index, item in enumerate(started_items):
         _exact_keys(
             item,
@@ -4093,6 +4095,7 @@ def _validate_final_shard_payload(
     ):
         _require(body.get(field) is False, f"final case shard {field} must be false")
     case_payload = _plain_mapping(body.get("case"), "final shard case")
+    # 239 must stay equal to N_MATCHED_CASES - 1 (30 seed pairs x 8 conditions).
     case_index = _strict_int(case_payload.get("case_index"), "final shard case index", maximum=239)
     design = _frozen_design()
     case = design.cases[case_index]
