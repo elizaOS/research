@@ -15,19 +15,27 @@ default construction does not exercise every mechanism on every transition.
 See [RESEARCH_STATUS.md](RESEARCH_STATUS.md) for the evidence matrix and
 fail-closed completion criteria.
 
-## Continual-learning SOTA campaign (development-grade, nonpromoting)
+## Continual-learning screening record (development-grade, nonpromoting)
 
-The IPMNIST screening campaign is complete. Everything below is a
-**development-grade, permanently nonpromoting** measurement under the
-repository's evidence rules — our own protocol-exact instrumentation, matched
-seeds, and paired controls, but no preregistered frozen protocol, so no
-scientific-evidence or SOTA claim. Protocol: input-permuted MNIST from the
+The recorded IPMNIST screening measurements below are
+**development-grade, permanently nonpromoting** observations under the
+repository's evidence rules. A 2026-08-02 read-only audit found that this is
+not a reproducible completed campaign: the checked-in proxy validator reports
+`proxy_validated: false` because all three UPGD control prefixes disagree with
+their claimed full-horizon references (maximum per-task discrepancies
+`0.0084`–`0.0096`), the aggregate summary contains 132 of the 144 current
+screening shards, and the round-2 driver fails on a nonexistent shard field.
+The round-2 means and the 69 full-horizon confirmation means can be recomputed
+from the stored curves, but the v1 shards bind neither source nor command nor
+dataset bytes. They are therefore historical development observations, not an
+authenticated result for the current source tree and not a scientific-evidence
+or SOTA claim. Protocol: input-permuted MNIST from the
 UPGD paper (Elsayed & Mahmood, ICLR 2024) — 1M examples one-per-step,
 permutation every 5,000 steps, 200 tasks, 300×150 ReLU MLP, average online
 accuracy. Baseline: our 10-seed published-config UPGD-W reproduction at
 **0.7791**.
 
-Full-horizon (200-task) confirmed improvements over that baseline
+Stored full-horizon (200-task) development means relative to that baseline
 (`outputs/ipmnist_screening/confirm_full/`):
 
 | Arm | Seeds | Mean online acc. | Scoping |
@@ -45,10 +53,16 @@ Full-horizon (200-task) confirmed improvements over that baseline
 "Protocol-pure" arms keep the published raw input encoding;
 "protocol-extended" arms prepend online EMA input normalization — an
 input-encoding change the published architecture does not include — and are
-always reported on their own rows, never as the headline.
+always reported on their own rows, never as the headline. The tuned arms
+(`sigma0_ndecay099`, `adamw_cbp_r3e4`, `upgd_w_wd0005`) were selected on
+seeds 0-2 and are confirmed on those same seeds, so their means carry
+selection bias of unquantified (likely small) size; seeds 3-9 remain
+unconsumed for `sigma0_ndecay099` and `adamw_cbp_r3e4`
+(`outputs/ipmnist_screening/AUDIT.md` has the full audit).
 
-The dissection cascade decomposes the 0.854-class result into stable
-mechanism contributions (stable across the 60→200-task horizon extension):
+The stored contrasts suggest the following descriptive decomposition; the
+failed proxy/source audit means it is not an authenticated common-source
+60→200-task mechanism decomposition:
 **input conditioning +0.061** (`sgd_ema_norm` vs the 0.7791 reproduction),
 **utility gate +0.011** (`upgd_ema_norm_sigma0` vs `sgd_ema_norm`), and
 **perturbation +0.003 when normalization is present** (`upgd_ema_norm` vs
@@ -57,15 +71,19 @@ published configuration (`upgd_w_sigma0`, 60-task proxy) *costs* −0.035 —
 the noise IS load-bearing without normalization, and input conditioning
 substitutes for it.
 
-The frontier wave sharpened the conditioning mechanism further: dropping the
+The frontier wave generated a sharper conditioning hypothesis: dropping the
 normalizer's EMA decay from 0.999 to 0.99 (`sigma0_ndecay099`) adds another
 +0.012 — the permutation boundary shifts input statistics instantly, and a
 100-step EMA re-conditions ~10x faster after each switch. The symmetric
 result (decay 0.9999 *loses* 0.007; hidden-layer normalization loses 0.019)
-confirms the mechanism is input-tracking speed specifically.
+is consistent with input-tracking speed as the mechanism, but does not by
+itself confirm that causal interpretation.
 
-Mechanism analysis and the pre-registered outcome matrix are in
-[CONTINUAL_LEARNING_THEORY.md](CONTINUAL_LEARNING_THEORY.md); the complete
+These numerical contrasts remain useful for generating hypotheses, but the
+cross-horizon and mechanism language below is descriptive until a fresh
+source-bound lifecycle reproduces it. Mechanism analysis and the
+pre-registered outcome matrix are in
+[CONTINUAL_LEARNING_THEORY.md](CONTINUAL_LEARNING_THEORY.md); the historical
 arm-by-arm record is `outputs/ipmnist_screening/FINAL_REPORT.md`. None of
 these results is promotable without a fresh source-bound preregistered run
 under the v3 contract (`UPGD_IPMNIST_V3_RUNBOOK.md`).
@@ -151,6 +169,13 @@ Key documents:
 
 - [RESEARCH_STATUS.md](RESEARCH_STATUS.md) — evidence levels (L0–L3), the
   requirement-to-evidence matrix, and the fail-closed completion gates.
+- [RESEARCH_REPORT_AGE_OF_EXPERIENCE.md](RESEARCH_REPORT_AGE_OF_EXPERIENCE.md)
+  — the 2026-08-02 research synthesis: SOTA verification, optimizer/benchmark
+  landscape, Alberta Plan gap analysis, and the derived wave A–D experiment
+  program.
+- [FORAGER_MATCHED_V3_RUNBOOK.md](FORAGER_MATCHED_V3_RUNBOOK.md) — the live
+  next-generation Forager matched-campaign contract (v3 schemas, SHA-pinned
+  plans).
 - [CONTINUAL_LEARNING_EVIDENCE.md](CONTINUAL_LEARNING_EVIDENCE.md) — the
   property-by-property evidence map, measured numbers, and the bug ledger.
 - [FORAGER_BENCHMARK.md](FORAGER_BENCHMARK.md) — the arXiv:2605.01131 testbed
@@ -206,11 +231,33 @@ runs.
   "sparks joy" means that the Kondo gate selects a sample for a backward pass.
   `PrototypeUpdateResult.sparks_joy` and `joyful_gradient_applied` are
   historical compatibility aliases, not the paper's Kondo semantics.
-- **`KondoGate`.** A detached forward screen with a fixed-capacity sparse
-  gather. It has no integrated learner and no measured compute-saving result,
-  and the `kondo_enabled` flag on the separate Delightful Policy Gradient
-  config is reserved and fail-closed: passing `True` raises because that
-  full-batch helper cannot skip compiled backward work.
+- **`KondoGate` and actor consumer.** A detached forward screen with a fixed-
+  capacity sparse gather now feeds `KondoSparseActor`: the nonlinear
+  categorical actor gathers first and only then calls `jax.value_and_grad` on
+  the smaller fixed shape. Forced/overflow survivors use an explicit full-shape
+  fallback, while critic, baseline, and safety inputs remain full-batch and
+  ungated. A strict four-arm development evaluator shares one immutable
+  parameter snapshot and source trace across ordinary-full, capacity-matched
+  uniform-sparse, Kondo-top-k, and diagnostic-overflow arms. It records exact
+  backward shapes/invocations and a separately bound, warmed, blocked,
+  interleaved raw/p50/p95 `perf_counter_ns` timing section, while excluding
+  host screening/gathering, memory, energy, and end-to-end latency. Every result
+  is `not_assessed`, so this is measurement instrumentation rather than a
+  compute-saving or learning claim. The `kondo_enabled` flag on the separate
+  Delightful Policy Gradient config remains reserved and fail-closed because
+  that full-batch helper cannot
+  skip compiled backward work.
+- **Kondo actor/critic replay diagnostics.** A second nonpromoting lane runs
+  ordinary-full, capacity-matched uniform, paper top-k Kondo, and a
+  fixed-capacity Kondo-plus-minimum-random-reserve extension on one immutable
+  A1/B/A2 contextual-gambling replay. Every source batch produces one actor
+  and one full protected update per arm; baseline, critic, representation,
+  world-model, and safety/guardrail gradients and final states are
+  bit-identical across arms, including rare failures. Actions are evaluator-
+  fixed, however, with no behavior policy or importance correction. Actor
+  losses are off-policy surrogates, and logical row-slot reductions are not
+  measured compute or efficacy. The lane remains `not_assessed` and writes no
+  evidence.
 - **World-model lanes.** Four mutually exclusive Prototype lanes: the legacy
   single `OneStepWorldModel`/`ActionConditionedWorldModel` lane, a bounded
   bootstrap ensemble, `ModelReplayRehearsal` (ensemble plus fixed-capacity
@@ -302,6 +349,48 @@ runs.
   and one-update fresh-STOMP smoke coverage only—not empirical benefit, option
   discovery/lifecycle, persistent consumer integration, a WP7 exit, evidence
   promotion, or Alberta Plan completion.
+- **Standalone option lifecycle and calibrated search-control contracts.**
+  `OptionLifecycleAudit` records semantic-generation-bound initiation,
+  termination reasons, returns, frozen option-model error, randomized
+  primitive comparisons, planning use, redundancy, and resource cost through
+  an exact two-phase transaction. It proposes bounded maintenance concerns but
+  has no curation, control, or promotion authority. An opt-in persistent STOMP
+  wrapper now derives those events from actual option ownership and frozen
+  pre-update model state. Audit exhaustion or rejected attribution freezes only
+  the observer; valid STOMP continues, while persistent composed-state
+  corruption requires checkpoint recovery. Separately,
+  `CalibratedExtendedSearchControl` gives model-free, primitive-model,
+  option-model, and combined search one shared fixed backup budget. It uses
+  correct differential primitive/option targets and a noncompensating product
+  of calibrated value change, future real-anchor reachability, model
+  reliability, and support. Natural and censored resolutions, option-semantic
+  invalidation, pending-arm checkpoints, stable ties, zero RNG, and exact
+  resources are mechanism-tested. A source/runtime-bound four-arm development
+  evaluator gives every arm one frozen model/calibration snapshot, the same
+  Threefry trace, and exactly `B` attempts with strict resume and exact causal
+  replay. It is `not-assessed` and action independent, so the search core is not
+  a live Prototype/STOMP model adapter and the combined L0 surfaces provide no
+  automatic keyboard routing, online planning benefit, WP7 exit, or L3
+  evidence.
+- **Bounded semantic/procedural consolidation and completion accounting.**
+  `ConsolidatedMemory` adds fixed-capacity SHA-identified semantic
+  GVF/fact/affordance and procedural skill stores with confidence, provenance,
+  revisions, evidence/outcome moments, staleness, invalidation, deterministic
+  replacement, and exact option-lifecycle links. Query-before-write,
+  next-generation resets, resources, JIT/scan, and strict checkpoints are L0
+  tested. A frozen 17-event development evaluator adds full-memory,
+  same-kernel readout-ablation, and zero-memory traces with integrity-bound
+  replay, but is explicitly `not-assessed`; no transfer or negative-transfer
+  result is claimed. A stateless `ConsolidatedProceduralMemoryPolicy` applies
+  exact lifecycle, evidence, Wilson success-bound, outcome-uncertainty,
+  score-mass, and hard-safety gates to an already-produced procedural retrieval
+  and can only propose the lowest-index safe positive-mass action. It performs
+  no query, write, RNG, dispatch, or mutation and is not yet a live Prototype
+  consumer. A separate
+  fail-closed complete-prototype manifest enumerates all 18 final scorecard
+  rows and accepts only configuration-matched, source-pinned, immutable,
+  frozen L3 evidence with untouched held-out seeds. It has no default evidence
+  bindings, so tests and stored booleans cannot manufacture a completion claim.
 - **Continuing-control companions.** The separate bounded
   `ContinuousAverageRewardActorCriticAgent` closes the L0 continuous mechanism
   gap: direct affine-`tanh` actions with cached pre-`tanh` ownership, stable
@@ -324,8 +413,37 @@ runs.
   L0 kernel composes them with learned state, online pair discovery,
   joint-model planning, and differential SARSA in one causal update, with
   shape-matched component and retention ablations. The stream's partner is
-  scripted, so none of this is learning-partner coadaptation, and no
-  reliability-calibration, partner-benefit, or WP8 completion claim is made.
+  scripted. A separate strict development stress lane runs learned,
+  outcome-blinded, and base-only fusion over one shared 96-event contextual
+  reliability reversal with costs, cost spikes, disconnects, and hard-mask
+  exclusions; fixed shapes/call counts, raw traces, exact replay, and prefix
+  resume are explicit. It is always `not_assessed`, so none of this is a
+  reliability-calibration, closed-loop partner-benefit, or WP8 completion
+  claim.
+- **Embodied hard envelope.** `EmbodiedSafetyEnvelope` is a public,
+  deterministic L0 filter over measured and proposed joint, workspace,
+  collision, timing, bridge, identity, and version constraints. It returns a
+  safe proposal, a statically configured in-envelope fallback, or no available
+  action and has zero dispatch authority. Emergency stop latches independently
+  of a rejected command transaction; authority-bound reset requires a strictly
+  newer stationary-safe sample and external caller authentication. Rollback
+  preserves diagnostics while suspending deployment, and checkpoint restore
+  requires an exact revision and SHA-256 anchor retained outside the payload.
+  Pure shadow records drive a non-authoritative Wilson/calibration/latency/hard-
+  violation readiness readout. This is not a geometry proof, physical-safety
+  result, robot-simulation result, or deployment authorization.
+- **Synthetic embodied fault audit.** A strict 30-event continuing schedule
+  exercises telemetry/wear drift, timing and delayed-reward metadata faults,
+  sensor failure, bridge loss, unsafe candidates, emergency stop, reset,
+  rollback, and checkpoint recovery against the hard envelope. Only available
+  commands count as simulated executions; physical dispatch is zero. Raw
+  traces, shadow facts whose success input is only action availability,
+  action-availability recovery delays, kernel parity,
+  externally anchored resume, and exact replay are retained. The schedule is
+  not a dynamics simulator or geometry proof, its unchanged opaque controller
+  cannot establish learner adaptation, and external caller authentication is
+  still required. It has no thresholds, artifacts, deployment authority, or
+  safety/efficacy verdict and remains `not_assessed`.
 - **Development-only evaluators.** Strict, hash-bound, `not-assessed`
   evaluators make the lanes above inspectable without promoting them:
   feed-forward and recurrent world-model snapshot evaluators, a recurrent
@@ -711,14 +829,14 @@ artifact checks are development infrastructure, not scientific promotion:
 
 - `upgd_ipmnist` — the input-permuted-MNIST protocol from the UPGD paper
   (Elsayed & Mahmood, ICLR 2024);
-- `ipmnist_screening` — a beat-SOTA *screening* lane: 30 registered
+- `ipmnist_screening` — a development *screening* lane: 48 registered
   mechanism-combination arms (UPGD×IDBD, UPGD×Autostep, UPGD+CBP, weight
   clipping, per-layer gate normalization, FADE-style meta-learned decay,
-  SwiftTD-stabilized UPGD×IDBD, and others) on a validated 60-task proxy that
-  is an exact bit-prefix of the 200-task protocol, with plan/run/
-  validate-proxy/merge CLI and full-protocol confirmation pipelines
-  (`outputs/ipmnist_screening/`). Screening results are permanently
-  nonpromoting;
+  SwiftTD-stabilized UPGD×IDBD, and others) on a 60-task proxy with
+  run/validate-proxy/merge CLI and full-protocol confirmation pipelines
+  (`outputs/ipmnist_screening/`). The stored proxy receipt rejects the UPGD
+  prefix check, and the v1 shards lack source-bound execution provenance;
+  screening results are permanently nonpromoting historical diagnostics;
 - `upgd_label_emnist` — label-permuted EMNIST (balanced 47-class, labels
   permuted every 2,500 steps, 400 tasks), pinned to the audited upstream
   commit. The first 3-seed artifact

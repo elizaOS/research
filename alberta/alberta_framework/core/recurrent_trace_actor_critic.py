@@ -288,6 +288,9 @@ class RecurrentTraceActorCriticConfig:
     normalize_observations: bool = True
     normalize_rewards: bool = True
     normalization_epsilon: float = 1e-8
+    # Diagonal Taylor trace correction, NOT exact RTRL — a derivation, not a
+    # port (no upstream reference implementation exists); see
+    # RTU_TAYLOR_CORRECTION.md for the derivation and its limits.
     rtrl_taylor_correction: bool = False
     adaptive_obgd: bool = False
     beta2: float = 0.999
