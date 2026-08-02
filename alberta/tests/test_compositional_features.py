@@ -1355,3 +1355,59 @@ class TestCompositionalFeatureLearner:
         assert int(result.state.step_count) == 50
         # Sanity check the resulting state retains the type.
         assert isinstance(result.state, CompositionalFeatureState)
+
+
+class TestImprintConsolidation:
+    """_initial_candidate_output_weights delegates to the module-level imprint."""
+
+    def test_explicit_scale_parameter(self) -> None:
+        errors = jnp.array([1.0, -2.0], dtype=jnp.float32)
+        candidate_value = jnp.array(0.5, dtype=jnp.float32)
+        active_count = jnp.array(1.0, dtype=jnp.float32)
+
+        weights = _imprint_candidate_output_weights(
+            errors, candidate_value, active_count, 0.3
+        )
+
+        np.testing.assert_allclose(
+            np.asarray(weights),
+            np.asarray(0.3 * errors * candidate_value / ((0.5 * 0.5 + 1.0) * 1.0)),
+            rtol=1e-6,
+        )
+
+    def test_learner_initial_weights_match_module_imprint(self) -> None:
+        learner = CompositionalFeatureLearner(
+            n_features=4,
+            n_tasks=2,
+            candidate_count=1,
+            candidate_imprint_scale=0.3,
+        )
+        observation = jnp.array([0.4, -0.2, 0.1, 0.9], dtype=jnp.float32)
+        active_values = observation  # OP_RAW prefix: values equal raw inputs
+        errors = jnp.array([1.5, -0.5], dtype=jnp.float32)
+        active_count = jnp.array(2.0, dtype=jnp.float32)
+        op = jnp.array(OP_RAW, dtype=jnp.int32)
+        parent_a = jnp.array(0, dtype=jnp.int32)
+        parent_b = jnp.array(-1, dtype=jnp.int32)
+        theta = jnp.zeros(2, dtype=jnp.float32)
+
+        learner_weights = learner._initial_candidate_output_weights(
+            op,
+            parent_a,
+            parent_b,
+            theta,
+            active_values,
+            observation,
+            errors,
+            active_count,
+        )
+        expected = _imprint_candidate_output_weights(
+            errors,
+            observation[0],
+            active_count,
+            jnp.asarray(0.3, dtype=jnp.float32),
+        )
+
+        np.testing.assert_allclose(
+            np.asarray(learner_weights), np.asarray(expected), rtol=1e-6
+        )

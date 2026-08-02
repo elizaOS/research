@@ -9,10 +9,11 @@ traces, and pure single-step APIs compatible with ``jax.jit`` and
 
 The Horde-backed critic integration point is the scalar ``value``/TD-error
 path in ``update``: replace the linear critic estimate and critic trace update
-with a GVF value adapter that exposes ``value(state, obs)`` and
-``update(state, reward, discount, obs)`` while preserving the actor's
-advantage signal. That adapter is intentionally left out of this core slice so
-the linear AC(lambda) semantics remain explicit and covered by focused tests.
+with a GVF value adapter that preserves the actor's advantage signal. That
+adapter lives in :mod:`alberta_framework.core.horde_actor_critic`
+(``HordeActorCriticAgent`` and ``QHordeActorCriticAgent``); it is kept out of
+this core slice so the linear AC(lambda) semantics here remain explicit and
+covered by focused tests.
 """
 
 from __future__ import annotations

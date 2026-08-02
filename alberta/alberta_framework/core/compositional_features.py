@@ -689,6 +689,7 @@ def _imprint_candidate_output_weights(
     errors: Array,
     candidate_value: Array,
     active_count: Array,
+    scale: Array | float = CANDIDATE_IMPRINT_SCALE,
 ) -> Array:
     """Initialize a candidate head with a small residual-aligned coefficient.
 
@@ -699,12 +700,12 @@ def _imprint_candidate_output_weights(
     blow the coefficient up.  Inactive heads already have zero error, so they
     stay zero.
 
-    ``CompositionalFeatureLearner._initial_candidate_output_weights`` applies
-    the same formula with a configurable scale; this module-level form is the
-    directly-testable reference.
+    ``CompositionalFeatureLearner._initial_candidate_output_weights`` is the
+    production call site: it evaluates the candidate's feature value and
+    delegates here with the learner's configured ``candidate_imprint_scale``.
     """
     denom = candidate_value * candidate_value + 1.0
-    return CANDIDATE_IMPRINT_SCALE * errors * candidate_value / (denom * active_count)
+    return scale * errors * candidate_value / (denom * active_count)
 
 
 class CompositionalFeatureLearner:
@@ -1777,7 +1778,11 @@ class CompositionalFeatureLearner:
         active_count: Array,
         imprint_scale: Array | None = None,
     ) -> Array:
-        """Initialize fresh candidate output weights from the current residual."""
+        """Initialize fresh candidate output weights from the current residual.
+
+        Delegates to :func:`_imprint_candidate_output_weights` for the damped
+        one-sample least-squares imprint formula.
+        """
         scale = (
             jnp.asarray(self._candidate_imprint_scale, dtype=jnp.float32)
             if imprint_scale is None
@@ -1793,12 +1798,11 @@ class CompositionalFeatureLearner:
             active_values,
             observation,
         )
-        denom = candidate_value * candidate_value + 1.0
-        return (
-            scale
-            * errors
-            * candidate_value
-            / (denom * active_count)
+        return _imprint_candidate_output_weights(
+            errors,
+            candidate_value,
+            active_count,
+            scale,
         )
 
     def _promoted_output_weights(
