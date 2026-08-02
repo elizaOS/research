@@ -3,17 +3,16 @@ from __future__ import annotations
 import ast
 import sys
 from collections import Counter
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Any
 
 import pytest
 
-from eliza_robot.bridge.physical_execution import UnsupervisedPhysicalControlError
-from scripts import (
-    evidence_aruco_full_anchor_e2e,
-    evidence_text_to_action_calibrated_e2e,
-    evidence_text_to_action_e2e,
-    run_asimov1_real_agent,
+from eliza_robot.bridge.physical_execution import (
+    UnsupervisedPhysicalControlError,
+    reject_unsupervised_physical_motion,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -119,19 +118,65 @@ def _constructor_trap(calls: list[str]):
     return ConstructorTrap
 
 
+def _load_quarantined_async_function(
+    path: Path,
+    function_name: str,
+    *,
+    globals_: Mapping[str, object] | None = None,
+) -> Callable[..., Any]:
+    """Load one exact script function without importing its GPU/media stack.
+
+    The CI-light lane deliberately omits OpenCV and MuJoCo. Compiling the
+    function node from the real script keeps these safety tests executable
+    there while the separate AST audit above verifies the function's source
+    location and quarantine ordering.
+    """
+
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    matches = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == function_name
+    ]
+    assert len(matches) == 1, f"expected exactly one {function_name} in {path}"
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__",
+                names=[ast.alias(name="annotations")],
+                level=0,
+            ),
+            matches[0],
+        ],
+        type_ignores=[],
+    )
+    ast.fix_missing_locations(module)
+    namespace: dict[str, object] = {
+        "reject_unsupervised_physical_motion": reject_unsupervised_physical_motion,
+    }
+    if globals_ is not None:
+        namespace.update(globals_)
+    exec(compile(module, str(path), "exec"), namespace)  # noqa: S102
+    loaded = namespace[function_name]
+    assert callable(loaded)
+    return loaded
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("profile", ["hiwonder-ainex", "asimov-1"])
 async def test_text_to_action_builder_quarantines_before_remote_constructor(
-    monkeypatch: pytest.MonkeyPatch,
     profile: str,
 ) -> None:
     calls: list[str] = []
     trap = _constructor_trap(calls)
-    monkeypatch.setattr(evidence_text_to_action_e2e, "AinexRemoteBackend", trap)
-    monkeypatch.setattr(evidence_text_to_action_e2e, "AsimovRemoteBackend", trap)
+    build_backend = _load_quarantined_async_function(
+        ROOT / "scripts" / "evidence_text_to_action_e2e.py",
+        "_build_backend",
+        globals_={"AinexRemoteBackend": trap, "AsimovRemoteBackend": trap},
+    )
 
     with pytest.raises(UnsupervisedPhysicalControlError, match="quarantined"):
-        await evidence_text_to_action_e2e._build_backend(
+        await build_backend(
             SimpleNamespace(profile=profile, no_real=False, host="unused", port=0)
         )
 
@@ -140,17 +185,16 @@ async def test_text_to_action_builder_quarantines_before_remote_constructor(
 
 @pytest.mark.asyncio
 async def test_calibrated_builder_quarantines_before_remote_constructor(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
-    monkeypatch.setattr(
-        evidence_text_to_action_calibrated_e2e,
-        "AinexRemoteBackend",
-        _constructor_trap(calls),
+    build_backend = _load_quarantined_async_function(
+        ROOT / "scripts" / "evidence_text_to_action_calibrated_e2e.py",
+        "_build_backend",
+        globals_={"AinexRemoteBackend": _constructor_trap(calls)},
     )
 
     with pytest.raises(UnsupervisedPhysicalControlError, match="quarantined"):
-        await evidence_text_to_action_calibrated_e2e._build_backend(SimpleNamespace())
+        await build_backend(SimpleNamespace())
 
     assert calls == []
 
@@ -163,25 +207,28 @@ async def test_aruco_helper_quarantines_before_remote_constructor(
     backend_module = ModuleType("eliza_robot.bridge.backends.ainex_remote")
     backend_module.AinexRemoteBackend = _constructor_trap(calls)  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, backend_module.__name__, backend_module)
+    try_connect_real = _load_quarantined_async_function(
+        ROOT / "scripts" / "evidence_aruco_full_anchor_e2e.py",
+        "_try_connect_real",
+    )
 
     with pytest.raises(UnsupervisedPhysicalControlError, match="quarantined"):
-        await evidence_aruco_full_anchor_e2e._try_connect_real("unused", 0)
+        await try_connect_real("unused", 0)
 
     assert calls == []
 
 
 @pytest.mark.asyncio
 async def test_asimov_runner_quarantines_before_remote_constructor(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
-    monkeypatch.setattr(
-        run_asimov1_real_agent,
-        "AsimovRemoteBackend",
-        _constructor_trap(calls),
+    run_motion = _load_quarantined_async_function(
+        ROOT / "scripts" / "run_asimov1_real_agent.py",
+        "_run_motion",
+        globals_={"AsimovRemoteBackend": _constructor_trap(calls)},
     )
 
     with pytest.raises(UnsupervisedPhysicalControlError, match="quarantined"):
-        await run_asimov1_real_agent._run_motion(SimpleNamespace())
+        await run_motion(SimpleNamespace())
 
     assert calls == []

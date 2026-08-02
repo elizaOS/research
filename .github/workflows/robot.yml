@@ -38,7 +38,10 @@ jobs:
       # submodule. That tier runs on GPU hosts. This lane installs only the
       # small-wheel subset that the import-safe modules and their tests need.
       - name: Install CI-light dependency tier
-        run: uv pip install --system -r requirements-ci.txt
+        run: |
+          uv venv .venv --python 3.12
+          uv pip install --python .venv/bin/python -r requirements-ci.txt
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       # Parse-level check: the whole Python tree byte-compiles with zero heavy
       # deps. compileall never imports, so heavy-dep modules are still covered.
