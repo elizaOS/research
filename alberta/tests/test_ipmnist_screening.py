@@ -22,6 +22,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     CBPState,
     EMANormState,
     ScreeningSpec,
+    _make_adamw_cbp_ema_norm_learner,
     _make_adamw_cbp_learner,
     _make_adamw_cbp_noreset_learner,
     _make_guarded_cbp_adam_learner,
@@ -100,6 +101,7 @@ class TestRegistry:
             "upgd_w_idbd_swift",
             "guarded_cbp_adam",
             "adamw_cbp_noreset",
+            "adamw_cbp_ema_norm",
             "upgd_w_sigma0",
             "upgd_alpha_utility",
             "adamw_cbp_r3e5",
@@ -655,8 +657,8 @@ class TestSmokeRuns:
         "upgd_idbd", "upgd_autostep", "upgd_l2init", "upgd_ema_norm",
         "upgd_cbp", "adamw_cbp", "upgd_w_wclip_k1", "upgd_w_wclip_k2_wd0",
         "upgd_w_localgate", "upgd_w_fade_head", "upgd_w_idbd_swift",
-        "guarded_cbp_adam", "adamw_cbp_noreset", "upgd_w_sigma0",
-        "upgd_alpha_utility", "adamw_cbp_r3e4",
+        "guarded_cbp_adam", "adamw_cbp_noreset", "adamw_cbp_ema_norm",
+        "upgd_w_sigma0", "upgd_alpha_utility", "adamw_cbp_r3e4",
     ])
     def test_combo_runs_and_is_finite(self, small_data, name):
         x, y = small_data
@@ -954,6 +956,105 @@ class TestAdamCBPNoReset:
             x, y, specs["adamw_cbp_noreset"], seed=2, config=SMALL
         )
         assert not np.array_equal(reset.per_task_loss, nores.per_task_loss)
+
+
+class TestAdamCBPEMANorm:
+    """Composition arm: the adamw_cbp leader behind upgd_ema_norm's normalizer."""
+
+    def test_registry_config(self):
+        spec = screening_spec("adamw_cbp_ema_norm")
+        base = screening_spec("adamw_cbp")
+        norm = screening_spec("upgd_ema_norm")
+        assert spec.base_learner == "adamw"
+        assert spec.noise_update is None
+        # exact adamw_cbp optimizer/CBP hyperparameters, unchanged
+        for key, value in base.hyperparameters.items():
+            assert spec.hyperparameters[key] == value, key
+        # exact upgd_ema_norm normalizer hyperparameters, unchanged
+        assert spec.hyperparameters["norm_decay"] == norm.hyperparameters["norm_decay"]
+        assert (
+            spec.hyperparameters["norm_epsilon"] == norm.hyperparameters["norm_epsilon"]
+        )
+        assert spec.hyperparameters["norm_enabled"] == 1.0
+
+    def test_norm_disabled_reduces_to_adamw_cbp_bitwise(self, small_data):
+        """norm_enabled=0: the whole trajectory equals adamw_cbp bit-for-bit."""
+        x, y = small_data
+        hp = dict(screening_spec("adamw_cbp_ema_norm").hyperparameters)
+        hp["norm_enabled"] = 0.0
+        spec = ScreeningSpec(
+            name="adamw_cbp",  # reuse registry identity for shard plumbing
+            base_learner="adamw",
+            mechanism="input_normalization_recycling",
+            hyperparameters=hp,
+            factory=_make_adamw_cbp_ema_norm_learner,
+        )
+        ours = run_screening_config(x, y, spec, seed=13, config=SMALL)
+        ref = run_screening_config(
+            x, y, screening_spec("adamw_cbp"), seed=13, config=SMALL
+        )
+        np.testing.assert_array_equal(ours.per_task_accuracy, ref.per_task_accuracy)
+        np.testing.assert_array_equal(ours.per_task_loss, ref.per_task_loss)
+        np.testing.assert_array_equal(ours.per_task_plasticity, ref.per_task_plasticity)
+
+    def test_normalizer_outputs_match_upgd_ema_norm(self):
+        """One shared observation stream through both arms' registry
+        (decay, eps): bitwise-equal normalized outputs and normalizer states
+        at every step."""
+        ours_hp = screening_spec("adamw_cbp_ema_norm").hyperparameters
+        ref_hp = screening_spec("upgd_ema_norm").hyperparameters
+        s_ours = EMANormState(mean=jnp.zeros(6), var=jnp.ones(6), count=jnp.array(0.0))
+        s_ref = EMANormState(mean=jnp.zeros(6), var=jnp.ones(6), count=jnp.array(0.0))
+        key = jr.key(29)
+        for i in range(25):
+            obs = jr.normal(jr.fold_in(key, i), (6,)) * 4.0 - 2.0
+            got, s_ours = ema_normalize(
+                s_ours, obs, ours_hp["norm_decay"], ours_hp["norm_epsilon"]
+            )
+            want, s_ref = ema_normalize(
+                s_ref, obs, ref_hp["norm_decay"], ref_hp["norm_epsilon"]
+            )
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+        for field in ("mean", "var", "count"):
+            np.testing.assert_array_equal(
+                np.asarray(getattr(s_ours, field)), np.asarray(getattr(s_ref, field))
+            )
+
+    def test_full_step_threads_identical_normalizer_state(self, small_data):
+        """Both arms' full steps on the same (x, y) stream keep the threaded
+        normalizer states bit-identical even as their params diverge."""
+        x, y = small_data
+        params = init_mlp_params(jr.key(0), SMALL)
+        spec_ours = screening_spec("adamw_cbp_ema_norm")
+        spec_ref = screening_spec("upgd_ema_norm")
+        init_ours, step_ours = spec_ours.factory(spec_ours.hyperparameters)
+        init_ref, step_ref = spec_ref.factory(spec_ref.hyperparameters)
+        s_ours = init_ours(params)
+        s_ref = init_ref(params)
+        p_ours = p_ref = params
+        for i in range(5):
+            xi = jnp.asarray(x[i], jnp.float32)
+            yi = jnp.asarray(y[i], jnp.int32)
+            p_ours, s_ours, _ = step_ours(p_ours, s_ours, xi, yi, jr.key(100 + i))
+            p_ref, s_ref, _ = step_ref(p_ref, s_ref, xi, yi, jr.key(100 + i))
+            for field in ("mean", "var", "count"):
+                np.testing.assert_array_equal(
+                    np.asarray(getattr(s_ours.norm, field)),
+                    np.asarray(getattr(s_ref.norm, field)),
+                )
+        assert float(s_ours.norm.count) == 5.0
+
+    def test_normalization_changes_the_trajectory(self, small_data):
+        """Sanity: with normalization enabled the trajectory separates from
+        adamw_cbp's."""
+        x, y = small_data
+        ours = run_screening_config(
+            x, y, screening_spec("adamw_cbp_ema_norm"), seed=13, config=SMALL
+        )
+        ref = run_screening_config(
+            x, y, screening_spec("adamw_cbp"), seed=13, config=SMALL
+        )
+        assert not np.array_equal(ours.per_task_loss, ref.per_task_loss)
 
 
 class TestUPGDSigma0:

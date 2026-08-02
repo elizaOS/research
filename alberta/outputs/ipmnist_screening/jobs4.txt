@@ -22,3 +22,6 @@ adamw_cbp_m200 2
 upgd_w_sigma0 0
 upgd_w_sigma0 1
 upgd_w_sigma0 2
+adamw_cbp_ema_norm 0
+adamw_cbp_ema_norm 1
+adamw_cbp_ema_norm 2

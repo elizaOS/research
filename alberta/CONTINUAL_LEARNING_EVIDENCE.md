@@ -206,11 +206,31 @@ completion, and held-out gates remain part of the promotion boundary.
   the 200-task protocol (control shards verified bitwise against the completed
   full-horizon shards). Three arms exceeded the `+0.005` confirmation
   threshold over `upgd_w_control`: `upgd_ema_norm` `+0.0751`, `adamw_cbp`
-  `+0.0188`, and `upgd_w_wd0005` `+0.0056`. Exact-noise 200-task confirmation
-  shards for `adamw_cbp` and `upgd_w_wd0005` (10 seeds each) sit under
-  `confirm_full/` with no merged confirmation verdict at this snapshot.
-  Screening results support development ranking only; the runbook is
-  `outputs/ipmnist_screening/RUNBOOK.md`.
+  `+0.0188`, and `upgd_w_wd0005` `+0.0056`. Full-horizon 200-task
+  confirmation shards under `confirm_full/` (development, nonpromoting):
+  `adamw_cbp` 10 seeds mean `0.79876 ± 0.00009` (exact noise; every seed
+  above its paired control; the 60→200-task trajectory does not erode),
+  `upgd_w_wd0005` 10 seeds mean `0.78431 ± 0.00014` (pool64 noise, known
+  `−0.00012` pool-vs-exact delta), and `upgd_ema_norm` 3 seeds mean
+  `0.85357` — the screening margin held at full horizon.  Scoping:
+  `adamw_cbp` (AdamW + continual-backprop unit recycling) is
+  protocol-pure under the published input encoding; `upgd_ema_norm`
+  prepends online EMA input normalization and is therefore a
+  protocol-extended variant (an input-encoding change the published
+  architecture does not include), reported on its own row, never as the
+  headline.  `upgd_w_wd0005` shows the published UPGD-W hyperparameters
+  are suboptimal on their own benchmark.  Against the repo's own 10-seed
+  published-config reproduction (`0.7791`), these are development-grade
+  improvements of `+0.020` (pure), `+0.005` (tuned), and `+0.074`
+  (extended); none is promotable without a fresh source-bound
+  preregistered run per the v3 contract.  Screening results support
+  development ranking only; the runbook is
+  `outputs/ipmnist_screening/RUNBOOK.md`, the mechanism analysis is
+  `CONTINUAL_LEARNING_THEORY.md` (three-failure-modes theory with
+  pre-registered outcome matrix; first refutation recorded:
+  utility-gated protection on the AdamW+CBP base *costs* `−0.0055` on
+  this no-recurrence protocol, exactly the tie/hurt branch the matrix
+  anticipated — protection pays rent only where tasks recur).
 - **Label-permuted EMNIST, UPGD protocol** (Elsayed & Mahmood ICLR 2024:
   EMNIST balanced 47 classes, labels permuted every 2,500 steps, 400 tasks,
   1M online examples) — `benchmarks/upgd_label_emnist.py`; first artifact

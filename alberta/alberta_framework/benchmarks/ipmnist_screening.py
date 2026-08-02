@@ -70,6 +70,11 @@ identical seeds):
 - ``adamw_cbp_{r3e5,r3e4,m50,m200}``: axis-aligned mini-star around the
   untuned ``adamw_cbp`` leader (replacement rate 3e-5/3e-4, maturity
   50/200).
+- ``adamw_cbp_ema_norm``: the exact ``adamw_cbp`` update behind the exact
+  ``upgd_ema_norm`` EMA input normalizer (same decay/eps/state threading) —
+  composition of the screening's two orthogonal wins (input conditioning +
+  capacity regeneration). ``norm_enabled=0`` skips the normalizer entirely
+  and reduces bit-exactly to ``adamw_cbp`` (pinned).
 
 Everything here is a development screening diagnostic — never promotable
 scientific evidence. Benchmark executions happen through the CLI
@@ -1296,6 +1301,95 @@ def _make_adamw_cbp_noreset_learner(
 
 
 # =============================================================================
+# (m) Composition: AdamW+CBP behind EMA input normalization
+# =============================================================================
+
+
+@chex.dataclass(frozen=True)
+class AdamCBPNormState:
+    """AdamW+CBP state plus the EMA input-normalizer state."""
+
+    m: dict[str, Array]
+    v: dict[str, Array]
+    count: dict[str, Array]
+    cbp: CBPState
+    norm: EMANormState
+
+
+def _make_adamw_cbp_ema_norm_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """The exact ``adamw_cbp`` update behind ``upgd_ema_norm``'s normalizer.
+
+    The EMA input-normalization step (:func:`ema_normalize` equations,
+    ``norm_decay``/``norm_epsilon``, per-step state threading) is identical
+    to ``upgd_ema_norm``'s (pinned by unit tests); everything downstream —
+    gradients, activations for CBP utility, the per-element AdamW step, and
+    the recycling with optimizer-state reset — is the ``adamw_cbp`` step run
+    on the normalized input. With ``norm_enabled = 0`` the normalizer is
+    skipped entirely (state untouched) and the arm reduces bit-exactly to
+    ``adamw_cbp`` (pinned by a unit test).
+    """
+    decay = hp["norm_decay"]
+    epsilon = hp["norm_epsilon"]
+    normalize = hp.get("norm_enabled", 1.0) != 0.0
+
+    def init_fn(params: dict[str, Array]) -> AdamCBPNormState:
+        zeros = {name: jnp.zeros_like(value) for name, value in params.items()}
+        input_dim = params["w1"].shape[0]
+        return AdamCBPNormState(  # type: ignore[call-arg]
+            m=dict(zeros),
+            v=dict(zeros),
+            count={name: jnp.zeros_like(value) for name, value in params.items()},
+            cbp=_init_cbp_state(params["w1"].shape[1], params["w2"].shape[1]),
+            norm=EMANormState(  # type: ignore[call-arg]
+                mean=jnp.zeros(input_dim, dtype=jnp.float32),
+                var=jnp.ones(input_dim, dtype=jnp.float32),
+                count=jnp.array(0.0, dtype=jnp.float32),
+            ),
+        )
+
+    def full_step(
+        params: dict[str, Array], state: AdamCBPNormState, x: Array, y: Array, key: Array
+    ) -> tuple[dict[str, Array], AdamCBPNormState, StepMetrics]:
+        if normalize:
+            x_in, new_norm = ema_normalize(state.norm, x, decay, epsilon)
+        else:
+            x_in, new_norm = x, state.norm
+        (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+            params, x_in, y
+        )
+        _, _, a1, z2, a2 = _forward_with_activations(params, x_in)
+        da1, da2 = _activation_loss_grads(params, logits, y, z2)
+        new_params: dict[str, Array] = {}
+        new_m: dict[str, Array] = {}
+        new_v: dict[str, Array] = {}
+        new_count: dict[str, Array] = {}
+        for name, value in params.items():
+            new_params[name], new_m[name], new_v[name], new_count[name] = adam_elem_update(
+                value, state.m[name], state.v[name], state.count[name], grads[name], hp
+            )
+        opt_arrays: dict[str, Array] | None = {
+            name: jnp.stack([new_m[name], new_v[name], new_count[name]])
+            for name in new_params
+        }
+        new_params, opt_arrays, new_cbp = _cbp_update(
+            new_params, opt_arrays, state.cbp, a1, da1, a2, da2, key, hp
+        )
+        assert opt_arrays is not None
+        metrics = _step_metrics(new_params, x_in, y, loss, logits)
+        return new_params, AdamCBPNormState(  # type: ignore[call-arg]
+            m={name: opt_arrays[name][0] for name in new_params},
+            v={name: opt_arrays[name][1] for name in new_params},
+            count={name: opt_arrays[name][2] for name in new_params},
+            cbp=new_cbp,
+            norm=new_norm,
+        ), metrics
+
+    return init_fn, full_step
+
+
+# =============================================================================
 # (j) Guarded AdamW+CBP: utility protection on Adam's delta, CBP regeneration
 # =============================================================================
 
@@ -1736,6 +1830,23 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             description=(
                 "adamw_cbp WITHOUT the per-unit Adam moment/count reset at "
                 "replacement (moment-freshness dissection; the leader resets)."
+            ),
+        ),
+        ScreeningSpec(
+            name="adamw_cbp_ema_norm",
+            base_learner="adamw",
+            mechanism="input_normalization_recycling",
+            hyperparameters={
+                **ADAMW_PROTOCOL_HYPERPARAMETERS,
+                **_CBP_DEFAULTS,
+                "norm_decay": 0.999,
+                "norm_epsilon": 1e-8,
+                "norm_enabled": 1.0,
+            },
+            factory=_make_adamw_cbp_ema_norm_learner,
+            description=(
+                "adamw_cbp behind the exact upgd_ema_norm EMA input "
+                "normalizer (composition of the two orthogonal wins)."
             ),
         ),
         ScreeningSpec(

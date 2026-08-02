@@ -152,3 +152,23 @@ is additionally vs `adamw_cbp` (`merge --control-name adamw_cbp` on the
 adamw-family shards into a SEPARATE summary file, e.g.
 `summary_wave4_adamcbp.json` — never overwrite `summary.json` with a
 different control).
+
+## Wave-4b (2026-08-01, appended late): `adamw_cbp_ema_norm`
+
+- `adamw_cbp_ema_norm` — composition arm: the exact `adamw_cbp` update
+  behind the exact `upgd_ema_norm` EMA input normalizer (same
+  norm_decay=0.999 / norm_epsilon=1e-8, same per-step state threading;
+  normalizer state carried in the arm state). `norm_enabled=0` reduces
+  bit-exactly to `adamw_cbp` (pinned); the normalizer path is pinned
+  bitwise against `upgd_ema_norm`'s on a shared stream. Cost ~ `adamw_cbp`.
+- Ops: the three seeds (0-2) were APPENDED to `jobs4.txt` so endgame3's
+  per-shard wait loop (which re-reads jobs4.txt each cycle) counts them and
+  the final merge includes them. Because endgame3's first blocking
+  `xargs < jobs4.txt` had already buffered the original 24 lines and its 6h
+  deadline (started 17:18) will lapse before that xargs drains, the three
+  workers were ALSO launched directly, detached, at `-P 3` via `worker.sh`
+  (idempotent; endgame3's restart branch cannot double-run them — it only
+  fires when no `ipmnist_screening run` processes are alive).
+- Interesting paired contrasts once merged: vs `upgd_w_control` (standard),
+  and vs `adamw_cbp` / `upgd_ema_norm` on the adamw-family/normalized side
+  (separate summary files as above; never overwrite `summary.json`).
