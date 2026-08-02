@@ -182,6 +182,14 @@ runs.
   audit stores the mixed delta only when its formed-candidate and effective
   finite-precision checks both pass. This is integration evidence, not
   evidence that the online-gated representation improves control.
+- **Bounded Prototype pair-feature lifecycle.** A mutually restricted opt-in
+  lane trains a fixed pair bank from one owner-bound behavior TD target and
+  atomically descriptor-routes every linear OaK feature axis. Gradient
+  pullback and the enabled OaK subtree carry the exact generation plus full
+  descriptor bank, rejecting stale and same-generation forked consumers even
+  when their observation caches collide. Standalone callers must checkpoint
+  the returned binding with their OaK state. This is L0 plumbing, not a
+  multi-consumer utility, control-benefit, or WP7 completion result.
 - **Continuing-control companions.** The separate bounded
   `ContinuousAverageRewardActorCriticAgent` closes the L0 continuous mechanism
   gap: direct affine-`tanh` actions with cached pre-`tanh` ownership, stable
@@ -537,22 +545,30 @@ fairness boundary, and the attested RTU-PPO/DQN/PPO comparison workflow.
 
 #### Matched-current campaign (frozen before execution)
 
-The matched-current pipeline (the `forager_matched_*` modules, console
-scripts `alberta-forager-matched-qualification` and
-`alberta-forager-matched-campaign`) qualifies a live networkless OCI runtime,
-freezes a 21-candidate open-tuning protocol, and defines a sealed held-out
-evaluation stage. Its current state, verifiable under `outputs/forager/`:
+The matched-current pipeline (the `forager_matched_*` modules and console
+scripts `alberta-forager-matched-qualification`,
+`alberta-forager-matched-campaign`, and
+`alberta-forager-matched-sealed-evaluation`) qualifies a live networkless OCI
+runtime, freezes 23 registered candidates (21 open-tuning candidates plus two
+fixed descriptive orientations), and defines a sealed held-out evaluation
+stage. Current source uses candidate-universe schema v2 (SHA-256
+`6a9315cb…`); it has no renewed qualification or open-campaign artifact yet.
+The existing `2c3b214c` roots below are immutable historical v1 artifacts and
+must not be resumed with the current builder. A fresh qualification and new
+output namespace are required before v2 execution.
 
-- `matched_current_qualification_2c3b214c_v1` — qualification completed.
+- `matched_current_qualification_2c3b214c_v1` — historical v1 qualification
+  completed.
 - `matched_current_open_tuning_2c3b214c_v1` — the open-tuning campaign is
-  prepared and frozen, but its `runs/` and `completions/` directories are
-  empty: **zero tuning cells have been executed**.
+  historically prepared and frozen, but its `runs/` and `completions/`
+  directories are empty: **zero tuning cells have been executed**.
 - The sealed stage (`forager_matched_seal`,
   `forager_matched_sealed_evaluation_campaign`,
   `forager_matched_final_analysis`, `forager_matched_statistics`) is
-  implemented and contract-tested but has no console script and has never
-  been executed; no seal, sealed-evaluation, or final-analysis artifact
-  exists.
+  implemented and contract-tested. The evaluation runner is exposed as
+  `alberta-forager-matched-sealed-evaluation`; seal and final-analysis remain
+  module-only. None has been executed, and no seal, sealed-evaluation, or
+  final-analysis artifact exists.
 
 Every authority-bearing path in the pipeline terminates at a caller-supplied
 external trust resolver that does not exist in-tree; the only in-tree anchor

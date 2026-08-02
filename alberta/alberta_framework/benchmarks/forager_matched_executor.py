@@ -2870,7 +2870,7 @@ def _cleanup_interrupted_container(
                     raise ForagerMatchedExecutorError(
                         "OCI cidfile does not contain an exact container ID"
                     )
-            except (UnicodeDecodeError, ForagerMatchedExecutorError) as exc:
+            except (OSError, UnicodeDecodeError, ForagerMatchedExecutorError) as exc:
                 cidfile_error = exc
             else:
                 cleanup_target = container_id
@@ -3001,7 +3001,6 @@ def _run_bounded_process(
                     chunk = os.read(key.fd, min(64 * 1024, allowance + 1))
                     if not chunk:
                         selector.unregister(pipe)
-                        pipe.close()
                         continue
                     accepted = min(len(chunk), allowance)
                     if accepted:
@@ -3035,12 +3034,26 @@ def _run_bounded_process(
             _terminate_and_reap_process(process)
             raise
         finally:
+            close_error: OSError | None = None
             if selector is not None:
-                selector.close()
+                try:
+                    selector.close()
+                except OSError as exc:
+                    close_error = exc
             if not process.stdout.closed:
-                process.stdout.close()
+                try:
+                    process.stdout.close()
+                except OSError as exc:
+                    close_error = close_error or exc
             if not process.stderr.closed:
-                process.stderr.close()
+                try:
+                    process.stderr.close()
+                except OSError as exc:
+                    close_error = close_error or exc
+            if close_error is not None:
+                raise ForagerMatchedExecutorError(
+                    "OCI process resources could not be closed cleanly"
+                ) from close_error
 
 
 def _default_runner(command: Sequence[str]) -> ProcessResult:
@@ -3109,7 +3122,12 @@ def _default_runner(command: Sequence[str]) -> ProcessResult:
 
 
 def _runner_result(runner: ProcessRunner, command: Sequence[str], label: str) -> ProcessResult:
-    result = runner(tuple(command))
+    try:
+        result = runner(tuple(command))
+    except ForagerMatchedExecutorError:
+        raise
+    except (OSError, subprocess.SubprocessError, _BoundedProcessOutputError) as exc:
+        raise ForagerMatchedExecutorError(f"{label} runner failed") from exc
     if type(result) is not ProcessResult:
         raise ForagerMatchedExecutorError(f"{label} runner returned an invalid result")
     return result

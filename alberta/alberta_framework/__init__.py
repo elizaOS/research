@@ -37,7 +37,7 @@ References
 - Streaming Deep Reinforcement Learning Finally Works (Elsayed et al., 2024)
 """
 
-__version__ = "0.27.0"
+__version__ = "0.28.0"
 
 # Baseline optimizers
 from alberta_framework.core.actor_critic import (
@@ -137,6 +137,10 @@ from alberta_framework.core.checkpoints import (
     save_checkpoint,
 )
 from alberta_framework.core.compositional_features import (
+    CURATION_DESTINATION_ACTIVE,
+    CURATION_DESTINATION_CANDIDATE,
+    CURATION_DESTINATION_NONE,
+    CompositionalCurationTrace,
     CompositionalFeatureLearner,
     run_compositional_arrays,
 )
@@ -580,6 +584,9 @@ from alberta_framework.core.prototype_agent import (
     PrototypeExperientialMemoryDiagnostics,
     PrototypeExperientialMemoryInput,
     PrototypeExperientialMemoryResourceDeclaration,
+    PrototypeFeatureLifecycleIntegrationDiagnostics,
+    PrototypeFeatureOaKState,
+    PrototypeFeatureRepresentationState,
     PrototypeGradientJoyEvidence,
     PrototypeInteractionState,
     PrototypeMemoryInteractionState,
@@ -594,6 +601,23 @@ from alberta_framework.core.prototype_agent import (
     feature_to_subtask_specs,
     load_prototype_checkpoint,
     save_prototype_checkpoint,
+)
+from alberta_framework.core.prototype_feature_lifecycle import (
+    PROTOTYPE_FEATURE_LIFECYCLE_CHECKPOINT_SCHEMA,
+    PROTOTYPE_FEATURE_LIFECYCLE_CONFIG_SCHEMA,
+    PROTOTYPE_FEATURE_LIFECYCLE_MECHANISM_STATUS,
+    PROTOTYPE_FEATURE_LIFECYCLE_SCIENTIFIC_PROMOTION_ALLOWED,
+    PrototypeFeatureConsumerBinding,
+    PrototypeFeatureLifecycle,
+    PrototypeFeatureLifecycleConfig,
+    PrototypeFeatureLifecycleDiagnostics,
+    PrototypeFeatureLifecycleEvent,
+    PrototypeFeatureLifecycleResourceBudget,
+    PrototypeFeatureLifecycleResult,
+    PrototypeFeatureLifecycleState,
+    PrototypePairGradientPullback,
+    load_prototype_feature_lifecycle_checkpoint,
+    save_prototype_feature_lifecycle_checkpoint,
 )
 from alberta_framework.core.recurrent_latent_world_model_ensemble import (
     EVIDENCE_LEVEL as RECURRENT_LATENT_WORLD_MODEL_EVIDENCE_LEVEL,
@@ -1232,6 +1256,9 @@ __all__ = [
     "PrototypeExperientialMemoryDiagnostics",
     "PrototypeExperientialMemoryInput",
     "PrototypeExperientialMemoryResourceDeclaration",
+    "PrototypeFeatureLifecycleIntegrationDiagnostics",
+    "PrototypeFeatureOaKState",
+    "PrototypeFeatureRepresentationState",
     "PrototypeGradientJoyEvidence",
     "PrototypeInteractionState",
     "PrototypeMemoryInteractionState",
@@ -1246,6 +1273,22 @@ __all__ = [
     "feature_to_subtask_specs",
     "load_prototype_checkpoint",
     "save_prototype_checkpoint",
+    # Bounded Prototype pair-feature lifecycle
+    "PROTOTYPE_FEATURE_LIFECYCLE_CHECKPOINT_SCHEMA",
+    "PROTOTYPE_FEATURE_LIFECYCLE_CONFIG_SCHEMA",
+    "PROTOTYPE_FEATURE_LIFECYCLE_MECHANISM_STATUS",
+    "PROTOTYPE_FEATURE_LIFECYCLE_SCIENTIFIC_PROMOTION_ALLOWED",
+    "PrototypeFeatureConsumerBinding",
+    "PrototypeFeatureLifecycle",
+    "PrototypeFeatureLifecycleConfig",
+    "PrototypeFeatureLifecycleDiagnostics",
+    "PrototypeFeatureLifecycleEvent",
+    "PrototypeFeatureLifecycleResourceBudget",
+    "PrototypeFeatureLifecycleResult",
+    "PrototypeFeatureLifecycleState",
+    "PrototypePairGradientPullback",
+    "load_prototype_feature_lifecycle_checkpoint",
+    "save_prototype_feature_lifecycle_checkpoint",
     # Learners - Supervised Learning
     "LinearLearner",
     "run_learning_loop",
@@ -1272,6 +1315,10 @@ __all__ = [
     "AssociativeMemoryPrediction",
     "AssociativeMemoryState",
     "AssociativeMemoryUpdateResult",
+    "CURATION_DESTINATION_ACTIVE",
+    "CURATION_DESTINATION_CANDIDATE",
+    "CURATION_DESTINATION_NONE",
+    "CompositionalCurationTrace",
     "CompositionalFeatureLearner",
     "CumulantDiscovery",
     "FixedBudgetFeatureLearner",

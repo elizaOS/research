@@ -2,8 +2,18 @@
 """Development-only matched benchmarks for Delightful Policy Gradient.
 
 This module evaluates the paper-specific actor-sample gate, never the separate
-Prototype ``sparks_joy`` candidate-update audit.  It implements neither Kondo
-selection nor a promotion path.  Ordinary and paper-specific DG policy gradients
+Prototype ``sparks_joy`` candidate-update audit.  It reports Kondo selection
+accounting: a deterministic post-hoc counterfactual that replays the paper's
+delight-price selection rule over each fully executed trace and accounts, per
+learning-value channel, the backward work a real Kondo gate would have run
+versus skipped.  Actual Kondo compute gating remains unimplemented here.
+Every actor, critic, and average-reward update in every life is executed in
+full and no compiled backward work is skipped, so ``KONDO_IMPLEMENTED`` stays
+``False`` — the implemented-Kondo bar (see
+:mod:`alberta_framework.core.kondo_gate`) requires demonstrably skipped
+backward work, which masking or post-hoc accounting cannot provide — and
+"Kondo compute savings" stays an excluded claim.  There is no promotion path.
+Ordinary and paper-specific DG policy gradients
 use matched categorical actor-critic configurations that differ only in gate mode,
 the same initialization and sampler, paired action/environment random-number
 schedules, and the same logical resource budget.  Their realized actions and
@@ -22,8 +32,9 @@ implementing the bounded discrete-action experiment specified in WP5 of
 Reports are deterministic, versioned, JSON-compatible development records.
 Their strict validator checks schema, digest, common-random-number pairing,
 environment reconstruction, action sampling, exact paper-specific DG
-delight/gate equations, metrics, strata, and logical accounting.  No result
-or threshold in this file can promote a scientific claim.
+delight/gate equations, metrics, strata, Kondo selection accounting, and
+logical accounting.  No result or threshold in this file can promote a
+scientific claim.
 """
 
 from __future__ import annotations
@@ -64,10 +75,13 @@ from alberta_framework.streams.closed_loop import (
     RiverSwimMDP,
 )
 
-DELIGHTFUL_POLICY_GRADIENT_DEVELOPMENT_SCHEMA = "alberta.delightful-policy-gradient.development.v1"
+DELIGHTFUL_POLICY_GRADIENT_DEVELOPMENT_SCHEMA = "alberta.delightful-policy-gradient.development.v2"
 DEVELOPMENT_ONLY = True
 SCIENTIFIC_PROMOTION_ALLOWED = False
+# Actual Kondo compute gating (skipping compiled backward work) is not
+# implemented in this harness; only counterfactual selection accounting is.
 KONDO_IMPLEMENTED = False
+KONDO_SELECTION_ACCOUNTING = True
 
 BenchmarkName = Literal[
     "contextual_heteroskedastic_gambling",
@@ -98,6 +112,15 @@ _EXCLUDED_CLAIMS = (
 _INTERPRETATION = (
     "calculation and matched development diagnostics only; no thresholds or "
     "results in this report can promote a claim"
+)
+# Frozen parameters of the counterfactual Kondo selection rule.  The price is
+# the paper's Bernoulli-gate location parameter; selection is its deterministic
+# maximum-probability decision, `delight > price`.
+_KONDO_SELECTION_PRICE = 0.0
+_KONDO_ACCOUNTING_SEMANTICS = (
+    "measured post-hoc counterfactual over one fully executed life; every "
+    "actor, critic, and average-reward update ran in full, no backward work "
+    "was skipped, and no compute saving is claimed"
 )
 _UINT32_MAX = 2**32 - 1
 _INT32_MIN = -(2**31)
@@ -306,12 +329,13 @@ class DelightfulPolicyGradientDevelopmentConfig:
         )
 
     def to_config(self) -> dict[str, object]:
-        """Return the complete, nonpromoting v1 protocol record."""
+        """Return the complete, nonpromoting v2 protocol record."""
         return {
             "schema_version": DELIGHTFUL_POLICY_GRADIENT_DEVELOPMENT_SCHEMA,
             "development_only": DEVELOPMENT_ONLY,
             "scientific_promotion_allowed": SCIENTIFIC_PROMOTION_ALLOWED,
             "kondo_implemented": KONDO_IMPLEMENTED,
+            "kondo_selection_accounting": KONDO_SELECTION_ACCOUNTING,
             "claim_scope": _CLAIM_SCOPE,
             "excluded_claims": list(_EXCLUDED_CLAIMS),
             "benchmark_order": list(BENCHMARK_ORDER),
@@ -367,10 +391,10 @@ class DelightfulPolicyGradientDevelopmentConfig:
         cls,
         payload: Mapping[str, object],
     ) -> DelightfulPolicyGradientDevelopmentConfig:
-        """Reconstruct only an exact nonpromoting v1 protocol record."""
+        """Reconstruct only an exact nonpromoting v2 protocol record."""
         expected = set(cls().to_config())
         if set(payload) != expected:
-            raise ValueError("development protocol fields do not match the v1 schema")
+            raise ValueError("development protocol fields do not match the v2 schema")
         seeds = payload.get("seeds")
         if not isinstance(seeds, list):
             raise ValueError("development protocol seeds must be a JSON array")
@@ -984,6 +1008,115 @@ def _resource_accounting(
     }
 
 
+def _kondo_selection_accounting(
+    trace: Mapping[str, object],
+    config: DelightfulPolicyGradientDevelopmentConfig,
+    benchmark: BenchmarkName,
+    mode: PolicyGradientMode,
+) -> dict[str, object]:
+    """Account the paper's Kondo selection as a measured counterfactual.
+
+    The selection rule is the deterministic maximum-probability decision of
+    the paper's ``Bernoulli(sigmoid((delight - price) / temperature))`` gate:
+    a step is selected exactly when ``delight > price``.  Each decision uses
+    only that step's forward-pass quantities, so a real gate could have made
+    it before the backward pass.  Only the actor channel is Kondo-gateable —
+    paper-defined delight is a policy-gradient sample statistic, and critic
+    and average-reward losses stay outside the policy-gradient helper — so
+    their compute is never counted as skippable.  In this development harness
+    no backward work was actually skipped: every logged update ran in full,
+    and the skipped columns are counterfactual bookkeeping, not savings.
+    """
+    arrays = _trace_arrays_from_dict(trace)
+    delight = arrays["delight"].astype(np.float64)
+    steps = int(delight.size)
+    price = _KONDO_SELECTION_PRICE
+    temperature = float(config.delight_temperature)
+    selected = delight > price
+    scaled = (delight - price) / temperature
+    with np.errstate(over="ignore", invalid="ignore"):
+        gate_probability = np.where(
+            scaled >= 0.0,
+            1.0 / (1.0 + np.exp(-scaled)),
+            np.exp(scaled) / (1.0 + np.exp(scaled)),
+        )
+    selected_steps = int(np.sum(selected))
+    selection_rate_by_phase = [
+        float(np.mean(selected[phase * config.phase_length : (phase + 1) * config.phase_length]))
+        for phase in range(len(REGIME_SCHEDULE))
+    ]
+    dimension = 2 if benchmark == "contextual_heteroskedastic_gambling" else _RIVER_CONFIG.n_states
+    budget = DelightfulActorCriticAgent(config.agent_config(dimension, mode)).resource_budget
+    scalar_updates_per_transition = {
+        "actor": int(budget.actor_scalar_updates_per_transition),
+        "critic": int(budget.critic_scalar_updates_per_transition),
+        "average_reward": int(budget.average_reward_scalar_updates_per_transition),
+    }
+    gateable = {"actor": True, "critic": False, "average_reward": False}
+    rationales = {
+        "actor": (
+            "paper-defined delight is a per-sample policy-gradient statistic; "
+            "the Kondo gate decides whether the actor backward pass runs"
+        ),
+        "critic": (
+            "critic prediction losses remain outside the policy-gradient "
+            "helper and are never Kondo-gated"
+        ),
+        "average_reward": (
+            "average-reward tracking is not a policy-gradient loss and is "
+            "never Kondo-gated"
+        ),
+    }
+    channels: list[dict[str, object]] = []
+    for name in ("actor", "critic", "average_reward"):
+        executed = steps * scalar_updates_per_transition[name]
+        counterfactual_selected = (
+            selected_steps * scalar_updates_per_transition[name] if gateable[name] else executed
+        )
+        channels.append(
+            {
+                "channel": name,
+                "kondo_gateable": gateable[name],
+                "gate_rationale": rationales[name],
+                "scalar_updates_per_transition": scalar_updates_per_transition[name],
+                "executed_scalar_updates": executed,
+                "counterfactual_selected_scalar_updates": counterfactual_selected,
+                "counterfactual_skipped_scalar_updates": executed - counterfactual_selected,
+            }
+        )
+    executed_total = sum(cast(int, channel["executed_scalar_updates"]) for channel in channels)
+    selected_total = sum(
+        cast(int, channel["counterfactual_selected_scalar_updates"]) for channel in channels
+    )
+    skipped_total = executed_total - selected_total
+    return {
+        "actual_compute_gating": False,
+        "accounting_semantics": _KONDO_ACCOUNTING_SEMANTICS,
+        "selection_policy": {
+            "signal": "paper-defined delight = advantage * action_surprisal",
+            "rule": "deterministic_price_threshold",
+            "price": price,
+            "temperature": temperature,
+            "selected_iff": "delight > price",
+            "bernoulli_gate_probability": "sigmoid((delight - price) / temperature)",
+            "decision_point": (
+                "after the forward pass of each step, before the backward "
+                "pass a real Kondo gate would skip"
+            ),
+        },
+        "total_steps": steps,
+        "selected_steps": selected_steps,
+        "selection_rate": selected_steps / steps,
+        "expected_bernoulli_selection_rate": float(np.mean(gate_probability)),
+        "selection_rate_by_phase": selection_rate_by_phase,
+        "channels": channels,
+        "executed_scalar_updates_total": executed_total,
+        "counterfactual_selected_scalar_updates_total": selected_total,
+        "counterfactual_skipped_scalar_updates_total": skipped_total,
+        "counterfactual_skipped_fraction": skipped_total / executed_total,
+    }
+
+
 def _state_fingerprint(
     agent: DelightfulActorCriticAgent,
     state: DelightfulActorCriticState,
@@ -1037,6 +1170,9 @@ def _run_record(
         "performance": _performance_metrics(trace_payload, config),
         "dg_diagnostics": _dg_diagnostics(trace_payload, mode, config),
         "heteroskedastic_gambling": _gambling_diagnostics(trace_payload, benchmark),
+        "kondo_selection_accounting": _kondo_selection_accounting(
+            trace_payload, config, benchmark, mode
+        ),
         "operations": _operation_accounting(trace_payload),
         "resources": _resource_accounting(agent, trace, benchmark),
     }
@@ -1147,6 +1283,7 @@ def run_delightful_policy_gradient_development(
         "development_only": DEVELOPMENT_ONLY,
         "scientific_promotion_allowed": SCIENTIFIC_PROMOTION_ALLOWED,
         "kondo_implemented": KONDO_IMPLEMENTED,
+        "kondo_selection_accounting": KONDO_SELECTION_ACCOUNTING,
         "claim_scope": _CLAIM_SCOPE,
         "excluded_claims": list(_EXCLUDED_CLAIMS),
         "interpretation": _INTERPRETATION,
@@ -1227,6 +1364,7 @@ _RUN_FIELDS = {
     "performance",
     "dg_diagnostics",
     "heteroskedastic_gambling",
+    "kondo_selection_accounting",
     "operations",
     "resources",
 }
@@ -1276,7 +1414,7 @@ def _strict_trace_arrays(
 ) -> tuple[dict[str, np.ndarray] | None, list[str]]:
     errors: list[str] = []
     if set(trace) != _TRACE_FIELDS:
-        errors.append("trace fields do not match the v1 schema")
+        errors.append("trace fields do not match the v2 schema")
         return None, errors
     shapes = {
         **{
@@ -1554,7 +1692,7 @@ def _validate_run(
     prefix = f"{expected_benchmark}/seed={expected_seed}/{expected_mode}"
     errors: list[str] = []
     if set(run) != _RUN_FIELDS:
-        errors.append(f"{prefix}: run fields do not match the v1 schema")
+        errors.append(f"{prefix}: run fields do not match the v2 schema")
         return errors
     if (
         run.get("benchmark") != expected_benchmark
@@ -1663,6 +1801,24 @@ def _validate_run(
     )
     if not _mapping_close(run.get("resources"), expected_resources):
         errors.append(f"{prefix}: logical resource accounting does not reconstruct")
+    kondo_payload = run.get("kondo_selection_accounting")
+    if not isinstance(kondo_payload, Mapping):
+        errors.append(f"{prefix}: kondo_selection_accounting must be an object")
+    else:
+        if kondo_payload.get("actual_compute_gating") is not False:
+            errors.append(
+                f"{prefix}: Kondo selection accounting must not claim actual compute gating"
+            )
+        expected_kondo = _kondo_selection_accounting(
+            trace,
+            config,
+            expected_benchmark,
+            expected_mode,
+        )
+        if not _mapping_close(kondo_payload, expected_kondo):
+            errors.append(
+                f"{prefix}: Kondo selection accounting does not reconstruct from the trace"
+            )
     return errors
 
 
@@ -1676,6 +1832,7 @@ def validate_delightful_policy_gradient_development_report(
         "development_only",
         "scientific_promotion_allowed",
         "kondo_implemented",
+        "kondo_selection_accounting",
         "claim_scope",
         "excluded_claims",
         "interpretation",
@@ -1686,7 +1843,7 @@ def validate_delightful_policy_gradient_development_report(
         "report_digest",
     }
     if set(report) != expected_top:
-        errors.append("top-level report fields do not match the v1 schema")
+        errors.append("top-level report fields do not match the v2 schema")
     if report.get("schema_version") != DELIGHTFUL_POLICY_GRADIENT_DEVELOPMENT_SCHEMA:
         errors.append("development report schema is unsupported")
     if report.get("development_only") is not True:
@@ -1694,7 +1851,12 @@ def validate_delightful_policy_gradient_development_report(
     if report.get("scientific_promotion_allowed") is not False:
         errors.append("report must forbid scientific promotion")
     if report.get("kondo_implemented") is not False:
-        errors.append("Kondo is outside this development harness")
+        errors.append(
+            "Kondo compute gating is outside this development harness; only "
+            "counterfactual selection accounting is reported"
+        )
+    if report.get("kondo_selection_accounting") is not True:
+        errors.append("Kondo selection accounting declaration was changed")
     if report.get("claim_scope") != _CLAIM_SCOPE:
         errors.append("claim scope is not the fixed Delightful Policy Gradient scope")
     if report.get("excluded_claims") != list(_EXCLUDED_CLAIMS):
@@ -1788,7 +1950,7 @@ def validate_delightful_policy_gradient_development_report(
         "scope",
         "sha256",
     }:
-        errors.append("report_digest fields do not match the v1 schema")
+        errors.append("report_digest fields do not match the v2 schema")
     else:
         without_digest = dict(report)
         without_digest.pop("report_digest", None)
@@ -1810,6 +1972,7 @@ __all__ = [
     "DEVELOPMENT_ONLY",
     "DELIGHTFUL_POLICY_GRADIENT_DEVELOPMENT_SCHEMA",
     "KONDO_IMPLEMENTED",
+    "KONDO_SELECTION_ACCOUNTING",
     "POLICY_GRADIENT_MODES",
     "SCIENTIFIC_PROMOTION_ALLOWED",
     "DelightfulPolicyGradientDevelopmentConfig",

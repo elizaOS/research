@@ -24,7 +24,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Final, Literal, cast
 
 FORAGER_MATCHED_CANDIDATE_UNIVERSE_SCHEMA_VERSION: Final = (
-    "alberta.forager_matched_candidate_universe.v1"
+    "alberta.forager_matched_candidate_universe.v2"
 )
 
 _MAX_JSON_BYTES: Final = 2 * 1024 * 1024
@@ -1024,13 +1024,16 @@ def _descriptor() -> dict[str, Any]:
             "screens_support_derived_rng_isolated_performance": False,
             "historical_sources_authorize_current_execution": False,
             "eventual_claim_requires_sealed_matched_evaluation": True,
+            "registered_panel_ranking_identified_by_design": False,
             "narrowest_permitted_eventual_scope": (
-                "best among the frozen registered matched candidate panel on the exact "
-                "preregistered task, runtime, seeds, horizon, and metric"
+                "contrast-specific interpretation of the preregistered Alberta-versus-selected-"
+                "external comparisons on the exact task, runtime, seeds, horizon, and metric"
             ),
             "forbidden_scope": [
                 "universal state of the art",
                 "exhaustive dominance over the research literature",
+                "best member of the registered panel",
+                "winner among the six held-out executed arms",
                 "superiority inferred from any open-development screen",
                 "performance attribution from shared-RNG source to an RNG-isolated derivative",
             ],

@@ -155,7 +155,7 @@ def _execution_envelope() -> dict[str, Any]:
         "network": "none",
         "oci_runtime_executable_sha256": "d" * 64,
         "probe_mount": "private_exact_readonly_snapshot_v1",
-        "qualification_mount": "minimal_exact_readable_snapshot_v1",
+        "qualification_mount": "minimal_exact_readable_snapshot_v2",
         "qualified_image_executed": True,
         "root_filesystem": "read_only",
         "source_mount": "pinned_archive_extracted_in_private_tmpfs_v1",
@@ -182,6 +182,8 @@ def _all_mapping_keys(value: Any) -> set[str]:
 
 
 def test_contract_is_fixed_to_public_seed_zero_and_ten_thousand_steps() -> None:
+    assert probe.SCHEMA_VERSION == "alberta.forager_causal_grid_divergence_probe.v2"
+    assert probe.DEFAULT_OUTPUT_ROOT.name == "causal_q_grid_divergence_seed0_v2"
     assert probe.FIXED_SEED == 0
     assert probe.FIXED_EXPLORATION_PROBABILITY == 0.05
     assert probe.FIXED_STEPS == 10_000
@@ -246,6 +248,180 @@ def test_frozen_source_configuration_runtime_and_task_bindings_are_exact() -> No
         comparison.pop("respawn_quantile_z")
         without_q.append(comparison)
     assert without_q[0] == without_q[1] == without_q[2]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda value: value.__setitem__("schema_version", "wrong.schema.v1"),
+        lambda value: value["sources"]["alberta"].__setitem__(
+            "root", "sources/alberta/elsewhere"
+        ),
+        lambda value: value["sources"]["alberta"].__setitem__(
+            "snapshot_descriptor_path", "sources/alberta/wrong.json"
+        ),
+        lambda value: value["sources"]["alberta"].__setitem__(
+            "patch_path", "sources/alberta/unexpected.patch"
+        ),
+        lambda value: value["sources"]["alberta"].__setitem__(
+            "unexpected", False
+        ),
+        lambda value: value.__setitem__("unexpected", False),
+    ),
+)
+def test_qualification_manifest_contract_rejects_schema_path_and_field_drift(
+    mutate: Any,
+) -> None:
+    manifest = json.loads(
+        (probe.DEFAULT_QUALIFICATION_ROOT / "manifest.json").read_bytes()
+    )
+    mutate(manifest)
+    with pytest.raises(probe.CausalGridDivergenceProbeError):
+        probe._qualification_manifest_bindings(manifest)  # noqa: SLF001
+
+
+def test_manifest_bound_source_root_rejects_siblings_symlinks_and_relative_paths(
+    tmp_path: Path,
+) -> None:
+    expected = probe.DEFAULT_QUALIFICATION_ROOT / "sources" / "alberta" / "source"
+    probe._require_manifest_source_root(  # noqa: SLF001
+        probe.DEFAULT_QUALIFICATION_ROOT,
+        expected,
+    )
+    sibling = tmp_path / "sibling"
+    sibling.mkdir()
+    symlink = tmp_path / "source-link"
+    symlink.symlink_to(expected, target_is_directory=True)
+    relative = Path(os.path.relpath(expected, Path.cwd()))
+    for changed in (sibling, symlink, relative):
+        with pytest.raises(
+            probe.CausalGridDivergenceProbeError,
+            match="source root|absolute canonical",
+        ):
+            probe._require_manifest_source_root(  # noqa: SLF001
+                probe.DEFAULT_QUALIFICATION_ROOT,
+                changed,
+            )
+
+    qualification_root = tmp_path / "qualification"
+    escaped_root = tmp_path / "escaped"
+    escaped_source = escaped_root / "alberta" / "source"
+    qualification_root.mkdir()
+    escaped_source.mkdir(parents=True)
+    (qualification_root / "sources").symlink_to(
+        escaped_root,
+        target_is_directory=True,
+    )
+    with pytest.raises(
+        probe.CausalGridDivergenceProbeError,
+        match="source root|canonical|qualification",
+    ):
+        probe._require_manifest_source_root(  # noqa: SLF001
+            qualification_root,
+            escaped_source,
+        )
+
+
+@pytest.mark.parametrize(
+    "relative_text",
+    probe._qualification_mount_relative_paths(),  # noqa: SLF001
+)
+def test_every_qualification_input_rejects_symlinked_path_components(
+    tmp_path: Path,
+    relative_text: str,
+) -> None:
+    qualification_root = tmp_path / "qualification"
+    outside_root = tmp_path / "outside"
+    qualification_root.mkdir()
+    relative = Path(relative_text)
+    target = outside_root.joinpath(*relative.parts)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"{}")
+    if len(relative.parts) == 1:
+        (qualification_root / relative.name).symlink_to(target)
+    else:
+        (qualification_root / relative.parts[0]).symlink_to(
+            outside_root / relative.parts[0],
+            target_is_directory=True,
+        )
+
+    with pytest.raises(
+        probe.CausalGridDivergenceProbeError,
+        match="canonical|qualification|symlink",
+    ):
+        probe._qualification_input_path(  # noqa: SLF001
+            qualification_root,
+            relative_text,
+            label="test qualification input",
+        )
+
+
+def test_bound_input_loader_rejects_a_bad_manifest_sidecar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_read = probe._read_stable_regular_file  # noqa: SLF001
+
+    def read(path: Path, *, label: str, maximum: int) -> bytes:
+        if label == "matched qualification manifest digest sidecar":
+            return b"0" * 64 + b"\n"
+        return real_read(path, label=label, maximum=maximum)
+
+    monkeypatch.setattr(probe, "_read_stable_regular_file", read)
+    with pytest.raises(
+        probe.CausalGridDivergenceProbeError,
+        match="manifest sidecar",
+    ):
+        probe._load_bound_inputs(  # noqa: SLF001
+            probe.DEFAULT_QUALIFICATION_ROOT,
+            probe.DEFAULT_QUALIFICATION_ROOT / "sources" / "alberta" / "source",
+        )
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "traversal_path",
+        "absolute_path",
+        "bad_digest",
+        "wrong_schema",
+        "extra_field",
+        "source_drift",
+        "entrypoint_drift",
+    ),
+)
+def test_capability_receipt_contract_rejects_path_schema_and_binding_drift(
+    case: str,
+) -> None:
+    root = probe.DEFAULT_QUALIFICATION_ROOT
+    manifest = json.loads((root / "manifest.json").read_bytes())
+    candidate_id, _quantile, configuration_sha256 = probe._CANDIDATE_CONFIGURATIONS[0]
+    candidate = copy.deepcopy(manifest["candidates"][candidate_id])
+    binding = copy.deepcopy(candidate["capability_receipt"])
+    payload = json.loads((root / binding["path"]).read_bytes())
+    source_binding = manifest["sources"]["alberta"]["binding"]
+    if case == "traversal_path":
+        binding["path"] = "receipts/../manifest.json"
+    elif case == "absolute_path":
+        binding["path"] = "/tmp/receipt.json"
+    elif case == "bad_digest":
+        binding["sha256"] = "not-a-digest"
+    elif case == "wrong_schema":
+        payload["schema_version"] = "wrong.schema.v1"
+    elif case == "extra_field":
+        payload["unexpected"] = False
+    elif case == "source_drift":
+        payload["source"]["archive_sha256"] = "f" * 64
+    else:
+        payload["entrypoint_path"] = "alberta_framework/wrong.py"
+    with pytest.raises(probe.CausalGridDivergenceProbeError):
+        probe._validate_capability_receipt(  # noqa: SLF001
+            candidate_id=candidate_id,
+            expected_configuration_sha256=configuration_sha256,
+            capability_binding=binding,
+            capability_payload=payload,
+            candidate_manifest=candidate,
+            source_binding=source_binding,
+        )
 
 
 def test_source_identity_rejects_byte_drift(tmp_path: Path) -> None:
@@ -314,6 +490,7 @@ def test_qualification_mount_mirror_is_minimal_exact_and_world_readable(
     )
 
     expected_paths = probe._qualification_mount_relative_paths()
+    assert "manifest.json.sha256" in expected_paths
     assert tuple(digests) == expected_paths
     observed_files = sorted(
         path.relative_to(destination_root).as_posix()
@@ -503,6 +680,7 @@ def test_divergence_payload_has_one_based_witnesses_and_passes() -> None:
     )
 
     assert passed is True
+    assert receipt["schema_version"] == probe.SCHEMA_VERSION
     assert receipt["status"] == "action_divergence_observed"
     assert receipt["divergence_summary"] == {
         "all_pairs_diverged": False,
@@ -513,6 +691,22 @@ def test_divergence_payload_has_one_based_witnesses_and_passes() -> None:
     }
     assert receipt["promotion_authorized"] is False
     assert receipt["protocol_relationship"]["retroactive_evidence_gate"] is False
+    assert receipt["execution_envelope"]["qualification_mount"] == (
+        "minimal_exact_readable_snapshot_v2"
+    )
+    assert receipt["frozen_inputs"]["qualification_manifest_path"] == "manifest.json"
+    assert receipt["frozen_inputs"]["qualification_manifest_sidecar_path"] == (
+        "manifest.json.sha256"
+    )
+    assert receipt["frozen_inputs"]["qualification_manifest_schema_version"] == (
+        probe.QUALIFICATION_MANIFEST_SCHEMA_VERSION
+    )
+    assert receipt["frozen_inputs"]["alberta_source_root_path"] == (
+        "sources/alberta/source"
+    )
+    assert receipt["frozen_inputs"]["capability_receipt_schema_version"] == (
+        probe.CAPABILITY_RECEIPT_SCHEMA_VERSION
+    )
     disclosed_actions = [
         action
         for pair in receipt["pairwise_action_divergence"]
@@ -616,6 +810,34 @@ def test_child_schema_rejects_channel_shape_and_impossible_delay_aggregates() ->
         probe._validate_child_payload(boolean_index)
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda value: value["candidates"][0].__setitem__(
+            "action_count",
+            float(probe.FIXED_STEPS),
+        ),
+        lambda value: value["candidates"][0]["per_channel_diagnostics"][0][
+            "estimated_delay"
+        ].__setitem__("sample_count", float(probe.FIXED_STEPS)),
+        lambda value: value["pairwise_action_divergence"][1][
+            "first_divergence_merkle_proof"
+        ].__setitem__(
+            "tree_leaf_count",
+            float(probe.ACTION_MERKLE_TREE_LEAF_COUNT),
+        ),
+    ),
+)
+def test_child_schema_rejects_float_aliases_for_exact_integer_fields(
+    mutate: Any,
+) -> None:
+    payload = _child_payload()
+    mutate(payload)
+
+    with pytest.raises(probe.CausalGridDivergenceProbeError, match="integer"):
+        probe._validate_child_payload(payload)
+
+
 def test_child_schema_rejects_protected_or_unknown_array_fields() -> None:
     payload = _child_payload()
     payload["candidates"][0]["actions"] = [0] * probe.FIXED_STEPS
@@ -627,7 +849,7 @@ def test_child_schema_rejects_protected_or_unknown_array_fields() -> None:
 def test_output_root_is_canonical_disjoint_and_write_once(tmp_path: Path) -> None:
     qualification_root = tmp_path / "qualification"
     source_root = qualification_root / "source"
-    output_root = tmp_path / "development" / "probe-v1"
+    output_root = tmp_path / "development" / "probe-v2"
     qualification_root.mkdir()
     source_root.mkdir()
     receipt = {"schema_version": probe.SCHEMA_VERSION, "status": "test"}
@@ -717,6 +939,17 @@ def test_oci_child_command_is_digest_pinned_read_only_and_has_no_scientific_knob
     assert "--read-only" in command
     assert "--cap-drop=ALL" in command
     assert "--pull=never" in command
+    for proxy_variable in (
+        "ALL_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    ):
+        assert f"--env={proxy_variable}=" in command
     assert f"sha256:{probe.QUALIFIED_IMAGE_SHA256}" in command
     assert not any("destination=/inputs/source" in argument for argument in command)
     assert "/run/alberta/source" in command
@@ -727,7 +960,148 @@ def test_oci_child_command_is_digest_pinned_read_only_and_has_no_scientific_knob
     assert observed["maximum_stderr_bytes"] == probe.MAXIMUM_STDERR_BYTES
 
 
-def test_oci_timeout_forcibly_cleans_up_the_exact_named_container(
+def test_named_container_cleanup_requires_bounded_exact_name_absence_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = tmp_path / "docker"
+    environment = {"PATH": "/usr/bin"}
+    container_name = "alberta-causal-q-probe-" + "a" * 24
+    commands: list[tuple[str, ...]] = []
+
+    def fake_run(command: tuple[str, ...], **kwargs: Any) -> Any:
+        commands.append(command)
+        if len(commands) == 1:
+            return subprocess.CompletedProcess(
+                command,
+                returncode=1,
+                stdout=b"",
+                stderr=b"Error: No such container",
+            )
+        assert kwargs["timeout_seconds"] == 120
+        assert (
+            kwargs["maximum_stdout_bytes"]
+            == probe.MAXIMUM_CLEANUP_INSPECTION_BYTES
+        )
+        assert (
+            kwargs["maximum_stderr_bytes"]
+            == probe.MAXIMUM_CLEANUP_INSPECTION_BYTES
+        )
+        return subprocess.CompletedProcess(command, returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(probe, "_run_bounded_command", fake_run)
+    assert probe._cleanup_named_container(runtime, container_name, environment)  # noqa: SLF001
+    assert commands == [
+        (runtime.as_posix(), "rm", "--force", container_name),
+        (
+            runtime.as_posix(),
+            "container",
+            "ls",
+            "--all",
+            "--quiet",
+            "--no-trunc",
+            f"--filter=name=^/{container_name}$",
+        ),
+    ]
+
+
+def test_named_container_cleanup_rejects_a_still_present_exact_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = tmp_path / "docker"
+    container_name = "alberta-causal-q-probe-" + "b" * 24
+    calls = 0
+
+    def fake_run(command: tuple[str, ...], **_kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return subprocess.CompletedProcess(command, 1, b"", b"missing")
+        return subprocess.CompletedProcess(command, 0, b"c" * 64 + b"\n", b"")
+
+    monkeypatch.setattr(probe, "_run_bounded_command", fake_run)
+    assert not probe._cleanup_named_container(  # noqa: SLF001
+        runtime,
+        container_name,
+        {"PATH": "/usr/bin"},
+    )
+    assert calls == 2
+
+
+def test_named_container_cleanup_accepts_one_successful_exact_removal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_name = "alberta-causal-q-probe-" + "c" * 24
+    commands: list[tuple[str, ...]] = []
+
+    def fake_run(command: tuple[str, ...], **_kwargs: Any) -> Any:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(probe, "_run_bounded_command", fake_run)
+    assert probe._cleanup_named_container(  # noqa: SLF001
+        tmp_path / "docker",
+        container_name,
+        {"PATH": "/usr/bin"},
+    )
+    assert len(commands) == 1
+
+
+def test_named_container_cleanup_fails_closed_if_absence_query_overflows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_name = "alberta-causal-q-probe-" + "d" * 24
+    calls = 0
+
+    def fake_run(command: tuple[str, ...], **_kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return subprocess.CompletedProcess(command, 1, b"", b"missing")
+        raise probe.CausalGridDivergenceProbeError("injected inspection overflow")
+
+    monkeypatch.setattr(probe, "_run_bounded_command", fake_run)
+    assert not probe._cleanup_named_container(  # noqa: SLF001
+        tmp_path / "docker",
+        container_name,
+        {"PATH": "/usr/bin"},
+    )
+    assert calls == 2
+
+
+@pytest.mark.parametrize(
+    "container_name",
+    (
+        "--force",
+        "alberta-causal-q-probe-" + "a" * 23,
+        "alberta-causal-q-probe-" + "g" * 24,
+    ),
+)
+def test_named_container_cleanup_rejects_non_internal_names_without_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    container_name: str,
+) -> None:
+    called = False
+
+    def run(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal called
+        called = True
+        raise AssertionError("invalid cleanup names must not reach the OCI runtime")
+
+    monkeypatch.setattr(probe, "_run_bounded_command", run)
+    assert not probe._cleanup_named_container(  # noqa: SLF001
+        tmp_path / "docker",
+        container_name,
+        {"PATH": "/usr/bin"},
+    )
+    assert called is False
+
+
+def test_oci_timeout_attempts_cleanup_for_the_exact_validated_container_name(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -754,7 +1128,7 @@ def test_oci_timeout_forcibly_cleans_up_the_exact_named_container(
         cleanup_calls.append((runtime_path, container_name))
         return True
 
-    monkeypatch.setattr(secrets, "token_hex", lambda _count: "abc123")
+    monkeypatch.setattr(secrets, "token_hex", lambda _count: "b" * 24)
     monkeypatch.setattr(probe, "_run_bounded_command", fake_run)
     monkeypatch.setattr(probe, "_cleanup_named_container", fake_cleanup)
 
@@ -768,9 +1142,60 @@ def test_oci_timeout_forcibly_cleans_up_the_exact_named_container(
             ).hexdigest(),
         )
 
-    container_name = "alberta-causal-q-probe-abc123"
+    container_name = "alberta-causal-q-probe-" + "b" * 24
     assert f"--name={container_name}" in commands[0]
     assert cleanup_calls == [(runtime.resolve(), container_name)]
+
+
+@pytest.mark.parametrize("failure_kind", ("oserror", "subprocess"))
+def test_oci_runner_failures_are_public_after_confirmed_named_container_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    qualification_root = tmp_path / "qualification"
+    runtime = tmp_path / "docker"
+    qualification_root.mkdir()
+    runtime.write_bytes(b"fake docker executable")
+    runtime.chmod(0o755)
+    probe_mount = _private_probe_mount(tmp_path)
+    cleanup_names: list[str] = []
+    failure: BaseException = (
+        OSError("injected private runner failure")
+        if failure_kind == "oserror"
+        else subprocess.SubprocessError("injected private runner failure")
+    )
+
+    def fail(*_args: Any, **_kwargs: Any) -> Any:
+        raise failure
+
+    def clean(
+        _runtime_path: Path,
+        container_name: str,
+        _environment: Any,
+    ) -> bool:
+        cleanup_names.append(container_name)
+        return True
+
+    monkeypatch.setattr(secrets, "token_hex", lambda _count: "a" * 24)
+    monkeypatch.setattr(probe, "_run_bounded_command", fail)
+    monkeypatch.setattr(probe, "_cleanup_named_container", clean)
+
+    with pytest.raises(
+        probe.CausalGridDivergenceProbeError,
+        match="runner failed; named-container cleanup completed",
+    ) as caught:
+        probe._run_child_with_qualification_mount(
+            qualification_root,
+            probe_mount,
+            oci_runtime=runtime,
+            expected_probe_source_sha256=hashlib.sha256(
+                Path(probe.__file__).read_bytes()
+            ).hexdigest(),
+        )
+
+    assert caught.value.__cause__ is failure
+    assert cleanup_names == ["alberta-causal-q-probe-" + "a" * 24]
 
 
 def test_completed_oci_failure_confirms_named_container_cleanup(
@@ -796,7 +1221,7 @@ def test_completed_oci_failure_confirms_named_container_cleanup(
         cleanup_names.append(container_name)
         return True
 
-    monkeypatch.setattr(secrets, "token_hex", lambda _count: "completed-failure")
+    monkeypatch.setattr(secrets, "token_hex", lambda _count: "c" * 24)
     monkeypatch.setattr(probe, "_run_bounded_command", fail)
     monkeypatch.setattr(probe, "_cleanup_named_container", clean)
 
@@ -809,7 +1234,7 @@ def test_completed_oci_failure_confirms_named_container_cleanup(
                 Path(probe.__file__).read_bytes()
             ).hexdigest(),
         )
-    assert cleanup_names == ["alberta-causal-q-probe-completed-failure"]
+    assert cleanup_names == ["alberta-causal-q-probe-" + "c" * 24]
 
 
 def test_probe_source_mutation_across_oci_execution_is_rejected(
@@ -876,7 +1301,7 @@ def test_oci_interrupts_always_attempt_named_container_cleanup(
         cleanup_names.append(container_name)
         return True
 
-    monkeypatch.setattr(secrets, "token_hex", lambda _count: "interrupt")
+    monkeypatch.setattr(secrets, "token_hex", lambda _count: "d" * 24)
     monkeypatch.setattr(probe, "_run_bounded_command", interrupt)
     monkeypatch.setattr(probe, "_cleanup_named_container", clean)
 
@@ -889,7 +1314,7 @@ def test_oci_interrupts_always_attempt_named_container_cleanup(
                 Path(probe.__file__).read_bytes()
             ).hexdigest(),
         )
-    assert cleanup_names == ["alberta-causal-q-probe-interrupt"]
+    assert cleanup_names == ["alberta-causal-q-probe-" + "d" * 24]
 
 
 def test_bounded_command_never_accumulates_beyond_the_stdout_limit() -> None:
@@ -961,6 +1386,144 @@ def test_bounded_command_cleans_process_and_pipes_when_selector_setup_fails(
     assert selector.closed is True
 
 
+@pytest.mark.parametrize(
+    ("failure_phase", "cleanup_error", "expected_message"),
+    (
+        (
+            "kill",
+            OSError("injected kill failure"),
+            "bounded child could not be terminated cleanly",
+        ),
+        (
+            "kill",
+            ProcessLookupError("injected exited-child race"),
+            "hard byte bound",
+        ),
+        (
+            "wait",
+            subprocess.TimeoutExpired(("unused",), 10),
+            "bounded child could not be reaped after termination",
+        ),
+        (
+            "wait",
+            OSError("injected wait failure"),
+            "bounded child could not be inspected after termination",
+        ),
+        (
+            "selector_close",
+            OSError("injected selector close failure"),
+            "bounded child resources could not be closed cleanly",
+        ),
+        (
+            "stdout_close",
+            OSError("injected stdout close failure"),
+            "bounded child resources could not be closed cleanly",
+        ),
+        (
+            "stderr_close",
+            OSError("injected stderr close failure"),
+            "bounded child resources could not be closed cleanly",
+        ),
+    ),
+    ids=(
+        "kill-error",
+        "kill-process-gone",
+        "reap-timeout",
+        "reap-error",
+        "selector-close-error",
+        "stdout-close-error",
+        "stderr-close-error",
+    ),
+)
+def test_bounded_command_normalizes_termination_and_reap_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_phase: str,
+    cleanup_error: BaseException,
+    expected_message: str,
+) -> None:
+    class CloseBuffer(io.BytesIO):
+        def __init__(self, failure_name: str) -> None:
+            super().__init__()
+            self.failure_name = failure_name
+
+        def close(self) -> None:
+            super().close()
+            if failure_phase == self.failure_name:
+                raise cleanup_error
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = CloseBuffer("stdout_close")
+            self.stderr = CloseBuffer("stderr_close")
+            self.kill_called = False
+            self.waited = False
+
+        def poll(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            self.kill_called = True
+            if failure_phase == "kill":
+                raise cleanup_error
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            self.waited = True
+            if failure_phase == "wait":
+                raise cleanup_error
+            return -9
+
+    class SelectorKey:
+        data = "stdout"
+        fd = 101
+
+    class OverflowSelector:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def register(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def get_map(self) -> dict[str, bool]:
+            return {"active": True}
+
+        def select(self, _timeout: float) -> list[tuple[SelectorKey, int]]:
+            return [(SelectorKey(), selectors.EVENT_READ)]
+
+        def close(self) -> None:
+            self.closed = True
+            if failure_phase == "selector_close":
+                raise cleanup_error
+
+    process = FakeProcess()
+    selector = OverflowSelector()
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(selectors, "DefaultSelector", lambda: selector)
+    monkeypatch.setattr(os, "read", lambda _descriptor, _size: b"xx")
+
+    with pytest.raises(
+        probe.CausalGridDivergenceProbeError,
+        match=expected_message,
+    ) as caught:
+        probe._run_bounded_command(  # noqa: SLF001
+            ("unused",),
+            environment={},
+            timeout_seconds=1,
+            maximum_stdout_bytes=1,
+            maximum_stderr_bytes=1,
+        )
+
+    assert process.kill_called is True
+    assert process.waited is True
+    if isinstance(cleanup_error, ProcessLookupError):
+        assert caught.value.__cause__ is None
+    else:
+        assert caught.value.__cause__ is cleanup_error
+    assert process.stdout.closed is True
+    assert process.stderr.closed is True
+    assert selector.closed is True
+
+
 def test_publication_after_rename_has_distinct_uncertain_exit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -983,6 +1546,98 @@ def test_publication_after_rename_has_distinct_uncertain_exit(
 
     monkeypatch.setattr(probe, "run_probe", uncertain)
     assert probe.main([]) == 3
+
+
+def test_published_descriptor_close_failure_is_uncertain_and_closes_the_rest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "published-close-failure"
+    real_match = probe._directory_entry_matches_descriptor  # noqa: SLF001
+    matched_descriptors: list[tuple[int, int]] = []
+
+    def track_match(parent: int, name: str, held: int) -> bool:
+        matched_descriptors.append((parent, held))
+        return real_match(parent, name, held)
+
+    monkeypatch.setattr(probe, "_directory_entry_matches_descriptor", track_match)
+    real_close = os.close
+    attempted_closes: list[int] = []
+    failure_index: int | None = None
+
+    def fail_published_close(descriptor: int) -> None:
+        nonlocal failure_index
+        attempted_closes.append(descriptor)
+        published_descriptor = (
+            matched_descriptors[1][1] if len(matched_descriptors) >= 2 else None
+        )
+        if descriptor == published_descriptor and failure_index is None:
+            real_close(descriptor)
+            failure_index = len(attempted_closes) - 1
+            raise OSError("injected published-descriptor close failure")
+        real_close(descriptor)
+
+    monkeypatch.setattr(os, "close", fail_published_close)
+
+    with pytest.raises(
+        probe.ReceiptPublishedButUncertainError,
+        match="do not reuse",
+    ):
+        probe._write_receipt(output_root, {"status": "test"})
+
+    assert output_root.is_dir()
+    assert failure_index is not None
+    parent_descriptor, staging_descriptor = matched_descriptors[0]
+    assert staging_descriptor in attempted_closes[failure_index + 1 :]
+    assert parent_descriptor in attempted_closes[failure_index + 1 :]
+
+
+def test_unpublished_descriptor_close_failure_is_public_and_closes_the_rest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "unpublished-close-failure"
+    checks = iter((True, False))
+    monkeypatch.setattr(
+        probe,
+        "_directory_descriptor_matches_path",
+        lambda _descriptor, _path: next(checks),
+    )
+    real_create = probe._create_staging_directory  # noqa: SLF001
+    held_descriptors: dict[str, int] = {}
+
+    def track_create(parent: int, *, output_name: str) -> tuple[str, int]:
+        staging_name, staging_descriptor = real_create(
+            parent,
+            output_name=output_name,
+        )
+        held_descriptors.update(parent=parent, staging=staging_descriptor)
+        return staging_name, staging_descriptor
+
+    monkeypatch.setattr(probe, "_create_staging_directory", track_create)
+    real_close = os.close
+    attempted_closes: list[int] = []
+    failed = False
+
+    def fail_staging_close(descriptor: int) -> None:
+        nonlocal failed
+        attempted_closes.append(descriptor)
+        if descriptor == held_descriptors.get("staging") and not failed:
+            real_close(descriptor)
+            failed = True
+            raise OSError("injected staging-descriptor close failure")
+        real_close(descriptor)
+
+    monkeypatch.setattr(os, "close", fail_staging_close)
+
+    with pytest.raises(probe.CausalGridDivergenceProbeError) as caught:
+        probe._write_receipt(output_root, {"status": "test"})
+
+    assert not isinstance(caught.value, probe.ReceiptPublishedButUncertainError)
+    assert not output_root.exists()
+    assert failed is True
+    staging_index = attempted_closes.index(held_descriptors["staging"])
+    assert held_descriptors["parent"] in attempted_closes[staging_index + 1 :]
 
 
 def test_parent_path_change_before_rename_leaves_no_published_or_staging_root(
@@ -1089,7 +1744,9 @@ def test_strict_receipt_loader_rejects_sidecar_canonical_and_schema_tampering(
         lambda value: value.__setitem__("seed", False),
         lambda value: value.__setitem__("promotion_authorized", 0),
         lambda value: value["action_boundary"]["scalar_domain"].__setitem__(0, False),
-        lambda value: value.__setitem__("divergent_pair_count", False),
+        lambda value: value["divergence_summary"].__setitem__(
+            "divergent_pair_count", False
+        ),
     ),
 )
 def test_strict_receipt_loader_rejects_boolean_integer_aliases(

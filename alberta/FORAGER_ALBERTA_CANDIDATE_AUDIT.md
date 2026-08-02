@@ -18,10 +18,14 @@ engineering-only and permanently nonpromoting. A valid rejection may motivate ab
 v1, but it cannot retroactively amend the frozen protocol or turn seed 0 into an evidence
 gate.
 
-Execution status (2026-08-01): unchanged since this audit. The open-tuning campaign root
+Execution status (2026-07-31): unchanged since this audit. The open-tuning campaign root
 `outputs/forager/matched_current_open_tuning_2c3b214c_v1` still has empty `runs/` and
 `completions/` directories — zero of its 210 tuning cells have executed — and the q-grid
-divergence probe has not been run (no probe output artifact exists in the repository).
+divergence probe has not been run (no probe output artifact exists in the repository). The
+hardened harness now reserves receipt schema
+`alberta.forager_causal_grid_divergence_probe.v2` and default output
+`outputs/forager/development/causal_q_grid_divergence_seed0_v2`; those version changes record
+provenance hardening, not an execution or result.
 
 ## Scope and boundaries
 
@@ -59,8 +63,14 @@ edited. The diagnostic harness is deliberately a repository-root tool, outside
 - Environment RNG-schedule SHA-256:
   `51d811e6fccd2b015b1703f22775f880089bbca3fc8938421ad3e18526882cb0`
 
-Every original configuration is byte-identical to its derived configuration, has no
-allowed transform, and round-trips through its frozen parser.
+These are the last pinned qualification bindings, not newly renewed q-probe-v2 identities.
+After a fresh matched-current qualification is published, its canonical artifact root and all
+qualification-derived hashes and root bindings must be reviewed and repinned together before
+the hardened diagnostic is run. The v2 harness does not infer authority from a manifest
+sidecar or silently adopt a new qualification.
+
+Each of the 14 Alberta configurations is byte-identical to its derived configuration,
+has no allowed transform, and round-trips through its frozen parser.
 
 | Candidate | Frozen configuration SHA-256 |
 |---|---|
@@ -120,17 +130,46 @@ bounded action scalars per divergent pair and never emits a reward array. Exit m
 - `2`: malformed identity/runtime/execution failure;
 - `3`: the final path was published but durability or replay verification is uncertain.
 
-The harness uses the qualified digest-pinned OCI image, bounded streaming stdout/stderr,
-named-container cleanup on timeout, interruption, runner exceptions, and completed child
-failure, private exact harness bytes,
-dirfd-anchored Linux `renameat2(RENAME_NOREPLACE)` publication, held-inode destination
-checks, and a strict two-file receipt loader. Linux `renameat2` is required; absence fails
-closed. Noncooperative same-uid writers remain outside the local filesystem threat model.
-Because the frozen qualification root is mode 0700 while the OCI process runs as uid 65532,
-the parent copies only the 13 exact hash-bound inputs into a temporary mode-0444/0755 mirror,
-mounts that mirror read-only, and removes it when the child returns. The live source tree is
-not mounted: the child reconstructs the pinned source archive in private tmpfs and verifies
-all 205 files before import. The parent revalidates the private frozen root after execution.
+Version 2 changes only provenance, isolation, cleanup, and receipt validation. Its seed, q
+panel, epsilon, horizon, coupled environment-key schedule, divergence gate, action disclosure
+boundary, and permanently open-development/nonpromoting scientific semantics are unchanged.
+It remains incapable of authorizing promotion, retroactively changing frozen v1, or turning
+seed 0 into an evidence gate.
+
+The harness now requires the canonical qualification manifest and its exact detached digest
+sidecar, validates the manifest/source/runtime schemas and authority boundary, binds the
+Alberta source root and snapshot descriptor to their exact safe manifest-relative paths, and
+cross-checks each q arm's exact capability-receipt path, schema, source, entrypoint, and
+configuration identity. The qualification root itself is portable: it may live at any supplied
+canonical absolute path, while its source root must resolve exactly to the manifest-declared
+`sources/alberta/source` tree below it. The v2 receipt carries the manifest and Alberta-source
+relative paths, schemas, archive size, and content digests; its candidate identities and the
+manifest digest transitively bind the exact configuration and capability-receipt paths. It is
+replayed with its detached sidecar from an exact two-file output directory.
+
+Every qualification input lookup rejects a symlinked final component, symlinked ancestor, or
+resolved escape from that canonical root. This includes the source, manifest and sidecar,
+inventory, archive, snapshot descriptor, original/derived configurations, and capability
+receipts.
+
+The parent copies exactly 14 hash-bound qualification inputs, including
+`manifest.json.sha256`, into a temporary mode-0444/0755 mirror, mounts only that mirror and a
+private exact harness snapshot read-only, and removes both after the child returns. The live
+source tree is never mounted. Instead, the child reconstructs the pinned source archive in
+private tmpfs and requires its complete extracted file inventory to equal the detailed pinned
+inventory before import; the parent revalidates the manifest-bound source tree after execution.
+The OCI command remains networkless, read-only, capability-dropped, and non-root, and now
+clears both upper- and lower-case proxy variables explicitly.
+
+Stdout/stderr are actively bounded. Timeout, interruption, runner failure, and completed
+nonzero-child paths force-remove only a validated collision-resistant internal container name;
+if removal reports failure, a separately bounded exact-name daemon query must prove that name
+absent with empty stdout and stderr. Failure or overflow of that proof fails closed. Publication
+still uses dirfd-anchored Linux `renameat2(RENAME_NOREPLACE)`, held-inode destination checks,
+and distinct published-uncertain handling. Runner, kill, bounded-reap, and resource-close
+failures are public-error normalized; all final receipt descriptors receive independent close
+attempts, and a close failure after rename is published-uncertain. Linux `renameat2` remains
+required, and noncooperative same-uid writers remain outside the local filesystem threat model.
 
 ## State, RNG, update, and resource audit
 
@@ -183,12 +222,14 @@ scoring. No host-side reward-array read or feedback path was found.
 
 ## Verification performed
 
-The live probe and all Forager benchmarks remained unexecuted. Focused non-Forager tests
-cover frozen identity, q-only configuration differences, shared reset/step keys, pre-step
-action capture, action commitments, OCI construction, hard stream limits, timeout and
-interrupt cleanup, source mutation rejection, output-path separation, atomic no-replace
-publication, published-uncertain handling, exact destination inode checks, and strict
-receipt/sidecar replay.
+The live probe and all Forager benchmarks remained unexecuted. Focused non-Forager tests cover
+the fixed q semantics, manifest and sidecar identity, exact manifest/source/snapshot/capability
+schemas and paths, canonical source-root binding, the 14-file mirror, shared reset/step keys,
+pre-step action capture, action commitments, proxy clearing, OCI construction, hard stream
+limits, bounded termination/reaping and resource-close errors, exact-name cleanup and absence
+proof, source mutation rejection, exact-integer alias rejection, output-path separation, atomic
+no-replace publication, published-uncertain handling, exact destination inode checks, and strict
+v2 receipt/sidecar replay.
 
 ```text
 .venv/bin/python -m py_compile forager_causal_grid_divergence_probe.py tests/test_forager_causal_grid_divergence_probe.py
@@ -196,8 +237,6 @@ receipt/sidecar replay.
 .venv/bin/python -m mypy --strict forager_causal_grid_divergence_probe.py tests/test_forager_causal_grid_divergence_probe.py
 .venv/bin/python -m pytest tests/test_forager_causal_grid_divergence_probe.py -q -o addopts=""
 ```
-
-Final focused result: `44 passed`; ruff, strict mypy, and targeted compilation passed.
 
 A read-only `.venv/bin/alberta-evidence-status` check exited `2` in the pre-existing dirty
 worktree, consistent with registered-source drift already present there. It was not

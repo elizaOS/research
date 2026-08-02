@@ -68,7 +68,7 @@ from alberta_framework.core import recurrent_trace_actor_critic
 from alberta_framework.core import types as core_types
 
 MATCHED_FINAL_ANALYSIS_MANIFEST_SCHEMA_VERSION: Final = (
-    "alberta.forager_matched_final_analysis_manifest.v2"
+    "alberta.forager_matched_final_analysis_manifest.v3"
 )
 MATCHED_FINAL_ANALYSIS_RUNTIME_SOURCE_SCHEMA_VERSION: Final = (
     "alberta.forager_matched_final_analysis_runtime_source.v2"
@@ -2628,7 +2628,10 @@ def _build_manifest(
             "self_authentication_forbidden": True,
         },
         "claim_boundary": {
-            "scope": "heldout_executed_six_candidate_set_only",
+            "scope": (
+                "three_preregistered_alberta_vs_selected_external_contrasts_"
+                "within_six_executed_arms"
+            ),
             "heldout_executed_candidate_ids": list(candidate_order),
             "tuning_selected_inferential_candidate_ids": list(selected_ids),
             "fixed_descriptive_candidate_ids": list(fixed_ids),
@@ -2636,7 +2639,8 @@ def _build_manifest(
             "contrast_count": 3,
             "six_arm_ranking_authorized": False,
             "full_registered_universe_best_claim_authorized": False,
-            "candidate_universe_eventual_best_wording_is_not_result_authority": True,
+            "candidate_universe_v2_contrast_specific_scope_enforced": True,
+            "registered_panel_ranking_identified_by_design": False,
             "tuning_selection_endpoint_interpretation": (
                 "frozen_ranking_statistic_not_population_confidence_bound"
             ),

@@ -382,7 +382,9 @@ An opt-in Prototype lane now augments a fixed-width builder base with a bounded
 pair-product bank and trains it from one owner-bound behavior TD target: base-Q
 while idle or the executing option's intra-option target. The augmented
 gradient is pulled back to builder coordinates against the exact pre-route
-semantic generation. A descriptor change routes atomically through every
+generation and full descriptor bank. The same identity is persisted beside
+the enabled OaK subtree, rejecting stale or same-generation forked consumers.
+A descriptor change routes atomically through every
 linear OaK feature axis at a safe idle/cached-base boundary; otherwise the
 proposal is rolled back and curation is deferred rather than queued. Static
 allocation ceilings, exact resource declarations, and versioned checkpoints

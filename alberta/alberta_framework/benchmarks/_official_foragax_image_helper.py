@@ -1,9 +1,20 @@
 #!/usr/bin/python3.12
 """Standard-library image construction helper for the official Foragax OCI.
 
-The host tooling copies these exact bytes into BuildKit bind mounts.  The
-helper is never copied into the final image.  Its outputs use canonical JSON
-and a reconstructible tree hashing scheme shared with the runtime verifier.
+Runs inside the network-disabled BuildKit stages of the
+:mod:`official_foragax_oci` image build, bind-mounted read-only as
+``/input/image-helper.py``.  It executes under ``python3.12 -I -B`` before
+the scientific environment exists, so only the standard library may be
+imported.  The helper is never copied into the final image, but its exact
+bytes are hashed into the build spec (``image_helper_sha256``), so any edit
+here changes the identity of future image builds.
+
+Subcommands mirror the build stages: ``extract-source`` / ``extract-cache``
+unpack the validated inputs, ``verify-debian`` checks installed apt state
+against the audited Debian bundle, and ``finalize`` hardens the sealed
+layout and writes the attestation set under ``/opt/alberta-attestations``.
+All outputs use canonical JSON and a reconstructible tree hashing scheme
+shared with the runtime verifier.
 """
 
 from __future__ import annotations
@@ -332,6 +343,18 @@ def _debian_installed_paths(packages: list[dict[str, Any]]) -> list[Path]:
 
 
 def debian_inventory(manifest_path: Path) -> dict[str, Any]:
+    """Inventory every file dpkg attributes to the audited Debian bundle.
+
+    Two dpkg checks feed the inventory.  ``dpkg-query -W`` must report each
+    manifest package as exactly ``install ok installed`` at the pinned
+    version/architecture -- any other status (wrong version, half-configured,
+    absent) fails the build.  ``dpkg-query -L`` then enumerates the paths
+    those packages own; every path present on disk becomes a canonical
+    directory/file/symlink entry (files carry sha256 and size) and special
+    files fail closed.  Paths dpkg lists that are absent on disk are skipped:
+    the inventory records on-disk state only.  Entries are hashed into
+    ``tree_sha256`` under the scheme shared with the runtime verifier.
+    """
     manifest = _strict_json(manifest_path)
     if manifest.get("schema_version") != DEBIAN_SCHEMA:
         raise ImageHelperError("Debian bundle schema is unsupported")
@@ -406,6 +429,15 @@ def debian_inventory(manifest_path: Path) -> dict[str, Any]:
 
 
 def verify_debian(manifest_path: Path, *, allow_unbound: bool = False) -> dict[str, Any]:
+    """Check installed apt state against the audited Debian bundle manifest.
+
+    Fails when the recomputed installed-file inventory hash differs from the
+    manifest's ``installed_file_inventory_sha256``, or when the interpreter
+    at ``python_executable`` does not hash to ``python_executable_sha256``.
+    ``allow_unbound`` skips only the inventory-hash comparison; it exists for
+    authoring a new manifest (the inventory JSON is printed so its hash can
+    be captured) and is never passed by the in-image build step.
+    """
     manifest = _strict_json(manifest_path)
     inventory = debian_inventory(manifest_path)
     expected_inventory = manifest.get("installed_file_inventory_sha256")
@@ -430,6 +462,24 @@ def verify_debian(manifest_path: Path, *, allow_unbound: bool = False) -> dict[s
 
 
 def _runtime_probe(python: Path) -> dict[str, Any]:
+    """Interrogate the built runtime venv from an isolated interpreter.
+
+    The probe runs under ``-I -B`` with a pinned minimal environment and
+    gates the image on four hermeticity checks:
+
+    - no installed distribution's ``direct_url.json`` references a build
+      path, so build-host locations cannot leak into runtime metadata;
+    - the upstream ``continual-foragax-agents`` project itself is not
+      installed -- it must execute from the read-only source mount, never
+      from site-packages;
+    - the only ``.pth`` file is the canonical ``_virtualenv.pth``, ruling
+      out startup-time import injection;
+    - the bundled imageio-ffmpeg binary is a regular, non-hardlinked file.
+
+    Returns the SPDX-shaped package list (with per-distribution RECORD
+    hashes), the ffmpeg identity, and the interpreter identity consumed by
+    :func:`finalize_image`.
+    """
     script = r"""
 import hashlib, importlib.metadata, json, os, re, stat, sys
 from pathlib import Path
@@ -530,6 +580,22 @@ def finalize_image(
     build_attestation: Path,
     attestation_root: Path,
 ) -> None:
+    """Harden the sealed layout and write the image's attestation set.
+
+    Rejects any deviation from the sealed roots, leftover Git metadata, and
+    cache outputs (``__pycache__``/``.pyc``/``.cache``), then makes the
+    source and runtime trees read-only and probes the hardened runtime
+    (:func:`_runtime_probe`).  Emits four read-only artifacts under
+    ``/opt/alberta-attestations``:
+
+    - ``sbom.spdx.json`` -- SPDX 2.3 document over the probed packages, with
+      a fixed epoch timestamp and a namespace derived from the dependency
+      lock hash so identical builds produce identical bytes;
+    - ``native-inventory.json`` -- canonical tree inventory of the runtime
+      root, with ``tree_sha256`` under the shared hashing scheme;
+    - ``runtime-metadata.json`` -- interpreter and bundled-ffmpeg identities;
+    - ``build-attestation.json`` -- byte copy of the host build attestation.
+    """
     if source_root != SOURCE_ROOT or runtime_root != RUNTIME_ROOT:
         raise ImageHelperError("final image roots differ from the sealed layout")
     if attestation_root != ATTESTATION_ROOT:

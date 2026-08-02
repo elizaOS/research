@@ -123,6 +123,7 @@ from alberta_framework.core.partner_policy_fusion import (
     PartnerPolicyFusionState,
 )
 from alberta_framework.core.prototype_feature_lifecycle import (
+    PrototypeFeatureConsumerBinding,
     PrototypeFeatureLifecycle,
     PrototypeFeatureLifecycleConfig,
     PrototypeFeatureLifecycleDiagnostics,
@@ -459,8 +460,9 @@ class PrototypeAgentConfig:
             stored action mass must match the primitive action count, and the
             outcome stores the bootstrap representation plus scalar reward.
         state_builder: Canonical causal representation builder. Its output
-            width must equal ``oak.observation_dim``. Mutually exclusive with
-            the deprecated fixed-weight ``gru_perception`` path.
+            width must equal the feature lifecycle's base width when that lane
+            is enabled, and ``oak.observation_dim`` otherwise. Mutually
+            exclusive with the deprecated fixed-weight ``gru_perception`` path.
         learn_state_builder_from_world_model: Apply the configured ensemble
             lane's causal, real pre-update representation gradient to an
             online-gated builder. Model replay gradients are never routed here.
@@ -862,10 +864,10 @@ class PrototypeAgentConfig:
             PrototypeFeatureLifecycle(
                 feature_lifecycle
             ).require_compatible_oak_config(self.oak)
-            if not isinstance(
-                self.state_builder,
-                (IdentityStateBuilderConfig, OnlineGatedStateBuilderConfig),
-            ):
+            if type(self.state_builder) not in {
+                IdentityStateBuilderConfig,
+                OnlineGatedStateBuilderConfig,
+            }:
                 raise ValueError(
                     "prototype_feature_lifecycle requires an Identity or "
                     "OnlineGated state_builder"
@@ -1227,6 +1229,14 @@ class PrototypeFeatureRepresentationState:
 
 
 @chex.dataclass(frozen=True)
+class PrototypeFeatureOaKState:
+    """Enabled-only OaK subtree coupled to its exact feature-bank identity."""
+
+    oak_state: OaKState
+    consumer_binding: PrototypeFeatureConsumerBinding
+
+
+@chex.dataclass(frozen=True)
 class PrototypeAgentState:
     """Full prototype agent state.
 
@@ -1237,7 +1247,7 @@ class PrototypeAgentState:
     ``None`` and a real state after initialisation.
     """
 
-    oak_state: OaKState
+    oak_state: Any  # OaKState | PrototypeFeatureOaKState
     world_model_state: Any  # ActionConditionedWorldModelState | None
     buffer_state: Any  # RecentObservationBufferState | None
     horde_state: Any  # MultiHeadMLPState | None
@@ -2388,6 +2398,59 @@ class PrototypeAgent:
             feature_lifecycle_state=feature_lifecycle_state,
         )
 
+    def _oak_component_state(self, slot: Any) -> OaKState:
+        """Unwrap OaK only on the feature lane; preserve legacy PyTrees."""
+
+        if self._prototype_feature_lifecycle is None:
+            return cast(OaKState, slot)
+        if type(slot) is not PrototypeFeatureOaKState:
+            raise TypeError(
+                "oak_state must be a PrototypeFeatureOaKState when "
+                "prototype_feature_lifecycle is configured"
+            )
+        if type(slot.oak_state) is not OaKState:
+            raise TypeError("bound feature consumer must contain an exact OaKState")
+        return slot.oak_state
+
+    def _feature_consumer_binding(
+        self,
+        slot: Any,
+    ) -> PrototypeFeatureConsumerBinding:
+        """Return the identity physically coupled to the enabled OaK subtree."""
+
+        if self._prototype_feature_lifecycle is None:
+            raise RuntimeError("prototype feature lifecycle is disabled")
+        if type(slot) is not PrototypeFeatureOaKState:
+            raise TypeError(
+                "oak_state must be a PrototypeFeatureOaKState when "
+                "prototype_feature_lifecycle is configured"
+            )
+        if type(slot.consumer_binding) is not PrototypeFeatureConsumerBinding:
+            raise TypeError(
+                "bound feature consumer must contain an exact consumer binding"
+            )
+        return slot.consumer_binding
+
+    def _oak_state_slot(
+        self,
+        oak_state: OaKState,
+        consumer_binding: PrototypeFeatureConsumerBinding | None,
+    ) -> Any:
+        """Compose the enabled-only bound OaK subtree."""
+
+        if self._prototype_feature_lifecycle is None:
+            return oak_state
+        if type(oak_state) is not OaKState:
+            raise TypeError("feature consumer must be an exact OaKState")
+        if type(consumer_binding) is not PrototypeFeatureConsumerBinding:
+            raise TypeError(
+                "configured prototype feature lifecycle requires a consumer binding"
+            )
+        return PrototypeFeatureOaKState(
+            oak_state=oak_state,
+            consumer_binding=consumer_binding,
+        )
+
     @property
     def partner_policy_fusion(self) -> PartnerPolicyFusion | None:
         """Return the opt-in bounded partner-message policy fusion mechanism."""
@@ -3436,7 +3499,7 @@ class PrototypeAgent:
         """
         observation_dim = self._config.oak.observation_dim
         stomp_config = self._config.oak.stomp
-        stomp_state = state.oak_state.stomp_state
+        stomp_state = self._oak_component_state(state.oak_state).stomp_state
         current = jnp.asarray(state.current_representation, dtype=jnp.float32)
         bootstrap = jnp.asarray(bootstrap_observation, dtype=jnp.float32)
         transition_reward = jnp.asarray(reward, dtype=jnp.float32)
@@ -3854,6 +3917,7 @@ class PrototypeAgent:
             feature_state = self._feature_lifecycle_component_state(
                 state.state_builder_state
             )
+            consumer_binding = self._feature_consumer_binding(state.oak_state)
             maximum_observations = jnp.asarray(
                 self._config.prototype_feature_lifecycle.max_observations,
                 dtype=jnp.int32,
@@ -3864,6 +3928,10 @@ class PrototypeAgent:
             )
             feature_lifecycle_valid = (
                 self._prototype_feature_lifecycle.state_valid(feature_state)
+                & self._prototype_feature_lifecycle.consumer_binding_valid(
+                    feature_state,
+                    consumer_binding,
+                )
                 & (feature_state.observe_count == expected_observations)
             )
         if (
@@ -3948,6 +4016,7 @@ class PrototypeAgent:
         state: PrototypeAgentState,
     ) -> Array:
         """Check that causal representation caches agree with their owners."""
+        oak_state = self._oak_component_state(state.oak_state)
         representation_consistent = jnp.array(True)
         builder_count_consistent = jnp.array(True)
         if self._state_builder is not None:
@@ -3993,13 +4062,13 @@ class PrototypeAgent:
             jnp.all(jnp.isfinite(state.current_raw_observation))
             & jnp.all(jnp.isfinite(state.current_representation))
             & (state.observation_event_count >= 1)
-            & (state.oak_state.step_count == state.step_count)
-            & (state.oak_state.stomp_state.step_count == state.step_count)
+            & (oak_state.step_count == state.step_count)
+            & (oak_state.stomp_state.step_count == state.step_count)
             & representation_consistent
             & builder_count_consistent
             & jnp.array_equal(
                 state.current_representation,
-                state.oak_state.stomp_state.base_last_obs,
+                oak_state.stomp_state.base_last_obs,
             )
         )
 
@@ -4011,7 +4080,7 @@ class PrototypeAgent:
         action_in_range = (state.current_action >= 0) & (
             state.current_action < self._config.oak.n_primitive_actions
         )
-        stomp_state = state.oak_state.stomp_state
+        stomp_state = self._oak_component_state(state.oak_state).stomp_state
         executing_option_valid = (
             (stomp_state.executing_option >= -1)
             & (stomp_state.executing_option < self._config.oak.n_options)
@@ -4106,6 +4175,7 @@ class PrototypeAgent:
         state: PrototypeAgentState,
     ) -> Array:
         """Return whether ``state`` has the structure of an untouched init."""
+        oak_state = self._oak_component_state(state.oak_state)
         recurrent_fresh = jnp.array(True)
         if self._state_builder is not None:
             recurrent_fresh = (
@@ -4147,9 +4217,9 @@ class PrototypeAgent:
             & jnp.all(state.current_decision_id[2:] == 0)
             & jnp.all(state.current_raw_observation == 0.0)
             & jnp.all(state.current_representation == 0.0)
-            & (state.oak_state.step_count == 0)
-            & (state.oak_state.stomp_state.step_count == 0)
-            & jnp.all(state.oak_state.stomp_state.base_last_obs == 0.0)
+            & (oak_state.step_count == 0)
+            & (oak_state.stomp_state.step_count == 0)
+            & jnp.all(oak_state.stomp_state.base_last_obs == 0.0)
             & recurrent_fresh
             & recurrent_world_fresh
             & partner_fusion_fresh
@@ -4267,21 +4337,26 @@ class PrototypeAgent:
         if self._state_builder is not None:
             builder_state = self._state_builder.init(builder_key)
         feature_lifecycle_state: PrototypeFeatureLifecycleState | None = None
+        feature_consumer_binding: PrototypeFeatureConsumerBinding | None = None
         if self._prototype_feature_lifecycle is not None:
             feature_key = jr.fold_in(
                 builder_key,
                 _PROTOTYPE_FEATURE_LIFECYCLE_KEY_TAG,
             )
-            feature_lifecycle_state = self._prototype_feature_lifecycle.init(
-                feature_key
-            )
+            (
+                feature_lifecycle_state,
+                feature_consumer_binding,
+            ) = self._prototype_feature_lifecycle.init_bound(feature_key)
         representation_state = self._representation_state_slot(
             builder_state,
             feature_lifecycle_state,
         )
 
         initial_state = PrototypeAgentState(
-            oak_state=oak_state,
+            oak_state=self._oak_state_slot(
+                oak_state,
+                feature_consumer_binding,
+            ),
             world_model_state=wm_state,
             buffer_state=buf_state,
             horde_state=horde_state,
@@ -4373,7 +4448,15 @@ class PrototypeAgent:
                     fresh_state.gru_state,
                     safe_raw_obs,
                 )
-            new_oak = self._oak.start(fresh_state.oak_state, obs_for_oak)
+            feature_consumer_binding = (
+                self._feature_consumer_binding(fresh_state.oak_state)
+                if self._prototype_feature_lifecycle is not None
+                else None
+            )
+            new_oak = self._oak.start(
+                self._oak_component_state(fresh_state.oak_state),
+                obs_for_oak,
+            )
             previous_ia = self._ia_component_state(fresh_state.ia_state)
             new_ia = previous_ia
             if self._ia is not None and previous_ia is not None:
@@ -4413,7 +4496,10 @@ class PrototypeAgent:
             candidate = cast(
                 PrototypeAgentState,
                 fresh_state.replace(
-                    oak_state=new_oak,
+                    oak_state=self._oak_state_slot(
+                        new_oak,
+                        feature_consumer_binding,
+                    ),
                     world_model_state=new_world_model_state,
                     ia_state=new_interaction_state,
                     gru_state=new_gru_state,
@@ -4547,7 +4633,10 @@ class PrototypeAgent:
         elif state.gru_state is not None:
             obs = jnp.concatenate([raw_obs, state.gru_state.hidden], axis=0)
         n_prim = self._config.oak.n_primitive_actions
-        all_q = self._oak.base_q_values(state.oak_state, obs)
+        all_q = self._oak.base_q_values(
+            self._oak_component_state(state.oak_state),
+            obs,
+        )
         return jnp.argmax(all_q[:n_prim]).astype(jnp.int32)
 
     def _oak_counterfactual_dispatch_score(
@@ -5129,8 +5218,14 @@ class PrototypeAgent:
                 )
             )
         )
-        legacy_representation = state.oak_state.stomp_state.base_last_obs
-        legacy_stomp_state = state.oak_state.stomp_state
+        current_oak_state = self._oak_component_state(state.oak_state)
+        feature_consumer_binding = (
+            self._feature_consumer_binding(state.oak_state)
+            if self._prototype_feature_lifecycle is not None
+            else None
+        )
+        legacy_representation = current_oak_state.stomp_state.base_last_obs
+        legacy_stomp_state = current_oak_state.stomp_state
         # The historical wrapper predates the explicit intra-option decision
         # owner cache. Reconstruct that one missing owner from the primitive
         # command STOMP actually dispatched; the authoritative transition API
@@ -5142,18 +5237,21 @@ class PrototypeAgent:
                 legacy_stomp_state.option_last_intra_action,
             )
         )
-        legacy_oak_state = state.oak_state.replace(
+        legacy_oak_state = current_oak_state.replace(
             stomp_state=legacy_stomp_state,
         )
         legacy_state = cast(
             PrototypeAgentState,
             state.replace(
-                oak_state=legacy_oak_state,
+                oak_state=self._oak_state_slot(
+                    legacy_oak_state,
+                    feature_consumer_binding,
+                ),
                 current_raw_observation=legacy_representation[
                     : self._raw_observation_dim()
                 ],
                 current_representation=legacy_representation,
-                current_action=state.oak_state.stomp_state.last_primitive_action,
+                current_action=current_oak_state.stomp_state.last_primitive_action,
             ),
         )
         transition, diagnostics = self._normalize_transition(
@@ -5555,7 +5653,7 @@ class PrototypeAgent:
                 memory_diagnostics,
             ) = self._apply_experiential_memory(
                 current_memory_state,
-                state.oak_state,
+                self._oak_component_state(state.oak_state),
                 state.current_representation,
                 state.current_representation,
                 state.current_representation,
@@ -5587,7 +5685,7 @@ class PrototypeAgent:
             ) = self._apply_partner_policy_fusion(
                 state.ia_state,
                 self._ia_component_state(state.ia_state),
-                state.oak_state,
+                self._oak_component_state(state.oak_state),
                 state.current_representation,
                 derived_decision_id=_saturating_int32_increment(
                     state.step_count
@@ -5966,6 +6064,13 @@ class PrototypeAgent:
             else None
         )
         new_feature_state = old_feature_state
+        current_oak_state = self._oak_component_state(state.oak_state)
+        old_feature_consumer_binding = (
+            self._feature_consumer_binding(state.oak_state)
+            if self._prototype_feature_lifecycle is not None
+            else None
+        )
+        new_feature_consumer_binding = old_feature_consumer_binding
         bootstrap_base_obs = bootstrap_raw_obs
         decision_base_obs = decision_raw_obs
         if self._state_builder is not None:
@@ -6338,6 +6443,7 @@ class PrototypeAgent:
                     last_base_obs,
                     builder_representation_gradient,
                     old_feature_state.router_state.generation_count,
+                    old_feature_state.router_state.descriptors,
                 )
             )
             pullback_valid = (
@@ -6379,7 +6485,7 @@ class PrototypeAgent:
 
         # -- Steps 5/6/10/11: OaK update (real transition) -------------------
         oak_result = self._oak.update(
-            state.oak_state,
+            current_oak_state,
             rew,
             bootstrap_obs,
             control_discount,
@@ -6438,6 +6544,7 @@ class PrototypeAgent:
                 self._prototype_feature_lifecycle.observe_and_route(
                     old_feature_state,
                     new_oak_state,
+                    old_feature_consumer_binding,
                     PrototypeFeatureLifecycleEvent(
                         observation=last_base_obs,
                         targets=feature_targets,
@@ -6451,6 +6558,7 @@ class PrototypeAgent:
             )
             new_feature_state = feature_result.state
             new_oak_state = feature_result.oak_state
+            new_feature_consumer_binding = feature_result.consumer_binding
             decision_obs = feature_result.next_augmented_observation
             prediction = feature_result.predictions[0]
             error = feature_result.errors[0]
@@ -6686,7 +6794,10 @@ class PrototypeAgent:
                 ),
             )
         new_state = PrototypeAgentState(
-            oak_state=new_oak_state,
+            oak_state=self._oak_state_slot(
+                new_oak_state,
+                new_feature_consumer_binding,
+            ),
             world_model_state=new_wm_state,
             buffer_state=new_buf_state,
             horde_state=new_horde_state,
@@ -7333,10 +7444,13 @@ class PrototypeAgent:
                 "PrototypeAgent.curate is unavailable when "
                 "prototype_feature_lifecycle owns the fixed feature bank"
             )
+        current_oak_state = self._oak_component_state(state.oak_state)
         new_oak, new_oak_state = self._oak.curate(
-            state.oak_state, key, available_feature_indices
+            current_oak_state,
+            key,
+            available_feature_indices,
         )
-        if new_oak is self._oak and new_oak_state is state.oak_state:
+        if new_oak is self._oak and new_oak_state is current_oak_state:
             return self, state
         new_config = PrototypeAgentConfig(
             oak=new_oak.config,
@@ -7432,7 +7546,7 @@ class PrototypeAgent:
         """
         template = self._config.oak.stomp.subtask_specs[0]
         return feature_to_subtask_specs(
-            state.oak_state,
+            self._oak_component_state(state.oak_state),
             n_subtasks=n_subtasks,
             threshold=template.threshold,
             pseudo_reward_scale=template.pseudo_reward_scale,
@@ -7654,6 +7768,9 @@ __all__ = [
     "PrototypeExperientialMemoryDiagnostics",
     "PrototypeExperientialMemoryInput",
     "PrototypeExperientialMemoryResourceDeclaration",
+    "PrototypeFeatureLifecycleIntegrationDiagnostics",
+    "PrototypeFeatureOaKState",
+    "PrototypeFeatureRepresentationState",
     "PrototypeGradientJoyEvidence",
     "PrototypeInteractionState",
     "PrototypeMemoryInteractionState",

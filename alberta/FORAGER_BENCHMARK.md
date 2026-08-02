@@ -398,18 +398,25 @@ order, are:
 
 Execution status in this tree:
 
-- Qualification **completed**:
+- Current source uses candidate-universe schema v2 (SHA-256 `6a9315cb…`) and
+  has no renewed qualification or open-campaign artifact. It requires a fresh
+  qualification and a new output namespace before execution; the `2c3b214c`
+  roots below are immutable historical v1 artifacts and are source-incompatible
+  with the current builder.
+- Historical v1 qualification **completed**:
   `outputs/forager/matched_current_qualification_2c3b214c_v1` (candidate
   universe SHA-256 `2c3b214c…`, status
   `structurally_qualified_external_trust_resolution_required`,
   classification `content_only_unendorsed_nonpromoting`).
-- Open tuning is **prepared but unexecuted**:
+- Historical v1 open tuning is **prepared but unexecuted**:
   `outputs/forager/matched_current_open_tuning_2c3b214c_v1` holds the frozen
   manifests, but its `runs/` and `completions/` directories are empty — zero
   of the 210 cells have run.
 - The sealed stages are **implemented and tested but never executed**: no
   seal bundle, sealed-evaluation artifact, or final-analysis bundle exists
-  under `outputs/`, and the sealed campaign module has no console script.
+  under `outputs/`. The sealed campaign is exposed as
+  `alberta-forager-matched-sealed-evaluation`; seal and final analysis remain
+  module-only.
 
 Every in-tree authority is `content_only_unendorsed_v1`. The external trust
 resolver that authority-bearing paths require does not exist in this

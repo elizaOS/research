@@ -692,7 +692,7 @@ def test_result_is_canonical_hash_bound_and_contains_no_host_metadata() -> None:
     assert claimed == hashlib.sha256(independently_encoded).hexdigest()
     assert claimed == result.payload_sha256
     assert load_canonical_result(raw, result.contract) == result
-    assert payload["schema"] == "alberta.forager_matched_statistics.result.v3"
+    assert payload["schema"] == "alberta.forager_matched_statistics.result.v4"
     assert payload["contract"]["schema"] == ("alberta.forager_matched_statistics.contract.v3")
     text = raw.decode("utf-8").lower()
     assert "/home/" not in text
@@ -701,6 +701,18 @@ def test_result_is_canonical_hash_bound_and_contains_no_host_metadata() -> None:
     assert "scores_hex" not in text
     assert "paired_differences_hex" not in text
     assert '"raw_scores_or_differences_embedded":false' in text
+    assert payload["interpretation"] == {
+        "global_ranking_or_sota_claim_authorized": False,
+        "primary_bootstrap_endpoint_interpretation": (
+            "frozen_resampling_summary_not_population_confidence_interval"
+        ),
+        "primary_population_model_established": False,
+        "primary_superiority_passed_field_role": "mechanical_frozen_gate_only",
+        "secondary_analysis_role": "nonconfirmatory_sensitivity_only",
+        "secondary_holm_reject_field_role": "mechanical_threshold_flag_only",
+        "secondary_sign_exchangeability_established": False,
+        "standalone_performance_claim_authorized": False,
+    }
 
     pending: list[object] = [payload]
     serialized_keys: set[str] = set()

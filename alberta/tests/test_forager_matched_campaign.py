@@ -458,9 +458,9 @@ def test_open_campaign_v2_golden_byte_contract(tmp_path: Path) -> None:
         ),
     }
     assert {name: digest(raw) for name, raw in immutable_bytes.items()} == {
-        "open-protocol.json": "c42a7420e7b0bac83677274c6c5a0069a1fa584a1972f199127e70cefedf6049",
+        "open-protocol.json": "448f2eab78f6ffbb390a9bbe053a5ff379a3e91b77961d6e7acd96609cb668ca",
         "candidate-universe.json": (
-            "2c3b214cf29e013e3f8d88b2558bd94f75e92330bf0ddcc6afd7514279a1ee77"
+            "6a9315cb996fe5698e4c1580d30da9b0524e9875ce085d1399bb975cc5b510a8"
         ),
         "execution-plan.json": (
             "3fe36c652f07cf9dbda075ad23bac10a1ff468953c574ed87376dabe94b384ca"
@@ -475,17 +475,17 @@ def test_open_campaign_v2_golden_byte_contract(tmp_path: Path) -> None:
             "0ac448b2686c7f7da8cc3f2a489bc764f76e215193de67cd62308ac21d83d24a"
         ),
         "execution-schedule.json": (
-            "9f97835adcd4a7ff76e521a91e36373b7d37e35a7f8c8e00ea4e1d392d760094"
+            "06cbe35d345bc3e4fdc79d7628a181a0ac126f929e0c0b70c2b25d9ef250d7d5"
         ),
         "live-runtime.json": (
             "e21cfe5bcc592f83dc696826540d17b9aec5ad850acb4f59ca20d5a24b701e54"
         ),
         "campaign.json": (
-            "e374d229564477e96ab7c02e7328dfdaee7c6d3b7ed19176850fde511e2956ac"
+            "f19e230e7f8007624ad8a5920037cc25405604367ce807385ebdd79878767263"
         ),
     }
     assert frozen_schedule["schedule_sha256"] == (
-        "b6414d342b2a3b0fce13776797b9d5f41453aa267fed5851ea55be7a80bb532e"
+        "0c5aa63a5a8e7c1482bf26f165b3c5277075360c9ff96c58bc82bd93463992f4"
     )
 
     candidate_id = context.rebuilt.candidate_ids[0]

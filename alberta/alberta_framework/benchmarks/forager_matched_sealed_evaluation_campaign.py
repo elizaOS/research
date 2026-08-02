@@ -24,11 +24,14 @@ boundary for any performance or promotion claim.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
+import logging
 import os
 import re
 import stat
-from collections.abc import Callable, Iterator, Mapping
+import sys
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +45,7 @@ from alberta_framework.benchmarks import forager_matched_open_protocol as open_p
 from alberta_framework.benchmarks import forager_matched_protocol as protocol
 from alberta_framework.benchmarks import forager_matched_qualification as qualification
 from alberta_framework.benchmarks import forager_matched_seal as seal
+from alberta_framework.benchmarks import forager_matched_trust as trust
 from alberta_framework.benchmarks.forager_matched_evidence import MatchedScoreEvidence
 
 MATCHED_SEALED_EVALUATION_CAMPAIGN_SCHEMA_VERSION: Final = (
@@ -1402,12 +1406,194 @@ def load_completed_sealed_evaluation_campaign_content(
         )
 
 
+_CLI_ERROR_SCHEMA_VERSION: Final = (
+    "alberta.forager_matched_sealed_evaluation_campaign_cli_error.v1"
+)
+_CLI_LOAD_RESULT_SCHEMA_VERSION: Final = (
+    "alberta.forager_matched_sealed_evaluation_campaign_cli_load_result.v1"
+)
+_EXIT_FAILED_CLOSED: Final = 2
+_EXIT_PUBLISHED_UNCERTAIN: Final = 3
+
+
+def _add_mutation_arguments(command: argparse.ArgumentParser) -> None:
+    """Declare the fresh-authentication material every mutating operation must pin.
+
+    There is deliberately no bypass, force, or cached-bindings flag: the reference
+    resolver and all three expected pins are required, and every fail-closed refusal
+    from the underlying entry points surfaces unchanged.
+    """
+    command.add_argument("--trust-anchor", type=Path, required=True)
+    command.add_argument("--trust-key", type=Path, required=True)
+    command.add_argument("--trust-receipt-directory", type=Path, required=True)
+    command.add_argument("--expected-trust-anchor-identity", required=True)
+    command.add_argument("--expected-seal-manifest-payload-sha256", required=True)
+    command.add_argument("--expected-open-verification-subject-sha256", required=True)
+
+
+def _cli_resolver(arguments: argparse.Namespace) -> trust.SignedReceiptTrustResolver:
+    """Build the reference signed-receipt resolver from explicit ceremony paths."""
+    return trust.SignedReceiptTrustResolver(
+        anchor_path=arguments.trust_anchor,
+        key_path=arguments.trust_key,
+        receipt_directory=arguments.trust_receipt_directory,
+    )
+
+
+def _cli_load_result(bundle: campaign.CompletedCampaignBundle) -> dict[str, Any]:
+    """Summarize a completed content closure without any authentication claim."""
+    return {
+        "schema_version": _CLI_LOAD_RESULT_SCHEMA_VERSION,
+        "classification": "content_only_unendorsed_nonpromoting",
+        "status": "complete_content_only_external_verification_unresolved",
+        "stage": "sealed_evaluation",
+        "output_root": bundle.output_root.as_posix(),
+        "candidate_count": len(bundle.candidate_ids),
+        "candidate_order": list(bundle.candidate_ids),
+        "seed_count": len(bundle.active_seeds),
+        "completed_cell_count": len(bundle.candidate_ids) * len(bundle.active_seeds),
+        "protocol_sha256": bundle.protocol.protocol_sha256,
+        "execution_plan_sha256": bundle.plan.plan_sha256,
+        "live_runtime_identity_sha256": bundle.live_runtime.identity_sha256,
+        "execution_receipt_index_payload_sha256": (
+            bundle.execution_receipt_index.payload_sha256
+        ),
+        "score_evidence_sha256": bundle.score_evidence.payload_sha256,
+        "verification_subject_sha256": (
+            bundle.verification_request.verification_subject_sha256
+        ),
+        "final_file_sha256": dict(bundle.final_file_sha256),
+        "promotion_authorized": False,
+        "external_verification_required": True,
+    }
+
+
+def _write_cli_error(
+    status_label: str,
+    error: BaseException,
+    *,
+    destination: Path | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "schema_version": _CLI_ERROR_SCHEMA_VERSION,
+        "classification": "content_only_unendorsed_nonpromoting",
+        "status": status_label,
+        "error_type": type(error).__name__,
+        "error_message": str(error),
+        "promotion_authorized": False,
+        "external_verification_required": True,
+    }
+    if destination is not None:
+        payload["destination"] = destination.as_posix()
+    sys.stderr.buffer.write(campaign.canonical_json_bytes(payload) + b"\n")
+
+
+def _cli(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    subparsers = parser.add_subparsers(dest="operation", required=True)
+    for operation in ("prepare", "run", "verify", "status", "load"):
+        command = subparsers.add_parser(operation, allow_abbrev=False)
+        command.add_argument("--qualification-root", type=Path, required=True)
+        command.add_argument("--seal-root", type=Path, required=True)
+        command.add_argument("--output-root", type=Path, required=True)
+        command.add_argument("--runtime", default="docker")
+        if operation in {"prepare", "run"}:
+            _add_mutation_arguments(command)
+        if operation == "run":
+            command.add_argument("--max-cells", type=int)
+    arguments = parser.parse_args(argv)
+    if arguments.operation == "load":
+        bundle = load_completed_sealed_evaluation_campaign_content(
+            arguments.qualification_root,
+            arguments.seal_root,
+            arguments.output_root,
+            runtime=arguments.runtime,
+        )
+        sys.stdout.buffer.write(campaign.canonical_json_bytes(_cli_load_result(bundle)))
+        return 0
+    if arguments.operation == "prepare":
+        status = prepare_sealed_evaluation_campaign(
+            arguments.qualification_root,
+            arguments.seal_root,
+            arguments.output_root,
+            resolver=_cli_resolver(arguments),
+            expected_trust_anchor_identity=arguments.expected_trust_anchor_identity,
+            expected_seal_manifest_payload_sha256=(
+                arguments.expected_seal_manifest_payload_sha256
+            ),
+            expected_open_verification_subject_sha256=(
+                arguments.expected_open_verification_subject_sha256
+            ),
+            runtime=arguments.runtime,
+        )
+    elif arguments.operation == "run":
+        status = run_sealed_evaluation_campaign(
+            arguments.qualification_root,
+            arguments.seal_root,
+            arguments.output_root,
+            resolver=_cli_resolver(arguments),
+            expected_trust_anchor_identity=arguments.expected_trust_anchor_identity,
+            expected_seal_manifest_payload_sha256=(
+                arguments.expected_seal_manifest_payload_sha256
+            ),
+            expected_open_verification_subject_sha256=(
+                arguments.expected_open_verification_subject_sha256
+            ),
+            runtime=arguments.runtime,
+            max_cells=arguments.max_cells,
+        )
+    elif arguments.operation == "verify":
+        status = verify_sealed_evaluation_campaign_content(
+            arguments.qualification_root,
+            arguments.seal_root,
+            arguments.output_root,
+            runtime=arguments.runtime,
+        )
+    else:
+        status = sealed_evaluation_campaign_content_status(
+            arguments.qualification_root,
+            arguments.seal_root,
+            arguments.output_root,
+            runtime=arguments.runtime,
+        )
+    sys.stdout.buffer.write(campaign.canonical_json_bytes(status.to_dict()))
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the prepare/run/verify/status/load sealed-evaluation CLI.
+
+    Success writes one canonical JSON document to stdout and returns ``0``.
+    Failures write one canonical JSON error payload to stderr and exit
+    nonzero: ``3`` when a root was published but its safe handoff is
+    uncertain (:class:`PublishedSealedEvaluationCampaignUncertainError`),
+    ``2`` for every other fail-closed refusal (``OSError``/``ValueError``,
+    surfaced unchanged from the underlying entry points).  Argument errors
+    keep argparse's usage behavior (exit ``2``); ``--help`` exits ``0``.
+    There are no bypass, force, or repair flags.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    try:
+        return _cli(tuple(argv) if argv is not None else tuple(sys.argv[1:]))
+    except PublishedSealedEvaluationCampaignUncertainError as exc:
+        _write_cli_error("published_uncertain", exc, destination=exc.destination)
+        return _EXIT_PUBLISHED_UNCERTAIN
+    except (OSError, ValueError) as exc:
+        _write_cli_error("failed_closed", exc)
+        return _EXIT_FAILED_CLOSED
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
+
+
 __all__ = [
     "ForagerMatchedSealedEvaluationCampaignError",
     "MATCHED_SEALED_EVALUATION_CAMPAIGN_SCHEMA_VERSION",
     "MATCHED_SEALED_EVALUATION_COMPLETION_SCHEMA_VERSION",
     "PublishedSealedEvaluationCampaignUncertainError",
     "load_completed_sealed_evaluation_campaign_content",
+    "main",
     "prepare_sealed_evaluation_campaign",
     "run_sealed_evaluation_campaign",
     "sealed_evaluation_campaign_content_status",

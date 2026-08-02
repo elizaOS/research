@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import shutil
 import subprocess
 import sys
@@ -1255,6 +1256,150 @@ def test_live_runtime_and_commands_pin_exact_cpu_sandbox_seed_and_horizon(
         executor.build_candidate_command(plan, "alberta_causal", seed + 10_000, live)
 
 
+@pytest.mark.parametrize(
+    ("failure_phase", "cleanup_error", "expected_type", "expected_message"),
+    (
+        (
+            "kill",
+            OSError("injected kill failure"),
+            executor.ForagerMatchedExecutorError,
+            "OCI process could not be terminated cleanly",
+        ),
+        (
+            "kill",
+            ProcessLookupError("injected exited-child race"),
+            executor._BoundedProcessOutputError,  # noqa: SLF001
+            "active byte limit",
+        ),
+        (
+            "wait",
+            subprocess.TimeoutExpired(("unused",), 10),
+            executor.ForagerMatchedExecutorError,
+            "OCI process could not be reaped after termination",
+        ),
+        (
+            "wait",
+            OSError("injected wait failure"),
+            executor.ForagerMatchedExecutorError,
+            "OCI process could not be inspected after termination",
+        ),
+        (
+            "selector_close",
+            OSError("injected selector close failure"),
+            executor.ForagerMatchedExecutorError,
+            "OCI process resources could not be closed cleanly",
+        ),
+        (
+            "stdout_close",
+            OSError("injected stdout close failure"),
+            executor.ForagerMatchedExecutorError,
+            "OCI process resources could not be closed cleanly",
+        ),
+        (
+            "stderr_close",
+            OSError("injected stderr close failure"),
+            executor.ForagerMatchedExecutorError,
+            "OCI process resources could not be closed cleanly",
+        ),
+    ),
+    ids=(
+        "kill-error",
+        "kill-process-gone",
+        "reap-timeout",
+        "reap-error",
+        "selector-close-error",
+        "stdout-close-error",
+        "stderr-close-error",
+    ),
+)
+def test_bounded_process_normalizes_cleanup_failures_and_attempts_every_close(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_phase: str,
+    cleanup_error: BaseException,
+    expected_type: type[BaseException],
+    expected_message: str,
+) -> None:
+    class CloseBuffer(BytesIO):
+        def __init__(self, failure_name: str) -> None:
+            super().__init__()
+            self.failure_name = failure_name
+            self.close_called = False
+
+        def close(self) -> None:
+            self.close_called = True
+            super().close()
+            if failure_phase == self.failure_name:
+                raise cleanup_error
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = CloseBuffer("stdout_close")
+            self.stderr = CloseBuffer("stderr_close")
+            self.kill_called = False
+            self.waited = False
+
+        def poll(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            self.kill_called = True
+            if failure_phase == "kill":
+                raise cleanup_error
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            self.waited = True
+            if failure_phase == "wait":
+                raise cleanup_error
+            return -9
+
+    class SelectorKey:
+        data = "stdout"
+        fd = 101
+
+    class OverflowSelector:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def register(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def get_map(self) -> dict[str, bool]:
+            return {"active": True}
+
+        def select(self, _timeout: float) -> list[tuple[SelectorKey, int]]:
+            return [(SelectorKey(), selectors.EVENT_READ)]
+
+        def close(self) -> None:
+            self.closed = True
+            if failure_phase == "selector_close":
+                raise cleanup_error
+
+    process = FakeProcess()
+    selector = OverflowSelector()
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(selectors, "DefaultSelector", lambda: selector)
+    monkeypatch.setattr(os, "read", lambda _descriptor, _size: b"xx")
+
+    with pytest.raises(expected_type, match=expected_message) as caught:
+        executor._run_bounded_process(  # noqa: SLF001
+            ("unused",),
+            timeout=1,
+            maximum_stdout_bytes=1,
+            maximum_stderr_bytes=1,
+        )
+
+    assert process.kill_called is True
+    assert process.waited is True
+    assert selector.closed is True
+    assert process.stdout.close_called is True
+    assert process.stderr.close_called is True
+    if isinstance(cleanup_error, ProcessLookupError):
+        assert caught.value.__cause__ is None
+    else:
+        assert caught.value.__cause__ is cleanup_error
+
+
 @pytest.mark.parametrize("failure_kind", ["timeout", "runner_error"])
 def test_default_runner_cidfile_force_removes_interrupted_container(
     monkeypatch: pytest.MonkeyPatch,
@@ -1352,6 +1497,39 @@ def test_executor_cleanup_uses_exact_name_for_a_partial_cidfile(
     assert len(observed) == 1
 
 
+def test_executor_cleanup_wraps_cidfile_read_oserror_after_exact_name_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cidfile = tmp_path / "container.cid"
+    cidfile.write_bytes(b"b" * 64)
+    container_name = "alberta-matched-executor-" + "c" * 32
+    read_error = FileNotFoundError("injected cidfile disappearance")
+    observed: list[tuple[str, ...]] = []
+
+    def fail_read(*_args: Any, **_kwargs: Any) -> Any:
+        raise read_error
+
+    def cleanup(command: Sequence[str], **_kwargs: Any) -> Any:
+        materialized = tuple(command)
+        observed.append(materialized)
+        return subprocess.CompletedProcess(materialized, 0)
+
+    monkeypatch.setattr(executor, "_read_stable_file", fail_read)
+    monkeypatch.setattr(subprocess, "run", cleanup)
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="cidfile contract failed after cleanup=force_removed_by_name",
+    ) as caught:
+        executor._cleanup_interrupted_container(  # noqa: SLF001
+            ("/usr/bin/docker", "run"),
+            cidfile,
+            container_name,
+        )
+    assert caught.value.__cause__ is read_error
+    assert observed == [("/usr/bin/docker", "rm", "--force", container_name)]
+
+
 def test_default_runner_cleans_a_completed_nonzero_container_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1382,6 +1560,35 @@ def test_default_runner_cleans_a_completed_nonzero_container_run(
     )
     assert result.returncode == 125
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (
+        FileNotFoundError("injected runner launch failure"),
+        subprocess.TimeoutExpired(("docker", "run"), 1),
+        executor._BoundedProcessOutputError(  # noqa: SLF001
+            "injected runner output overflow"
+        ),
+    ),
+    ids=("oserror", "timeout", "overflow"),
+)
+def test_injected_executor_runner_failures_use_the_public_error(
+    fault: BaseException,
+) -> None:
+    def runner(_command: Sequence[str]) -> Any:
+        raise fault
+
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="candidate runner failed",
+    ) as caught:
+        executor._runner_result(  # noqa: SLF001
+            runner,
+            ("docker", "run", "image"),
+            "candidate",
+        )
+    assert caught.value.__cause__ is fault
 
 
 def test_executor_cleanup_accepts_bounded_proof_that_name_is_already_absent(
@@ -1421,6 +1628,37 @@ def test_executor_cleanup_accepts_bounded_proof_that_name_is_already_absent(
             f"--filter=name=^/{container_name}$",
         ),
     ]
+
+
+def test_executor_cleanup_wraps_bounded_absence_query_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_name = "alberta-matched-executor-" + "f" * 32
+    overflow = executor._BoundedProcessOutputError(  # noqa: SLF001
+        "injected cleanup inspection overflow"
+    )
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 1),
+    )
+
+    def inspect(*_args: Any, **_kwargs: Any) -> Any:
+        raise overflow
+
+    monkeypatch.setattr(executor, "_run_bounded_process", inspect)
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="could not prove the exact name absent",
+    ) as caught:
+        executor._cleanup_interrupted_container(  # noqa: SLF001
+            ("/usr/bin/docker", "run"),
+            tmp_path / "missing.cid",
+            container_name,
+        )
+    assert caught.value.__cause__ is overflow
 
 
 @pytest.mark.parametrize(

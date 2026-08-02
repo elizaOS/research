@@ -14,7 +14,10 @@ appear in serialized payloads; domain-separated SHA-256 digests bind the caller-
 
 Evidence bindings must be constructed from artifacts validated by an external protocol
 transition and trust resolver.  A digest is an integrity identifier, not a signature, and
-this module has no promotion authority.
+this module has no promotion authority.  Serialized ``superiority_passed`` and Holm
+``reject`` values are mechanical frozen-protocol calculation flags: the result establishes
+neither a seed-population model nor sign exchangeability and cannot stand alone as a
+confirmatory, ranking, or SOTA claim.
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ from typing import Final, Literal, NoReturn, cast
 import numpy as np
 
 CONTRACT_SCHEMA = "alberta.forager_matched_statistics.contract.v3"
-RESULT_SCHEMA = "alberta.forager_matched_statistics.result.v3"
+RESULT_SCHEMA = "alberta.forager_matched_statistics.result.v4"
 SCORE_VECTOR_SCHEMA = "alberta.forager_matched_statistics.score_vector.v1"
 DIFFERENCE_VECTOR_SCHEMA = "alberta.forager_matched_statistics.difference_vector.v1"
 COMPARISON_INPUT_SCHEMA = "alberta.forager_matched_statistics.comparison_input.v2"
@@ -764,12 +767,14 @@ class BootstrapLowerBound:
 
 @dataclass(frozen=True, slots=True)
 class SignFlipResult:
-    """One-sided paired sign-flip test outcome with an exact rational p-value.
+    """One-sided paired sign-flip calculation with a rational tail fraction.
 
     ``mode="exact"`` enumerates all ``2**n_pairs`` sign assignments (n <= 20, no
     add-one correction); ``mode="monte_carlo"`` uses ``draws`` PCG64 resamples with
     the add-one correction ``p = (extreme + 1) / (draws + 1)``.  ``__post_init__``
-    re-derives these count identities, so an inconsistent payload fails closed.
+    re-derives these count identities, so an inconsistent payload fails closed.  The
+    fraction is a conditional randomization calculation, not a confirmatory population
+    p-value: the frozen protocol does not establish sign exchangeability.
     """
 
     n_pairs: int
@@ -844,8 +849,10 @@ def _require_probability_or_one(value: object, name: str) -> float:
 class HolmDecision:
     """Per-hypothesis outcome of the Holm (1979) step-down correction.
 
-    Raw and adjusted p-values are carried as exact integer fractions; ``reject``
-    is the familywise decision at the contract's frozen alpha.
+    Raw and adjusted fractions are carried as exact integers; ``reject`` is the
+    mechanically derived threshold flag at the contract's frozen alpha.  It is retained
+    only for nonconfirmatory sensitivity analysis and does not authorize a confirmatory
+    rejection claim.
     """
 
     hypothesis_id: str
@@ -909,7 +916,8 @@ class PrimaryComparisonResult:
     Raw scores never appear here; ``matched_inputs_sha256`` and
     ``paired_differences_sha256`` bind the caller-held vectors.  ``__post_init__``
     re-derives ``superiority_passed`` from the bootstrap endpoint and margin, so
-    the pass flag cannot be edited independently of its inputs.
+    the pass flag cannot be edited independently of its inputs.  The flag is the
+    preregistered resampling-summary gate, not a population-superiority inference.
     """
 
     comparison: ComparisonSpec
@@ -1170,6 +1178,18 @@ class MatchedComparisonResult:
             "fixed_descriptive_exclusions": [
                 item.to_payload() for item in self.fixed_descriptive_exclusions
             ],
+            "interpretation": {
+                "global_ranking_or_sota_claim_authorized": False,
+                "primary_bootstrap_endpoint_interpretation": (
+                    "frozen_resampling_summary_not_population_confidence_interval"
+                ),
+                "primary_population_model_established": False,
+                "primary_superiority_passed_field_role": "mechanical_frozen_gate_only",
+                "secondary_analysis_role": "nonconfirmatory_sensitivity_only",
+                "secondary_holm_reject_field_role": "mechanical_threshold_flag_only",
+                "secondary_sign_exchangeability_established": False,
+                "standalone_performance_claim_authorized": False,
+            },
             "no_promotion_authority": True,
             "primary": self.primary.to_payload(),
             "primary_superiority_passed": self.primary.superiority_passed,
@@ -1268,8 +1288,9 @@ def paired_sign_flip_test(differences: tuple[float, ...], spec: PermutationSpec)
 
     Zero differences are kept and count inclusively toward the extreme event.  The
     Monte Carlo branch applies the add-one correction ``(extreme + 1) / (draws + 1)``
-    so a resampled p-value can never be zero (Phipson & Smyth, 2010, "Permutation
-    p-values should never be zero").
+    so a resampled tail fraction can never be zero (Phipson & Smyth, 2010,
+    "Permutation p-values should never be zero").  This function establishes no
+    sign-exchangeability or confirmatory interpretation.
     """
 
     checked = _require_score_tuple(differences, "differences")

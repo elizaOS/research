@@ -55,7 +55,7 @@ artifact path and schema version with untouched preregistered seeds.
 | Option value plus duration (Step 5) | online TD heads recover returns `(6, 4)` and durations `(10, 2)` in a deterministic renewal problem; value-only picks the slow option while predicted return/duration picks the optimal fast option | L1 development mechanism; supplied options/features, same successor state, no held-out control comparison | `test_option_value_duration.py` |
 | Support-aware option-model value search | An opt-in stateless controller recomputes completion-supported differential semi-MDP option targets and Bellman residuals after every accepted backup, stably prioritizes the largest magnitude under a fixed budget, and commits only the base learner while preserving traces, action/lifecycle ownership, OaK counters, models, and RNG | L0 mechanism only; completion count is not calibration, the already cached action is not refreshed, effects are deferred to a later extended-action selection, and there is no shared primitive/option budget or control-benefit result | `test_option_search_control.py` |
 | Causal state construction | identity, fixed-trace, and online gated recurrent builders satisfy fixed-budget/JIT/checkpoint contracts; a small write/hold POMDP confirms the trainable plumbing changes parameters and can be scored | L0/development mechanism; resource-unmatched supervised probe, not integrated control | `test_state_builder.py`, `test_state_builder_pomdp.py` |
-| Prototype pair-feature lifecycle | An opt-in fixed-width base/pair bank consumes one owner-bound behavior TD target and routes descriptor changes through every linear OaK feature axis; pullback is bound to the pre-route semantic generation, unsafe curation defers by rollback, safe routing is atomic, and resources/checkpoints are fixed and versioned | L0 mechanism/integration only; the compatible lane excludes world models, Horde, replay, dreaming, IA, partner fusion, experiential memory, and GRU perception, and proves no benefit, promotion, WP7 completion, multi-consumer/deletion utility, or automatic subtask/option discovery | `test_prototype_feature_lifecycle.py`, `test_prototype_feature_lifecycle_integration.py` |
+| Prototype pair-feature lifecycle | An opt-in fixed-width base/pair bank consumes one owner-bound behavior TD target and routes descriptor changes through every linear OaK feature axis; pullback and the enabled OaK subtree are bound to the pre-route generation plus full descriptor bank, unsafe curation defers by rollback, safe routing is atomic, and resources/checkpoints are fixed and versioned | L0 mechanism/integration only; standalone callers must checkpoint OaK plus its returned binding together, the compatible lane excludes world models, Horde, replay, dreaming, IA, partner fusion, experiential memory, and GRU perception, and it proves no benefit, promotion, WP7 completion, multi-consumer/deletion utility, or automatic subtask/option discovery | `test_prototype_feature_lifecycle.py`, `test_prototype_feature_lifecycle_integration.py` |
 | Hidden-partner integration kernel | focused tests cover the causal composed transition; eight uninterrupted development lives add matched state, memory, lifecycle, carry, retention, planning, partner-belief, and curation ablations, with all full lives finite and mean reward 0.89335 | L0/development integration only; artifact is structurally nonpromoting and fails its obsolete-D forgetting check because D is absent at life end in 0/8 full lives; partner is scripted and the candidate archive is closed | `test_integrated_hidden_partner.py`, `outputs/hidden_partner_development/robustness.v1.json` |
 | Hidden-partner v6 execution contract | fixed-shape runner, 15 primary plus 3 diagnostic controls, exact source/runtime payload closure, intervention witnesses, stream/RNG reconstruction, deterministic initial state, strict per-run structural validation, matched-suite validation, and a separate canonical source-replay verifier | development infrastructure only; every open certification prerequisite remains `NOT_CERTIFIED`, and no complete v6 life, source replay, 18-arm outcome suite, calibration, threshold, artifact, efficacy result, or promotion authority has been produced | `test_hidden_partner_lifecycle_world_v6_runner.py`, `test_hidden_partner_lifecycle_world_v6_runtime.py`, `test_hidden_partner_lifecycle_world_v6_intervention_audit.py`, `test_hidden_partner_lifecycle_world_v6_validator.py`, `test_hidden_partner_lifecycle_world_v6_matched_suite.py`, `test_hidden_partner_lifecycle_world_v6_source_replay.py` |
 | Hidden-regime signaling and factorial calibration | a 240-case factorial calibration design, threshold-freeze and protected-plan validators, execution governance, readiness receipts, trace audit, and summary/lineage oracles are implemented fail-closed; the six-condition evidence draft is execution-disabled and the three protected structural-generalization worlds record zero executed learner outcomes | design-only; `outputs/` contains no hidden-regime artifact, the protected plan is `preregistered_unexecuted` with no execution issuer, and the development runner hard-codes promotion disallowed | `test_hidden_regime_factorial_calibration.py`, `test_hidden_regime_factorial_thresholds.py`, `test_hidden_regime_signaling_evidence.py`, `test_hidden_regime_signaling.py` |
@@ -127,7 +127,8 @@ partner-belief marginalization) ·
 `core/feature_bank_router.py` (fail-closed atomic descriptor-identity routing
 for every downstream feature consumer) ·
 `core/prototype_feature_lifecycle.py` (fixed-resource pair discovery plus
-semantic-generation-bound gradient pullback and atomic linear-OaK routing) ·
+generation-and-full-descriptor-bound gradient pullback, bound OaK consumer,
+and atomic linear-OaK routing) ·
 `core/integrated_hidden_partner.py` (bounded composed hidden-partner
 development kernel) ·
 `benchmarks/causal_map_forager.py` (stationary observation-causal relative-map
@@ -258,16 +259,20 @@ completion, and held-out gates remain part of the promotion boundary.
   RTU-minus-DQN mean, but the comparator was configured post-output and has
   unmatched runtime, representation, resources, and update work. It is not an
   admissible pair and neither receipt has promotion standing.
-  The frozen matched-current campaign (candidate universe SHA-256
-  `2c3b214c…`, 23 registered arms) has completed executor qualification
+  Current matched-source uses candidate-universe schema v2 (SHA-256
+  `6a9315cb…`) and has no renewed qualification/open artifact; it requires a
+  fresh qualification and new namespace before execution. The immutable
+  historical v1 campaign (candidate universe SHA-256 `2c3b214c…`, 23
+  registered arms) completed executor qualification
   (`outputs/forager/matched_current_qualification_2c3b214c_v1`), but the
   prepared open-tuning stage
   (`outputs/forager/matched_current_open_tuning_2c3b214c_v1`) has executed
   zero cells — its `runs/` and `completions/` are empty — and the sealed
   held-out stage (seal, 6×30 schedule, final analysis, statistics) is
-  implemented and tested but has never run and has no console script. Every
-  authority path requires an external trust resolver that does not exist
-  in-tree; the 2026-07-31 audits recorded implementation GO but campaign
+  implemented and tested but has never run. Its evaluation runner is exposed
+  as `alberta-forager-matched-sealed-evaluation`; seal and final analysis remain
+  module-only. Every authority path requires an external trust resolver that
+  does not exist in-tree; the 2026-07-31 audits recorded implementation GO but campaign
   authority NOT CLEARED (`FORAGER_ALBERTA_CANDIDATE_AUDIT.md`,
   `FORAGER_COMPARATOR_AUDIT.md`).
 - **OPMNIST 800-task closure** (the ROADMAP's published-scale multi-seed

@@ -306,29 +306,32 @@ def _score_planning_actions(
     strategy: Step7PlanningStrategy,
     n_actions: int,
 ) -> tuple[Array, Array]:
-    """Score all candidate actions for model-based search control."""
+    """Score all candidate actions for model-based search control.
+
+    Returns the greedily selected action index and its priority score.  The
+    score is exactly the selected action's priority: ``|predicted reward|``
+    for the ``reward`` strategy, plus predicted transition magnitude for all
+    others.  Non-finite reward predictions propagate into the score through
+    the ``|predicted reward|`` term, so downstream finiteness checks still
+    observe them.
+    """
     actions = jnp.arange(n_actions, dtype=jnp.int32)
 
-    def predict_action(action: Array) -> tuple[Array, Array]:
+    def predict_action(action: Array) -> Array:
         prediction = model.predict(model_state, anchor_observation, action)
         transition_magnitude = jnp.sqrt(
             jnp.mean((prediction.next_observation - anchor_observation) ** 2)
         )
         reward_priority = jnp.abs(prediction.reward)
-        priority = (
+        return (
             reward_priority
             if strategy == "reward"
             else reward_priority + transition_magnitude
         )
-        return priority, prediction.reward
 
-    priorities, rewards = jax.vmap(predict_action)(actions)
+    priorities = jax.vmap(predict_action)(actions)
     selected = jnp.argmax(priorities).astype(jnp.int32)
-    # ``0.0 * rewards[selected]`` is an arithmetic no-op: the returned score
-    # is the selected action's priority.  A non-finite reward prediction does
-    # still propagate into the score, where downstream finiteness checks
-    # can observe it.
-    return selected, priorities[selected] + 0.0 * rewards[selected]
+    return selected, priorities[selected]
 
 
 def _store_real_transition(

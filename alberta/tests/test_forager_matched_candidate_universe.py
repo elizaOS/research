@@ -30,7 +30,7 @@ from alberta_framework.benchmarks import forager_matched_open_protocol as open_p
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 # Frozen content digest of the canonical universe descriptor bytes; any
 # change to the descriptor is deliberate and must re-pin this constant.
-_EXPECTED_DIGEST = "2c3b214cf29e013e3f8d88b2558bd94f75e92330bf0ddcc6afd7514279a1ee77"
+_EXPECTED_DIGEST = "6a9315cb996fe5698e4c1580d30da9b0524e9875ce085d1399bb975cc5b510a8"
 
 
 def _canonical_sha256(value: object) -> str:
@@ -311,6 +311,7 @@ def test_claim_scope_is_narrow_and_never_universal() -> None:
     scope = descriptor["scope"]
     boundaries = descriptor["claim_boundaries"]
 
+    assert descriptor["schema_version"] == "alberta.forager_matched_candidate_universe.v2"
     assert scope["registered_panel_complete"] is True
     assert scope["registered_candidate_count"] == 23
     assert scope["alberta_inferential_candidate_count"] == 14
@@ -326,9 +327,10 @@ def test_claim_scope_is_narrow_and_never_universal() -> None:
     assert boundaries["screens_support_derived_rng_isolated_performance"] is False
     assert boundaries["historical_sources_authorize_current_execution"] is False
     assert boundaries["eventual_claim_requires_sealed_matched_evaluation"] is True
-    assert boundaries["narrowest_permitted_eventual_scope"].startswith(
-        "best among the frozen registered matched candidate panel"
-    )
+    assert boundaries["registered_panel_ranking_identified_by_design"] is False
+    assert "contrast-specific" in boundaries["narrowest_permitted_eventual_scope"]
+    assert "best among" not in boundaries["narrowest_permitted_eventual_scope"]
+    assert "best member of the registered panel" in boundaries["forbidden_scope"]
     assert "universal state of the art" in boundaries["forbidden_scope"]
 
 

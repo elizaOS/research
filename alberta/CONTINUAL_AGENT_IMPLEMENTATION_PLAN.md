@@ -1153,8 +1153,10 @@ Turn the extensive lifecycle modules into the causal loop required by Steps
 maps a fixed builder base through bounded pair products into the linear OaK
 loop. A single owner-bound behavior TD target trains the bank (base-Q while
 idle, current intra-option target while executing), and builder gradients are
-pulled back against the exact pre-route semantic generation. At a safe
-idle/cached-base boundary, descriptor routing is atomic; otherwise the
+pulled back against the exact pre-route generation and full descriptor bank.
+That identity travels with the enabled OaK subtree and rejects stale or forked
+consumer state. At a safe idle/cached-base boundary, descriptor routing is
+atomic; otherwise the
 curation proposal is rolled back and deferred rather than queued. Allocation
 ceilings, exact resource declarations, and versioned checkpoints bound the
 lane.

@@ -30,7 +30,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Float, Int, PRNGKeyArray
+from jaxtyping import Bool, Float, Int, PRNGKeyArray
 
 from alberta_framework.core.future_utility import (
     contribution_trace_output_loss_reduction,
@@ -93,12 +93,52 @@ DEFAULT_GENERATOR_META_PROMOTION_MARGIN_MULTIPLIERS = (1.25, 1.0, 0.9, 0.75)
 DEFAULT_GENERATOR_META_CANDIDATE_MIN_AGE_MULTIPLIERS = (1.5, 1.0, 0.75, 0.5)
 DEFAULT_GENERATOR_META_IMPRINT_SCALES = (0.0, 0.25, 1.0, 1.0)
 
+# Generator-policy provenance arrays keep their existing non-negative,
+# fixed-width representation even when the optional meta-resource learner is
+# disabled.  In that mode zero is a deterministic placeholder only; callers
+# must consult ``learn_generator_resources`` before interpreting it as a
+# sampled policy identity.
+FIXED_GENERATOR_POLICY_PLACEHOLDER = 0
+
+# Stable, named domains below separate a fresh composition proposal from the
+# descendant refills that may follow its application.  The integer tags are
+# the big-endian ASCII words ``PROP`` and ``CASC`` and are part of the public
+# deterministic key-derivation contract.
+COMPOSITIONAL_CURATION_PROPOSAL_CHANNEL = 0x50524F50
+COMPOSITIONAL_CURATION_CASCADE_CHANNEL = 0x43415343
+
+# Fixed integer tags used by ``CompositionalCurationTrace``.  ``NONE`` is a
+# sentinel rather than a bank, while active and candidate banks are distinct
+# identity namespaces for runner-side lifecycle accounting.
+CURATION_DESTINATION_NONE = -1
+CURATION_DESTINATION_ACTIVE = 0
+CURATION_DESTINATION_CANDIDATE = 1
+
 PROMOTION_SCALED_CANDIDATE = "scaled_candidate"
 PROMOTION_BLEND = "blend"
 
 CANDIDATE_SELECTOR_LEGACY = "legacy"
 CANDIDATE_SELECTOR_HEDGE = "hedge"
 CANDIDATE_SELECTOR_EXP3 = "exp3"
+
+
+def compositional_curation_keys(curation_root_key: Array) -> tuple[Array, Array]:
+    """Derive disjoint proposal and cascade keys from one curation root.
+
+    The returned keys preserve the root key's PRNG implementation.  This
+    helper assigns stable domains only; callers remain responsible for giving
+    every curation event a fresh root key.
+    """
+
+    proposal_key = jr.fold_in(
+        curation_root_key,
+        jnp.uint32(COMPOSITIONAL_CURATION_PROPOSAL_CHANNEL),
+    )
+    cascade_key = jr.fold_in(
+        curation_root_key,
+        jnp.uint32(COMPOSITIONAL_CURATION_CASCADE_CHANNEL),
+    )
+    return proposal_key, cascade_key
 
 
 @chex.dataclass(frozen=True)
@@ -160,9 +200,12 @@ class CompositionalFeatureState:
             only when ``candidate_selector`` is not ``"legacy"``.  The default
             promote heuristic ignores these fields.
         feature_generator_policy: Meta-resource policy that created each
-            active feature slot.
+            active feature slot.  When generator-resource learning is
+            disabled, entries use ``FIXED_GENERATOR_POLICY_PLACEHOLDER`` and
+            are not sampled-policy identities.
         candidate_generator_policy: Meta-resource policy that created each
-            candidate slot.
+            candidate slot, with the same deterministic-placeholder semantics
+            when generator-resource learning is disabled.
         generator_resource_state: Contextual policy-allocation state for
             generator-internal choices.
         replacement_accumulator: Fractional replacement clock used when the
@@ -220,6 +263,89 @@ class CompositionalFeatureState:
 
 
 @chex.dataclass(frozen=True)
+class CompositionalCurationTrace:
+    """Raw fixed-shape facts emitted by one curation decision.
+
+    This trace is public learner output for runner-side birth-ledger
+    construction.  It records actual applied events and exact descriptors; it
+    is not authenticated lifecycle evidence by itself.  Descriptor arrays
+    retain ``parent_a`` even for ``OP_RAW`` so raw-input identity is explicit.
+    Masks select meaningful rows in full-bank descriptor snapshots.
+    """
+
+    pre_step: Int[Array, ""]
+    post_step: Int[Array, ""]
+    decision_key: PRNGKeyArray
+    curation_key: PRNGKeyArray
+    proposal_key: PRNGKeyArray
+    cascade_key: PRNGKeyArray
+    should_try_replace: Bool[Array, ""]
+    has_event: Bool[Array, ""]
+    generator_policy_sampled: Bool[Array, ""]
+    generator_policy_id: Int[Array, ""]
+
+    proposal_formed: Bool[Array, ""]
+    proposal_destination_bank: Int[Array, ""]
+    proposal_destination_slot: Int[Array, ""]
+    proposal_op: Int[Array, ""]
+    proposal_parent_a: Int[Array, ""]
+    proposal_parent_b: Int[Array, ""]
+    proposal_theta: Float[Array, " 2"]
+    proposal_depth: Int[Array, ""]
+    proposal_generator_policy: Int[Array, ""]
+
+    root_change_mask: Bool[Array, " n_features"]
+    root_change_applied: Bool[Array, ""]
+    post_root_pre_cascade_slot: Int[Array, ""]
+    post_root_pre_cascade_op: Int[Array, ""]
+    post_root_pre_cascade_parent_a: Int[Array, ""]
+    post_root_pre_cascade_parent_b: Int[Array, ""]
+    post_root_pre_cascade_theta: Float[Array, " 2"]
+    post_root_pre_cascade_depth: Int[Array, ""]
+    post_root_pre_cascade_generator_policy: Int[Array, ""]
+
+    promotion_applied: Bool[Array, ""]
+    promotion_source_candidate: Int[Array, ""]
+    promotion_destination_active: Int[Array, ""]
+    promoted_pre_refresh_op: Int[Array, ""]
+    promoted_pre_refresh_parent_a: Int[Array, ""]
+    promoted_pre_refresh_parent_b: Int[Array, ""]
+    promoted_pre_refresh_theta: Float[Array, " 2"]
+    promoted_pre_refresh_depth: Int[Array, ""]
+    promoted_pre_refresh_generator_policy: Int[Array, ""]
+
+    cascade_refill_mask: Bool[Array, " n_features"]
+    cascade_final_ops: Int[Array, " n_features"]
+    cascade_final_parent_a: Int[Array, " n_features"]
+    cascade_final_parent_b: Int[Array, " n_features"]
+    cascade_final_theta: Float[Array, "n_features 2"]
+    cascade_final_depth: Int[Array, " n_features"]
+    cascade_final_generator_policy: Int[Array, " n_features"]
+    active_change_mask: Bool[Array, " n_features"]
+
+    ordinary_candidate_refresh_mask: Bool[Array, " n_candidates"]
+    post_promotion_candidate_refresh_mask: Bool[Array, " n_candidates"]
+    candidate_refresh_mask: Bool[Array, " n_candidates"]
+    candidate_rebound_mask: Bool[Array, " n_candidates"]
+    candidate_final_ops: Int[Array, " n_candidates"]
+    candidate_final_parent_a: Int[Array, " n_candidates"]
+    candidate_final_parent_b: Int[Array, " n_candidates"]
+    candidate_final_theta: Float[Array, "n_candidates 2"]
+    candidate_final_depth: Int[Array, " n_candidates"]
+    candidate_final_generator_policy: Int[Array, " n_candidates"]
+
+    proposal_count: Int[Array, ""]
+    root_change_count: Int[Array, ""]
+    promotion_count: Int[Array, ""]
+    cascade_refill_count: Int[Array, ""]
+    ordinary_candidate_refresh_count: Int[Array, ""]
+    post_promotion_candidate_refresh_count: Int[Array, ""]
+    candidate_refresh_count: Int[Array, ""]
+    candidate_rebound_count: Int[Array, ""]
+    logical_event_count: Int[Array, ""]
+
+
+@chex.dataclass(frozen=True)
 class CompositionalFeatureUpdateResult:
     """Result of one compositional-feature update."""
 
@@ -229,6 +355,7 @@ class CompositionalFeatureUpdateResult:
     metrics: Float[Array, " 7"]
     replaced_slot: Int[Array, ""]
     promoted_candidate: Int[Array, ""]
+    curation_trace: CompositionalCurationTrace
 
 
 @chex.dataclass(frozen=True)
@@ -494,7 +621,7 @@ def _candidate_scores_to_unit_losses(
 
     Higher utility-like scores become lower losses.  The conversion is only
     for the opt-in finite-candidate selector; it is not a theorem for the
-    legacy promote heuristic.
+    default ``"legacy"`` argmax-utility promotion path.
     """
     scores = jnp.asarray(scores, dtype=jnp.float32)
     finite_mask = jnp.asarray(finite_mask, dtype=jnp.bool_) & jnp.isfinite(scores)
@@ -1629,29 +1756,29 @@ class CompositionalFeatureLearner:
         fixed prefix of the bank and are never generated.  The per-strategy
         priors are hand-tuned, not learned; strategies aimed at
         product-structured recursive targets put most or all mass on
-        ``OP_PRODUCT``, while ``residual_imprint`` splits its mass evenly
-        between ``OP_PRODUCT`` and the parameterized ``OP_TANH``.
+        ``OP_PRODUCT``, while ``residual_imprint`` puts equal (0.35) mass on
+        ``OP_PRODUCT`` and the parameterized ``OP_TANH``.
         """
         if forced_op is not None:
             op_ids = jnp.arange(NUM_OPS, dtype=jnp.int32)
-            return jnp.where(op_ids == forced_op, 0.0, -1e9)
+            return jnp.where(op_ids == forced_op, 0.0, -jnp.inf)
         if self._operation_prior is not None:
             probs = jnp.asarray(self._operation_prior, dtype=jnp.float32)
             probs = probs / jnp.sum(probs)
-            return jnp.log(probs + 1e-8)
+            return jnp.where(probs > 0.0, jnp.log(probs), -jnp.inf)
         if self._generation_strategy == GENERATION_RECURSIVE_PRODUCT:
             probs = jnp.array([0.0, 1.0, 0.0, 0.0, 0.0], dtype=jnp.float32)
-            return jnp.log(probs + 1e-8)
+            return jnp.where(probs > 0.0, jnp.log(probs), -jnp.inf)
         if self._generation_strategy == GENERATION_ROBUST_RECURSIVE:
             probs = jnp.array([0.0, 0.5, 0.1, 0.3, 0.1], dtype=jnp.float32)
-            return jnp.log(probs + 1e-8)
+            return jnp.where(probs > 0.0, jnp.log(probs), -jnp.inf)
         if self._generation_strategy == GENERATION_MUTATION:
             probs = jnp.array([0.0, 0.55, 0.15, 0.15, 0.15], dtype=jnp.float32)
         elif self._generation_strategy == GENERATION_RESIDUAL_IMPRINT:
             probs = jnp.array([0.0, 0.35, 0.15, 0.35, 0.15], dtype=jnp.float32)
         else:
             probs = jnp.array([0.0, 0.4, 0.2, 0.2, 0.2], dtype=jnp.float32)
-        return jnp.log(probs + 1e-8)
+        return jnp.where(probs > 0.0, jnp.log(probs), -jnp.inf)
 
     def _parent_logits(
         self,
@@ -2118,9 +2245,10 @@ class CompositionalFeatureLearner:
 
         The op type is biased toward cheap/non-trivial compositional
         primitives.  Parent selection is controlled by ``generation_strategy``:
-        the historical path is utility-biased; mutation/imprint variants anchor
-        one parent on high-score features and sample the other from shallow
-        eligible features to encourage local variants of useful parents.
+        ``"utility"`` biases parents toward high-utility slots; mutation and
+        imprint variants anchor one parent on high-score features and sample
+        the other from shallow eligible features to encourage local variants
+        of useful parents.
 
         Args:
             key: PRNG key.
@@ -2223,7 +2351,7 @@ class CompositionalFeatureLearner:
         ).astype(jnp.int32)
         return op, a_idx, b_idx, new_theta, new_depth
 
-    def _cascade_replace(
+    def _cascade_replace_with_mask(
         self,
         ops: Array,
         parent_a: Array,
@@ -2240,7 +2368,7 @@ class CompositionalFeatureLearner:
         feature_credit: Array | None = None,
         forced_op: Array | None = None,
         parent_mode: Array | None = None,
-    ) -> tuple[Array, Array, Array, Array, Array, Array, Array, Array]:
+    ) -> tuple[Array, Array, Array, Array, Array, Array, Array, Array, Array]:
         """Apply cascade replacement: every descendant of a replaced slot is also replaced.
 
         Iterates over slots in topological order; on each pass, a slot is
@@ -2287,10 +2415,10 @@ class CompositionalFeatureLearner:
         # randomly chosen still-alive earlier slot, or a raw input if none
         # earlier slots survive.
         def refill_step(
-            carry: tuple[Array, Array, Array, Array, Array, Array, Array, Array, Array],
+            carry: tuple[Array, Array, Array, Array, Array, Array, Array, Array],
             i: Array,
         ) -> tuple[
-            tuple[Array, Array, Array, Array, Array, Array, Array, Array, Array], None
+            tuple[Array, Array, Array, Array, Array, Array, Array, Array], None
         ]:
             (
                 ops_c,
@@ -2301,10 +2429,11 @@ class CompositionalFeatureLearner:
                 utils_c,
                 ages_c,
                 ow_c,
-                key_c,
             ) = carry
             do_replace = cascaded_mask[i]
-            key_c, slot_key = jr.split(key_c)
+            # Give each slot a stable random substream so an unrelated earlier
+            # slot entering or leaving the cascade cannot perturb this refill.
+            slot_key = jr.fold_in(key, i.astype(jnp.uint32))
             op_key, pa_key, pb_key, theta_key = jr.split(slot_key, 4)
 
             # Determine the eligible parent set: indices < i whose slot is
@@ -2376,16 +2505,64 @@ class CompositionalFeatureLearner:
             ow_n = jnp.where(
                 do_replace, ow_c.at[:, i].set(0.0), ow_c
             )
-            return (ops_n, pa_n, pb_n, theta_n, depth_n, utils_n, ages_n, ow_n, key_c), None
+            return (ops_n, pa_n, pb_n, theta_n, depth_n, utils_n, ages_n, ow_n), None
 
-        (ops_f, pa_f, pb_f, theta_f, depth_f, utils_f, ages_f, ow_f, _), _ = (
+        (ops_f, pa_f, pb_f, theta_f, depth_f, utils_f, ages_f, ow_f), _ = (
             jax.lax.scan(
                 refill_step,
-                (ops, parent_a, parent_b, theta, depth, utilities, ages, output_weights, key),
+                (ops, parent_a, parent_b, theta, depth, utilities, ages, output_weights),
                 jnp.arange(n_features),
             )
         )
-        return ops_f, pa_f, pb_f, theta_f, depth_f, utils_f, ages_f, ow_f
+        return (
+            ops_f,
+            pa_f,
+            pb_f,
+            theta_f,
+            depth_f,
+            utils_f,
+            ages_f,
+            ow_f,
+            cascaded_mask,
+        )
+
+    def _cascade_replace(
+        self,
+        ops: Array,
+        parent_a: Array,
+        parent_b: Array,
+        theta: Array,
+        depth: Array,
+        utilities: Array,
+        ages: Array,
+        output_weights: Array,
+        replaced_mask: Array,
+        observation: Array,
+        key: Array,
+        feature_values: Array | None = None,
+        feature_credit: Array | None = None,
+        forced_op: Array | None = None,
+        parent_mode: Array | None = None,
+    ) -> tuple[Array, Array, Array, Array, Array, Array, Array, Array]:
+        """Retain the private eight-value surface for compatibility callers."""
+        result = self._cascade_replace_with_mask(
+            ops,
+            parent_a,
+            parent_b,
+            theta,
+            depth,
+            utilities,
+            ages,
+            output_weights,
+            replaced_mask,
+            observation,
+            key,
+            feature_values=feature_values,
+            feature_credit=feature_credit,
+            forced_op=forced_op,
+            parent_mode=parent_mode,
+        )
+        return result[:8]
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def update(
@@ -2442,7 +2619,8 @@ class CompositionalFeatureLearner:
         # Backward-looking utility: an equal blend of contribution magnitude
         # (mean |w| * |f|, how much slot i currently moves the predictions)
         # and gradient credit (|errors @ W|, how much the residual would move
-        # it).  Same signal as FixedBudgetFeatureLearner in feature_discovery.
+        # it).  Matches ``FixedBudgetFeatureLearner``'s default (mean-aggregated)
+        # signal in feature_discovery.
         current_utility_signal = (
             0.5 * jnp.mean(jnp.abs(state.output_weights), axis=0) * jnp.abs(feature_values)
             + 0.5 * jnp.abs(feature_credit)
@@ -2660,23 +2838,29 @@ class CompositionalFeatureLearner:
         ages = state.ages + 1
         candidate_ages = state.candidate_ages + 1
         step_count = state.step_count + 1
-        key, decision_key, replacement_key = jr.split(state.key, 3)
+        key, decision_key, curation_key = jr.split(state.key, 3)
+        proposal_key, cascade_key = compositional_curation_keys(curation_key)
 
         replaced_slot = jnp.array(-1, dtype=jnp.int32)
         promoted_candidate = jnp.array(-1, dtype=jnp.int32)
 
-        decision = self._generator_resource_manager.select(
-            state.generator_resource_state,
-            decision_key,
-            context,
-        )
         forced_op: Array | None = None
         parent_mode: Array | None = None
+        generator_policy = jnp.asarray(
+            FIXED_GENERATOR_POLICY_PLACEHOLDER,
+            dtype=jnp.int32,
+        )
         imprint_scale = jnp.asarray(self._candidate_imprint_scale, dtype=jnp.float32)
         promotion_margin = jnp.asarray(self._promotion_margin, dtype=jnp.float32)
         candidate_min_age = jnp.asarray(self._candidate_min_age, dtype=jnp.float32)
         replacement_accumulator = state.replacement_accumulator
         if self._learn_generator_resources:
+            decision = self._generator_resource_manager.select(
+                state.generator_resource_state,
+                decision_key,
+                context,
+            )
+            generator_policy = decision.action
             forced_op = decision.op_id
             parent_mode = decision.parent_mode
             imprint_scale = decision.imprint_scale
@@ -2762,6 +2946,46 @@ class CompositionalFeatureLearner:
         should_promote_for_trace = jnp.array(False)
         best_candidate_for_trace = jnp.array(0, dtype=jnp.int32)
         promoted_slot_for_trace = worst_active
+        no_event = jnp.asarray(False, dtype=jnp.bool_)
+        absent_index = jnp.asarray(-1, dtype=jnp.int32)
+        absent_theta = jnp.zeros((2,), dtype=jnp.float32)
+        proposal_formed = no_event
+        proposal_destination_bank = jnp.asarray(
+            CURATION_DESTINATION_NONE, dtype=jnp.int32
+        )
+        proposal_destination_slot = absent_index
+        proposal_op = absent_index
+        proposal_parent_a = absent_index
+        proposal_parent_b = absent_index
+        proposal_theta = absent_theta
+        proposal_depth = absent_index
+        proposal_generator_policy = absent_index
+        root_change_applied = no_event
+        post_root_pre_cascade_slot = absent_index
+        post_root_pre_cascade_op = absent_index
+        post_root_pre_cascade_parent_a = absent_index
+        post_root_pre_cascade_parent_b = absent_index
+        post_root_pre_cascade_theta = absent_theta
+        post_root_pre_cascade_depth = absent_index
+        post_root_pre_cascade_generator_policy = absent_index
+        promotion_source_candidate = absent_index
+        promotion_destination_active = absent_index
+        promoted_pre_refresh_op = absent_index
+        promoted_pre_refresh_parent_a = absent_index
+        promoted_pre_refresh_parent_b = absent_index
+        promoted_pre_refresh_theta = absent_theta
+        promoted_pre_refresh_depth = absent_index
+        promoted_pre_refresh_generator_policy = absent_index
+        root_change_mask = jnp.zeros((self._n_features,), dtype=jnp.bool_)
+        cascade_change_mask = jnp.zeros((self._n_features,), dtype=jnp.bool_)
+        active_change_mask = jnp.zeros((self._n_features,), dtype=jnp.bool_)
+        ordinary_candidate_refresh_mask = jnp.zeros(
+            (self._candidate_count,), dtype=jnp.bool_
+        )
+        post_promotion_candidate_refresh_mask = jnp.zeros(
+            (self._candidate_count,), dtype=jnp.bool_
+        )
+        candidate_rebound_mask = jnp.zeros((self._candidate_count,), dtype=jnp.bool_)
         candidate_selector_log_weights = state.candidate_selector_log_weights
         candidate_selector_cumulative_loss = state.candidate_selector_cumulative_loss
         candidate_selector_action_counts = state.candidate_selector_action_counts
@@ -2852,6 +3076,15 @@ class CompositionalFeatureLearner:
                     > promotion_margin * active_replacement_score[promotion_slot]
                 )
             )
+            ordinary_candidate_refresh_applied = (
+                (~should_promote) & should_try_replace & has_refresh_candidate
+            )
+            pre_curation_candidate_ops = candidate_ops
+            pre_curation_candidate_parent_a = candidate_parent_a
+            pre_curation_candidate_parent_b = candidate_parent_b
+            pre_curation_candidate_theta = candidate_theta
+            pre_curation_candidate_depth = candidate_depth
+            pre_curation_candidate_generator_policy = candidate_generator_policy
 
             def promote_branch(args: tuple[Array, ...]) -> tuple[Array, ...]:
                 (
@@ -2953,7 +3186,7 @@ class CompositionalFeatureLearner:
                     observation,
                 )
                 gen_op, gen_pa, gen_pb, gen_theta, gen_depth = self._generate_one(
-                    replacement_key,
+                    proposal_key,
                     depth_b,
                     util_b,
                     existing_ages=age_b,
@@ -2981,7 +3214,7 @@ class CompositionalFeatureLearner:
                 cow_b = cow_a.at[:, best_candidate].set(gen_weights)
                 cutil_b = cutil_a.at[best_candidate].set(0.0)
                 cage_b = cage_a.at[best_candidate].set(0)
-                cgp_b = cgp_a.at[best_candidate].set(decision.action)
+                cgp_b = cgp_a.at[best_candidate].set(generator_policy)
 
                 return (
                     ops_b,
@@ -3025,60 +3258,85 @@ class CompositionalFeatureLearner:
                     fgp_a,
                     cgp_a,
                 ) = args
-                gen_op, gen_pa, gen_pb, gen_theta, gen_depth = self._generate_one(
-                    replacement_key,
-                    depth_a,
-                    util_a,
-                    existing_ages=age_a,
-                    feature_values=feature_values,
-                    feature_credit=feature_credit,
-                    forced_op=forced_op,
-                    parent_mode=parent_mode,
-                )
-                gen_weights = self._initial_candidate_output_weights(
-                    gen_op,
-                    gen_pa,
-                    gen_pb,
-                    gen_theta,
-                    feature_values,
-                    observation,
-                    errors,
-                    active_count,
-                    imprint_scale=imprint_scale,
-                )
-                do_refresh = should_try_replace & has_refresh_candidate
-                co_b = jnp.where(
-                    do_refresh, co_a.at[worst_candidate].set(gen_op), co_a
-                )
-                cpa_b = jnp.where(
-                    do_refresh, cpa_a.at[worst_candidate].set(gen_pa), cpa_a
-                )
-                cpb_b = jnp.where(
-                    do_refresh, cpb_a.at[worst_candidate].set(gen_pb), cpb_a
-                )
-                ctheta_b = jnp.where(
+                do_refresh = ordinary_candidate_refresh_applied
+
+                def apply_refresh(
+                    candidate_args: tuple[Array, ...],
+                ) -> tuple[Array, ...]:
+                    (
+                        co_x,
+                        cpa_x,
+                        cpb_x,
+                        ctheta_x,
+                        cdepth_x,
+                        cow_x,
+                        cutil_x,
+                        cage_x,
+                        cgp_x,
+                    ) = candidate_args
+                    gen_op, gen_pa, gen_pb, gen_theta, gen_depth = self._generate_one(
+                        proposal_key,
+                        depth_a,
+                        util_a,
+                        existing_ages=age_a,
+                        feature_values=feature_values,
+                        feature_credit=feature_credit,
+                        forced_op=forced_op,
+                        parent_mode=parent_mode,
+                    )
+                    gen_weights = self._initial_candidate_output_weights(
+                        gen_op,
+                        gen_pa,
+                        gen_pb,
+                        gen_theta,
+                        feature_values,
+                        observation,
+                        errors,
+                        active_count,
+                        imprint_scale=imprint_scale,
+                    )
+                    return (
+                        co_x.at[worst_candidate].set(gen_op),
+                        cpa_x.at[worst_candidate].set(gen_pa),
+                        cpb_x.at[worst_candidate].set(gen_pb),
+                        ctheta_x.at[worst_candidate].set(gen_theta),
+                        cdepth_x.at[worst_candidate].set(gen_depth),
+                        cow_x.at[:, worst_candidate].set(gen_weights),
+                        cutil_x.at[worst_candidate].set(0.0),
+                        cage_x.at[worst_candidate].set(0),
+                        cgp_x.at[worst_candidate].set(generator_policy),
+                    )
+
+                def keep_candidate(
+                    candidate_args: tuple[Array, ...],
+                ) -> tuple[Array, ...]:
+                    return candidate_args
+
+                (
+                    co_b,
+                    cpa_b,
+                    cpb_b,
+                    ctheta_b,
+                    cdepth_b,
+                    cow_b,
+                    cutil_b,
+                    cage_b,
+                    cgp_b,
+                ) = jax.lax.cond(
                     do_refresh,
-                    ctheta_a.at[worst_candidate].set(gen_theta),
-                    ctheta_a,
-                )
-                cdepth_b = jnp.where(
-                    do_refresh,
-                    cdepth_a.at[worst_candidate].set(gen_depth),
-                    cdepth_a,
-                )
-                cow_b = jnp.where(
-                    do_refresh, cow_a.at[:, worst_candidate].set(gen_weights), cow_a
-                )
-                cutil_b = jnp.where(
-                    do_refresh, cutil_a.at[worst_candidate].set(0.0), cutil_a
-                )
-                cage_b = jnp.where(
-                    do_refresh, cage_a.at[worst_candidate].set(0), cage_a
-                )
-                cgp_b = jnp.where(
-                    do_refresh,
-                    cgp_a.at[worst_candidate].set(decision.action),
-                    cgp_a,
+                    apply_refresh,
+                    keep_candidate,
+                    (
+                        co_a,
+                        cpa_a,
+                        cpb_a,
+                        ctheta_a,
+                        cdepth_a,
+                        cow_a,
+                        cutil_a,
+                        cage_a,
+                        cgp_a,
+                    ),
                 )
                 return (
                     ops_a,
@@ -3150,12 +3408,145 @@ class CompositionalFeatureLearner:
             should_promote_for_trace = should_promote
             best_candidate_for_trace = best_candidate
             promoted_slot_for_trace = promotion_slot
+            ordinary_candidate_refresh_mask = ordinary_candidate_refresh_mask.at[
+                worst_candidate
+            ].set(ordinary_candidate_refresh_applied)
+            post_promotion_candidate_refresh_mask = (
+                post_promotion_candidate_refresh_mask.at[best_candidate].set(
+                    should_promote
+                )
+            )
+            proposal_formed = should_promote | ordinary_candidate_refresh_applied
+            proposal_destination_bank = jnp.where(
+                proposal_formed,
+                jnp.asarray(CURATION_DESTINATION_CANDIDATE, dtype=jnp.int32),
+                proposal_destination_bank,
+            )
+            proposed_candidate_slot = jnp.where(
+                should_promote, best_candidate, worst_candidate
+            )
+            proposal_destination_slot = jnp.where(
+                proposal_formed,
+                proposed_candidate_slot,
+                proposal_destination_slot,
+            )
+            proposal_op = jnp.where(
+                proposal_formed,
+                candidate_ops[proposed_candidate_slot],
+                proposal_op,
+            )
+            proposal_parent_a = jnp.where(
+                proposal_formed,
+                candidate_parent_a[proposed_candidate_slot],
+                proposal_parent_a,
+            )
+            proposal_parent_b = jnp.where(
+                proposal_formed,
+                candidate_parent_b[proposed_candidate_slot],
+                proposal_parent_b,
+            )
+            proposal_theta = jnp.where(
+                proposal_formed,
+                candidate_theta[proposed_candidate_slot],
+                proposal_theta,
+            )
+            proposal_depth = jnp.where(
+                proposal_formed,
+                candidate_depth[proposed_candidate_slot],
+                proposal_depth,
+            )
+            proposal_generator_policy = jnp.where(
+                proposal_formed,
+                candidate_generator_policy[proposed_candidate_slot],
+                proposal_generator_policy,
+            )
+
+            root_change_applied = should_promote
+            root_change_mask = root_change_mask.at[promotion_slot].set(
+                should_promote
+            )
+            post_root_pre_cascade_slot = jnp.where(
+                should_promote,
+                promotion_slot,
+                post_root_pre_cascade_slot,
+            )
+            post_root_pre_cascade_op = jnp.where(
+                should_promote,
+                ops[promotion_slot],
+                post_root_pre_cascade_op,
+            )
+            post_root_pre_cascade_parent_a = jnp.where(
+                should_promote,
+                parent_a[promotion_slot],
+                post_root_pre_cascade_parent_a,
+            )
+            post_root_pre_cascade_parent_b = jnp.where(
+                should_promote,
+                parent_b[promotion_slot],
+                post_root_pre_cascade_parent_b,
+            )
+            post_root_pre_cascade_theta = jnp.where(
+                should_promote,
+                theta[promotion_slot],
+                post_root_pre_cascade_theta,
+            )
+            post_root_pre_cascade_depth = jnp.where(
+                should_promote,
+                depth[promotion_slot],
+                post_root_pre_cascade_depth,
+            )
+            post_root_pre_cascade_generator_policy = jnp.where(
+                should_promote,
+                feature_generator_policy[promotion_slot],
+                post_root_pre_cascade_generator_policy,
+            )
+
+            promotion_source_candidate = jnp.where(
+                should_promote,
+                best_candidate,
+                promotion_source_candidate,
+            )
+            promotion_destination_active = jnp.where(
+                should_promote,
+                promotion_slot,
+                promotion_destination_active,
+            )
+            promoted_pre_refresh_op = jnp.where(
+                should_promote,
+                pre_curation_candidate_ops[best_candidate],
+                promoted_pre_refresh_op,
+            )
+            promoted_pre_refresh_parent_a = jnp.where(
+                should_promote,
+                pre_curation_candidate_parent_a[best_candidate],
+                promoted_pre_refresh_parent_a,
+            )
+            promoted_pre_refresh_parent_b = jnp.where(
+                should_promote,
+                pre_curation_candidate_parent_b[best_candidate],
+                promoted_pre_refresh_parent_b,
+            )
+            promoted_pre_refresh_theta = jnp.where(
+                should_promote,
+                pre_curation_candidate_theta[best_candidate],
+                promoted_pre_refresh_theta,
+            )
+            promoted_pre_refresh_depth = jnp.where(
+                should_promote,
+                pre_curation_candidate_depth[best_candidate],
+                promoted_pre_refresh_depth,
+            )
+            promoted_pre_refresh_generator_policy = jnp.where(
+                should_promote,
+                pre_curation_candidate_generator_policy[best_candidate],
+                promoted_pre_refresh_generator_policy,
+            )
 
             # If we promoted, cascade-replace any active descendants of
             # ``promotion_slot`` (slots that referenced it as a parent).
             def cascade_after_promote(
                 args: tuple[Array, Array, Array, Array, Array, Array, Array, Array],
-            ) -> tuple[Array, Array, Array, Array, Array, Array, Array, Array]:
+            ) -> tuple[Array, Array, Array, Array, Array, Array, Array, Array, Array]:
                 (
                     ops_x,
                     pa_x,
@@ -3182,7 +3573,7 @@ class CompositionalFeatureLearner:
                     & (slot_indices > promotion_slot)
                 )
                 replaced_mask = refs_a | refs_b
-                return self._cascade_replace(
+                return self._cascade_replace_with_mask(
                     ops_x,
                     pa_x,
                     pb_x,
@@ -3193,7 +3584,7 @@ class CompositionalFeatureLearner:
                     ow_x,
                     replaced_mask,
                     observation,
-                    replacement_key,
+                    cascade_key,
                     feature_values=feature_values,
                     feature_credit=feature_credit,
                     forced_op=forced_op,
@@ -3202,8 +3593,18 @@ class CompositionalFeatureLearner:
 
             def no_cascade(
                 args: tuple[Array, Array, Array, Array, Array, Array, Array, Array],
-            ) -> tuple[Array, Array, Array, Array, Array, Array, Array, Array]:
-                return args
+            ) -> tuple[Array, Array, Array, Array, Array, Array, Array, Array, Array]:
+                return (
+                    args[0],
+                    args[1],
+                    args[2],
+                    args[3],
+                    args[4],
+                    args[5],
+                    args[6],
+                    args[7],
+                    jnp.zeros((self._n_features,), dtype=jnp.bool_),
+                )
 
             (
                 ops,
@@ -3214,6 +3615,7 @@ class CompositionalFeatureLearner:
                 new_utilities,
                 ages,
                 output_weights,
+                cascade_change_mask,
             ) = jax.lax.cond(
                 should_promote,
                 cascade_after_promote,
@@ -3229,11 +3631,21 @@ class CompositionalFeatureLearner:
                     output_weights,
                 ),
             )
+            feature_generator_policy = jnp.where(
+                cascade_change_mask,
+                generator_policy,
+                feature_generator_policy,
+            )
+            active_change_mask = root_change_mask | cascade_change_mask
         else:
 
             def replace_active_branch(
-                args: tuple[Array, Array, Array, Array, Array, Array, Array, Array, Array],
-            ) -> tuple[Array, Array, Array, Array, Array, Array, Array, Array, Array]:
+                args: tuple[
+                    Array, Array, Array, Array, Array, Array, Array, Array, Array, Array
+                ],
+            ) -> tuple[
+                Array, Array, Array, Array, Array, Array, Array, Array, Array, Array
+            ]:
                 (
                     ops_x,
                     pa_x,
@@ -3244,12 +3656,13 @@ class CompositionalFeatureLearner:
                     age_x,
                     ow_x,
                     fgp_x,
+                    _change_mask_x,
                 ) = args
                 # Build a fresh composition whose parents are < worst_active.
                 # Mask out slots >= worst_active and bias selection by the
                 # current utility estimate so productive features become
                 # parents more often.
-                op_key, pa_key, pb_key, theta_key = jr.split(replacement_key, 4)
+                op_key, pa_key, pb_key, theta_key = jr.split(proposal_key, 4)
                 slot_indices = jnp.arange(self._n_features)
                 in_range = slot_indices < worst_active
                 depth_ok = depth_x + 1 <= self._max_depth
@@ -3288,7 +3701,7 @@ class CompositionalFeatureLearner:
                 util_n = util_x.at[worst_active].set(0.0)
                 age_n = age_x.at[worst_active].set(0)
                 ow_n = ow_x.at[:, worst_active].set(0.0)
-                fgp_n = fgp_x.at[worst_active].set(decision.action)
+                fgp_n = fgp_x.at[worst_active].set(generator_policy)
 
                 # Cascade-replace descendants of worst_active.
                 composed = ops_n != OP_RAW
@@ -3300,7 +3713,17 @@ class CompositionalFeatureLearner:
                     & (slot_indices > worst_active)
                 )
                 replaced_mask = refs_a | refs_b
-                ops_f, pa_f, pb_f, theta_f, depth_f, util_f, age_f, ow_f = self._cascade_replace(
+                (
+                    ops_f,
+                    pa_f,
+                    pb_f,
+                    theta_f,
+                    depth_f,
+                    util_f,
+                    age_f,
+                    ow_f,
+                    cascade_change_mask,
+                ) = self._cascade_replace_with_mask(
                     ops_n,
                     pa_n,
                     pb_n,
@@ -3311,17 +3734,34 @@ class CompositionalFeatureLearner:
                     ow_n,
                     replaced_mask,
                     observation,
-                    replacement_key,
+                    cascade_key,
                     feature_values=feature_values,
                     feature_credit=feature_credit,
                     forced_op=forced_op,
                     parent_mode=parent_mode,
                 )
-                return ops_f, pa_f, pb_f, theta_f, depth_f, util_f, age_f, ow_f, fgp_n
+                fgp_f = jnp.where(cascade_change_mask, generator_policy, fgp_n)
+                applied_change_mask = cascade_change_mask.at[worst_active].set(True)
+                return (
+                    ops_f,
+                    pa_f,
+                    pb_f,
+                    theta_f,
+                    depth_f,
+                    util_f,
+                    age_f,
+                    ow_f,
+                    fgp_f,
+                    applied_change_mask,
+                )
 
             def keep_active_branch(
-                args: tuple[Array, Array, Array, Array, Array, Array, Array, Array, Array],
-            ) -> tuple[Array, Array, Array, Array, Array, Array, Array, Array, Array]:
+                args: tuple[
+                    Array, Array, Array, Array, Array, Array, Array, Array, Array, Array
+                ],
+            ) -> tuple[
+                Array, Array, Array, Array, Array, Array, Array, Array, Array, Array
+            ]:
                 return args
 
             do_replace = should_try_replace & has_active_slot
@@ -3335,6 +3775,7 @@ class CompositionalFeatureLearner:
                 ages,
                 output_weights,
                 feature_generator_policy,
+                active_change_mask,
             ) = jax.lax.cond(
                 do_replace,
                 replace_active_branch,
@@ -3349,12 +3790,175 @@ class CompositionalFeatureLearner:
                     ages,
                     output_weights,
                     feature_generator_policy,
+                    active_change_mask,
                 ),
+            )
+            root_change_applied = do_replace
+            root_change_mask = root_change_mask.at[worst_active].set(do_replace)
+            cascade_change_mask = active_change_mask & (~root_change_mask)
+            proposal_formed = do_replace
+            proposal_destination_bank = jnp.where(
+                do_replace,
+                jnp.asarray(CURATION_DESTINATION_ACTIVE, dtype=jnp.int32),
+                proposal_destination_bank,
+            )
+            proposal_destination_slot = jnp.where(
+                do_replace,
+                worst_active,
+                proposal_destination_slot,
+            )
+            proposal_op = jnp.where(do_replace, ops[worst_active], proposal_op)
+            proposal_parent_a = jnp.where(
+                do_replace,
+                parent_a[worst_active],
+                proposal_parent_a,
+            )
+            proposal_parent_b = jnp.where(
+                do_replace,
+                parent_b[worst_active],
+                proposal_parent_b,
+            )
+            proposal_theta = jnp.where(
+                do_replace,
+                theta[worst_active],
+                proposal_theta,
+            )
+            proposal_depth = jnp.where(
+                do_replace,
+                depth[worst_active],
+                proposal_depth,
+            )
+            proposal_generator_policy = jnp.where(
+                do_replace,
+                feature_generator_policy[worst_active],
+                proposal_generator_policy,
+            )
+            post_root_pre_cascade_slot = jnp.where(
+                do_replace,
+                worst_active,
+                post_root_pre_cascade_slot,
+            )
+            post_root_pre_cascade_op = jnp.where(
+                do_replace,
+                ops[worst_active],
+                post_root_pre_cascade_op,
+            )
+            post_root_pre_cascade_parent_a = jnp.where(
+                do_replace,
+                parent_a[worst_active],
+                post_root_pre_cascade_parent_a,
+            )
+            post_root_pre_cascade_parent_b = jnp.where(
+                do_replace,
+                parent_b[worst_active],
+                post_root_pre_cascade_parent_b,
+            )
+            post_root_pre_cascade_theta = jnp.where(
+                do_replace,
+                theta[worst_active],
+                post_root_pre_cascade_theta,
+            )
+            post_root_pre_cascade_depth = jnp.where(
+                do_replace,
+                depth[worst_active],
+                post_root_pre_cascade_depth,
+            )
+            post_root_pre_cascade_generator_policy = jnp.where(
+                do_replace,
+                feature_generator_policy[worst_active],
+                post_root_pre_cascade_generator_policy,
             )
             replaced_slot = jnp.where(do_replace, worst_active, replaced_slot)
 
-        reset_active_traces = ages == 0
         if self._candidate_count > 0:
+            # Candidate descriptors are slot-relative.  Replacing an active
+            # parent rebinds such a candidate to a new signal and therefore a
+            # new structural lifetime identity.  The external event ledger
+            # must allocate that identity.  Locally, preserve its op, parents,
+            # and provenance, recompute derived depth, and restart learned state.
+            # A trainable pre-existing TANH theta is learned state and cold
+            # resets too.  The source slot refreshed by a promotion is born
+            # after the root mutation, so only the subsequent cascade can
+            # rebound that fresh proposal and its newly sampled theta remains
+            # valid for its post-root parents.
+            safe_candidate_pa = jnp.clip(
+                candidate_parent_a, 0, self._n_features - 1
+            )
+            safe_candidate_pb = jnp.clip(
+                candidate_parent_b, 0, self._n_features - 1
+            )
+            references_active_change = (candidate_ops != OP_RAW) & (
+                active_change_mask[safe_candidate_pa]
+                | (
+                    (candidate_parent_b >= 0)
+                    & active_change_mask[safe_candidate_pb]
+                )
+            )
+            references_later_cascade = (candidate_ops != OP_RAW) & (
+                cascade_change_mask[safe_candidate_pa]
+                | (
+                    (candidate_parent_b >= 0)
+                    & cascade_change_mask[safe_candidate_pb]
+                )
+            )
+            candidate_indices = jnp.arange(self._candidate_count, dtype=jnp.int32)
+            refreshed_after_root = should_promote_for_trace & (
+                candidate_indices == best_candidate_for_trace
+            )
+            candidate_rebound_mask = jnp.where(
+                refreshed_after_root,
+                references_later_cascade,
+                references_active_change,
+            )
+            rebound_depth = (
+                jnp.maximum(
+                    depth[safe_candidate_pa],
+                    jnp.where(
+                        candidate_parent_b >= 0,
+                        depth[safe_candidate_pb],
+                        jnp.asarray(0, dtype=jnp.int32),
+                    ),
+                )
+                + 1
+            ).astype(jnp.int32)
+            candidate_depth = jnp.where(
+                candidate_rebound_mask,
+                rebound_depth,
+                candidate_depth,
+            )
+            if self._train_candidate_theta:
+                preexisting_trainable_rebound = (
+                    candidate_rebound_mask
+                    & (~refreshed_after_root)
+                    & (candidate_ops == OP_TANH)
+                )
+                candidate_theta = jnp.where(
+                    preexisting_trainable_rebound[:, None],
+                    jnp.zeros_like(candidate_theta),
+                    candidate_theta,
+                )
+            candidate_output_weights = jnp.where(
+                candidate_rebound_mask[None, :],
+                jnp.zeros_like(candidate_output_weights),
+                candidate_output_weights,
+            )
+            new_candidate_utilities = jnp.where(
+                candidate_rebound_mask,
+                jnp.zeros_like(new_candidate_utilities),
+                new_candidate_utilities,
+            )
+            candidate_ages = jnp.where(
+                candidate_rebound_mask,
+                jnp.zeros_like(candidate_ages),
+                candidate_ages,
+            )
+
+        reset_active_traces = active_change_mask
+        if self._candidate_count > 0:
+            # Snapshot promotion evidence before the candidate-local reset
+            # below.  A freshly generated promoted-candidate slot and any
+            # rebound candidates have age zero, but the promoted active root
+            # still inherits the source candidate's pre-refresh traces.
             safe_best_candidate = jnp.clip(
                 best_candidate_for_trace, 0, self._candidate_count - 1
             )
@@ -3475,7 +4079,7 @@ class CompositionalFeatureLearner:
                 retention_slow_utilities[promoted_slot_for_trace],
             )
         )
-        reset_candidate_traces = candidate_ages == 0
+        reset_candidate_traces = (candidate_ages == 0) | candidate_rebound_mask
         candidate_utility_contribution_trace = jnp.where(
             reset_candidate_traces[None, :],
             0.0,
@@ -3655,6 +4259,108 @@ class CompositionalFeatureLearner:
             dtype=jnp.float32,
         )
 
+        candidate_refresh_mask = (
+            ordinary_candidate_refresh_mask | post_promotion_candidate_refresh_mask
+        )
+        proposal_count = proposal_formed.astype(jnp.int32)
+        root_change_count = jnp.sum(root_change_mask.astype(jnp.int32))
+        promotion_count = should_promote_for_trace.astype(jnp.int32)
+        cascade_refill_count = jnp.sum(cascade_change_mask.astype(jnp.int32))
+        ordinary_candidate_refresh_count = jnp.sum(
+            ordinary_candidate_refresh_mask.astype(jnp.int32)
+        )
+        post_promotion_candidate_refresh_count = jnp.sum(
+            post_promotion_candidate_refresh_mask.astype(jnp.int32)
+        )
+        candidate_refresh_count = jnp.sum(candidate_refresh_mask.astype(jnp.int32))
+        candidate_rebound_count = jnp.sum(candidate_rebound_mask.astype(jnp.int32))
+        # Proposal formation is the cause of an active-root or candidate-slot
+        # birth, not a second ledger event.  Promotion classifies the root
+        # change.  Cascades and rebounds each create additional structural
+        # lifetimes and therefore contribute independently.
+        logical_event_count = (
+            root_change_count
+            + candidate_refresh_count
+            + cascade_refill_count
+            + candidate_rebound_count
+        )
+        curation_trace = CompositionalCurationTrace(
+            pre_step=state.step_count,
+            post_step=step_count,
+            decision_key=decision_key,
+            curation_key=curation_key,
+            proposal_key=proposal_key,
+            cascade_key=cascade_key,
+            should_try_replace=jnp.asarray(should_try_replace, dtype=jnp.bool_),
+            has_event=logical_event_count > 0,
+            generator_policy_sampled=jnp.asarray(
+                self._learn_generator_resources, dtype=jnp.bool_
+            ),
+            generator_policy_id=generator_policy,
+            proposal_formed=proposal_formed,
+            proposal_destination_bank=proposal_destination_bank,
+            proposal_destination_slot=proposal_destination_slot,
+            proposal_op=proposal_op,
+            proposal_parent_a=proposal_parent_a,
+            proposal_parent_b=proposal_parent_b,
+            proposal_theta=proposal_theta,
+            proposal_depth=proposal_depth,
+            proposal_generator_policy=proposal_generator_policy,
+            root_change_mask=root_change_mask,
+            root_change_applied=root_change_applied,
+            post_root_pre_cascade_slot=post_root_pre_cascade_slot,
+            post_root_pre_cascade_op=post_root_pre_cascade_op,
+            post_root_pre_cascade_parent_a=post_root_pre_cascade_parent_a,
+            post_root_pre_cascade_parent_b=post_root_pre_cascade_parent_b,
+            post_root_pre_cascade_theta=post_root_pre_cascade_theta,
+            post_root_pre_cascade_depth=post_root_pre_cascade_depth,
+            post_root_pre_cascade_generator_policy=(
+                post_root_pre_cascade_generator_policy
+            ),
+            promotion_applied=should_promote_for_trace,
+            promotion_source_candidate=promotion_source_candidate,
+            promotion_destination_active=promotion_destination_active,
+            promoted_pre_refresh_op=promoted_pre_refresh_op,
+            promoted_pre_refresh_parent_a=promoted_pre_refresh_parent_a,
+            promoted_pre_refresh_parent_b=promoted_pre_refresh_parent_b,
+            promoted_pre_refresh_theta=promoted_pre_refresh_theta,
+            promoted_pre_refresh_depth=promoted_pre_refresh_depth,
+            promoted_pre_refresh_generator_policy=(
+                promoted_pre_refresh_generator_policy
+            ),
+            cascade_refill_mask=cascade_change_mask,
+            cascade_final_ops=ops,
+            cascade_final_parent_a=parent_a,
+            cascade_final_parent_b=parent_b,
+            cascade_final_theta=theta,
+            cascade_final_depth=depth,
+            cascade_final_generator_policy=feature_generator_policy,
+            active_change_mask=active_change_mask,
+            ordinary_candidate_refresh_mask=ordinary_candidate_refresh_mask,
+            post_promotion_candidate_refresh_mask=(
+                post_promotion_candidate_refresh_mask
+            ),
+            candidate_refresh_mask=candidate_refresh_mask,
+            candidate_rebound_mask=candidate_rebound_mask,
+            candidate_final_ops=candidate_ops,
+            candidate_final_parent_a=candidate_parent_a,
+            candidate_final_parent_b=candidate_parent_b,
+            candidate_final_theta=candidate_theta,
+            candidate_final_depth=candidate_depth,
+            candidate_final_generator_policy=candidate_generator_policy,
+            proposal_count=proposal_count,
+            root_change_count=root_change_count,
+            promotion_count=promotion_count,
+            cascade_refill_count=cascade_refill_count,
+            ordinary_candidate_refresh_count=ordinary_candidate_refresh_count,
+            post_promotion_candidate_refresh_count=(
+                post_promotion_candidate_refresh_count
+            ),
+            candidate_refresh_count=candidate_refresh_count,
+            candidate_rebound_count=candidate_rebound_count,
+            logical_event_count=logical_event_count,
+        )
+
         return CompositionalFeatureUpdateResult(
             state=new_state,
             predictions=predictions,
@@ -3662,6 +4368,7 @@ class CompositionalFeatureLearner:
             metrics=metrics,
             replaced_slot=replaced_slot,
             promoted_candidate=promoted_candidate,
+            curation_trace=curation_trace,
         )
 
 

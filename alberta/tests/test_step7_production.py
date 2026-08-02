@@ -14,6 +14,7 @@ from alberta_framework.steps.step7 import (
     Step7DynaState,
     Step7DynaUpdateResult,
     Step7SmokeResult,
+    _score_planning_actions,
     init_step7_state,
     make_step7_components,
     run_step7_scan,
@@ -328,3 +329,62 @@ class TestStep7Fineness:
         acceptance = jnp.sum(result.planning_accepted)
         # At least some steps should have accepted planning
         assert int(acceptance) > 0
+
+
+# ---------------------------------------------------------------------------
+# Search-control action scoring
+# ---------------------------------------------------------------------------
+
+
+class TestScorePlanningActions:
+    """The returned score is exactly the selected action's priority."""
+
+    def _trained_model_state(self, model):  # type: ignore[no-untyped-def]
+        state = model.init(jr.key(7))
+        obs = jr.normal(jr.key(8), (OBS_DIM,), dtype=jnp.float32)
+        next_obs = jr.normal(jr.key(9), (OBS_DIM,), dtype=jnp.float32)
+        result = model.update(
+            state, obs, jnp.array(1, dtype=jnp.int32), jnp.array(0.7), next_obs
+        )
+        return result.state
+
+    def test_reward_strategy_score_is_selected_abs_reward(self) -> None:
+        cfg = _cfg()
+        _, model = make_step7_components(cfg)
+        model_state = self._trained_model_state(model)
+        anchor = jr.normal(jr.key(10), (OBS_DIM,), dtype=jnp.float32)
+
+        selected, score = _score_planning_actions(
+            model, model_state, anchor, "reward", N_ACTIONS
+        )
+
+        rewards = jnp.array(
+            [
+                jnp.abs(
+                    model.predict(
+                        model_state, anchor, jnp.array(a, dtype=jnp.int32)
+                    ).reward
+                )
+                for a in range(N_ACTIONS)
+            ]
+        )
+        assert int(selected) == int(jnp.argmax(rewards))
+        assert float(score) == pytest.approx(float(rewards[int(selected)]))
+
+    def test_surprise_strategy_score_adds_transition_magnitude(self) -> None:
+        cfg = _cfg()
+        _, model = make_step7_components(cfg)
+        model_state = self._trained_model_state(model)
+        anchor = jr.normal(jr.key(11), (OBS_DIM,), dtype=jnp.float32)
+
+        selected, score = _score_planning_actions(
+            model, model_state, anchor, "surprise", N_ACTIONS
+        )
+
+        prediction = model.predict(
+            model_state, anchor, jnp.asarray(selected, dtype=jnp.int32)
+        )
+        expected = jnp.abs(prediction.reward) + jnp.sqrt(
+            jnp.mean((prediction.next_observation - anchor) ** 2)
+        )
+        assert float(score) == pytest.approx(float(expected), rel=1e-6)

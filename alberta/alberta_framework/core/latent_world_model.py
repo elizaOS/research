@@ -11,17 +11,37 @@ Two deliberate simplifications keep the first research question about
 predictive latent dynamics, surprise, and dream selection rather than
 unstable joint representation learning:
 
-1. **Fixed random encoder** — observations are embedded by an untrained
-   ``tanh`` random projection, i.e. a random-features map (cf. Rahimi &
-   Recht 2007; the sparse FTL world model in
+1. **Fixed random encoder by default** — observations are embedded by an
+   untrained ``tanh`` random projection, i.e. a random-features map (cf.
+   Rahimi & Recht 2007; the sparse FTL world model in
    :mod:`alberta_framework.core.ftl_world_model` makes the same trade for
-   the same reason).  Because the encoder receives no gradient,
+   the same reason).  Because the default encoder receives no gradient,
    representation collapse cannot be caused by training here.
 2. **Collapse tracking as diagnostic, not loss** — an EMA of per-dimension
    target-latent variance is maintained, and ``collapse_score`` reports the
    fraction of latent dimensions whose std falls below ``min_latent_std``.
-   With a learned encoder this diagnostic would become an anti-collapse
-   gate; with the fixed encoder it flags degenerate inputs or encoders.
+   With the fixed encoder it flags degenerate inputs or encoders; with the
+   trainable-encoder variant below it becomes an anti-collapse gate.
+
+**Trainable-encoder variant** (``encoder_learning=True``, default off): the
+encoder additionally takes one bounded gradient step per accepted transition
+on the latent prediction loss
+``mean((z_t + predicted_delta - encode(next_obs))**2)``, differentiated
+through both the predictor input branch and the target branch with the
+predictor weights held fixed at their pre-update values.  The step is
+elementwise-clipped to ``max_encoder_update`` and is skipped fail-closed
+whenever the fresh ``collapse_score`` exceeds
+``encoder_collapse_gate_threshold`` or any gradient/candidate value is
+non-finite — a skipped step leaves the encoder bytes unchanged.  With the
+flag at its default ``False`` the update path is exactly the fixed-encoder
+computation.
+
+This module is development/L0 mechanism code and makes no efficacy,
+scientific-evidence, or SOTA claim.  ("Development" and "L0" are this
+repository's evidence vocabulary, defined in ``RESEARCH_STATUS.md``: L0
+covers mechanism-level checks — API, shape, finite-value, serialization,
+local update behavior — and development modules can never promote
+scientific claims.)
 """
 
 from __future__ import annotations
@@ -35,7 +55,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 
 from alberta_framework.core.multi_head_learner import (
     AnyOptimizer,
@@ -46,13 +66,21 @@ from alberta_framework.core.multi_head_learner import (
 from alberta_framework.core.optimizers import Bounder
 from alberta_framework.core.types import TraceMode
 
+EVIDENCE_LEVEL = "L0"
+SCIENTIFIC_PROMOTION_ALLOWED = False
+
 
 @dataclasses.dataclass(frozen=True)
 class LatentWorldModelConfig:
     """Configuration for :class:`LatentWorldModel`.
 
-    The encoder is fixed in this first version. Anti-collapse is therefore a
-    diagnostic and gate, not yet a representation-learning gradient.
+    The encoder is fixed by default (``encoder_learning=False``), keeping
+    anti-collapse a pure diagnostic.  Setting ``encoder_learning=True``
+    enables the development-only (L0) trainable-encoder variant: one bounded
+    encoder gradient step per accepted transition, elementwise-clipped to
+    ``max_encoder_update`` and skipped whenever the fresh ``collapse_score``
+    exceeds ``encoder_collapse_gate_threshold`` (the anti-collapse diagnostic
+    acting as a gate) or any gradient/candidate value is non-finite.
     """
 
     observation_dim: int
@@ -76,6 +104,10 @@ class LatentWorldModelConfig:
     min_latent_std: float = 0.05
     max_latent_delta: float = 5.0
     include_action_interactions: bool = False
+    encoder_learning: bool = False
+    encoder_step_size: float = 0.01
+    max_encoder_update: float = 0.1
+    encoder_collapse_gate_threshold: float = 0.0
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dictionary."""
@@ -129,7 +161,13 @@ class LatentWorldModelPrediction:
 
 @chex.dataclass(frozen=True)
 class LatentWorldModelUpdateResult:
-    """Result from one real latent-dynamics update."""
+    """Result from one real latent-dynamics update.
+
+    ``encoder_update_applied``, ``encoder_collapse_gated``, and
+    ``encoder_gradient_norm`` describe the optional trainable-encoder step;
+    with ``encoder_learning=False`` they are the constants ``False``,
+    ``False``, and ``0.0``.
+    """
 
     state: LatentWorldModelState
     prediction: LatentWorldModelPrediction
@@ -144,6 +182,9 @@ class LatentWorldModelUpdateResult:
     collapse_score: Float[Array, ""]
     per_head_metrics: Float[Array, "model_heads 3"]
     learner_result: MultiHeadMLPUpdateResult
+    encoder_update_applied: Bool[Array, ""]
+    encoder_collapse_gated: Bool[Array, ""]
+    encoder_gradient_norm: Float[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -163,10 +204,18 @@ class LatentWorldModelLearningResult:
     latent_std_means: Float[Array, " num_steps"]
     collapse_scores: Float[Array, " num_steps"]
     per_head_metrics: Float[Array, "num_steps model_heads metrics"]
+    encoder_updates_applied: Bool[Array, " num_steps"]
+    encoder_collapse_gates: Bool[Array, " num_steps"]
+    encoder_gradient_norms: Float[Array, " num_steps"]
 
 
 class LatentWorldModel:
-    """Fixed-encoder latent model for ``(z_t, a_t) -> (z_{t+1}, r, gamma)``."""
+    """Latent model for ``(z_t, a_t) -> (z_{t+1}, r, gamma)``.
+
+    The encoder is a fixed ``tanh`` random projection by default; with
+    ``encoder_learning=True`` (development-only, L0) it additionally takes
+    bounded, collapse-gated gradient steps on the latent prediction loss.
+    """
 
     def __init__(
         self,
@@ -287,19 +336,28 @@ class LatentWorldModel:
             step_count=jnp.array(0, dtype=jnp.int32),
         )
 
+    def _encode_with(
+        self,
+        encoder_matrix: Array,
+        encoder_bias: Array,
+        observation: Array,
+    ) -> Float[Array, " latent_dim"]:
+        """Encode one observation with explicit (differentiable) encoder params."""
+        obs = jnp.asarray(observation, dtype=jnp.float32).reshape(
+            (self._config.observation_dim,)
+        )
+        scale = jnp.asarray(self._observation_scale, dtype=jnp.float32)
+        scaled = obs / jnp.maximum(scale, jnp.asarray(1e-6, dtype=jnp.float32))
+        return jnp.tanh(scaled @ encoder_matrix + encoder_bias)
+
     @functools.partial(jax.jit, static_argnums=(0,))
     def encode(
         self,
         state: LatentWorldModelState,
         observation: Array,
     ) -> Float[Array, " latent_dim"]:
-        """Encode one observation into the fixed latent space."""
-        obs = jnp.asarray(observation, dtype=jnp.float32).reshape(
-            (self._config.observation_dim,)
-        )
-        scale = jnp.asarray(self._observation_scale, dtype=jnp.float32)
-        scaled = obs / jnp.maximum(scale, jnp.asarray(1e-6, dtype=jnp.float32))
-        return jnp.tanh(scaled @ state.encoder_matrix + state.encoder_bias)
+        """Encode one observation into the current latent space."""
+        return self._encode_with(state.encoder_matrix, state.encoder_bias, observation)
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def input_features_from_latent(
@@ -407,6 +465,84 @@ class LatentWorldModel:
             self.predict_from_latent(state, self.encode(state, observation), action),
         )
 
+    def _encoder_step(
+        self,
+        state: LatentWorldModelState,
+        observation: Array,
+        action: Array,
+        next_observation: Array,
+        collapse_score: Array,
+    ) -> tuple[Array, Array, Array, Array, Array]:
+        """Return one bounded, collapse-gated encoder update candidate.
+
+        The latent prediction loss is differentiated with respect to the
+        encoder parameters through both the predictor input branch and the
+        target branch, with the predictor weights held fixed at their
+        pre-update values.  The step is elementwise-clipped to
+        ``max_encoder_update`` and skipped fail-closed — encoder bytes
+        unchanged — when the fresh ``collapse_score`` exceeds
+        ``encoder_collapse_gate_threshold`` or any gradient/candidate value
+        is non-finite.
+
+        Returns:
+            ``(encoder_matrix, encoder_bias, applied, gate_blocked,
+            gradient_norm)``.
+        """
+        config = self._config
+
+        def latent_prediction_loss(
+            encoder_matrix: Array,
+            encoder_bias: Array,
+        ) -> Array:
+            latent = self._encode_with(encoder_matrix, encoder_bias, observation)
+            target_next_latent = self._encode_with(
+                encoder_matrix, encoder_bias, next_observation
+            )
+            raw_predictions = self._learner.predict(
+                state.learner_state,
+                self.input_features_from_latent(latent, action),
+            )
+            latent_part = jnp.clip(
+                raw_predictions[: config.latent_dim],
+                -config.max_latent_delta,
+                config.max_latent_delta,
+            )
+            predicted_next_latent = jnp.where(
+                config.predict_delta,
+                latent + latent_part,
+                latent_part,
+            )
+            return jnp.mean((predicted_next_latent - target_next_latent) ** 2)
+
+        grad_matrix, grad_bias = jax.grad(latent_prediction_loss, argnums=(0, 1))(
+            state.encoder_matrix,
+            state.encoder_bias,
+        )
+        grads_finite = jnp.all(jnp.isfinite(grad_matrix)) & jnp.all(jnp.isfinite(grad_bias))
+        gradient_norm = jnp.where(
+            grads_finite,
+            jnp.sqrt(jnp.sum(grad_matrix**2) + jnp.sum(grad_bias**2)),
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        step_size = jnp.asarray(config.encoder_step_size, dtype=jnp.float32)
+        bound = jnp.asarray(config.max_encoder_update, dtype=jnp.float32)
+        candidate_matrix = state.encoder_matrix + jnp.clip(
+            -step_size * grad_matrix, -bound, bound
+        )
+        candidate_bias = state.encoder_bias + jnp.clip(-step_size * grad_bias, -bound, bound)
+        gate_blocked = collapse_score > jnp.asarray(
+            config.encoder_collapse_gate_threshold, dtype=jnp.float32
+        )
+        applied = (
+            grads_finite
+            & ~gate_blocked
+            & jnp.all(jnp.isfinite(candidate_matrix))
+            & jnp.all(jnp.isfinite(candidate_bias))
+        )
+        encoder_matrix = jnp.where(applied, candidate_matrix, state.encoder_matrix)
+        encoder_bias = jnp.where(applied, candidate_bias, state.encoder_bias)
+        return encoder_matrix, encoder_bias, applied, gate_blocked, gradient_norm
+
     @functools.partial(jax.jit, static_argnums=(0,))
     def update(
         self,
@@ -417,7 +553,14 @@ class LatentWorldModel:
         discount: Array,
         next_observation: Array,
     ) -> LatentWorldModelUpdateResult:
-        """Update from one real transition."""
+        """Update from one real transition.
+
+        With ``encoder_learning=True`` the fixed-encoder transaction is
+        followed by one bounded, collapse-gated encoder gradient step; the
+        updated encoder takes effect from the next event.  With the default
+        ``encoder_learning=False`` the computation is exactly the
+        fixed-encoder path.
+        """
         prediction = self.predict(state, observation, action)
         targets = self.targets(state, observation, reward, discount, next_observation)
         learner_result = self._learner.update(
@@ -470,9 +613,24 @@ class LatentWorldModel:
             collapse_decay * state.collapse_score_ema + (1.0 - collapse_decay) * collapse_score,
         )
 
+        if self._config.encoder_learning:
+            (
+                encoder_matrix,
+                encoder_bias,
+                encoder_update_applied,
+                encoder_collapse_gated,
+                encoder_gradient_norm,
+            ) = self._encoder_step(state, observation, action, next_observation, collapse_score)
+        else:
+            encoder_matrix = state.encoder_matrix
+            encoder_bias = state.encoder_bias
+            encoder_update_applied = jnp.asarray(False, dtype=jnp.bool_)
+            encoder_collapse_gated = jnp.asarray(False, dtype=jnp.bool_)
+            encoder_gradient_norm = jnp.asarray(0.0, dtype=jnp.float32)
+
         new_state = LatentWorldModelState(
-            encoder_matrix=state.encoder_matrix,
-            encoder_bias=state.encoder_bias,
+            encoder_matrix=encoder_matrix,
+            encoder_bias=encoder_bias,
             learner_state=learner_result.state,
             latent_mean_ema=next_mean,
             latent_var_ema=next_var,
@@ -495,6 +653,9 @@ class LatentWorldModel:
             collapse_score=collapse_score,
             per_head_metrics=learner_result.per_head_metrics,
             learner_result=learner_result,
+            encoder_update_applied=encoder_update_applied,
+            encoder_collapse_gated=encoder_collapse_gated,
+            encoder_gradient_norm=encoder_gradient_norm,
         )
 
     def _validate_config(self, config: LatentWorldModelConfig) -> None:
@@ -529,6 +690,12 @@ class LatentWorldModel:
             raise ValueError("min_latent_std must be non-negative")
         if config.max_latent_delta <= 0.0:
             raise ValueError("max_latent_delta must be positive")
+        if config.encoder_step_size <= 0.0:
+            raise ValueError("encoder_step_size must be positive")
+        if config.max_encoder_update <= 0.0:
+            raise ValueError("max_encoder_update must be positive")
+        if not 0.0 <= config.encoder_collapse_gate_threshold <= 1.0:
+            raise ValueError("encoder_collapse_gate_threshold must be in [0, 1]")
 
 
 def run_latent_world_model_learning_loop(
@@ -566,6 +733,9 @@ def run_latent_world_model_learning_loop(
             result.latent_std_mean,
             result.collapse_score,
             result.per_head_metrics,
+            result.encoder_update_applied,
+            result.encoder_collapse_gated,
+            result.encoder_gradient_norm,
         )
 
     final_state, (
@@ -581,6 +751,9 @@ def run_latent_world_model_learning_loop(
         latent_std_means,
         collapse_scores,
         per_head_metrics,
+        encoder_updates_applied,
+        encoder_collapse_gates,
+        encoder_gradient_norms,
     ) = jax.lax.scan(
         _scan_fn,
         state,
@@ -600,15 +773,20 @@ def run_latent_world_model_learning_loop(
         latent_std_means=latent_std_means,
         collapse_scores=collapse_scores,
         per_head_metrics=per_head_metrics,
+        encoder_updates_applied=encoder_updates_applied,
+        encoder_collapse_gates=encoder_collapse_gates,
+        encoder_gradient_norms=encoder_gradient_norms,
     )
 
 
 __all__ = [
+    "EVIDENCE_LEVEL",
     "LatentWorldModel",
     "LatentWorldModelConfig",
     "LatentWorldModelLearningResult",
     "LatentWorldModelPrediction",
     "LatentWorldModelState",
     "LatentWorldModelUpdateResult",
+    "SCIENTIFIC_PROMOTION_ALLOWED",
     "run_latent_world_model_learning_loop",
 ]

@@ -107,13 +107,18 @@ L0 path from a fixed-width base representation through bounded pair products to
 the linear OaK control loop. It trains the pair bank from one exact
 owner-bound behavior TD target: base-Q while idle or the current intra-option
 target while an option executes. Any builder gradient through the augmented
-representation is pulled back against the exact pre-route semantic generation.
+representation is pulled back against the exact pre-route generation and full
+descriptor bank. That identity is persisted beside the enabled OaK subtree,
+so lifecycle/OaK branch swaps fail closed even at an all-zero cache collision.
 At a safe idle/cached-base boundary, descriptor changes route atomically through
 the linear OaK consumers; otherwise curation is deferred by restoring the
 pre-curation proposal state rather than queuing the mutation.
 
 The lifecycle has explicit allocation ceilings, fixed resource accounting, and
-versioned config/checkpoint contracts. Its Prototype compatibility boundary
+versioned config/checkpoint contracts. A standalone lifecycle checkpoint owns
+no OaK state: callers using the standalone API must persist the returned
+consumer binding atomically with their OaK checkpoint. Its Prototype
+compatibility boundary
 deliberately excludes world models, Horde, replay, dreaming, IA, partner
 fusion, experiential memory, and GRU perception. Consequently it is not the
 multi-consumer feature loop required by the Plan. The tests establish no
@@ -783,8 +788,10 @@ trust resolver, and explicitly has `promotion_authorized: false`. Thus the
 screens and parity probe close operational diagnostics only; they support no
 inferential, superiority, SOTA, or WP3 claim.
 
-The matched-current campaign toward a paired Alberta-versus-baseline
-comparison is frozen but has not executed past qualification. Its frozen
+The current matched-source campaign toward a paired Alberta-versus-baseline
+comparison uses candidate-universe schema v2 (SHA-256 `6a9315cb…`) but has no
+renewed qualification/open artifact; a fresh qualification and new output
+namespace are required before execution. The immutable historical v1
 candidate universe (SHA-256 `2c3b214c…`, 23 registered arms: 14 Alberta
 candidates, 7 external inferential comparators, and 2 descriptive references)
 passed executor qualification
@@ -793,18 +800,20 @@ open-tuning stage (`matched_current_open_tuning_2c3b214c_v1`) publishes its
 complete immutable manifests — but its `runs/` and `completions/` directories
 are empty: zero tuning cells have executed. The sealed held-out stage (seal,
 6×30 evaluation schedule, final analysis, and statistics modules) is
-implemented and contract-tested but has never run, has no console script, and
-has produced no artifact. Every authority-bearing path terminates at an
-external trust resolver that does not exist in-tree, so in-tree code alone
-cannot produce promoted evidence. The 2026-07-31 internal candidate audit
+implemented and contract-tested but has never run and has produced no artifact.
+The evaluation runner is exposed as `alberta-forager-matched-sealed-evaluation`;
+seal and final analysis remain module-only. Every authority-bearing path
+terminates at an external trust resolver that does not exist in-tree, so in-tree
+code alone cannot produce promoted evidence. The 2026-07-31 internal candidate audit
 (`FORAGER_ALBERTA_CANDIDATE_AUDIT.md`) recorded implementation GO but
 campaign authority NOT CLEARED, and its recommended seed-0 q-grid divergence
 probe (`forager_causal_grid_divergence_probe.py`) is built but unrun.
 `FORAGER_COMPARATOR_AUDIT.md` records that the panel is a matched-panel
 comparison — several comparator arms are explicit task adaptations, not exact
-upstream replays — and that frozen v1 cannot support its own descriptor's
-"best among the panel" wording: an immutable claim-scope defect, not a
-license to reinterpret the protocol.
+upstream replays — and that historical v1 cannot support its descriptor's
+"best among the panel" wording. Candidate-universe v2 removes that wording and
+explicitly limits interpretation to the three preregistered contrasts; neither
+version licenses a panel-wide winner claim.
 
 The causal-map variant uses only observation/action/reward history, but it is
 specific to the stationary 15×15 toroidal field-of-view task and incorporates

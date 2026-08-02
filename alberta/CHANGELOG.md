@@ -7,14 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-08-01
+
+### Added
+
+- **Reference trust resolver** (`benchmarks/forager_matched_trust.py`, 25
+  tests): stdlib HMAC-SHA256 signed-receipt resolver implementing the
+  matched-campaign `TrustResolver` contract — trust-anchor document schema,
+  0600 single-link key loading, detached receipt issuance, and a
+  fail-closed `SignedReceiptTrustResolver` with immediate revocation and
+  freshness windows. Not wired as a default; the reserved
+  `content_only_unendorsed_v1` identity is refused. Asymmetric (Ed25519)
+  variant deferred until a crypto dependency is pinned.
+- **Hidden-partner lifecycle-world v6 runner and strict validator**
+  (`evaluation/hidden_partner_lifecycle_world_v6_runner.py`,
+  `..._v6_validator.py`): development machinery executing single v6 control
+  bindings deterministically with content-hashed result records, plus
+  fail-closed output validation. Certification and promotion flags remain
+  false; reserved evidence namespaces are refused at run time.
+- **Trainable-encoder latent world model** (opt-in, default-off; bitwise
+  identical trajectories when disabled): encoder backprop through the latent
+  prediction loss under the module's bounded-update discipline, gated by the
+  anti-collapse diagnostic. Development-only (L0).
+- **Kondo selection accounting** in the delightful-policy-gradient
+  development lane: per-step accounting of delight-selected channel compute
+  as a measured counterfactual. Actual compute gating remains unimplemented
+  and `KONDO_IMPLEMENTED` remains false.
+- **STOMP checkpoint migration loader** (`core/options.py`): pre-expansion
+  checkpoints (missing env-return/duration/baseline-mass fields) now restore
+  with documented zero-fill semantics instead of failing on template
+  mismatch.
+- `alberta-forager-matched-sealed-evaluation` console script for the sealed
+  held-out evaluation stage.
+
+### Fixed
+
+- Evidence CLI overwrite footguns: `ftl_decision_cli`, `continual_ia_cli`,
+  and `continual_multiagent_cli` no longer default to writing over their
+  sha-pinned canonical artifacts — pinned and pre-existing output paths are
+  refused before any protocol runs, and write sites use exclusive-create.
+  `scale_robust_feature_cli`'s default invocation now explains itself
+  instead of exiting 2 bare.
+- The legacy `alberta-evidence-gate` no longer checks vendored-out narrative
+  documents or five unregenerable Step 1/2 JSON paths. It is now a deprecated
+  compatibility wrapper for the strict `alberta-evidence-status` registry;
+  the former `--step` selector is rejected because no current per-step claim
+  contract exists.
+- Construction-time validation for MLP-path optimizers
+  (`supported_for_mlp()`): unsupported optimizers now fail at learner
+  construction instead of raising `NotImplementedError` inside a jitted
+  update.
+- `steps/step7.py` vestigial zero-multiplied reward term removed from
+  planning action scoring; `streams/gymnasium.py` VALUE mode no longer a
+  silent stub; `feature_discovery.replace_fraction` now wired or refused
+  rather than silently ignored; duplicate candidate-imprint formula in
+  `compositional_features.py` consolidated.
+- Test hygiene: `test_integrated_hidden_partner.py` marked `slow`;
+  Step 1/Step 2 replication suites now skip loudly with a registered
+  `replication` marker and a terminal summary of skipped counts; missing
+  upstream script trees now surface as visible skips rather than being hidden
+  by `collect_ignore`.
+
 ### Added
 
 - Added an opt-in bounded `PrototypeFeatureLifecycle` and its narrow
   `PrototypeAgent` composition. A fixed-width base is augmented with pair
   products and trained from one owner-bound behavior TD target before the
   linear OaK consumers are descriptor-routed. Builder gradients use an exact
-  semantic-generation-bound pullback; unsafe curation is deferred by proposal
-  rollback, while safe routing is atomic. Allocation ceilings, exact resource
+  generation-and-full-descriptor-bound pullback; the same identity travels
+  atomically with the enabled OaK subtree, so stale or forked consumers fail
+  closed even when their observation cache collides numerically. Unsafe
+  curation is deferred by proposal rollback, while safe routing is atomic.
+  Allocation ceilings, exact resource
   declarations, strict config/state checks, and versioned checkpoints are
   public. The compatible lane deliberately excludes world models, Horde,
   replay, dreaming, IA, partner fusion, experiential memory, and GRU
@@ -68,8 +132,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upstream Git archive is likewise produced by one system-path-resolved, content-rebound Git
   executable under a minimal environment, with 4 KiB metadata caps and an exact-size streamed
   archive cap, an explicit built-in tar format/default umask, and no repository-selected
-  archive command before its size and SHA-256 are accepted. The complete closure is
-  replayed both before fsync/rename and again under the held-inode post-publication validator.
+  archive command before its size and SHA-256 are accepted. Git identity and archive launch
+  `OSError`s, timeouts, and bounded-output overflows are normalized to the public qualification
+  error contract while the executable identity is rebound after every attempt. The complete
+  closure is replayed both before fsync/rename and again under the held-inode post-publication
+  validator.
   Post-rename validation or durability uncertainty preserves the occupied destination,
   exits with the distinct `PUBLISHED-UNCERTAIN` status, and forbids path reuse. The
   shared-source family is named for its RNG-isolated source contract rather than recurrent
@@ -77,12 +144,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   actively bounded sinks, preserves its 512 MiB/16 MiB asymmetric limits, never persists an
   overflow witness byte, and performs bounded kill/reap plus cidfile cleanup. Both runners
   assign collision-resistant container names and fall back to exact-name force removal if an
-  interruption lands before the cidfile is materialized. Completed nonzero clients are cleaned
-  too; an unsuccessful removal is accepted only after a separate actively bounded daemon query
-  proves the exact random name absent, and an overflow while making that proof is normalized to
-  each runner's public fail-closed error instead of leaking a private process exception. Malformed
-  nested caches retain layer-specific error contracts. The added provenance remains content
-  identity—not endorsement, promotion authority, or a performance claim.
+  interruption lands before the cidfile is materialized. CID-file disappearance, partial-read,
+  and other read-race failures trigger exact-name cleanup first and then surface as a public
+  qualification error carrying the confirmed cleanup state. Completed nonzero clients are
+  cleaned too; an unsuccessful removal is accepted only after a separate actively bounded
+  daemon query proves the exact random name absent. Absence-query launch, timeout, or overflow
+  failures, together with injected runtime-inspector, OCI-probe, and fresh-replay runner
+  `OSError`, timeout, and overflow failures, are normalized to their public fail-closed
+  qualification errors instead of leaking private process exceptions. Both bounded runners
+  tolerate exited-child races, always attempt bounded reaping, independently close their
+  selector and both pipes, and normalize kill, reap, and close failures to public errors.
+  Malformed nested caches retain layer-specific error contracts. The added provenance remains
+  content identity—not endorsement, promotion authority, or a performance claim.
+- **Matched-current claim-boundary correction**: candidate-universe schema v2 now states that
+  the preregistered procedure identifies only its three named Alberta-versus-selected-external
+  contrasts; it does not identify a best member of the 23-candidate registered panel or a
+  winner among the six held-out arms. Statistics-result schema v4 carries the same detached
+  interpretation boundary: bootstrap superiority and Holm rejection fields are mechanical
+  frozen-protocol flags, the bootstrap endpoint is not a population confidence interval, the
+  sign-flip calculation has no asserted sign-exchangeability model, and neither result grants
+  confirmatory, ranking, or SOTA authority. Final-analysis manifest schema v3 replaces its
+  obsolete v1-wording disclaimer with the v2-native contrast-specific/no-panel-ranking
+  boundary. Historical artifacts remain unchanged.
+- **Nonpromoting causal q-grid diagnostic v2 hardening**: the unchanged public-seed-0,
+  epsilon-0.05, q=.50/.75/.90, 10,000-transition diagnostic now writes receipt schema
+  `alberta.forager_causal_grid_divergence_probe.v2` under the default
+  `causal_q_grid_divergence_seed0_v2` root. Its portable canonical qualification root is bound
+  to exact manifest-relative source, inventory, archive, snapshot-descriptor, configuration,
+  and capability-receipt paths and schemas; the canonical manifest sidecar joins the 14-file
+  read-only mirror, and the receipt carries the replay-critical paths, schemas, archive size,
+  and digests. OCI execution clears both-case proxy variables, and cleanup accepts a failed
+  force removal only after a separately bounded exact-name absence proof. The harness and tests
+  also normalize runner, kill, bounded-reap, and resource-close failures; inability to confirm
+  reaping remains fail-closed while exact-name container cleanup is still required. Every final
+  receipt descriptor is closed independently, and a close failure after rename receives the
+  distinct published-uncertain status. The live probe remains unexecuted, permanently
+  open-development, and nonpromoting; no scientific q semantics, evidence gate, or frozen
+  protocol changed. A fresh qualification must still be published and its canonical root plus
+  all qualification-derived hashes repinned as one reviewed set before this v2 diagnostic is
+  run.
 - **Beat-SOTA screening lane** (`benchmarks/ipmnist_screening.py`, 51 tests):
   30 registered mechanism-combination arms on a validated 60-task proxy (an
   exact bit-prefix of the 200-task protocol; control parity pinned bitwise),

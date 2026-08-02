@@ -44,9 +44,18 @@ from pathlib import Path, PurePosixPath
 from statistics import NormalDist
 from typing import Any, Final, cast
 
-SCHEMA_VERSION: Final = "alberta.forager_causal_grid_divergence_probe.v1"
+SCHEMA_VERSION: Final = "alberta.forager_causal_grid_divergence_probe.v2"
 CHILD_SCHEMA_VERSION: Final = (
     "alberta.forager_causal_grid_divergence_probe_child.v1"
+)
+QUALIFICATION_MANIFEST_SCHEMA_VERSION: Final = (
+    "alberta.forager_matched_current_qualification.v1"
+)
+CAPABILITY_RECEIPT_SCHEMA_VERSION: Final = (
+    "alberta.forager_matched_capability_qualification_receipt.v1"
+)
+SNAPSHOT_DESCRIPTOR_SCHEMA_VERSION: Final = (
+    "alberta.forager_reviewed_source_snapshot.v1"
 )
 CLASSIFICATION: Final = "open_development_nonpromoting"
 SEED_CLASS: Final = "public_nonbenchmark_seed"
@@ -70,6 +79,7 @@ EXECUTOR_INVENTORY_SHA256: Final = (
 SOURCE_ARCHIVE_SHA256: Final = (
     "8f66a8cb2357e4d003adf2ac8084c75c7c46ac07cbbb8dddd6cce6e39f88bd79"
 )
+SOURCE_ARCHIVE_SIZE_BYTES: Final = 9_666_560
 SNAPSHOT_DESCRIPTOR_SHA256: Final = (
     "8a390e0ed1c88e373b0e0c9a682e2e9dec79370dc02e58a3a0ff4f8233827fa7"
 )
@@ -87,6 +97,7 @@ OPEN_PROTOCOL_SHA256: Final = (
 )
 MAXIMUM_JSON_BYTES: Final = 16 * 1024 * 1024
 MAXIMUM_STDERR_BYTES: Final = 64 * 1024
+MAXIMUM_CLEANUP_INSPECTION_BYTES: Final = 4 * 1024
 MAXIMUM_SOURCE_FILES: Final = 10_000
 MAXIMUM_SOURCE_BYTES: Final = 512 * 1024**2
 ACTION_MERKLE_ENCODING: Final = (
@@ -98,6 +109,60 @@ _ACTION_MERKLE_LEAF_DOMAIN: Final = b"alberta.causal_q.action_leaf.v1\0"
 _ACTION_MERKLE_PADDING_DOMAIN: Final = b"alberta.causal_q.padding_leaf.v1\0"
 _ACTION_MERKLE_NODE_DOMAIN: Final = b"alberta.causal_q.action_node.v1\0"
 _ACTION_MERKLE_ROOT_DOMAIN: Final = b"alberta.causal_q.action_root.v1\0"
+
+_QUALIFICATION_MANIFEST_PATH: Final = "manifest.json"
+_QUALIFICATION_MANIFEST_SIDECAR_PATH: Final = "manifest.json.sha256"
+_ALBERTA_SOURCE_ROOT_PATH: Final = "sources/alberta/source"
+_ALBERTA_SOURCE_INVENTORY_PATH: Final = "sources/alberta/inventory.json"
+_ALBERTA_SOURCE_ARCHIVE_PATH: Final = "sources/alberta/source.tar"
+_ALBERTA_SNAPSHOT_DESCRIPTOR_PATH: Final = (
+    "sources/alberta/snapshot-descriptor.json"
+)
+_QUALIFICATION_MANIFEST_FIELDS: Final = frozenset(
+    {
+        "authority",
+        "candidate_order",
+        "candidates",
+        "classification",
+        "executor_qualification_roots",
+        "external_verification_required",
+        "frozen_executor_qualification_artifacts",
+        "open_protocol_sha256",
+        "performance_claim",
+        "promotion_authorized",
+        "qualification_probe",
+        "resource_accounting_semantics",
+        "reward_blind_boundary",
+        "runtime_qualification",
+        "schema_version",
+        "sources",
+        "status",
+    }
+)
+_CAPABILITY_RECEIPT_FIELDS: Final = frozenset(
+    {
+        "agent_rng_identity",
+        "candidate_id",
+        "capability_descriptor_sha256",
+        "configuration_sha256",
+        "entrypoint_family",
+        "entrypoint_path",
+        "environment_key_shared",
+        "environment_rng_schedule_sha256",
+        "image_sha256",
+        "invocation_style",
+        "python_import_root",
+        "qualification_trust_anchor_identity",
+        "result_root",
+        "rng_isolation_patch_sha256",
+        "rng_parity_contract_sha256",
+        "runtime_profile_sha256",
+        "schema_version",
+        "source",
+        "status",
+        "task_identity_sha256",
+    }
+)
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parent
 DEFAULT_QUALIFICATION_ROOT = (
@@ -111,7 +176,7 @@ DEFAULT_OUTPUT_ROOT = (
     / "outputs"
     / "forager"
     / "development"
-    / "causal_q_grid_divergence_seed0_v1"
+    / "causal_q_grid_divergence_seed0_v2"
 )
 DEFAULT_OCI_RUNTIME = Path(shutil.which("docker") or "/usr/bin/docker")
 
@@ -266,6 +331,71 @@ def _read_stable_regular_file(
         )
     finally:
         os.close(descriptor)
+
+
+def _canonical_qualification_root(qualification_root: Path) -> Path:
+    if not qualification_root.is_absolute():
+        raise CausalGridDivergenceProbeError(
+            "qualification root must be a canonical absolute directory"
+        )
+    try:
+        metadata = qualification_root.lstat()
+        resolved = qualification_root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise CausalGridDivergenceProbeError(
+            "cannot resolve the canonical qualification root"
+        ) from exc
+    if (
+        qualification_root != resolved
+        or stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+    ):
+        raise CausalGridDivergenceProbeError(
+            "qualification root must be a canonical non-symlink directory"
+        )
+    return resolved
+
+
+def _qualification_input_path(
+    qualification_root: Path,
+    relative_text: str,
+    *,
+    label: str,
+    expected_directory: bool = False,
+) -> Path:
+    relative = PurePosixPath(relative_text) if type(relative_text) is str else None
+    if (
+        relative is None
+        or relative.is_absolute()
+        or relative_text != relative.as_posix()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+        or any(character in relative_text for character in ("\x00", "\n", "\r"))
+    ):
+        raise CausalGridDivergenceProbeError(f"{label} path is unsafe")
+    qualification_resolved = _canonical_qualification_root(qualification_root)
+    candidate = qualification_resolved.joinpath(*relative.parts)
+    try:
+        metadata = candidate.lstat()
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise CausalGridDivergenceProbeError(f"cannot resolve {label}") from exc
+    expected_kind = (
+        stat.S_ISDIR(metadata.st_mode)
+        if expected_directory
+        else stat.S_ISREG(metadata.st_mode)
+    )
+    if (
+        candidate != resolved
+        or not resolved.is_relative_to(qualification_resolved)
+        or stat.S_ISLNK(metadata.st_mode)
+        or not expected_kind
+    ):
+        raise CausalGridDivergenceProbeError(
+            f"{label} must be a canonical qualification-root-contained "
+            f"{'directory' if expected_directory else 'regular file'}"
+        )
+    return candidate
 
 
 def _sha256(raw: bytes) -> str:
@@ -620,7 +750,11 @@ def _extract_pinned_source_archive(
         raise CausalGridDivergenceProbeError(
             "private source extraction destination unexpectedly exists"
         )
-    inventory_path = qualification_root / "sources" / "alberta" / "inventory.json"
+    inventory_path = _qualification_input_path(
+        qualification_root,
+        _ALBERTA_SOURCE_INVENTORY_PATH,
+        label="frozen Alberta source inventory",
+    )
     records = _load_source_inventory_records(inventory_path)
     expected_by_path = {str(record["path"]): record for record in records}
     expected_directories = {
@@ -630,7 +764,11 @@ def _extract_pinned_source_archive(
         if parent.as_posix() != "."
     }
     archive_raw = _read_stable_regular_file(
-        qualification_root / "sources" / "alberta" / "source.tar",
+        _qualification_input_path(
+            qualification_root,
+            _ALBERTA_SOURCE_ARCHIVE_PATH,
+            label="private source extraction archive",
+        ),
         label="private source extraction archive",
         maximum=MAXIMUM_SOURCE_BYTES,
     )
@@ -738,14 +876,219 @@ def _extract_pinned_source_archive(
 
 
 def _configuration_path(qualification_root: Path, candidate_id: str) -> Path:
-    return qualification_root / "configurations" / candidate_id / "derived.json"
+    return _qualification_input_path(
+        qualification_root,
+        f"configurations/{candidate_id}/derived.json",
+        label=f"frozen configuration {candidate_id}",
+    )
+
+
+def _qualification_manifest_bindings(
+    manifest: Any,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+]:
+    if type(manifest) is not dict or set(manifest) != _QUALIFICATION_MANIFEST_FIELDS:
+        raise CausalGridDivergenceProbeError(
+            "matched qualification manifest fields drifted"
+        )
+    sources = manifest.get("sources")
+    runtime_qualification = manifest.get("runtime_qualification")
+    candidates = manifest.get("candidates")
+    if (
+        type(sources) is not dict
+        or set(sources) != {"alberta", "upstream", "upstream_rng_isolated"}
+        or type(runtime_qualification) is not dict
+        or type(candidates) is not dict
+    ):
+        raise CausalGridDivergenceProbeError(
+            "matched qualification manifest omits required binding maps"
+        )
+    alberta_source = sources.get("alberta")
+    if type(alberta_source) is not dict or set(alberta_source) != {
+        "archive",
+        "binding",
+        "inventory",
+        "patch_path",
+        "root",
+        "snapshot_descriptor_path",
+    }:
+        raise CausalGridDivergenceProbeError(
+            "matched qualification Alberta source fields drifted"
+        )
+    binding = alberta_source.get("binding")
+    inventory_binding = alberta_source.get("inventory")
+    archive_binding = alberta_source.get("archive")
+    if (
+        type(binding) is not dict
+        or set(binding)
+        != {
+            "archive_sha256",
+            "base_commit",
+            "inventory_sha256",
+            "provenance_kind",
+            "repository",
+            "snapshot_descriptor_sha256",
+            "tree_git_sha1",
+        }
+        or type(inventory_binding) is not dict
+        or set(inventory_binding) != {"canonical_sha256", "path"}
+        or type(archive_binding) is not dict
+        or set(archive_binding) != {"path", "sha256", "size_bytes"}
+        or set(runtime_qualification)
+        != {
+            "executor_qualification_receipt_sha256",
+            "image_sha256",
+            "qualification_trust_anchor_identity",
+            "runtime_profile_sha256",
+        }
+    ):
+        raise CausalGridDivergenceProbeError(
+            "matched qualification Alberta binding fields drifted"
+        )
+    if (
+        manifest.get("schema_version") != QUALIFICATION_MANIFEST_SCHEMA_VERSION
+        or manifest.get("classification")
+        != "content_only_unendorsed_nonpromoting"
+        or manifest.get("status")
+        != "structurally_qualified_external_trust_resolution_required"
+        or manifest.get("external_verification_required") is not True
+        or manifest.get("performance_claim") is not False
+        or manifest.get("promotion_authorized") is not False
+        or manifest.get("open_protocol_sha256") != OPEN_PROTOCOL_SHA256
+        or alberta_source.get("root") != _ALBERTA_SOURCE_ROOT_PATH
+        or alberta_source.get("snapshot_descriptor_path")
+        != _ALBERTA_SNAPSHOT_DESCRIPTOR_PATH
+        or alberta_source.get("patch_path") is not None
+        or binding.get("inventory_sha256") != SOURCE_INVENTORY_SHA256
+        or binding.get("archive_sha256") != SOURCE_ARCHIVE_SHA256
+        or binding.get("snapshot_descriptor_sha256")
+        != SNAPSHOT_DESCRIPTOR_SHA256
+        or inventory_binding.get("canonical_sha256") != EXECUTOR_INVENTORY_SHA256
+        or inventory_binding.get("path") != _ALBERTA_SOURCE_INVENTORY_PATH
+        or archive_binding.get("path") != _ALBERTA_SOURCE_ARCHIVE_PATH
+        or archive_binding.get("sha256") != SOURCE_ARCHIVE_SHA256
+        or type(archive_binding.get("size_bytes")) is not int
+        or archive_binding.get("size_bytes") != SOURCE_ARCHIVE_SIZE_BYTES
+        or runtime_qualification.get("image_sha256") != QUALIFIED_IMAGE_SHA256
+        or runtime_qualification.get("runtime_profile_sha256")
+        != RUNTIME_PROFILE_SHA256
+        or runtime_qualification.get("qualification_trust_anchor_identity")
+        != "content_only_unendorsed_v1"
+    ):
+        raise CausalGridDivergenceProbeError(
+            "matched qualification manifest Alberta identity drifted"
+        )
+    return (
+        alberta_source,
+        binding,
+        inventory_binding,
+        archive_binding,
+        runtime_qualification,
+        candidates,
+    )
+
+
+def _require_manifest_source_root(
+    qualification_root: Path,
+    source_root: Path,
+) -> None:
+    if not qualification_root.is_absolute() or not source_root.is_absolute():
+        raise CausalGridDivergenceProbeError(
+            "qualification and source roots must be absolute canonical paths"
+        )
+    expected_source = _qualification_input_path(
+        qualification_root,
+        _ALBERTA_SOURCE_ROOT_PATH,
+        label="manifest-bound Alberta source root",
+        expected_directory=True,
+    )
+    if source_root != expected_source:
+        raise CausalGridDivergenceProbeError(
+            "supplied source root differs from the manifest-bound Alberta tree"
+        )
+
+
+def _validate_capability_receipt(
+    *,
+    candidate_id: str,
+    expected_configuration_sha256: str,
+    capability_binding: Any,
+    capability_payload: Any,
+    candidate_manifest: Mapping[str, Any],
+    source_binding: Mapping[str, Any],
+) -> None:
+    expected_path = f"receipts/{candidate_id}.json"
+    if (
+        type(capability_binding) is not dict
+        or set(capability_binding) != {"path", "sha256"}
+        or capability_binding.get("path") != expected_path
+    ):
+        raise CausalGridDivergenceProbeError(
+            f"capability receipt binding for {candidate_id} is incomplete"
+        )
+    _require_sha256(
+        capability_binding.get("sha256"),
+        label=f"capability receipt digest for {candidate_id}",
+    )
+    entrypoint = candidate_manifest.get("entrypoint")
+    if (
+        type(capability_payload) is not dict
+        or set(capability_payload) != _CAPABILITY_RECEIPT_FIELDS
+        or type(entrypoint) is not dict
+        or set(entrypoint)
+        != {
+            "invocation_style",
+            "path",
+            "python_import_root",
+            "result_root",
+            "sha256",
+        }
+        or capability_payload.get("schema_version")
+        != CAPABILITY_RECEIPT_SCHEMA_VERSION
+        or capability_payload.get("candidate_id") != candidate_id
+        or capability_payload.get("configuration_sha256")
+        != expected_configuration_sha256
+        or capability_payload.get("environment_rng_schedule_sha256")
+        != ENVIRONMENT_RNG_SCHEDULE_SHA256
+        or capability_payload.get("image_sha256") != QUALIFIED_IMAGE_SHA256
+        or capability_payload.get("runtime_profile_sha256")
+        != RUNTIME_PROFILE_SHA256
+        or capability_payload.get("task_identity_sha256") != TASK_IDENTITY_SHA256
+        or capability_payload.get("status") != "qualified"
+        or capability_payload.get("qualification_trust_anchor_identity")
+        != "content_only_unendorsed_v1"
+        or capability_payload.get("entrypoint_family")
+        != "alberta_single_seed_worker"
+        or capability_payload.get("entrypoint_path") != entrypoint.get("path")
+        or capability_payload.get("python_import_root")
+        != entrypoint.get("python_import_root")
+        or capability_payload.get("invocation_style")
+        != entrypoint.get("invocation_style")
+        or capability_payload.get("result_root") != entrypoint.get("result_root")
+        or _canonical_json_bytes(capability_payload.get("source"))
+        != _canonical_json_bytes(dict(source_binding))
+    ):
+        raise CausalGridDivergenceProbeError(
+            f"capability receipt semantics drifted for {candidate_id}"
+        )
 
 
 def _load_bound_inputs(
     qualification_root: Path,
     source_root: Path,
 ) -> tuple[tuple[dict[str, Any], ...], dict[str, Any]]:
-    manifest_path = qualification_root / "manifest.json"
+    _require_manifest_source_root(qualification_root, source_root)
+    manifest_path = _qualification_input_path(
+        qualification_root,
+        _QUALIFICATION_MANIFEST_PATH,
+        label="matched qualification manifest",
+    )
     manifest_raw = _read_stable_regular_file(
         manifest_path,
         label="matched qualification manifest",
@@ -753,62 +1096,98 @@ def _load_bound_inputs(
     )
     if _sha256(manifest_raw) != QUALIFICATION_MANIFEST_SHA256:
         raise CausalGridDivergenceProbeError(
-            "matched qualification manifest differs from the frozen v1 identity"
+            "matched qualification manifest differs from the pinned qualification identity"
+        )
+    manifest_sidecar = _read_stable_regular_file(
+        _qualification_input_path(
+            qualification_root,
+            _QUALIFICATION_MANIFEST_SIDECAR_PATH,
+            label="matched qualification manifest digest sidecar",
+        ),
+        label="matched qualification manifest digest sidecar",
+        maximum=65,
+    )
+    if manifest_sidecar != f"{QUALIFICATION_MANIFEST_SHA256}\n".encode("ascii"):
+        raise CausalGridDivergenceProbeError(
+            "matched qualification manifest sidecar differs from the pinned digest"
         )
     manifest = _decode_strict_json(manifest_raw, label="matched qualification manifest")
     if manifest_raw != _canonical_json_bytes(manifest):
         raise CausalGridDivergenceProbeError(
             "matched qualification manifest is not canonical JSON"
         )
-    try:
-        alberta_source = manifest["sources"]["alberta"]
-        binding = alberta_source["binding"]
-        inventory_binding = alberta_source["inventory"]
-        archive_binding = alberta_source["archive"]
-        runtime_qualification = manifest["runtime_qualification"]
-        candidates = manifest["candidates"]
-    except (KeyError, TypeError) as exc:
-        raise CausalGridDivergenceProbeError(
-            "matched qualification manifest omits required Alberta bindings"
-        ) from exc
-    if (
-        manifest.get("classification") != "content_only_unendorsed_nonpromoting"
-        or manifest.get("promotion_authorized") is not False
-        or manifest.get("open_protocol_sha256") != OPEN_PROTOCOL_SHA256
-        or binding.get("inventory_sha256") != SOURCE_INVENTORY_SHA256
-        or binding.get("archive_sha256") != SOURCE_ARCHIVE_SHA256
-        or binding.get("snapshot_descriptor_sha256")
-        != SNAPSHOT_DESCRIPTOR_SHA256
-        or inventory_binding.get("canonical_sha256") != EXECUTOR_INVENTORY_SHA256
-        or inventory_binding.get("path") != "sources/alberta/inventory.json"
-        or archive_binding.get("path") != "sources/alberta/source.tar"
-        or archive_binding.get("sha256") != SOURCE_ARCHIVE_SHA256
-        or runtime_qualification.get("image_sha256") != QUALIFIED_IMAGE_SHA256
-        or runtime_qualification.get("runtime_profile_sha256")
-        != RUNTIME_PROFILE_SHA256
-    ):
-        raise CausalGridDivergenceProbeError(
-            "matched qualification manifest Alberta identity drifted"
-        )
-    inventory_path = qualification_root / "sources" / "alberta" / "inventory.json"
+    (
+        _alberta_source,
+        binding,
+        _inventory_binding,
+        _archive_binding,
+        _runtime_qualification,
+        candidates,
+    ) = _qualification_manifest_bindings(manifest)
+    inventory_path = _qualification_input_path(
+        qualification_root,
+        _ALBERTA_SOURCE_INVENTORY_PATH,
+        label="frozen Alberta source inventory",
+    )
     _verify_source_identity(source_root, inventory_path)
     archive_raw = _read_stable_regular_file(
-        qualification_root / "sources" / "alberta" / "source.tar",
+        _qualification_input_path(
+            qualification_root,
+            _ALBERTA_SOURCE_ARCHIVE_PATH,
+            label="frozen Alberta source archive",
+        ),
         label="frozen Alberta source archive",
         maximum=MAXIMUM_SOURCE_BYTES,
     )
-    if _sha256(archive_raw) != SOURCE_ARCHIVE_SHA256:
+    if (
+        len(archive_raw) != SOURCE_ARCHIVE_SIZE_BYTES
+        or _sha256(archive_raw) != SOURCE_ARCHIVE_SHA256
+    ):
         raise CausalGridDivergenceProbeError(
             "frozen Alberta source archive differs from qualification"
         )
     snapshot_raw = _read_stable_regular_file(
-        qualification_root / "sources" / "alberta" / "snapshot-descriptor.json",
+        _qualification_input_path(
+            qualification_root,
+            _ALBERTA_SNAPSHOT_DESCRIPTOR_PATH,
+            label="frozen Alberta snapshot descriptor",
+        ),
         label="frozen Alberta snapshot descriptor",
         maximum=MAXIMUM_JSON_BYTES,
     )
     if _sha256(snapshot_raw) != SNAPSHOT_DESCRIPTOR_SHA256:
         raise CausalGridDivergenceProbeError(
             "frozen Alberta snapshot descriptor differs from qualification"
+        )
+    snapshot_payload = _decode_strict_json(
+        snapshot_raw,
+        label="frozen Alberta snapshot descriptor",
+    )
+    if (
+        snapshot_raw != _canonical_json_bytes(snapshot_payload)
+        or type(snapshot_payload) is not dict
+        or set(snapshot_payload)
+        != {
+            "archive",
+            "authority",
+            "base_commit",
+            "classification",
+            "normalized_inventory_sha256",
+            "repository",
+            "schema_version",
+            "selection",
+        }
+        or snapshot_payload.get("schema_version")
+        != SNAPSHOT_DESCRIPTOR_SCHEMA_VERSION
+        or snapshot_payload.get("normalized_inventory_sha256")
+        != SOURCE_INVENTORY_SHA256
+        or type(snapshot_payload.get("archive")) is not dict
+        or snapshot_payload["archive"].get("sha256") != SOURCE_ARCHIVE_SHA256
+        or snapshot_payload["archive"].get("size_bytes")
+        != SOURCE_ARCHIVE_SIZE_BYTES
+    ):
+        raise CausalGridDivergenceProbeError(
+            "frozen Alberta snapshot descriptor semantics drifted"
         )
 
     loaded: list[dict[str, Any]] = []
@@ -829,7 +1208,11 @@ def _load_bound_inputs(
             raise CausalGridDivergenceProbeError(
                 f"frozen configuration {candidate_id} is not canonical JSON"
             )
-        original_path = qualification_root / "configurations" / candidate_id / "original.json"
+        original_path = _qualification_input_path(
+            qualification_root,
+            f"configurations/{candidate_id}/original.json",
+            label=f"original frozen configuration {candidate_id}",
+        )
         original_raw = _read_stable_regular_file(
             original_path,
             label=f"original frozen configuration {candidate_id}",
@@ -891,11 +1274,20 @@ def _load_bound_inputs(
                 "q-grid configurations differ outside the frozen quantile fields"
             )
         capability = candidate_manifest.get("capability_receipt")
-        if type(capability) is not dict or set(capability) != {"path", "sha256"}:
+        expected_capability_path = f"receipts/{candidate_id}.json"
+        if (
+            type(capability) is not dict
+            or set(capability) != {"path", "sha256"}
+            or capability.get("path") != expected_capability_path
+        ):
             raise CausalGridDivergenceProbeError(
                 f"capability receipt binding for {candidate_id} is incomplete"
             )
-        capability_path = qualification_root / str(capability["path"])
+        capability_path = _qualification_input_path(
+            qualification_root,
+            expected_capability_path,
+            label=f"capability receipt {candidate_id}",
+        )
         capability_raw = _read_stable_regular_file(
             capability_path,
             label=f"capability receipt {candidate_id}",
@@ -909,20 +1301,18 @@ def _load_bound_inputs(
             capability_raw,
             label=f"capability receipt {candidate_id}",
         )
-        if capability_raw != _canonical_json_bytes(capability_payload) or (
-            capability_payload.get("candidate_id") != candidate_id
-            or capability_payload.get("configuration_sha256") != expected_digest
-            or capability_payload.get("environment_rng_schedule_sha256")
-            != ENVIRONMENT_RNG_SCHEDULE_SHA256
-            or capability_payload.get("image_sha256") != QUALIFIED_IMAGE_SHA256
-            or capability_payload.get("runtime_profile_sha256")
-            != RUNTIME_PROFILE_SHA256
-            or capability_payload.get("task_identity_sha256") != TASK_IDENTITY_SHA256
-            or capability_payload.get("status") != "qualified"
-        ):
+        if capability_raw != _canonical_json_bytes(capability_payload):
             raise CausalGridDivergenceProbeError(
-                f"capability receipt semantics drifted for {candidate_id}"
+                f"capability receipt encoding drifted for {candidate_id}"
             )
+        _validate_capability_receipt(
+            candidate_id=candidate_id,
+            expected_configuration_sha256=expected_digest,
+            capability_binding=capability,
+            capability_payload=capability_payload,
+            candidate_manifest=candidate_manifest,
+            source_binding=binding,
+        )
         loaded.append(payload)
     return tuple(loaded), manifest
 
@@ -1375,6 +1765,31 @@ def _docker_mount_source(path: Path, *, label: str) -> str:
     return text
 
 
+def _terminate_and_reap_process(process: subprocess.Popen[bytes]) -> None:
+    """Best-effort kill followed by a bounded, fail-closed reap."""
+    termination_error: OSError | None = None
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        termination_error = exc
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired as exc:
+        raise CausalGridDivergenceProbeError(
+            "bounded child could not be reaped after termination"
+        ) from exc
+    except OSError as exc:
+        raise CausalGridDivergenceProbeError(
+            "bounded child could not be inspected after termination"
+        ) from exc
+    if termination_error is not None:
+        raise CausalGridDivergenceProbeError(
+            "bounded child could not be terminated cleanly"
+        ) from termination_error
+
+
 def _run_bounded_command(
     command: tuple[str, ...],
     *,
@@ -1452,20 +1867,29 @@ def _run_bounded_command(
             bytes(buffers["stderr"]),
         )
     except BaseException:
-        if process.poll() is None:
-            process.kill()
-        try:
-            process.wait(timeout=10)
-        except (OSError, subprocess.SubprocessError):
-            pass
+        _terminate_and_reap_process(process)
         raise
     finally:
+        close_error: OSError | None = None
         if selector is not None:
-            selector.close()
+            try:
+                selector.close()
+            except OSError as exc:
+                close_error = exc
         if stdout is not None and not stdout.closed:
-            stdout.close()
+            try:
+                stdout.close()
+            except OSError as exc:
+                close_error = close_error or exc
         if stderr is not None and not stderr.closed:
-            stderr.close()
+            try:
+                stderr.close()
+            except OSError as exc:
+                close_error = close_error or exc
+        if close_error is not None:
+            raise CausalGridDivergenceProbeError(
+                "bounded child resources could not be closed cleanly"
+            ) from close_error
 
 
 def _cleanup_named_container(
@@ -1473,6 +1897,14 @@ def _cleanup_named_container(
     container_name: str,
     environment: Mapping[str, str],
 ) -> bool:
+    prefix = "alberta-causal-q-probe-"
+    suffix = container_name.removeprefix(prefix)
+    if (
+        not container_name.startswith(prefix)
+        or len(suffix) != 24
+        or any(character not in "0123456789abcdef" for character in suffix)
+    ):
+        return False
     try:
         cleanup = _run_bounded_command(
             (
@@ -1488,15 +1920,36 @@ def _cleanup_named_container(
         )
     except (OSError, subprocess.SubprocessError, CausalGridDivergenceProbeError):
         return False
-    return cleanup.returncode == 0 or b"No such container" in cleanup.stderr
+    if cleanup.returncode == 0:
+        return True
+    try:
+        absence = _run_bounded_command(
+            (
+                runtime_path.as_posix(),
+                "container",
+                "ls",
+                "--all",
+                "--quiet",
+                "--no-trunc",
+                f"--filter=name=^/{container_name}$",
+            ),
+            environment=environment,
+            timeout_seconds=120,
+            maximum_stdout_bytes=MAXIMUM_CLEANUP_INSPECTION_BYTES,
+            maximum_stderr_bytes=MAXIMUM_CLEANUP_INSPECTION_BYTES,
+        )
+    except (OSError, subprocess.SubprocessError, CausalGridDivergenceProbeError):
+        return False
+    return absence.returncode == 0 and not absence.stdout and not absence.stderr
 
 
 def _qualification_mount_relative_paths() -> tuple[str, ...]:
     paths = [
-        "manifest.json",
-        "sources/alberta/inventory.json",
-        "sources/alberta/source.tar",
-        "sources/alberta/snapshot-descriptor.json",
+        _QUALIFICATION_MANIFEST_PATH,
+        _QUALIFICATION_MANIFEST_SIDECAR_PATH,
+        _ALBERTA_SOURCE_INVENTORY_PATH,
+        _ALBERTA_SOURCE_ARCHIVE_PATH,
+        _ALBERTA_SNAPSHOT_DESCRIPTOR_PATH,
     ]
     for candidate_id, _quantile, _configuration_sha256 in _CANDIDATE_CONFIGURATIONS:
         paths.extend(
@@ -1538,7 +1991,11 @@ def _materialize_readable_qualification_mount(
             else MAXIMUM_JSON_BYTES
         )
         raw = _read_stable_regular_file(
-            qualification_root / relative,
+            _qualification_input_path(
+                qualification_root,
+                relative_text,
+                label=f"qualification mount input {relative_text}",
+            ),
             label=f"qualification mount input {relative_text}",
             maximum=maximum,
         )
@@ -1686,6 +2143,14 @@ def _run_child_with_qualification_mount(
         "--pids-limit=512",
         tmpfs_spec,
         "--env=HOME=/run/alberta",
+        "--env=ALL_PROXY=",
+        "--env=HTTP_PROXY=",
+        "--env=HTTPS_PROXY=",
+        "--env=NO_PROXY=",
+        "--env=all_proxy=",
+        "--env=http_proxy=",
+        "--env=https_proxy=",
+        "--env=no_proxy=",
         "--env=JAX_ENABLE_COMPILATION_CACHE=false",
         "--env=JAX_PLATFORM_NAME=cpu",
         "--env=JAX_PLATFORMS=cpu",
@@ -1721,7 +2186,7 @@ def _run_child_with_qualification_mount(
         "network": "none",
         "oci_runtime_executable_sha256": _sha256(runtime_raw),
         "probe_mount": "private_exact_readonly_snapshot_v1",
-        "qualification_mount": "minimal_exact_readable_snapshot_v1",
+        "qualification_mount": "minimal_exact_readable_snapshot_v2",
         "qualified_image_executed": True,
         "root_filesystem": "read_only",
         "source_mount": "pinned_archive_extracted_in_private_tmpfs_v1",
@@ -1742,6 +2207,10 @@ def _run_child_with_qualification_mount(
         if isinstance(exc, subprocess.TimeoutExpired):
             raise CausalGridDivergenceProbeError(
                 "isolated probe timed out; named-container cleanup completed"
+            ) from exc
+        if isinstance(exc, (OSError, subprocess.SubprocessError)):
+            raise CausalGridDivergenceProbeError(
+                "isolated probe runner failed; named-container cleanup completed"
             ) from exc
         raise
     if completed.returncode != 0 or completed.stderr:
@@ -1782,7 +2251,11 @@ def _run_child(
     """Run only private snapshots while leaving every frozen input unchanged."""
     _verify_source_identity(
         source_root,
-        qualification_root / "sources" / "alberta" / "inventory.json",
+        _qualification_input_path(
+            qualification_root,
+            _ALBERTA_SOURCE_INVENTORY_PATH,
+            label="frozen Alberta source inventory",
+        ),
     )
     with tempfile.TemporaryDirectory(
         prefix="alberta-causal-q-qualification-mount-"
@@ -1830,11 +2303,16 @@ def _validate_first_divergence_merkle_proof(
         raise CausalGridDivergenceProbeError(
             "first-divergence Merkle proof fields drifted"
         )
+    _require_int(
+        proof["tree_leaf_count"],
+        label="first-divergence Merkle tree leaf count",
+        minimum=ACTION_MERKLE_TREE_LEAF_COUNT,
+        maximum=ACTION_MERKLE_TREE_LEAF_COUNT,
+    )
     if (
         type(proof["divergence_index"]) is not int
         or proof["divergence_index"] != divergence_index
         or proof["encoding"] != ACTION_MERKLE_ENCODING
-        or proof["tree_leaf_count"] != ACTION_MERKLE_TREE_LEAF_COUNT
     ):
         raise CausalGridDivergenceProbeError(
             "first-divergence Merkle proof identity drifted"
@@ -2002,11 +2480,16 @@ def _validate_child_payload(payload: Mapping[str, Any]) -> bool:
                 f"isolated probe candidate[{index}] fields drifted"
             )
         candidate_id, quantile, configuration_sha256 = expected
+        _require_int(
+            record["action_count"],
+            label=f"candidate[{index}] action count",
+            minimum=FIXED_STEPS,
+            maximum=FIXED_STEPS,
+        )
         if (
             record["candidate_id"] != candidate_id
             or record["configuration_sha256"] != configuration_sha256
             or record["respawn_safety_quantile"] != quantile
-            or record["action_count"] != FIXED_STEPS
             or record["action_trace_encoding"] != ACTION_MERKLE_ENCODING
         ):
             raise CausalGridDivergenceProbeError(
@@ -2073,11 +2556,16 @@ def _validate_child_payload(payload: Mapping[str, Any]) -> bool:
                 minimum=0,
                 maximum=FIXED_STEPS,
             )
+            _require_int(
+                delay["sample_count"],
+                label="delay sample count",
+                minimum=FIXED_STEPS,
+                maximum=FIXED_STEPS,
+            )
             if (
                 minimum > maximum
                 or not minimum <= final <= maximum
                 or not minimum * FIXED_STEPS <= total <= maximum * FIXED_STEPS
-                or delay["sample_count"] != FIXED_STEPS
                 or type(delay["mean_hex"]) is not str
             ):
                 raise CausalGridDivergenceProbeError(
@@ -2182,7 +2670,7 @@ def _assemble_receipt(
         or execution_envelope["probe_mount"]
         != "private_exact_readonly_snapshot_v1"
         or execution_envelope["qualification_mount"]
-        != "minimal_exact_readable_snapshot_v1"
+        != "minimal_exact_readable_snapshot_v2"
         or execution_envelope["qualified_image_executed"] is not True
         or execution_envelope["root_filesystem"] != "read_only"
         or execution_envelope["source_mount"]
@@ -2251,15 +2739,32 @@ def _assemble_receipt(
         "execution_envelope": dict(execution_envelope),
         "runtime_observation": child_payload["runtime_observation"],
         "frozen_inputs": {
+            "alberta_source_archive_path": _ALBERTA_SOURCE_ARCHIVE_PATH,
+            "alberta_source_inventory_path": _ALBERTA_SOURCE_INVENTORY_PATH,
+            "alberta_source_patch_path": None,
+            "alberta_source_root_path": _ALBERTA_SOURCE_ROOT_PATH,
+            "alberta_snapshot_descriptor_path": _ALBERTA_SNAPSHOT_DESCRIPTOR_PATH,
+            "capability_receipt_schema_version": CAPABILITY_RECEIPT_SCHEMA_VERSION,
             "candidate_source_inventory_sha256": SOURCE_INVENTORY_SHA256,
             "executor_inventory_sha256": EXECUTOR_INVENTORY_SHA256,
             "matched_horizon": MATCHED_HORIZON,
             "open_protocol_sha256": OPEN_PROTOCOL_SHA256,
+            "qualification_manifest_path": _QUALIFICATION_MANIFEST_PATH,
+            "qualification_manifest_schema_version": (
+                QUALIFICATION_MANIFEST_SCHEMA_VERSION
+            ),
             "qualification_manifest_sha256": QUALIFICATION_MANIFEST_SHA256,
+            "qualification_manifest_sidecar_path": (
+                _QUALIFICATION_MANIFEST_SIDECAR_PATH
+            ),
             "qualified_image_lock_sha256": QUALIFIED_IMAGE_SHA256,
             "runtime_profile_sha256": RUNTIME_PROFILE_SHA256,
             "source_archive_sha256": SOURCE_ARCHIVE_SHA256,
+            "source_archive_size_bytes": SOURCE_ARCHIVE_SIZE_BYTES,
             "snapshot_descriptor_sha256": SNAPSHOT_DESCRIPTOR_SHA256,
+            "snapshot_descriptor_schema_version": (
+                SNAPSHOT_DESCRIPTOR_SCHEMA_VERSION
+            ),
             "task_identity_sha256": TASK_IDENTITY_SHA256,
         },
         "probe_source_sha256": _require_sha256(
@@ -2466,6 +2971,18 @@ def _remove_staging_directory(
     os.rmdir(staging_name, dir_fd=parent_descriptor)
 
 
+def _close_descriptors(descriptors: Sequence[int]) -> OSError | None:
+    close_error: OSError | None = None
+    for descriptor in descriptors:
+        if descriptor < 0:
+            continue
+        try:
+            os.close(descriptor)
+        except OSError as exc:
+            close_error = close_error or exc
+    return close_error
+
+
 def _write_receipt(output_root: Path, receipt: Mapping[str, Any]) -> Path:
     if (
         not output_root.is_absolute()
@@ -2609,12 +3126,18 @@ def _write_receipt(output_root: Path, receipt: Mapping[str, Any]) -> Path:
             raise
         raise CausalGridDivergenceProbeError("cannot seal development receipt") from exc
     finally:
-        if published_descriptor >= 0:
-            os.close(published_descriptor)
-        if staging_descriptor >= 0:
-            os.close(staging_descriptor)
-        if parent_descriptor >= 0:
-            os.close(parent_descriptor)
+        close_error = _close_descriptors(
+            (published_descriptor, staging_descriptor, parent_descriptor)
+        )
+        if close_error is not None:
+            if published:
+                raise ReceiptPublishedButUncertainError(
+                    f"receipt was published at {output_root} but descriptor cleanup "
+                    "is uncertain; do not reuse this output root"
+                ) from close_error
+            raise CausalGridDivergenceProbeError(
+                "development receipt descriptors could not be closed cleanly"
+            ) from close_error
     return output_root / "receipt.json"
 
 

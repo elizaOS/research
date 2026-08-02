@@ -922,19 +922,19 @@ def test_publish_orders_authentication_before_analysis_and_replays_offline(
     )
     golden_payload_sha256 = {
         "manifest.json": (
-            "248e24f51e5963e85716ff62e07e590a3af48a1876f7b45760857b38e4159051"
+            "c643c798718b78f0c4de6421e2c2a899319f1827ea876549be7c23bb71746323"
         ),
         "analysis/analysis-runtime-source.json": (
-            "d01a6e149496bcffec2cd60fc3336ef79d70eed120e110093c35105b35fff653"
+            "ca6656e3d1e12aeab5c660921cc3a9ce00611e9c41a612e646a2ca458f70f52b"
         ),
         "analysis/evaluation-authenticated-bindings-cache.json": (
-            "2b00f43ddbbb3a814fb3dcc771d88ad348c98aefa3f96ed79788e027faef3ada"
+            "2d230d5ffc115598065fd7794402e0b1044eaa71e8b6b3eaf6f68417c2e506e7"
         ),
         "analysis/statistics-contract.json": (
-            "b5c0d7be8ebd02cc155756400d76119969443ccf8f1a6afdb062fbd7651811b1"
+            "fa20ac49b10bbbe5fa8605735fe46db7d572e642faf99728346af9b15d31cdc6"
         ),
         "analysis/statistics-result.json": (
-            "d233258f87819ea554ea2919d79c163e8e8d0e8d9271bac96250ea3c2ad75e74"
+            "96fe23912bbf5929184477b183af59012a78527d5868888c805292a6b1d4678b"
         ),
     }
     for relative, expected_sha256 in golden_payload_sha256.items():
@@ -944,10 +944,10 @@ def test_publish_orders_authentication_before_analysis_and_replays_offline(
             f"{expected_sha256}\n".encode("ascii")
         )
     assert content.manifest["payload_sha256"] == (
-        "8e49c6cbea69e9f467fe1f2c07cbf8029509ee45279a0c6d95572a3172161b7a"
+        "dcfdbe291c3606b06253446ac367bcb20e585314a8a1e3ab3719244b2c881e3f"
     )
     assert content.analysis_runtime_source["payload_sha256"] == (
-        "4a82987136184d841630a272032925efecdd56156a1993dc5dd27b63cf6179be"
+        "a23e65272f0785d4a2b3843610800088a5f2ca8352ef858d9ab4dfeed3caafd6"
     )
 
     assert events[:3] == ["open-resolver", "evaluation-resolver", "analysis"]
@@ -955,7 +955,7 @@ def test_publish_orders_authentication_before_analysis_and_replays_offline(
     assert events.count("evaluation-resolver") == 1
     qualification_digest = fixture.qualification_manifest_sha256
     assert content.manifest["schema_version"] == (
-        "alberta.forager_matched_final_analysis_manifest.v2"
+        "alberta.forager_matched_final_analysis_manifest.v3"
     )
     assert content.manifest["qualification_manifest_sha256"] == qualification_digest
     assert content.seal_content.open_score_evidence.qualification_manifest_sha256 == (
@@ -1039,7 +1039,6 @@ def test_publish_orders_authentication_before_analysis_and_replays_offline(
 
     claim = cast(Mapping[str, Any], content.manifest["claim_boundary"])
     scope = cast(Mapping[str, Any], content.manifest["bundle_replay_scope"])
-    assert claim["scope"] == "heldout_executed_six_candidate_set_only"
     assert claim["promotion_authorized"] is False
     assert claim["sota_claim_authorized"] is False
     assert claim["secondary_sign_flip_interpretation"] == ("nonconfirmatory_sensitivity_only")
@@ -1056,7 +1055,11 @@ def test_publish_orders_authentication_before_analysis_and_replays_offline(
     )
     assert claim["six_arm_ranking_authorized"] is False
     assert claim["full_registered_universe_best_claim_authorized"] is False
-    assert claim["candidate_universe_eventual_best_wording_is_not_result_authority"] is True
+    assert claim["scope"] == (
+        "three_preregistered_alberta_vs_selected_external_contrasts_within_six_executed_arms"
+    )
+    assert claim["candidate_universe_v2_contrast_specific_scope_enforced"] is True
+    assert claim["registered_panel_ranking_identified_by_design"] is False
     assert claim["tuning_selection_endpoint_interpretation"] == (
         "frozen_ranking_statistic_not_population_confidence_bound"
     )
@@ -1103,27 +1106,28 @@ def test_publish_orders_authentication_before_analysis_and_replays_offline(
     assert offline.contract == content.contract
     assert offline.result == content.result
 
-    legacy_output = tmp_path / "legacy-final-manifest"
-    shutil.copytree(output, legacy_output)
-    legacy_manifest_path = legacy_output / "manifest.json"
-    legacy_manifest = cast(
-        dict[str, Any],
-        json.loads(legacy_manifest_path.read_bytes()),
-    )
-    legacy_manifest["schema_version"] = (
-        "alberta.forager_matched_final_analysis_manifest.v1"
-    )
-    unsigned_legacy_manifest = dict(legacy_manifest)
-    unsigned_legacy_manifest.pop("payload_sha256")
-    legacy_manifest["payload_sha256"] = campaign._canonical_sha256(
-        unsigned_legacy_manifest
-    )
-    _rewrite_json_pair(legacy_manifest_path, legacy_manifest)
-    with pytest.raises(
-        final_analysis.ForagerMatchedFinalAnalysisError,
-        match="manifest differs from exact replay",
-    ):
-        final_analysis.load_final_analysis_content(legacy_output)
+    for legacy_version in ("v1", "v2"):
+        legacy_output = tmp_path / f"legacy-final-manifest-{legacy_version}"
+        shutil.copytree(output, legacy_output)
+        legacy_manifest_path = legacy_output / "manifest.json"
+        legacy_manifest = cast(
+            dict[str, Any],
+            json.loads(legacy_manifest_path.read_bytes()),
+        )
+        legacy_manifest["schema_version"] = (
+            f"alberta.forager_matched_final_analysis_manifest.{legacy_version}"
+        )
+        unsigned_legacy_manifest = dict(legacy_manifest)
+        unsigned_legacy_manifest.pop("payload_sha256")
+        legacy_manifest["payload_sha256"] = campaign._canonical_sha256(
+            unsigned_legacy_manifest
+        )
+        _rewrite_json_pair(legacy_manifest_path, legacy_manifest)
+        with pytest.raises(
+            final_analysis.ForagerMatchedFinalAnalysisError,
+            match="manifest differs from exact replay",
+        ):
+            final_analysis.load_final_analysis_content(legacy_output)
 
 
 def test_pin_failures_and_resolver_failures_write_nothing(

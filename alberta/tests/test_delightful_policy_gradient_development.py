@@ -260,6 +260,104 @@ def test_operation_and_resource_accounting_are_exact_and_non_kondo(
     assert all(comparison["verdict"] is None for comparison in comparisons)
 
 
+def test_kondo_selection_accounting_is_a_counterfactual_and_reconstructs(
+    development_report: dict[str, object],
+) -> None:
+    assert module.KONDO_IMPLEMENTED is False
+    assert module.KONDO_SELECTION_ACCOUNTING is True
+    assert development_report["kondo_implemented"] is False
+    assert development_report["kondo_selection_accounting"] is True
+    assert "Kondo compute savings" in cast(list[str], development_report["excluded_claims"])
+    for run in _runs(development_report):
+        kondo = cast(Mapping[str, object], run["kondo_selection_accounting"])
+        assert kondo["actual_compute_gating"] is False
+        policy = cast(Mapping[str, object], kondo["selection_policy"])
+        assert policy["selected_iff"] == "delight > price"
+        assert policy["price"] == 0.0
+
+        trace = cast(Mapping[str, object], run["trace"])
+        delight = np.asarray(trace["delight"], dtype=np.float64)
+        steps = int(delight.size)
+        assert kondo["total_steps"] == steps
+        assert kondo["selected_steps"] == int(np.sum(delight > 0.0))
+        assert 0.0 <= cast(float, kondo["selection_rate"]) <= 1.0
+        assert 0.0 <= cast(float, kondo["expected_bernoulli_selection_rate"]) <= 1.0
+        assert len(cast(list[float], kondo["selection_rate_by_phase"])) == 3
+
+        channels = {
+            cast(str, channel["channel"]): channel
+            for channel in cast(list[Mapping[str, object]], kondo["channels"])
+        }
+        assert set(channels) == {"actor", "critic", "average_reward"}
+        assert channels["actor"]["kondo_gateable"] is True
+        assert channels["critic"]["kondo_gateable"] is False
+        assert channels["average_reward"]["kondo_gateable"] is False
+        assert channels["critic"]["counterfactual_skipped_scalar_updates"] == 0
+        assert channels["average_reward"]["counterfactual_skipped_scalar_updates"] == 0
+        assert (
+            kondo["counterfactual_skipped_scalar_updates_total"]
+            == channels["actor"]["counterfactual_skipped_scalar_updates"]
+        )
+        assert (
+            cast(int, kondo["counterfactual_selected_scalar_updates_total"])
+            + cast(int, kondo["counterfactual_skipped_scalar_updates_total"])
+            == cast(int, kondo["executed_scalar_updates_total"])
+        )
+
+        # Every backward pass in the life was actually executed; the skipped
+        # column is bookkeeping only and the operation accounting still shows
+        # a fully executed life.
+        operations = cast(Mapping[str, object], run["operations"])
+        assert operations["actor_update_attempts"] == steps
+        assert operations["actor_update_commits"] == steps
+
+
+def test_validator_rejects_kondo_selection_accounting_tampering(
+    development_report: dict[str, object],
+) -> None:
+    gating_claimed = copy.deepcopy(development_report)
+    first_run = cast(dict[str, object], cast(list[object], gating_claimed["runs"])[0])
+    kondo = cast(dict[str, object], first_run["kondo_selection_accounting"])
+    kondo["actual_compute_gating"] = True
+    _redigest(gating_claimed)
+    validation = validate_delightful_policy_gradient_development_report(gating_claimed)
+    assert not validation.valid
+    assert any("actual compute gating" in error for error in validation.errors)
+
+    inflated = copy.deepcopy(development_report)
+    first_run = cast(dict[str, object], cast(list[object], inflated["runs"])[0])
+    kondo = cast(dict[str, object], first_run["kondo_selection_accounting"])
+    kondo["counterfactual_skipped_scalar_updates_total"] = (
+        cast(int, kondo["counterfactual_skipped_scalar_updates_total"]) + 1
+    )
+    _redigest(inflated)
+    validation = validate_delightful_policy_gradient_development_report(inflated)
+    assert not validation.valid
+    assert any(
+        "Kondo selection accounting does not reconstruct" in error
+        for error in validation.errors
+    )
+
+    repriced = copy.deepcopy(development_report)
+    first_run = cast(dict[str, object], cast(list[object], repriced["runs"])[0])
+    kondo = cast(dict[str, object], first_run["kondo_selection_accounting"])
+    cast(dict[str, object], kondo["selection_policy"])["price"] = 1.0
+    _redigest(repriced)
+    validation = validate_delightful_policy_gradient_development_report(repriced)
+    assert not validation.valid
+    assert any(
+        "Kondo selection accounting does not reconstruct" in error
+        for error in validation.errors
+    )
+
+    undeclared = copy.deepcopy(development_report)
+    undeclared["kondo_selection_accounting"] = False
+    _redigest(undeclared)
+    validation = validate_delightful_policy_gradient_development_report(undeclared)
+    assert not validation.valid
+    assert any("declaration" in error for error in validation.errors)
+
+
 def test_validator_rejects_digest_semantics_crn_and_numeric_type_tampering(
     development_report: dict[str, object],
 ) -> None:

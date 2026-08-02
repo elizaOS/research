@@ -79,6 +79,7 @@ _MAX_CLEANUP_INSPECTION_BYTES: Final = 4 * 1024
 _PROBE_TIMEOUT_SECONDS: Final = 10 * 60
 _GIT_IDENTITY_TIMEOUT_SECONDS: Final = 60
 _GIT_ARCHIVE_TIMEOUT_SECONDS: Final = 180
+_PROCESS_REAP_TIMEOUT_SECONDS: Final = 10
 _QUALIFIED_IMAGE_SHA256: Final = "5ecaabefce6439a8731c19e7a55fedb666788242baf035e6ffca86eb31299768"
 _QUALIFIED_RUNTIME_PROFILE_SHA256: Final = (
     "7170418e8082babbf17ebfbbb639ee75fcd8b5ae3931d35b3fb9199ea2bfd9b3"
@@ -221,10 +222,12 @@ _RESOURCE_ACCOUNTING_SEMANTICS: Final = MappingProxyType(
         ),
         "replay_capacity_transitions": "maximum replay capacity measured in transitions",
         "recurrent_state_elements": (
-            "initialized dynamic per-lane recurrent or nonparametric state elements; Horde "
-            "recurrent64 counts its 64-element hidden carry while its fixed substrate is "
-            "supplemental; causal maps count the full finite planner/map sufficient-statistic "
-            "state, including control and RNG state, despite zero trainable parameters"
+            "candidate-specific disclosed recurrent/carry/nonparametric-state proxy, not total "
+            "persistent state: Horde recurrent64 counts only its 64-element hidden carry while "
+            "its fixed substrate is supplemental; local RTU counts only actor/critic carry and "
+            "excludes sensitivities, eligibility traces, normalization/history, and RNG; causal "
+            "maps count the full finite planner/map sufficient-statistic state, including "
+            "control and RNG state, despite zero trainable parameters"
         ),
         "causal_map_scope": (
             "causal-map candidates have zero optimizer parameters and zero gradient updates; "
@@ -1457,13 +1460,22 @@ def _git_value(
 ) -> str:
     _rebind_git_runtime(identity)
     try:
-        completed = _run_bounded_process(
-            _git_command(identity, checkout, *arguments),
-            timeout=_GIT_IDENTITY_TIMEOUT_SECONDS,
-            maximum_stdout_bytes=_MAX_GIT_METADATA_BYTES,
-            maximum_stderr_bytes=_MAX_GIT_METADATA_BYTES,
-            environment=_git_environment(),
-        )
+        try:
+            completed = _run_bounded_process(
+                _git_command(identity, checkout, *arguments),
+                timeout=_GIT_IDENTITY_TIMEOUT_SECONDS,
+                maximum_stdout_bytes=_MAX_GIT_METADATA_BYTES,
+                maximum_stderr_bytes=_MAX_GIT_METADATA_BYTES,
+                environment=_git_environment(),
+            )
+        except _BoundedProcessOutputError as exc:
+            raise ForagerMatchedQualificationError(
+                "git identity query output exceeds its bound"
+            ) from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ForagerMatchedQualificationError(
+                "git identity query could not run"
+            ) from exc
     finally:
         _rebind_git_runtime(identity)
     if completed.returncode != 0 or completed.stderr:
@@ -1492,20 +1504,29 @@ def _build_exact_git_archive(checkout: Path, output: Path) -> None:
     with output.open("xb") as handle:
         _rebind_git_runtime(git_runtime)
         try:
-            completed = _run_bounded_process(
-                _git_command(
-                    git_runtime,
-                    checkout,
-                    "archive",
-                    "--format=tar",
-                    commit,
-                ),
-                timeout=_GIT_ARCHIVE_TIMEOUT_SECONDS,
-                maximum_stdout_bytes=_QUALIFIED_UPSTREAM_ARCHIVE_SIZE_BYTES,
-                maximum_stderr_bytes=_MAX_GIT_METADATA_BYTES,
-                stdout_sink=handle,
-                environment=_git_environment(),
-            )
+            try:
+                completed = _run_bounded_process(
+                    _git_command(
+                        git_runtime,
+                        checkout,
+                        "archive",
+                        "--format=tar",
+                        commit,
+                    ),
+                    timeout=_GIT_ARCHIVE_TIMEOUT_SECONDS,
+                    maximum_stdout_bytes=_QUALIFIED_UPSTREAM_ARCHIVE_SIZE_BYTES,
+                    maximum_stderr_bytes=_MAX_GIT_METADATA_BYTES,
+                    stdout_sink=handle,
+                    environment=_git_environment(),
+                )
+            except _BoundedProcessOutputError as exc:
+                raise ForagerMatchedQualificationError(
+                    "git archive output exceeds its bound"
+                ) from exc
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise ForagerMatchedQualificationError(
+                    "git archive generation could not run"
+                ) from exc
         finally:
             _rebind_git_runtime(git_runtime)
         handle.flush()
@@ -2843,7 +2864,11 @@ def _cleanup_interrupted_probe_container(
                     raise ForagerMatchedQualificationError(
                         "OCI probe cidfile does not contain an exact container ID"
                     )
-            except (UnicodeDecodeError, ForagerMatchedQualificationError) as exc:
+            except (
+                OSError,
+                UnicodeDecodeError,
+                ForagerMatchedQualificationError,
+            ) as exc:
                 cidfile_error = exc
             else:
                 cleanup_target = container_id
@@ -2891,6 +2916,32 @@ def _cleanup_interrupted_probe_container(
             f"OCI probe cidfile contract failed after cleanup={cleanup_state}"
         ) from cidfile_error
     return cleanup_state
+
+
+def _terminate_and_reap_process(process: subprocess.Popen[bytes]) -> None:
+    """Terminate one bounded child, then fail closed if it cannot be reaped."""
+    termination_error: OSError | None = None
+    if process.poll() is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            termination_error = exc
+    try:
+        process.wait(timeout=_PROCESS_REAP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        raise ForagerMatchedQualificationError(
+            "bounded child could not be reaped after termination"
+        ) from exc
+    except OSError as exc:
+        raise ForagerMatchedQualificationError(
+            "bounded child could not be inspected after termination"
+        ) from exc
+    if termination_error is not None:
+        raise ForagerMatchedQualificationError(
+            "bounded child could not be terminated cleanly"
+        ) from termination_error
 
 
 def _run_bounded_process(
@@ -2941,8 +2992,7 @@ def _run_bounded_process(
         env=materialized_environment,
     )
     if process.stdout is None or process.stderr is None:
-        process.kill()
-        process.wait(timeout=10)
+        _terminate_and_reap_process(process)
         raise AssertionError("bounded process pipes were not created")
     stdout = bytearray()
     stderr = bytearray()
@@ -2962,51 +3012,51 @@ def _run_bounded_process(
             None,
         ),
     }
+    selector: selectors.BaseSelector | None = None
     try:
-        with selectors.DefaultSelector() as selector:
-            for label, (stream, _buffer, _maximum, _sink) in streams.items():
-                selector.register(stream, selectors.EVENT_READ, label)
-            while selector.get_map():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(
-                        materialized,
-                        timeout,
-                        output=bytes(stdout),
-                        stderr=bytes(stderr),
-                    )
-                for selector_key, _events in selector.select(min(remaining, 1.0)):
-                    label = cast(Literal["stdout", "stderr"], selector_key.data)
-                    stream, buffer, maximum, sink = streams[label]
-                    allowance = maximum - sizes[label]
-                    chunk = os.read(
-                        selector_key.fd,
-                        min(64 * 1024, allowance + 1),
-                    )
-                    if not chunk:
-                        selector.unregister(selector_key.fileobj)
-                        stream.close()
-                        continue
-                    accepted = min(len(chunk), allowance)
-                    if accepted:
-                        if sink is None:
-                            buffer.extend(chunk[:accepted])
-                            written = accepted
+        selector = selectors.DefaultSelector()
+        for label, (stream, _buffer, _maximum, _sink) in streams.items():
+            selector.register(stream, selectors.EVENT_READ, label)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(
+                    materialized,
+                    timeout,
+                    output=bytes(stdout),
+                    stderr=bytes(stderr),
+                )
+            for selector_key, _events in selector.select(min(remaining, 1.0)):
+                label = cast(Literal["stdout", "stderr"], selector_key.data)
+                _stream, buffer, maximum, sink = streams[label]
+                allowance = maximum - sizes[label]
+                chunk = os.read(
+                    selector_key.fd,
+                    min(64 * 1024, allowance + 1),
+                )
+                if not chunk:
+                    selector.unregister(selector_key.fileobj)
+                    continue
+                accepted = min(len(chunk), allowance)
+                if accepted:
+                    if sink is None:
+                        buffer.extend(chunk[:accepted])
+                        written = accepted
+                    else:
+                        written_result = sink.write(chunk[:accepted])
+                        if written_result is None:
+                            written = 0
                         else:
-                            written_result = sink.write(chunk[:accepted])
-                            if written_result is None:
-                                written = 0
-                            else:
-                                written = written_result
-                            if written != accepted:
-                                raise ForagerMatchedQualificationError(
-                                    "bounded process stdout sink accepted a partial write"
-                                )
-                        sizes[label] += written
-                    if accepted != len(chunk):
-                        raise _BoundedProcessOutputError(
-                            "child output exceeds its active byte limit"
-                        )
+                            written = written_result
+                        if written != accepted:
+                            raise ForagerMatchedQualificationError(
+                                "bounded process stdout sink accepted a partial write"
+                            )
+                    sizes[label] += written
+                if accepted != len(chunk):
+                    raise _BoundedProcessOutputError(
+                        "child output exceeds its active byte limit"
+                    )
         remaining = deadline - time.monotonic()
         if remaining <= 0 and process.poll() is None:
             raise subprocess.TimeoutExpired(
@@ -3022,23 +3072,29 @@ def _run_bounded_process(
             bytes(stderr),
         )
     except BaseException:
-        if process.poll() is None:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired as exc:
-            raise ForagerMatchedQualificationError(
-                "bounded child could not be reaped after termination"
-            ) from exc
+        _terminate_and_reap_process(process)
         raise
     finally:
+        close_error: OSError | None = None
+        if selector is not None:
+            try:
+                selector.close()
+            except OSError as exc:
+                close_error = exc
         if not process.stdout.closed:
-            process.stdout.close()
+            try:
+                process.stdout.close()
+            except OSError as exc:
+                close_error = close_error or exc
         if not process.stderr.closed:
-            process.stderr.close()
+            try:
+                process.stderr.close()
+            except OSError as exc:
+                close_error = close_error or exc
+        if close_error is not None:
+            raise ForagerMatchedQualificationError(
+                "bounded child resources could not be closed cleanly"
+            ) from close_error
 
 
 def _default_runner(command: Sequence[str]) -> QualificationProcessResult:
@@ -3108,11 +3164,35 @@ def _default_runner(command: Sequence[str]) -> QualificationProcessResult:
         return completed
 
 
+def _invoke_qualification_runner(
+    runner: QualificationRunner,
+    command: Sequence[str],
+    *,
+    label: str,
+) -> QualificationProcessResult:
+    try:
+        return runner(tuple(command))
+    except ForagerMatchedQualificationError:
+        raise
+    except _BoundedProcessOutputError as exc:
+        raise ForagerMatchedQualificationError(
+            f"{label} runner output exceeds its bound"
+        ) from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ForagerMatchedQualificationError(
+            f"{label} runner could not run"
+        ) from exc
+
+
 def _executor_runner_adapter(runner: QualificationRunner) -> Any:
     from alberta_framework.benchmarks import forager_matched_executor as executor
 
     def adapted(command: Sequence[str]) -> Any:
-        result = runner(tuple(command))
+        result = _invoke_qualification_runner(
+            runner,
+            command,
+            label="qualification runtime inspector",
+        )
         if type(result) is not QualificationProcessResult:
             raise ForagerMatchedQualificationError(
                 "qualification runtime inspector returned an invalid result"
@@ -3275,7 +3355,11 @@ def _run_probe(
     probe_sha_before, _probe_size = _sha256_file(probe_path, maximum=_MAX_JSON_BYTES)
     if probe_sha_before != invocation.probe_sha256:
         raise ForagerMatchedQualificationError("staged qualification probe digest drifted")
-    result = runner(_probe_command(runtime, invocation))
+    result = _invoke_qualification_runner(
+        runner,
+        _probe_command(runtime, invocation),
+        label="OCI probe",
+    )
     probe_sha_after, _probe_size_after = _sha256_file(probe_path, maximum=_MAX_JSON_BYTES)
     if probe_sha_before != probe_sha_after:
         raise ForagerMatchedQualificationError("qualification probe changed during OCI execution")
@@ -4004,18 +4088,15 @@ def _run_fresh_snapshot_replay(
         raise ForagerMatchedQualificationError(
             "fresh replay qualification module differs from its trusted binding"
         )
-    try:
-        completed = runner(
-            _fresh_snapshot_replay_command(
-                runtime.executable,
-                qualification_root,
-                qualification_module_sha256=module_sha256,
-            )
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise ForagerMatchedQualificationError(
-            "fresh-process staged replay could not run"
-        ) from exc
+    completed = _invoke_qualification_runner(
+        runner,
+        _fresh_snapshot_replay_command(
+            runtime.executable,
+            qualification_root,
+            qualification_module_sha256=module_sha256,
+        ),
+        label="fresh-process staged replay",
+    )
     if type(completed) is not QualificationProcessResult:
         raise ForagerMatchedQualificationError(
             "fresh-process staged replay runner returned the wrong result type"

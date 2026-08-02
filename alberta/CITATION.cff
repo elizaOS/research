@@ -8,8 +8,8 @@ authors:
   - name: "elizaOS research contributors"
 repository-code: "https://github.com/lalalune/alberta"
 license: Apache-2.0
-version: "0.27.0"
-date-released: "2026-07-31"
+version: "0.28.0"
+date-released: "2026-08-01"
 keywords:
   - continual learning
   - meta-learning

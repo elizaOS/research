@@ -111,11 +111,12 @@ four selected candidates plus two fixed descriptive references on 30 new seeds.
 Consequently, held-out v1 executes three named Alberta-vs-external contrasts among four
 tuning-selected inferential arms; the two fixed references are descriptive only. It
 supports neither a winner among the six executed arms nor a held-out best among all 21
-inferential candidates, and it cannot support the candidate-universe descriptor's broader
-“best among the frozen registered matched candidate panel” wording. That wording is an
-immutable-v1 claim-scope defect, not permission to reinterpret or edit the frozen protocol.
-Any result must remain conditional on the declared selection rule and must not be called a
-panel-wide winner or SOTA.
+inferential candidates, and it cannot support the broader “best among the frozen registered
+matched candidate panel” wording carried by the historical v1 candidate-universe descriptor.
+Candidate-universe schema v2 removes that wording and explicitly forbids both full-panel and
+six-arm winner interpretations; historical v1 artifacts remain unchanged. Any result must
+remain conditional on the declared selection rule and must not be called a panel-wide winner
+or SOTA.
 
 ### Frozen secondary sign-flip gates are nonconfirmatory sensitivity analyses
 
@@ -229,7 +230,8 @@ q-grid arms), but its columns are not a complete or cross-method memory/compute 
 snapshots. PPO's replay value of zero excludes 2,048/128-step rollout storage, and causal
 optimizer updates of zero exclude 499,712 non-gradient state updates. Recurrent64 Horde
 also has a 61,248-element fixed substrate outside its 49,477 trainable parameters. The
-causal-map arms have no trainable parameters but carry a 1,847-element learned finite state.
+causal-map arms have no trainable parameters but carry a 1,847-element finite state that
+includes learned sufficient statistics as well as control and RNG state.
 Local RTU's value 32 counts actor/critic carry only; it excludes 576 RTRL sensitivities,
 576 Taylor sensitivities, 4,685 eligibility-tree elements, normalization/history, and RNG.
 

@@ -19,8 +19,10 @@ here executes a real container or a benchmark horizon.
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import re
+import selectors
 import stat
 import subprocess
 import tarfile
@@ -676,6 +678,59 @@ def test_git_value_uses_a_bound_executable_sanitized_environment_and_active_caps
     assert not any("proxy" in name.lower() for name in environment)
 
 
+@pytest.mark.parametrize(
+    ("fault", "message"),
+    (
+        (FileNotFoundError("injected Git launch failure"), "could not run"),
+        (
+            subprocess.TimeoutExpired(("git", "rev-parse"), 1),
+            "could not run",
+        ),
+        (
+            qualification._BoundedProcessOutputError(  # noqa: SLF001
+                "injected git metadata overflow"
+            ),
+            "output exceeds its bound",
+        ),
+    ),
+    ids=("oserror", "timeout", "overflow"),
+)
+def test_git_value_wraps_runner_failures_in_the_public_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: BaseException,
+    message: str,
+) -> None:
+    identity = qualification._GitRuntimeIdentity(  # noqa: SLF001
+        executable=tmp_path / "git",
+        executable_sha256=_sha("git-executable"),
+    )
+    rebinds = 0
+
+    def rebind(value: Any) -> None:
+        nonlocal rebinds
+        assert value is identity
+        rebinds += 1
+
+    def run(*_args: Any, **_kwargs: Any) -> Any:
+        raise fault
+
+    monkeypatch.setattr(qualification, "_rebind_git_runtime", rebind)
+    monkeypatch.setattr(qualification, "_run_bounded_process", run)
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match=message,
+    ) as caught:
+        qualification._git_value(  # noqa: SLF001
+            identity,
+            tmp_path,
+            "rev-parse",
+            "HEAD",
+        )
+    assert caught.value.__cause__ is fault
+    assert rebinds == 2
+
+
 def test_default_git_binding_ignores_the_ambient_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -747,6 +802,58 @@ def test_exact_git_archive_streams_to_a_size_bounded_sink(
     assert observed["maximum_stdout_bytes"] == len(archive)
     assert observed["maximum_stderr_bytes"] == qualification._MAX_GIT_METADATA_BYTES  # noqa: SLF001
     assert observed["environment"] == qualification._git_environment()  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("fault", "message"),
+    (
+        (FileNotFoundError("injected Git launch failure"), "could not run"),
+        (
+            subprocess.TimeoutExpired(("git", "archive"), 1),
+            "could not run",
+        ),
+        (
+            qualification._BoundedProcessOutputError(  # noqa: SLF001
+                "injected git archive overflow"
+            ),
+            "output exceeds its bound",
+        ),
+    ),
+    ids=("oserror", "timeout", "overflow"),
+)
+def test_exact_git_archive_wraps_runner_failures_in_the_public_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: BaseException,
+    message: str,
+) -> None:
+    identity = qualification._GitRuntimeIdentity(  # noqa: SLF001
+        executable=tmp_path / "git",
+        executable_sha256=_sha("git-executable"),
+    )
+    values = iter(
+        (
+            qualification._QUALIFIED_UPSTREAM_COMMIT,  # noqa: SLF001
+            qualification._QUALIFIED_UPSTREAM_TREE,  # noqa: SLF001
+        )
+    )
+    monkeypatch.setattr(qualification, "_bind_git_runtime", lambda: identity)
+    monkeypatch.setattr(qualification, "_rebind_git_runtime", lambda _value: None)
+    monkeypatch.setattr(qualification, "_git_value", lambda *_args: next(values))
+
+    def run(*_args: Any, **_kwargs: Any) -> Any:
+        raise fault
+
+    monkeypatch.setattr(qualification, "_run_bounded_process", run)
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match=message,
+    ) as caught:
+        qualification._build_exact_git_archive(  # noqa: SLF001
+            tmp_path,
+            tmp_path / "source.tar",
+        )
+    assert caught.value.__cause__ is fault
 
 
 def test_probe_runtime_binding_uses_one_absolute_executable_and_exact_image(
@@ -1119,6 +1226,33 @@ def test_fresh_replay_rejects_invalid_runner_outputs(
         )
 
 
+def test_fresh_replay_wraps_injected_runner_overflow(
+    tmp_path: Path,
+) -> None:
+    root, runtime, module_sha256, payload = _fresh_replay_fixture(tmp_path)
+    overflow = qualification._BoundedProcessOutputError(  # noqa: SLF001
+        "injected fresh replay output overflow"
+    )
+
+    def runner(_command: Any) -> Any:
+        raise overflow
+
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="fresh-process staged replay runner output exceeds its bound",
+    ) as caught:
+        qualification._run_fresh_snapshot_replay(  # noqa: SLF001
+            root,
+            runtime,
+            runner,
+            expected_manifest_sha256=payload["manifest_sha256"],
+            expected_protocol_sha256=payload["protocol_sha256"],
+            expected_plan_sha256=payload["plan_sha256"],
+            expected_qualification_module_sha256=module_sha256,
+        )
+    assert caught.value.__cause__ is overflow
+
+
 def test_fresh_bundle_replay_rebinds_runtime_and_reloads_both_sides(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1210,6 +1344,156 @@ def test_fresh_bundle_replay_rebinds_runtime_and_reloads_both_sides(
             lambda _command: qualification.QualificationProcessResult(1, b"", b""),
         )
     assert events == ["build", "runtime", "child", "runtime"]
+
+
+@pytest.mark.parametrize(
+    ("failure_phase", "cleanup_error", "expected_type", "expected_message"),
+    (
+        (
+            "kill",
+            OSError("injected kill failure"),
+            qualification.ForagerMatchedQualificationError,
+            "bounded child could not be terminated cleanly",
+        ),
+        (
+            "kill",
+            ProcessLookupError("injected exited-child race"),
+            qualification._BoundedProcessOutputError,  # noqa: SLF001
+            "active byte limit",
+        ),
+        (
+            "wait",
+            subprocess.TimeoutExpired(("unused",), 10),
+            qualification.ForagerMatchedQualificationError,
+            "bounded child could not be reaped after termination",
+        ),
+        (
+            "wait",
+            OSError("injected wait failure"),
+            qualification.ForagerMatchedQualificationError,
+            "bounded child could not be inspected after termination",
+        ),
+        (
+            "selector_close",
+            OSError("injected selector close failure"),
+            qualification.ForagerMatchedQualificationError,
+            "bounded child resources could not be closed cleanly",
+        ),
+        (
+            "stdout_close",
+            OSError("injected stdout close failure"),
+            qualification.ForagerMatchedQualificationError,
+            "bounded child resources could not be closed cleanly",
+        ),
+        (
+            "stderr_close",
+            OSError("injected stderr close failure"),
+            qualification.ForagerMatchedQualificationError,
+            "bounded child resources could not be closed cleanly",
+        ),
+    ),
+    ids=(
+        "kill-error",
+        "kill-process-gone",
+        "reap-timeout",
+        "reap-error",
+        "selector-close-error",
+        "stdout-close-error",
+        "stderr-close-error",
+    ),
+)
+def test_bounded_process_normalizes_cleanup_failures_and_attempts_every_close(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_phase: str,
+    cleanup_error: BaseException,
+    expected_type: type[BaseException],
+    expected_message: str,
+) -> None:
+    class CloseBuffer(io.BytesIO):
+        def __init__(self, failure_name: str) -> None:
+            super().__init__()
+            self.failure_name = failure_name
+            self.close_called = False
+
+        def close(self) -> None:
+            self.close_called = True
+            super().close()
+            if failure_phase == self.failure_name:
+                raise cleanup_error
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = CloseBuffer("stdout_close")
+            self.stderr = CloseBuffer("stderr_close")
+            self.kill_called = False
+            self.waited = False
+
+        def poll(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            self.kill_called = True
+            if failure_phase == "kill":
+                raise cleanup_error
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            self.waited = True
+            if failure_phase == "wait":
+                raise cleanup_error
+            return -9
+
+    class SelectorKey:
+        data = "stdout"
+        fd = 101
+
+    class OverflowSelector:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __enter__(self) -> OverflowSelector:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            self.close()
+
+        def register(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def get_map(self) -> dict[str, bool]:
+            return {"active": True}
+
+        def select(self, _timeout: float) -> list[tuple[SelectorKey, int]]:
+            return [(SelectorKey(), selectors.EVENT_READ)]
+
+        def close(self) -> None:
+            self.closed = True
+            if failure_phase == "selector_close":
+                raise cleanup_error
+
+    process = FakeProcess()
+    selector = OverflowSelector()
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(selectors, "DefaultSelector", lambda: selector)
+    monkeypatch.setattr(os, "read", lambda _descriptor, _size: b"xx")
+
+    with pytest.raises(expected_type, match=expected_message) as caught:
+        qualification._run_bounded_process(  # noqa: SLF001
+            ("unused",),
+            timeout=1,
+            maximum_stdout_bytes=1,
+            maximum_stderr_bytes=1,
+        )
+
+    assert process.kill_called is True
+    assert process.waited is True
+    assert selector.closed is True
+    assert process.stdout.close_called is True
+    assert process.stderr.close_called is True
+    if isinstance(cleanup_error, ProcessLookupError):
+        assert caught.value.__cause__ is None
+    else:
+        assert caught.value.__cause__ is cleanup_error
 
 
 def test_default_runner_actively_rejects_oversized_output(
@@ -1325,6 +1609,39 @@ def test_probe_cleanup_uses_exact_name_for_a_partial_cidfile(
     assert len(observed) == 1
 
 
+def test_probe_cleanup_wraps_cidfile_read_oserror_after_exact_name_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cidfile = tmp_path / "container.cid"
+    cidfile.write_bytes(b"a" * 64)
+    container_name = "alberta-matched-qualification-" + "b" * 32
+    read_error = FileNotFoundError("injected cidfile disappearance")
+    observed: list[tuple[str, ...]] = []
+
+    def fail_read(*_args: Any, **_kwargs: Any) -> Any:
+        raise read_error
+
+    def cleanup(command: Any, **_kwargs: Any) -> Any:
+        materialized = tuple(command)
+        observed.append(materialized)
+        return subprocess.CompletedProcess(materialized, 0)
+
+    monkeypatch.setattr(qualification, "_read_stable", fail_read)
+    monkeypatch.setattr(subprocess, "run", cleanup)
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="cidfile contract failed after cleanup=force_removed_by_name",
+    ) as caught:
+        qualification._cleanup_interrupted_probe_container(  # noqa: SLF001
+            ("fake-runtime", "run"),
+            cidfile,
+            container_name,
+        )
+    assert caught.value.__cause__ is read_error
+    assert observed == [("fake-runtime", "rm", "--force", container_name)]
+
+
 def test_default_runner_cleans_a_completed_nonzero_container_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1396,6 +1713,37 @@ def test_probe_cleanup_accepts_bounded_proof_that_name_is_already_absent(
     ]
 
 
+def test_probe_cleanup_wraps_bounded_absence_query_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_name = "alberta-matched-qualification-" + "d" * 32
+    overflow = qualification._BoundedProcessOutputError(  # noqa: SLF001
+        "injected cleanup inspection overflow"
+    )
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 1),
+    )
+
+    def inspect(*_args: Any, **_kwargs: Any) -> Any:
+        raise overflow
+
+    monkeypatch.setattr(qualification, "_run_bounded_process", inspect)
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="could not prove the exact name absent",
+    ) as caught:
+        qualification._cleanup_interrupted_probe_container(  # noqa: SLF001
+            ("fake-runtime", "run"),
+            tmp_path / "missing.cid",
+            container_name,
+        )
+    assert caught.value.__cause__ is overflow
+
+
 @pytest.mark.parametrize(
     "caller_option",
     ("--name=caller-owned", "--cidfile=/tmp/caller-owned.cid"),
@@ -1451,6 +1799,32 @@ def test_probe_cleanup_fails_if_the_exact_name_still_exists(
             tmp_path / "missing.cid",
             container_name,
         )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (
+        FileNotFoundError("injected inspector launch failure"),
+        subprocess.TimeoutExpired(("docker", "version"), 1),
+        qualification._BoundedProcessOutputError(  # noqa: SLF001
+            "injected inspector output overflow"
+        ),
+    ),
+    ids=("oserror", "timeout", "overflow"),
+)
+def test_executor_runner_adapter_wraps_injected_runner_failures(
+    fault: BaseException,
+) -> None:
+    def runner(_command: Any) -> Any:
+        raise fault
+
+    adapted = qualification._executor_runner_adapter(runner)  # noqa: SLF001
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="qualification runtime inspector runner",
+    ) as caught:
+        adapted(("docker", "version"))
+    assert caught.value.__cause__ is fault
 
 
 def test_probe_result_accepts_only_reward_blind_unendorsed_payload(tmp_path: Path) -> None:
@@ -1513,6 +1887,24 @@ def test_probe_result_accepts_only_reward_blind_unendorsed_payload(tmp_path: Pat
         match="reward-blind",
     ):
         qualification._run_probe("docker", invocation, runner)  # noqa: SLF001
+
+    overflow = qualification._BoundedProcessOutputError(  # noqa: SLF001
+        "injected probe output overflow"
+    )
+
+    def overflow_runner(_command: Any) -> Any:
+        raise overflow
+
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="OCI probe runner output exceeds its bound",
+    ) as caught:
+        qualification._run_probe(  # noqa: SLF001
+            "docker",
+            invocation,
+            overflow_runner,
+        )
+    assert caught.value.__cause__ is overflow
 
 
 @pytest.mark.parametrize(

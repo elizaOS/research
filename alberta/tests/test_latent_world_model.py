@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import math
+
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import pytest
+from jax import Array
 
 from alberta_framework.core.behavior_model import BehaviorModel, BehaviorModelConfig
 from alberta_framework.core.dreaming import (
@@ -13,10 +17,51 @@ from alberta_framework.core.dreaming import (
     score_dream_candidates,
 )
 from alberta_framework.core.latent_world_model import (
+    EVIDENCE_LEVEL,
+    SCIENTIFIC_PROMOTION_ALLOWED,
     LatentWorldModel,
     LatentWorldModelConfig,
     run_latent_world_model_learning_loop,
 )
+
+_ENCODER_CONFIG_KEYS = (
+    "encoder_learning",
+    "encoder_step_size",
+    "max_encoder_update",
+    "encoder_collapse_gate_threshold",
+)
+
+
+def _toy_rotation_stream(
+    num_steps: int,
+) -> tuple[Array, Array, Array, Array]:
+    """Deterministic learnable dynamics: damped 2D rotation + action shift."""
+    angle = 0.35
+    cos_a, sin_a = math.cos(angle), math.sin(angle)
+    x = [1.0, 0.0, 0.5]
+    observations: list[list[float]] = []
+    actions: list[int] = []
+    rewards: list[float] = []
+    next_observations: list[list[float]] = []
+    for step in range(num_steps):
+        action = step % 2
+        shift = 0.2 if action == 1 else -0.2
+        next_x = [
+            0.98 * (cos_a * x[0] - sin_a * x[1]),
+            0.98 * (sin_a * x[0] + cos_a * x[1]),
+            0.9 * x[2] + 0.1 * shift,
+        ]
+        observations.append(list(x))
+        actions.append(action)
+        rewards.append(x[0])
+        next_observations.append(list(next_x))
+        x = next_x
+    return (
+        jnp.array(observations, dtype=jnp.float32),
+        jnp.array(actions, dtype=jnp.int32),
+        jnp.array(rewards, dtype=jnp.float32),
+        jnp.array(next_observations, dtype=jnp.float32),
+    )
 
 
 def test_latent_world_model_update_and_prediction_shapes() -> None:
@@ -144,3 +189,224 @@ def test_behavior_model_dream_policy_samples_from_learned_agent_model() -> None:
     assert int(sample.action) in {0, 1}
     chex.assert_tree_all_finite(sample.action_probability)
     chex.assert_tree_all_finite(sample.log_probability)
+
+
+@pytest.mark.unit
+def test_latent_world_model_evidence_level_is_development_only() -> None:
+    assert EVIDENCE_LEVEL == "L0"
+    assert SCIENTIFIC_PROMOTION_ALLOWED is False
+
+
+@pytest.mark.unit
+def test_trainable_encoder_default_off_matches_legacy_fixed_encoder_path() -> None:
+    config = LatentWorldModelConfig(
+        observation_dim=3,
+        n_actions=2,
+        latent_dim=4,
+        hidden_sizes=(8,),
+        sparsity=0.0,
+    )
+    assert config.encoder_learning is False
+
+    legacy_payload = config.to_config()
+    for key in _ENCODER_CONFIG_KEYS:
+        del legacy_payload[key]
+    legacy_config = LatentWorldModelConfig.from_config(legacy_payload)
+    assert legacy_config == config
+
+    model = LatentWorldModel(config)
+    legacy_model = LatentWorldModel(legacy_config)
+    # One shared initial state removes init wall-clock metadata differences,
+    # so any trajectory difference below must come from the config flag.
+    state = model.init(jr.key(7))
+
+    observations, actions, rewards, next_observations = _toy_rotation_stream(16)
+    result = run_latent_world_model_learning_loop(
+        model, state, observations, actions, rewards, next_observations
+    )
+    legacy_result = run_latent_world_model_learning_loop(
+        legacy_model, state, observations, actions, rewards, next_observations
+    )
+
+    # Bitwise-identical trajectories and final state with the flag off.
+    chex.assert_trees_all_equal(result, legacy_result)
+    assert bool(jnp.array_equal(result.state.encoder_matrix, state.encoder_matrix))
+    assert bool(jnp.array_equal(result.state.encoder_bias, state.encoder_bias))
+    assert not bool(jnp.any(result.encoder_updates_applied))
+    assert not bool(jnp.any(result.encoder_collapse_gates))
+    assert bool(jnp.all(result.encoder_gradient_norms == 0.0))
+
+
+@pytest.mark.unit
+def test_trainable_encoder_learning_smoke_loss_decreases() -> None:
+    config = LatentWorldModelConfig(
+        observation_dim=3,
+        n_actions=2,
+        latent_dim=4,
+        hidden_sizes=(),
+        step_size=0.05,
+        sparsity=0.0,
+        encoder_learning=True,
+        encoder_step_size=0.05,
+        min_latent_std=0.0,  # collapse never detected: encoder gate stays open
+    )
+    model = LatentWorldModel(config)
+    state = model.init(jr.key(1))
+    observations, actions, rewards, next_observations = _toy_rotation_stream(300)
+    result = run_latent_world_model_learning_loop(
+        model, state, observations, actions, rewards, next_observations
+    )
+
+    assert int(result.state.step_count) == 300
+    chex.assert_tree_all_finite(result.prediction_errors)
+    chex.assert_tree_all_finite(result.state.encoder_matrix)
+    chex.assert_tree_all_finite(result.state.encoder_bias)
+    assert int(jnp.sum(result.encoder_updates_applied)) > 0
+    assert bool(jnp.any(result.encoder_gradient_norms > 0.0))
+    assert not bool(jnp.array_equal(result.state.encoder_matrix, state.encoder_matrix))
+
+    quarter = 75
+    early_loss = float(jnp.mean(result.prediction_errors[:quarter]))
+    late_loss = float(jnp.mean(result.prediction_errors[-quarter:]))
+    assert late_loss < early_loss
+
+
+@pytest.mark.unit
+def test_trainable_encoder_first_step_is_collapse_gated() -> None:
+    config = LatentWorldModelConfig(
+        observation_dim=3,
+        n_actions=2,
+        latent_dim=4,
+        hidden_sizes=(),
+        sparsity=0.0,
+        encoder_learning=True,
+    )
+    model = LatentWorldModel(config)
+    state = model.init(jr.key(2))
+
+    # At step 0 the variance EMA holds no evidence, so collapse_score is 1.0
+    # and the strict default threshold blocks the encoder step fail-closed.
+    result = model.update(
+        state,
+        jnp.array([0.2, -0.1, 0.3], dtype=jnp.float32),
+        jnp.array(1, dtype=jnp.int32),
+        jnp.array(0.5, dtype=jnp.float32),
+        jnp.array(0.95, dtype=jnp.float32),
+        jnp.array([0.3, 0.0, 0.2], dtype=jnp.float32),
+    )
+
+    assert float(result.collapse_score) == 1.0
+    assert bool(result.encoder_collapse_gated) is True
+    assert bool(result.encoder_update_applied) is False
+    assert bool(jnp.array_equal(result.state.encoder_matrix, state.encoder_matrix))
+    assert bool(jnp.array_equal(result.state.encoder_bias, state.encoder_bias))
+
+
+@pytest.mark.unit
+def test_trainable_encoder_collapse_gate_blocks_all_updates() -> None:
+    base: dict[str, object] = {
+        "observation_dim": 3,
+        "n_actions": 2,
+        "latent_dim": 4,
+        "hidden_sizes": (),
+        "step_size": 0.05,
+        "sparsity": 0.0,
+        # tanh latents always have std far below 5.0, so every step reports
+        # full collapse and the gate must block every encoder update.
+        "min_latent_std": 5.0,
+    }
+    gated_model = LatentWorldModel(
+        LatentWorldModelConfig(encoder_learning=True, **base)  # type: ignore[arg-type]
+    )
+    disabled_model = LatentWorldModel(
+        LatentWorldModelConfig(encoder_learning=False, **base)  # type: ignore[arg-type]
+    )
+    # One shared initial state removes init wall-clock metadata differences.
+    gated_state = gated_model.init(jr.key(3))
+
+    observations, actions, rewards, next_observations = _toy_rotation_stream(24)
+    gated_result = run_latent_world_model_learning_loop(
+        gated_model, gated_state, observations, actions, rewards, next_observations
+    )
+    disabled_result = run_latent_world_model_learning_loop(
+        disabled_model, gated_state, observations, actions, rewards, next_observations
+    )
+
+    assert bool(jnp.all(gated_result.encoder_collapse_gates))
+    assert not bool(jnp.any(gated_result.encoder_updates_applied))
+    assert bool(jnp.array_equal(gated_result.state.encoder_matrix, gated_state.encoder_matrix))
+    assert bool(jnp.array_equal(gated_result.state.encoder_bias, gated_state.encoder_bias))
+    # Predictor keeps learning while the encoder gate is closed.
+    assert int(gated_result.state.step_count) == 24
+
+    # A fully gated trainable encoder leaves the whole trajectory bitwise
+    # identical to the disabled path.
+    chex.assert_trees_all_equal(gated_result.state, disabled_result.state)
+    chex.assert_trees_all_equal(
+        gated_result.latent_predictions, disabled_result.latent_predictions
+    )
+    chex.assert_trees_all_equal(gated_result.surprises, disabled_result.surprises)
+    chex.assert_trees_all_equal(
+        gated_result.prediction_errors, disabled_result.prediction_errors
+    )
+
+
+@pytest.mark.unit
+def test_trainable_encoder_serialization_roundtrip() -> None:
+    config = LatentWorldModelConfig(
+        observation_dim=2,
+        n_actions=3,
+        latent_dim=3,
+        hidden_sizes=(8,),
+        sparsity=0.0,
+        encoder_learning=True,
+        encoder_step_size=0.02,
+        max_encoder_update=0.05,
+        encoder_collapse_gate_threshold=0.25,
+        min_latent_std=0.0,
+    )
+    assert LatentWorldModelConfig.from_config(config.to_config()) == config
+
+    model = LatentWorldModel(config)
+    restored = LatentWorldModel.from_config(model.to_config())
+    assert restored.config == config
+
+    # One shared initial state removes init wall-clock metadata differences.
+    state = model.init(jr.key(5))
+
+    args = (
+        jnp.array([0.4, -0.2], dtype=jnp.float32),
+        jnp.array(2, dtype=jnp.int32),
+        jnp.array(1.0, dtype=jnp.float32),
+        jnp.array(0.99, dtype=jnp.float32),
+        jnp.array([0.5, -0.1], dtype=jnp.float32),
+    )
+    result = model.update(state, *args)
+    restored_result = restored.update(state, *args)
+    chex.assert_trees_all_equal(result.state, restored_result.state)
+    assert bool(result.encoder_update_applied) == bool(restored_result.encoder_update_applied)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"encoder_step_size": 0.0},
+        {"encoder_step_size": -0.01},
+        {"max_encoder_update": 0.0},
+        {"max_encoder_update": -1.0},
+        {"encoder_collapse_gate_threshold": -0.1},
+        {"encoder_collapse_gate_threshold": 1.5},
+    ],
+)
+def test_trainable_encoder_config_validation_fails_closed(
+    overrides: dict[str, float],
+) -> None:
+    config = LatentWorldModelConfig(
+        observation_dim=2,
+        n_actions=2,
+        encoder_learning=True,
+        **overrides,  # type: ignore[arg-type]
+    )
+    with pytest.raises(ValueError):
+        LatentWorldModel(config)
