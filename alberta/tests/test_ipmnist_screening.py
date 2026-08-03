@@ -34,11 +34,18 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     _make_adamw_cbp_learner,
     _make_adamw_cbp_noreset_learner,
     _make_colnorm_gate_learner,
+    _make_fade_head_ema_norm_learner,
     _make_guarded_cbp_adam_learner,
+    _make_l2init_ema_norm_learner,
     _make_lion_gate_learner,
     _make_muon_gate_learner,
+    _make_norm_adam_fastv_learner,
+    _make_norm_apollo_gate_learner,
+    _make_norm_rmsprop_gate_learner,
     _make_rff_rls_learner,
     _make_sgd_ema_norm_learner,
+    _make_sgd_momentum_gate_learner,
+    _make_snr_ema_norm_learner,
     _make_upgd_alpha_utility_learner,
     _make_upgd_ema_norm_ext_learner,
     _make_upgd_idbd_learner,
@@ -46,8 +53,10 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     _make_upgd_w_fade_head_learner,
     _make_upgd_w_wclip_learner,
     _make_upgd_warmnorm_learner,
+    _make_wclip_ema_norm_learner,
     _newton_schulz_orthogonalize,
     _rff_frozen_probe_input,
+    _upgd_utility_and_gate,
     adam_elem_step,
     adam_elem_update,
     cbp_maybe_replace_layer,
@@ -60,6 +69,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     screening_spec,
     shard_payload,
     shift_adaptive_normalize,
+    snr_maybe_reset_layer,
     upgd_alpha_utility_update,
     upgd_idbd_swift_update,
     upgd_idbd_update,
@@ -150,6 +160,12 @@ class TestRegistry:
             "sigma0_shiftnorm",
             "sigma0_shiftnorm_k05",
             "sigma0_shiftnorm_d099",
+            "sigma0_shiftnorm_d099_k05",
+            "sigma0_shiftnorm_d099_k2",
+            "sigma0_shiftnorm_d098",
+            "sigma0_shiftnorm_d099_f08",
+            "sigma0_shiftnorm_d099_f095",
+            "sigma0_shiftnorm_d099_r200",
             "sigma0_warmnorm",
             "sigma0_gateplus",
             "colnorm_gate",
@@ -157,6 +173,18 @@ class TestRegistry:
             "lion_gate",
             "rff_rls",
             "lin_rls",
+            "sgd_ema_norm_d099",
+            "wclip_ema_norm",
+            "fade_head_ema_norm",
+            "snr_ema_norm",
+            "l2init_ema_norm",
+            "norm_adam_fastv",
+            "norm_adam_fastv_b2099",
+            "norm_adam_gate",
+            "norm_rmsprop_gate",
+            "norm_apollo_gate",
+            "sgd_momentum_gate",
+            "sgd_momentum_gate_m099",
         }
         assert expected == set(SCREENING_REGISTRY)
 
@@ -711,7 +739,8 @@ class TestSmokeRuns:
         "sgd_ema_norm", "sigma0_ndecay099", "sigma0_ndecay09999",
         "sigma0_eps1e6", "sigma0_eps1e4", "sigma0_hidden_norm",
         "sigma0_gate_beta05", "sigma0_gate_beta2", "sigma0_localgate",
-        "sigma0_shiftnorm", "sigma0_warmnorm", "sigma0_gateplus",
+        "sigma0_shiftnorm", "sigma0_shiftnorm_d099_r200", "sigma0_warmnorm",
+        "sigma0_gateplus",
     ])
     def test_combo_runs_and_is_finite(self, small_data, name):
         x, y = small_data
@@ -1949,7 +1978,12 @@ class TestShiftNorm:
     anneals back toward the slow ``norm_decay``.
     """
 
-    HP = {"fast_decay": 0.9, "shift_k": 1.0, "shift_delta": 0.02}
+    HP = {
+        "fast_decay": 0.9,
+        "shift_k": 1.0,
+        "shift_delta": 0.02,
+        "shift_refractory": 0.0,
+    }
 
     def test_registry_configs(self):
         base = screening_spec("upgd_ema_norm_sigma0").hyperparameters
@@ -1957,6 +1991,25 @@ class TestShiftNorm:
             "sigma0_shiftnorm": {"norm_decay": 0.999, **self.HP},
             "sigma0_shiftnorm_k05": {"norm_decay": 0.999, **self.HP, "shift_k": 0.5},
             "sigma0_shiftnorm_d099": {"norm_decay": 0.99, **self.HP},
+            # d099 detector mini-star: detector sensitivity (shift_k), detector
+            # speed (fast_decay), trigger rate-limiting (shift_refractory), and
+            # the d098 base (the frontier-2 decay plateau ties 0.98/0.99).
+            "sigma0_shiftnorm_d099_k05": {
+                "norm_decay": 0.99, **self.HP, "shift_k": 0.5
+            },
+            "sigma0_shiftnorm_d099_k2": {
+                "norm_decay": 0.99, **self.HP, "shift_k": 2.0
+            },
+            "sigma0_shiftnorm_d098": {"norm_decay": 0.98, **self.HP},
+            "sigma0_shiftnorm_d099_f08": {
+                "norm_decay": 0.99, **self.HP, "fast_decay": 0.8
+            },
+            "sigma0_shiftnorm_d099_f095": {
+                "norm_decay": 0.99, **self.HP, "fast_decay": 0.95
+            },
+            "sigma0_shiftnorm_d099_r200": {
+                "norm_decay": 0.99, **self.HP, "shift_refractory": 200.0
+            },
         }
         ext_defaults = {"gate_beta": 1.0, "local_gate": 0.0, "hidden_rms": 0.0}
         for name, overrides in expected.items():
@@ -2043,6 +2096,115 @@ class TestShiftNorm:
         err_plain = abs(float(plain.mean[0]) - 2.0)
         assert err_shift < 0.1, f"reset feature must recondition fast, err={err_shift}"
         assert err_plain > 1.0, f"slow EMA must still lag, err={err_plain}"
+
+    def test_refractory_zero_is_bitwise_prior_equations(self):
+        """``shift_refractory=0`` (and omitting it) is bitwise the unguarded
+        detector: counts are nonnegative, so the eligibility conjunct is
+        identically true and no float changes."""
+        d = 4
+        xs = np.asarray(
+            jr.uniform(jr.key(23), (120, d), jnp.float32, -0.05, 0.05)
+        ).copy()
+        xs[80:, 0] += 2.0  # force a mid-stream shift so triggers occur
+        kw = dict(decay=0.99, fast_decay=0.9, epsilon=1e-8,
+                  shift_k=1.0, shift_delta=0.02)
+
+        def reference(state, fast_mean, observation):
+            """Pre-refractory equations, verbatim."""
+            effective_fast = jnp.minimum(
+                kw["fast_decay"], 1.0 - 1.0 / (state.count + 2.0)
+            )
+            new_fast = (
+                effective_fast * fast_mean + (1.0 - effective_fast) * observation
+            )
+            threshold = kw["shift_k"] * jnp.sqrt(state.var) + kw["shift_delta"]
+            shifted = jnp.abs(new_fast - state.mean) > threshold
+            new_count = jnp.where(shifted, 0.0, state.count) + 1.0
+            effective_decay = jnp.minimum(
+                kw["decay"], 1.0 - 1.0 / (new_count + 1.0)
+            )
+            delta = observation - state.mean
+            new_mean = state.mean + (1.0 - effective_decay) * delta
+            delta2 = observation - new_mean
+            new_var = jnp.maximum(
+                kw["epsilon"],
+                effective_decay * state.var
+                + (1.0 - effective_decay) * delta * delta2,
+            )
+            normalized = (observation - new_mean) / (jnp.sqrt(new_var) + kw["epsilon"])
+            return normalized, EMANormState(  # type: ignore[call-arg]
+                mean=new_mean, var=new_var, count=new_count
+            ), new_fast, shifted
+
+        ref = EMANormState(mean=jnp.zeros(d), var=jnp.ones(d), count=jnp.zeros(d))
+        r0 = EMANormState(mean=jnp.zeros(d), var=jnp.ones(d), count=jnp.zeros(d))
+        omit = EMANormState(mean=jnp.zeros(d), var=jnp.ones(d), count=jnp.zeros(d))
+        f_ref = f_r0 = f_omit = jnp.zeros(d)
+        any_trigger = False
+        for t in range(120):
+            x = jnp.asarray(xs[t])
+            n_ref, ref, f_ref, m_ref = reference(ref, f_ref, x)
+            n_r0, r0, f_r0, m_r0 = shift_adaptive_normalize(
+                r0, f_r0, x, **kw, shift_refractory=0.0
+            )
+            n_omit, omit, f_omit, m_omit = shift_adaptive_normalize(
+                omit, f_omit, x, **kw
+            )
+            any_trigger = any_trigger or bool(jnp.any(m_ref))
+            for a, b in ((n_r0, n_ref), (n_omit, n_ref)):
+                np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+            for got in (r0, omit):
+                np.testing.assert_array_equal(np.asarray(got.mean), np.asarray(ref.mean))
+                np.testing.assert_array_equal(np.asarray(got.var), np.asarray(ref.var))
+                np.testing.assert_array_equal(
+                    np.asarray(got.count), np.asarray(ref.count)
+                )
+            np.testing.assert_array_equal(np.asarray(m_r0), np.asarray(m_ref))
+            np.testing.assert_array_equal(np.asarray(m_omit), np.asarray(m_ref))
+        assert any_trigger, "stream must exercise the trigger path"
+
+    def test_refractory_gates_immature_features_only(self):
+        """A diverged feature triggers only once its anneal count has matured
+        past ``shift_refractory``; mature features are unaffected."""
+        state = EMANormState(
+            mean=jnp.zeros(2),
+            var=jnp.full((2,), 1e-6),
+            count=jnp.array([5.0, 500.0]),
+        )
+        fast = jnp.full((2,), 3.0)  # both features far from the slow mean
+        _, new_state, _, mask = shift_adaptive_normalize(
+            state, fast, jnp.full((2,), 3.0),
+            decay=0.99, fast_decay=0.9, epsilon=1e-8,
+            shift_k=1.0, shift_delta=0.02, shift_refractory=100.0,
+        )
+        assert not bool(mask[0]), "immature feature (count 5 < 100) must be gated"
+        assert bool(mask[1]), "mature feature (count 500 >= 100) must trigger"
+        count = np.asarray(new_state.count)
+        assert count[0] == 6.0, "gated feature keeps annealing"
+        assert count[1] == 1.0, "triggered feature resets"
+
+    def test_refractory_blocks_then_allows_boundary_trigger(self):
+        """End-to-end: with refractory above the pre-shift count the boundary
+        trigger is suppressed; below it, the trigger fires as before."""
+        v_pre = np.array([0.0, 0.5, -0.3, 1.0], np.float32)
+        v_post = v_pre.copy()
+        v_post[0] = 2.0
+        kw = dict(decay=0.99, fast_decay=0.9, epsilon=1e-8,
+                  shift_k=1.0, shift_delta=0.02)
+        _, _, masks_blocked = self._run_constant_then_shift(
+            200, v_pre, v_post, 1, **kw, shift_refractory=300.0
+        )
+        assert not masks_blocked[0].any(), "count 200 < refractory 300: no trigger"
+        state, _, masks_open = self._run_constant_then_shift(
+            200, v_pre, v_post, 30, **kw, shift_refractory=100.0
+        )
+        assert masks_open[0][0], "count 200 >= refractory 100: boundary triggers"
+        assert not np.stack(masks_open[1:])[:, 0].any(), (
+            "after the reset the feature is immature again: no rapid re-triggering"
+        )
+        assert np.asarray(state.count)[0] == 30.0, (
+            "post-reset count anneals monotonically under the refractory"
+        )
 
     def test_learner_key_unused_and_state_shape(self):
         spec = screening_spec("sigma0_shiftnorm")
@@ -2358,3 +2520,702 @@ class TestRFFRLS:
             spec.frozen_probe_input(
                 state, jnp.zeros((3, SMALL.input_dim)), spec.hyperparameters
             )
+
+
+class TestOptimizerFloorHybrids:
+    """Wave-B optimizer-floor hybrids: Adam-class step adaptation under the
+    champion's full stability package (fast conditioning + utility gate +
+    decoupled decay).
+
+    Diagnosis driving the wave (from the pinned ``confirm_full/`` artifacts):
+    ``adamw_cbp_ema_norm`` reaches 0.8425 on task 1 — the best first-task
+    score of any arm measured — then decays monotonically to 0.743
+    (tasks 150-200) because the composition ran the protocol AdamW
+    hyperparameters: no utility gate, weight_decay 0, slow 0.999 normalizer.
+    Adam-class convergence under conditioning is real; continual stability
+    was simply never attached to it.  These arms attach it.
+    """
+
+    NEW_ARMS = (
+        "norm_adam_fastv",
+        "norm_adam_fastv_b2099",
+        "norm_adam_gate",
+        "norm_rmsprop_gate",
+        "norm_apollo_gate",
+        "sgd_momentum_gate",
+        "sgd_momentum_gate_m099",
+    )
+
+    _STABILITY = {
+        "weight_decay": 0.01,
+        "utility_decay": 0.9999,
+        "norm_decay": 0.99,
+        "norm_epsilon": 1e-8,
+    }
+    _SHIFT = {
+        "fast_decay": 0.9,
+        "shift_k": 1.0,
+        "shift_delta": 0.02,
+        "shift_refractory": 0.0,
+    }
+
+    def test_registry_configs(self):
+        expected_hp = {
+            "norm_adam_fastv": {
+                **self._STABILITY, **self._SHIFT,
+                "step_size": 0.001, "beta1": 0.0, "beta2": 0.9,
+                "eps": 1e-8, "vreset_enabled": 1.0,
+            },
+            "norm_adam_fastv_b2099": {
+                **self._STABILITY, **self._SHIFT,
+                "step_size": 0.0003, "beta1": 0.0, "beta2": 0.99,
+                "eps": 1e-8, "vreset_enabled": 1.0,
+            },
+            "norm_adam_gate": {
+                **self._STABILITY, **self._SHIFT,
+                "step_size": 0.0003, "beta1": 0.0, "beta2": 0.99,
+                "eps": 1e-8, "vreset_enabled": 0.0,
+            },
+            "norm_rmsprop_gate": {
+                **self._STABILITY,
+                "step_size": 0.001, "rms_rho": 0.9, "rms_epsilon": 1e-8,
+            },
+            "norm_apollo_gate": {
+                **self._STABILITY,
+                "step_size": 0.0003, "apollo_decay": 0.99, "apollo_epsilon": 1e-8,
+            },
+            "sgd_momentum_gate": {
+                **self._STABILITY, "step_size": 0.01, "momentum": 0.9,
+            },
+            "sgd_momentum_gate_m099": {
+                **self._STABILITY, "step_size": 0.01, "momentum": 0.99,
+            },
+        }
+        factories = {
+            "norm_adam_fastv": _make_norm_adam_fastv_learner,
+            "norm_adam_fastv_b2099": _make_norm_adam_fastv_learner,
+            "norm_adam_gate": _make_norm_adam_fastv_learner,
+            "norm_rmsprop_gate": _make_norm_rmsprop_gate_learner,
+            "norm_apollo_gate": _make_norm_apollo_gate_learner,
+            "sgd_momentum_gate": _make_sgd_momentum_gate_learner,
+            "sgd_momentum_gate_m099": _make_sgd_momentum_gate_learner,
+        }
+        for name in self.NEW_ARMS:
+            spec = screening_spec(name)
+            assert spec.mechanism == "optimizer_floor_hybrid", name
+            assert spec.noise_update is None, name
+            assert spec.factory is factories[name], name
+            assert spec.frozen_probe_input is _ema_frozen_probe_input, name
+            assert spec.hyperparameters == expected_hp[name], name
+            # no perturbation channel at all — not even as an inert hp
+            assert "noise_std" not in spec.hyperparameters, name
+
+    def _eager_norm_and_gate(self, norm_state, fast_mean, params, utility, clock,
+                             x, y, hp):
+        """Shared reference head: shift-normalize, grads, utility gate."""
+        x_norm, new_norm, new_fast, shifted = shift_adaptive_normalize(
+            norm_state, fast_mean, x,
+            decay=hp["norm_decay"], fast_decay=hp["fast_decay"],
+            epsilon=hp["norm_epsilon"], shift_k=hp["shift_k"],
+            shift_delta=hp["shift_delta"],
+            shift_refractory=hp["shift_refractory"],
+        )
+        _, grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+            params, x_norm, y
+        )
+        new_utility, gate = _upgd_utility_and_gate(
+            params, grads, utility, clock, hp["utility_decay"]
+        )
+        return x_norm, new_norm, new_fast, shifted, grads, new_utility, gate
+
+    def test_norm_adam_fastv_reduction_hand_composed(self):
+        """With an untriggerable detector the step equals the hand-composed
+        shift-normalize -> gated per-element AdamW (wd outside the moments)
+        trajectory, bit-for-bit."""
+        hp = dict(screening_spec("norm_adam_fastv").hyperparameters)
+        hp["shift_k"] = 1e9  # untriggerable: pure normalize -> gated AdamW
+        init_fn, step_fn = _make_norm_adam_fastv_learner(hp)
+        params = init_mlp_params(jr.key(5), SMALL)
+        state = init_fn(params)
+        adam_hp = {
+            "beta1": hp["beta1"], "beta2": hp["beta2"],
+            "step_size": hp["step_size"], "eps": hp["eps"], "weight_decay": 0.0,
+        }
+        ref = {
+            "params": params,
+            "utility": {n: jnp.zeros_like(v) for n, v in params.items()},
+            "m": {n: jnp.zeros_like(v) for n, v in params.items()},
+            "v": {n: jnp.zeros_like(v) for n, v in params.items()},
+            "count": {n: jnp.zeros_like(v) for n, v in params.items()},
+            "norm": EMANormState(
+                mean=jnp.zeros(SMALL.input_dim),
+                var=jnp.ones(SMALL.input_dim),
+                count=jnp.zeros(SMALL.input_dim),
+            ),
+            "fast": jnp.zeros(SMALL.input_dim),
+        }
+        param_decay = 1.0 - hp["step_size"] * hp["weight_decay"]
+        key = jr.key(31)
+        for i in range(4):
+            x = jr.normal(jr.fold_in(key, i), (SMALL.input_dim,)) * 1.5 + 0.25
+            y = jnp.array(i % SMALL.n_classes, jnp.int32)
+            params, state, _ = step_fn(params, state, x, y, jr.key(900 + i))
+            clock = jnp.array(i + 1, jnp.int32)
+            (_, ref["norm"], ref["fast"], _, grads, ref["utility"], gate,
+             ) = self._eager_norm_and_gate(
+                ref["norm"], ref["fast"], ref["params"], ref["utility"],
+                clock, x, y, hp,
+            )
+            new_ref_params = {}
+            for n in ref["params"]:
+                step_arr, ref["m"][n], ref["v"][n], ref["count"][n] = adam_elem_step(
+                    ref["params"][n], ref["m"][n], ref["v"][n], ref["count"][n],
+                    grads[n], adam_hp,
+                )
+                new_ref_params[n] = ref["params"][n] * param_decay - (
+                    step_arr * (1.0 - gate[n])
+                )
+            ref["params"] = new_ref_params
+            for n in ref["params"]:
+                np.testing.assert_array_equal(
+                    np.asarray(params[n]), np.asarray(ref["params"][n]), err_msg=n
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(state.v[n]), np.asarray(ref["v"][n]), err_msg=n
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(state.count[n]), np.asarray(ref["count"][n]), err_msg=n
+                )
+
+    def test_norm_adam_fastv_resets_w1_rows_on_shift(self):
+        """A detected input shift resets the shifted feature's w1-row Adam
+        moments (m, v, count) and nothing else; with vreset_enabled = 0 the
+        moments carry through the identical detector trigger."""
+        hp_reset = dict(screening_spec("norm_adam_fastv").hyperparameters)
+        hp_carry = dict(hp_reset)
+        hp_carry["vreset_enabled"] = 0.0
+        init_r, step_r = _make_norm_adam_fastv_learner(hp_reset)
+        init_c, step_c = _make_norm_adam_fastv_learner(hp_carry)
+        params = init_mlp_params(jr.key(9), SMALL)
+        s_r = init_r(params)
+        s_c = init_c(params)
+        p_r = p_c = params
+        warmup = 30
+        for i in range(warmup):
+            x = jnp.zeros(SMALL.input_dim, jnp.float32)
+            y = jnp.array(i % SMALL.n_classes, jnp.int32)
+            p_r, s_r, _ = step_r(p_r, s_r, x, y, jr.key(i))
+            p_c, s_c, _ = step_c(p_c, s_c, x, y, jr.key(i))
+        # feature 3 jumps far beyond shift_k * sqrt(var) + shift_delta
+        x = jnp.zeros(SMALL.input_dim, jnp.float32).at[3].set(50.0)
+        y = jnp.array(0, jnp.int32)
+        p_r, s_r, _ = step_r(p_r, s_r, x, y, jr.key(777))
+        p_c, s_c, _ = step_c(p_c, s_c, x, y, jr.key(777))
+        count_r = np.asarray(s_r.count["w1"])
+        count_c = np.asarray(s_c.count["w1"])
+        # the shifted feature's row restarted its per-element Adam clock
+        np.testing.assert_array_equal(count_r[3], np.ones(count_r.shape[1]))
+        assert np.all(count_c[3] == warmup + 1)
+        # every other row carried
+        mask = np.ones(count_r.shape[0], dtype=bool)
+        mask[3] = False
+        np.testing.assert_array_equal(count_r[mask], count_c[mask])
+        for field in ("m", "v"):
+            arr_r = np.asarray(getattr(s_r, field)["w1"])
+            arr_c = np.asarray(getattr(s_c, field)["w1"])
+            np.testing.assert_array_equal(arr_r[mask], arr_c[mask])
+        # non-input tensors never reset
+        for n in ("b1", "w2", "b2", "w3", "b3"):
+            np.testing.assert_array_equal(
+                np.asarray(s_r.count[n]), np.asarray(s_c.count[n]), err_msg=n
+            )
+
+    def test_norm_rmsprop_gate_hand_computed(self):
+        """The full step equals hand-computed normalize -> RMSprop (rho, no
+        momentum, no bias correction) -> gate -> decoupled decay."""
+        hp = screening_spec("norm_rmsprop_gate").hyperparameters
+        init_fn, step_fn = _make_norm_rmsprop_gate_learner(hp)
+        params = init_mlp_params(jr.key(13), SMALL)
+        state = init_fn(params)
+        ref_params = params
+        ref_utility = {n: jnp.zeros_like(v) for n, v in params.items()}
+        ref_v = {n: jnp.zeros_like(v) for n, v in params.items()}
+        norm_state = EMANormState(
+            mean=jnp.zeros(SMALL.input_dim),
+            var=jnp.ones(SMALL.input_dim),
+            count=jnp.array(0.0),
+        )
+        rho = hp["rms_rho"]
+        param_decay = 1.0 - hp["step_size"] * hp["weight_decay"]
+        key = jr.key(37)
+        for i in range(4):
+            x = jr.normal(jr.fold_in(key, i), (SMALL.input_dim,)) * 2.0 - 0.5
+            y = jnp.array((i + 1) % SMALL.n_classes, jnp.int32)
+            params, state, _ = step_fn(params, state, x, y, jr.key(300 + i))
+            x_norm, norm_state = ema_normalize(
+                norm_state, x, hp["norm_decay"], hp["norm_epsilon"]
+            )
+            _, grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+                ref_params, x_norm, y
+            )
+            ref_utility, gate = _upgd_utility_and_gate(
+                ref_params, grads, ref_utility, jnp.array(i + 1, jnp.int32),
+                hp["utility_decay"],
+            )
+            new_ref = {}
+            for n in ref_params:
+                ref_v[n] = rho * ref_v[n] + (1.0 - rho) * grads[n] * grads[n]
+                direction = grads[n] / (jnp.sqrt(ref_v[n]) + hp["rms_epsilon"])
+                new_ref[n] = ref_params[n] * param_decay - hp["step_size"] * (
+                    direction * (1.0 - gate[n])
+                )
+            ref_params = new_ref
+            for n in ref_params:
+                np.testing.assert_array_equal(
+                    np.asarray(params[n]), np.asarray(ref_params[n]), err_msg=n
+                )
+
+    def test_norm_apollo_gate_channel_axis_and_hand_computed(self):
+        """Channel = fan-out (per-neuron): vchan is (fan_out,) for 2-D weights
+        and per-element for biases; the applied step divides each column by
+        its channel RMS. Hand-computed pin over 3 steps."""
+        hp = screening_spec("norm_apollo_gate").hyperparameters
+        init_fn, step_fn = _make_norm_apollo_gate_learner(hp)
+        params = init_mlp_params(jr.key(17), SMALL)
+        state = init_fn(params)
+        assert state.vchan["w1"].shape == (SMALL.hidden1,)
+        assert state.vchan["w2"].shape == (SMALL.hidden2,)
+        assert state.vchan["w3"].shape == (SMALL.n_classes,)
+        assert state.vchan["b1"].shape == (SMALL.hidden1,)
+        ref_params = params
+        ref_utility = {n: jnp.zeros_like(v) for n, v in params.items()}
+        ref_v = {
+            n: (jnp.zeros(v.shape[1], jnp.float32) if v.ndim == 2
+                else jnp.zeros_like(v))
+            for n, v in params.items()
+        }
+        norm_state = EMANormState(
+            mean=jnp.zeros(SMALL.input_dim),
+            var=jnp.ones(SMALL.input_dim),
+            count=jnp.array(0.0),
+        )
+        rho = hp["apollo_decay"]
+        param_decay = 1.0 - hp["step_size"] * hp["weight_decay"]
+        key = jr.key(41)
+        for i in range(3):
+            x = jr.normal(jr.fold_in(key, i), (SMALL.input_dim,))
+            y = jnp.array(i % SMALL.n_classes, jnp.int32)
+            params, state, _ = step_fn(params, state, x, y, jr.key(500 + i))
+            x_norm, norm_state = ema_normalize(
+                norm_state, x, hp["norm_decay"], hp["norm_epsilon"]
+            )
+            _, grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+                ref_params, x_norm, y
+            )
+            ref_utility, gate = _upgd_utility_and_gate(
+                ref_params, grads, ref_utility, jnp.array(i + 1, jnp.int32),
+                hp["utility_decay"],
+            )
+            new_ref = {}
+            for n in ref_params:
+                g = grads[n]
+                if ref_params[n].ndim == 2:
+                    stat = jnp.mean(g * g, axis=0)
+                    ref_v[n] = rho * ref_v[n] + (1.0 - rho) * stat
+                    denom = jnp.sqrt(ref_v[n])[None, :] + hp["apollo_epsilon"]
+                else:
+                    ref_v[n] = rho * ref_v[n] + (1.0 - rho) * (g * g)
+                    denom = jnp.sqrt(ref_v[n]) + hp["apollo_epsilon"]
+                new_ref[n] = ref_params[n] * param_decay - hp["step_size"] * (
+                    (g / denom) * (1.0 - gate[n])
+                )
+            ref_params = new_ref
+            for n in ref_params:
+                np.testing.assert_array_equal(
+                    np.asarray(params[n]), np.asarray(ref_params[n]), err_msg=n
+                )
+
+    def test_norm_apollo_bias_step_equals_rmsprop_bias_step(self):
+        """The bias path is the exact 1-element-channel specialization: one
+        step from identical inits with matched decays produces bitwise equal
+        bias updates in both arms."""
+        base = dict(screening_spec("norm_rmsprop_gate").hyperparameters)
+        apollo_hp = dict(screening_spec("norm_apollo_gate").hyperparameters)
+        apollo_hp["apollo_decay"] = base["rms_rho"]
+        apollo_hp["apollo_epsilon"] = base["rms_epsilon"]
+        apollo_hp["step_size"] = base["step_size"]
+        init_r, step_r = _make_norm_rmsprop_gate_learner(base)
+        init_a, step_a = _make_norm_apollo_gate_learner(apollo_hp)
+        params = init_mlp_params(jr.key(23), SMALL)
+        x = jr.normal(jr.key(70), (SMALL.input_dim,))
+        y = jnp.array(1, jnp.int32)
+        p_r, _, _ = step_r(params, init_r(params), x, y, jr.key(0))
+        p_a, _, _ = step_a(params, init_a(params), x, y, jr.key(0))
+        for n in ("b1", "b2", "b3"):
+            np.testing.assert_array_equal(
+                np.asarray(p_r[n]), np.asarray(p_a[n]), err_msg=n
+            )
+
+    def test_sgd_momentum_gate_mu0_reduces_to_sigma0_ndecay099_bitwise(self):
+        """momentum = 0 collapses the EMA-corrected momentum to the raw
+        gradient, so the trajectory equals the sigma0_ndecay099 champion
+        bit-for-bit (same normalizer, same gate, same decay)."""
+        hp = dict(screening_spec("sgd_momentum_gate").hyperparameters)
+        hp["momentum"] = 0.0
+        init_fn, step_fn = _make_sgd_momentum_gate_learner(hp)
+        champion = screening_spec("sigma0_ndecay099")
+        init_ref, step_ref = champion.factory(champion.hyperparameters)
+        params = init_mlp_params(jr.key(29), SMALL)
+        s_ours = init_fn(params)
+        s_ref = init_ref(params)
+        p_ours = p_ref = params
+        key = jr.key(43)
+        for i in range(5):
+            x = jr.normal(jr.fold_in(key, i), (SMALL.input_dim,)) + 0.1
+            y = jnp.array(i % SMALL.n_classes, jnp.int32)
+            p_ours, s_ours, _ = step_fn(p_ours, s_ours, x, y, jr.key(600 + i))
+            p_ref, s_ref, _ = step_ref(p_ref, s_ref, x, y, jr.key(600 + i))
+            for n in p_ours:
+                np.testing.assert_array_equal(
+                    np.asarray(p_ours[n]), np.asarray(p_ref[n]), err_msg=n
+                )
+
+    def test_key_is_unused_on_every_arm(self):
+        """No perturbation anywhere in the wave: different RNG keys produce
+        bit-identical steps."""
+        params = init_mlp_params(jr.key(3), SMALL)
+        x = jr.normal(jr.key(90), (SMALL.input_dim,))
+        y = jnp.array(2, jnp.int32)
+        for name in self.NEW_ARMS:
+            spec = screening_spec(name)
+            init_fn, step_fn = spec.factory(spec.hyperparameters)
+            state = init_fn(params)
+            p_a, _, _ = step_fn(params, state, x, y, jr.key(0))
+            p_b, _, _ = step_fn(params, state, x, y, jr.key(987654))
+            for n in params:
+                np.testing.assert_array_equal(
+                    np.asarray(p_a[n]), np.asarray(p_b[n]), err_msg=f"{name}:{n}"
+                )
+
+    def test_smoke_runs_finite_and_mechanisms_engage(self, small_data):
+        """Tiny-protocol smoke: finite metrics on every arm, and each
+        mechanism family separates from the champion trajectory."""
+        x, y = small_data
+        champion = run_screening_config(
+            x, y, screening_spec("sigma0_ndecay099"), seed=19, config=SMALL
+        )
+        for name in ("norm_adam_fastv", "norm_rmsprop_gate", "norm_apollo_gate",
+                     "sgd_momentum_gate"):
+            result = run_screening_config(
+                x, y, screening_spec(name), seed=19, config=SMALL
+            )
+            assert np.all(np.isfinite(result.per_task_accuracy)), name
+            assert np.all(np.isfinite(result.per_task_loss)), name
+            assert not np.array_equal(
+                result.per_task_loss, champion.per_task_loss
+            ), name
+
+
+class TestComparisonArms:
+    """Reviewer comparison rows: published plasticity mechanisms behind the
+    champion's EMA input conditioning (decay 0.99) on a plain-SGD base — no
+    utility gate, no perturbation.  Each mechanism reduces bit-exactly to the
+    shared normalized-SGD base when its constant is inert."""
+
+    BASE = {"step_size": 0.01, "norm_decay": 0.99, "norm_epsilon": 1e-8}
+    ARMS = (
+        "sgd_ema_norm_d099",
+        "wclip_ema_norm",
+        "fade_head_ema_norm",
+        "snr_ema_norm",
+        "l2init_ema_norm",
+    )
+
+    def test_registry_configs(self):
+        expected = {
+            "sgd_ema_norm_d099": (
+                _make_sgd_ema_norm_learner,
+                {**self.BASE, "weight_decay": 0.01},
+            ),
+            "wclip_ema_norm": (
+                _make_wclip_ema_norm_learner,
+                {**self.BASE, "weight_decay": 0.0, "clip_kappa": 2.0},
+            ),
+            "fade_head_ema_norm": (
+                _make_fade_head_ema_norm_learner,
+                {
+                    **self.BASE,
+                    "weight_decay": 0.0,
+                    "fade_alpha": 0.005,
+                    "fade_gamma0": -6.9,
+                    "fade_theta_lambda": 0.1,
+                },
+            ),
+            "snr_ema_norm": (
+                _make_snr_ema_norm_learner,
+                {
+                    **self.BASE,
+                    "weight_decay": 0.0,
+                    "snr_eta": 0.005,
+                    "snr_rate_decay": 0.999,
+                    "snr_rate_floor": 1e-4,
+                },
+            ),
+            "l2init_ema_norm": (
+                _make_l2init_ema_norm_learner,
+                {**self.BASE, "weight_decay": 0.01},
+            ),
+        }
+        for name, (factory, hp) in expected.items():
+            spec = screening_spec(name)
+            assert spec.base_learner == "upgd_w", name
+            assert spec.noise_update is None, name
+            assert spec.factory is factory, name
+            assert spec.frozen_probe_input is _ema_frozen_probe_input, name
+            assert spec.hyperparameters == hp, name
+            # no utility, no gate, no noise — not even as inert hyperparameters
+            assert "utility_decay" not in spec.hyperparameters, name
+            assert "noise_std" not in spec.hyperparameters, name
+
+    def _cloned(self, name_for_plumbing, factory, hp):
+        return ScreeningSpec(
+            name=name_for_plumbing,
+            base_learner="upgd_w",
+            mechanism="comparison_reduction_pin",
+            hyperparameters=hp,
+            factory=factory,
+        )
+
+    def test_wclip_kappa_inf_reduces_to_sgd_base_bitwise(self, small_data):
+        """clip_kappa=inf makes the clip a no-op: bit-exact sgd_ema_norm_d099."""
+        x, y = small_data
+        ref_spec = screening_spec("sgd_ema_norm_d099")
+        ours = run_screening_config(
+            x, y,
+            self._cloned(
+                "sgd_ema_norm_d099", _make_wclip_ema_norm_learner,
+                {**ref_spec.hyperparameters, "clip_kappa": math.inf},
+            ),
+            seed=5, config=SMALL,
+        )
+        ref = run_screening_config(x, y, ref_spec, seed=5, config=SMALL)
+        np.testing.assert_array_equal(ours.per_task_accuracy, ref.per_task_accuracy)
+        np.testing.assert_array_equal(ours.per_task_loss, ref.per_task_loss)
+
+    def test_wclip_bounds_enforced_per_layer(self):
+        """After any step every weight and bias obeys |w| <= kappa/sqrt(fan_in)
+        (Elsayed et al. RLC 2024 Algorithm 1 clips biases too)."""
+        spec = screening_spec("wclip_ema_norm")
+        hp = {**spec.hyperparameters, "clip_kappa": 1.0}
+        init_fn, step_fn = _make_wclip_ema_norm_learner(hp)
+        params = init_mlp_params(jr.key(4), SMALL)
+        big = {n: v + 100.0 for n, v in params.items()}  # far outside every bound
+        state = init_fn(big)
+        x = jr.normal(jr.key(41), (SMALL.input_dim,))
+        y = jnp.array(1, jnp.int32)
+        new_params, _, _ = step_fn(big, state, x, y, jr.key(0))
+        fan_in = {"1": SMALL.input_dim, "2": SMALL.hidden1, "3": SMALL.hidden2}
+        for n in new_params:
+            bound = hp["clip_kappa"] / math.sqrt(fan_in[n[1:]])
+            values = np.asarray(new_params[n])
+            assert np.all(values <= bound + 1e-7), n
+            assert np.all(values >= -bound - 1e-7), n
+
+    def test_fade_lambda_zero_reduces_to_sgd_base_bitwise(self, small_data):
+        """theta=0 and gamma0=-inf (lambda=0) pin the head to the plain SGD
+        step, so the whole arm equals the wd=0 normalized-SGD base."""
+        x, y = small_data
+        base_hp = {**self.BASE, "weight_decay": 0.0}
+        ours = run_screening_config(
+            x, y,
+            self._cloned(
+                "sgd_ema_norm_d099", _make_fade_head_ema_norm_learner,
+                {
+                    **base_hp,
+                    "fade_alpha": 0.005,
+                    "fade_gamma0": -math.inf,
+                    "fade_theta_lambda": 0.0,
+                },
+            ),
+            seed=6, config=SMALL,
+        )
+        ref = run_screening_config(
+            x, y,
+            self._cloned("sgd_ema_norm_d099", _make_sgd_ema_norm_learner, base_hp),
+            seed=6, config=SMALL,
+        )
+        np.testing.assert_array_equal(ours.per_task_accuracy, ref.per_task_accuracy)
+        np.testing.assert_array_equal(ours.per_task_loss, ref.per_task_loss)
+
+    def test_fade_lambda_stays_bounded_over_random_steps(self):
+        """gamma is capped at 0 so lambda = exp(gamma) stays in [0, 1] and the
+        head decay factor 1 - lambda stays in [0, 1]; traces stay finite."""
+        spec = screening_spec("fade_head_ema_norm")
+        init_fn, step_fn = _make_fade_head_ema_norm_learner(spec.hyperparameters)
+        params = init_mlp_params(jr.key(8), SMALL)
+        state = init_fn(params)
+        key = jr.key(77)
+        for i in range(25):
+            x = jr.normal(jr.fold_in(key, i), (SMALL.input_dim,)) * 2.0
+            y = jnp.array(i % SMALL.n_classes, jnp.int32)
+            params, state, _ = step_fn(params, state, x, y, jr.key(300 + i))
+            for n in ("w3", "b3"):
+                gamma = np.asarray(state.gamma[n])
+                assert np.all(gamma <= 0.0), n
+                lam = np.exp(gamma)
+                assert np.all(lam >= 0.0) and np.all(lam <= 1.0), n
+                assert np.all(np.isfinite(np.asarray(state.fade_trace[n]))), n
+            assert np.all(np.isfinite(np.asarray(params["w3"])))
+
+    def test_snr_eta_zero_never_resets_matches_sgd_base_bitwise(self, small_data):
+        """snr_eta=0 disables the rejection test exactly: the parameter
+        trajectory is the plain normalized-SGD base, bit for bit."""
+        x, y = small_data
+        spec = screening_spec("snr_ema_norm")
+        ours = run_screening_config(
+            x, y,
+            self._cloned(
+                "sgd_ema_norm_d099", _make_snr_ema_norm_learner,
+                {**spec.hyperparameters, "snr_eta": 0.0},
+            ),
+            seed=9, config=SMALL,
+        )
+        ref = run_screening_config(
+            x, y,
+            self._cloned(
+                "sgd_ema_norm_d099", _make_sgd_ema_norm_learner,
+                {**self.BASE, "weight_decay": 0.0},
+            ),
+            seed=9, config=SMALL,
+        )
+        np.testing.assert_array_equal(ours.per_task_accuracy, ref.per_task_accuracy)
+        np.testing.assert_array_equal(ours.per_task_loss, ref.per_task_loss)
+
+    def test_snr_resets_silenced_high_rate_unit_only(self):
+        """A unit with high historical firing rate and a long silence fails
+        the geometric-tail test and resets (incoming redrawn in the init
+        range, incoming bias redrawn, outgoing zeroed, statistics cleared);
+        a unit whose observed rate was always ~0 keeps a long-tailed null
+        and does NOT reset; firing units are untouched."""
+        hp = dict(screening_spec("snr_ema_norm").hyperparameters)
+        params = init_mlp_params(jr.key(5), SMALL)
+        h1 = SMALL.hidden1
+        silence = jnp.zeros(h1, jnp.int32).at[0].set(50).at[1].set(50)
+        # unit 0: healthy history (rate EMA ~0.5); unit 1: dead from the start
+        rate = jnp.zeros(h1, jnp.float32).at[0].set(0.5)
+        rate = rate.at[2:].set(0.5)
+        age = jnp.full((h1,), 10_000, jnp.int32)
+        new_params, new_silence, new_rate, new_age, mask = snr_maybe_reset_layer(
+            params, silence, rate, age, _CBP_LAYERS[0], jr.key(6), hp
+        )
+        mask = np.asarray(mask)
+        assert mask[0], "silenced high-rate unit must reset"
+        assert not mask[1], "always-quiet unit must not reset (rate floor)"
+        assert not mask[2:].any(), "firing units must not reset"
+        bound = 1.0 / math.sqrt(SMALL.input_dim)
+        col = np.asarray(new_params["w1"][:, 0])
+        assert not np.allclose(col, np.asarray(params["w1"][:, 0]))
+        assert np.all(np.abs(col) <= bound)
+        assert abs(float(new_params["b1"][0])) <= bound
+        assert float(new_params["b1"][0]) != float(params["b1"][0])
+        np.testing.assert_allclose(np.asarray(new_params["w2"][0, :]), 0.0)
+        assert int(new_silence[0]) == 0
+        assert float(new_rate[0]) == 0.0
+        assert int(new_age[0]) == 0
+        # untouched units keep everything
+        np.testing.assert_array_equal(
+            np.asarray(new_params["w1"][:, 1]), np.asarray(params["w1"][:, 1])
+        )
+        assert int(new_silence[1]) == 50 and int(new_age[1]) == 10_000
+
+    def test_l2init_wd_zero_reduces_to_sgd_base_bitwise(self, small_data):
+        """weight_decay=0 removes the pull toward init: bit-exact base."""
+        x, y = small_data
+        base_hp = {**self.BASE, "weight_decay": 0.0}
+        ours = run_screening_config(
+            x, y,
+            self._cloned(
+                "sgd_ema_norm_d099", _make_l2init_ema_norm_learner, base_hp
+            ),
+            seed=13, config=SMALL,
+        )
+        ref = run_screening_config(
+            x, y,
+            self._cloned("sgd_ema_norm_d099", _make_sgd_ema_norm_learner, base_hp),
+            seed=13, config=SMALL,
+        )
+        np.testing.assert_array_equal(ours.per_task_accuracy, ref.per_task_accuracy)
+        np.testing.assert_array_equal(ours.per_task_loss, ref.per_task_loss)
+
+    def test_l2init_reduction_pin_hand_computed(self):
+        """The full step equals a hand-computed normalize -> grad ->
+        ``w - lr*wd*(w - w0) - lr*grad`` trajectory, bit for bit."""
+        hp = screening_spec("l2init_ema_norm").hyperparameters
+        init_fn, step_fn = _make_l2init_ema_norm_learner(hp)
+        params = init_mlp_params(jr.key(14), SMALL)
+        w0 = {n: v for n, v in params.items()}
+        state = init_fn(params)
+        ref_params = params
+        norm_state = EMANormState(
+            mean=jnp.zeros(SMALL.input_dim),
+            var=jnp.ones(SMALL.input_dim),
+            count=jnp.array(0.0),
+        )
+        key = jr.key(15)
+        for i in range(4):
+            x = jr.normal(jr.fold_in(key, i), (SMALL.input_dim,)) * 2.0 + 0.5
+            y = jnp.array(i % SMALL.n_classes, jnp.int32)
+            params, state, _ = step_fn(params, state, x, y, jr.key(500 + i))
+            x_norm, norm_state = ema_normalize(
+                norm_state, x, hp["norm_decay"], hp["norm_epsilon"]
+            )
+            _, grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+                ref_params, x_norm, y
+            )
+            ref_params = {
+                n: ref_params[n]
+                - hp["step_size"] * hp["weight_decay"] * (ref_params[n] - w0[n])
+                - hp["step_size"] * grads[n]
+                for n in ref_params
+            }
+            for n in ref_params:
+                np.testing.assert_array_equal(
+                    np.asarray(params[n]), np.asarray(ref_params[n])
+                )
+
+    def test_key_is_unused_except_snr(self):
+        """wclip/fade/l2init consume no randomness; snr consumes the key only
+        for redraw material, which cannot reach params when nothing resets."""
+        params = init_mlp_params(jr.key(3), SMALL)
+        x = jr.normal(jr.key(91), (SMALL.input_dim,))
+        y = jnp.array(2, jnp.int32)
+        for name in ("sgd_ema_norm_d099", "wclip_ema_norm", "fade_head_ema_norm",
+                     "l2init_ema_norm"):
+            spec = screening_spec(name)
+            init_fn, step_fn = spec.factory(spec.hyperparameters)
+            state = init_fn(params)
+            p_a, _, _ = step_fn(params, state, x, y, jr.key(0))
+            p_b, _, _ = step_fn(params, state, x, y, jr.key(424242))
+            for n in params:
+                np.testing.assert_array_equal(
+                    np.asarray(p_a[n]), np.asarray(p_b[n]), err_msg=f"{name}:{n}"
+                )
+
+    def test_smoke_runs_finite_and_mechanisms_engage(self, small_data):
+        """Tiny-protocol smoke: finite metrics on every comparison arm, and
+        each mechanism separates from the shared normalized-SGD base."""
+        x, y = small_data
+        base = run_screening_config(
+            x, y, screening_spec("sgd_ema_norm_d099"), seed=23, config=SMALL
+        )
+        assert np.all(np.isfinite(base.per_task_accuracy))
+        for name in ("wclip_ema_norm", "fade_head_ema_norm", "snr_ema_norm",
+                     "l2init_ema_norm"):
+            result = run_screening_config(
+                x, y, screening_spec(name), seed=23, config=SMALL
+            )
+            assert np.all(np.isfinite(result.per_task_accuracy)), name
+            assert np.all(np.isfinite(result.per_task_loss)), name
+            assert not np.array_equal(
+                result.per_task_loss, base.per_task_loss
+            ), name

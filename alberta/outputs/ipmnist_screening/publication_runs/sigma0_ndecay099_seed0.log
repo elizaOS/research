@@ -1,0 +1,14 @@
+WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-08-02 20:40:47,395 INFO loading MNIST from data_home=/home/shaw/milady/alberta/outputs/step2_published_mnist_openml_cache
+2026-08-02 20:40:50,267 INFO running sigma0_ndecay099 seed=0 for 200 tasks x 5000 steps (noise_mode=step)
+2026-08-02 20:42:29,982 INFO sigma0_ndecay099 seed=0 task 20/200 online_acc=0.8602 elapsed=95.6s
+2026-08-02 20:43:52,357 INFO sigma0_ndecay099 seed=0 task 40/200 online_acc=0.8598 elapsed=177.9s
+2026-08-02 20:46:05,209 INFO sigma0_ndecay099 seed=0 task 60/200 online_acc=0.8654 elapsed=310.8s
+2026-08-02 20:47:35,262 INFO sigma0_ndecay099 seed=0 task 80/200 online_acc=0.8664 elapsed=400.8s
+2026-08-02 20:49:57,200 INFO sigma0_ndecay099 seed=0 task 100/200 online_acc=0.8666 elapsed=542.8s
+2026-08-02 20:52:21,545 INFO sigma0_ndecay099 seed=0 task 120/200 online_acc=0.8574 elapsed=687.1s
+2026-08-02 20:54:19,174 INFO sigma0_ndecay099 seed=0 task 140/200 online_acc=0.8662 elapsed=804.7s
+2026-08-02 20:56:14,659 INFO sigma0_ndecay099 seed=0 task 160/200 online_acc=0.8598 elapsed=920.2s
+2026-08-02 20:57:41,864 INFO sigma0_ndecay099 seed=0 task 180/200 online_acc=0.8562 elapsed=1007.4s
+2026-08-02 20:59:00,156 INFO sigma0_ndecay099 seed=0 task 200/200 online_acc=0.8622 elapsed=1085.7s
+2026-08-02 20:59:01,050 INFO sigma0_ndecay099 seed=0 done: avg online acc 0.8623 (wall 1085.7s) -> outputs/ipmnist_screening/publication_runs/sigma0_ndecay099_seed0.json

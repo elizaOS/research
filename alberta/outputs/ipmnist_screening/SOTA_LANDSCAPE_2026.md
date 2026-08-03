@@ -11,6 +11,7 @@ pretraining, no replay (Elsayed & Mahmood 2024, arXiv:2404.00781).
 
 | Arm | Online acc |
 |---|---|
+| l2init_ema_norm (comparison wave, 2026-08-02: norm decay 0.99 + SGD + decay toward init, no gate) | 0.86457 |
 | sigma0_ndecay099 (champion: norm decay 0.99, sigma=0) | 0.86245 |
 | upgd_ema_norm (n=10) | 0.85362 |
 | sgd_ema_norm | 0.83991 |
@@ -22,7 +23,9 @@ gate +0.011, noise +0.003 with norm / −0.035 without (CONTINUAL_LEARNING_THEOR
 
 **Headline of this survey:** we found **no 2025–2026 published number on the exact
 ICLR-24 IPMNIST protocol (1M examples, 300x150 MLP, whole-stream online accuracy)
-that exceeds 0.86245**, and in fact no 2025–2026 paper re-running that exact protocol
+that exceeds 0.86245** (the survey-date champion; the campaign best has since
+moved to 0.86457/0.86459 — `l2init_ema_norm` / `sigma0_shiftnorm_d099`, both
+2026-08-02, still development-grade), and in fact no 2025–2026 paper re-running that exact protocol
 with absolute numbers at all — the field has moved to (a) degradation-curve/plasticity
 diagnostics on smaller PMNIST variants, (b) RL plasticity, and (c) pretrained-encoder
 class-incremental benchmarks. The nearest numerically-larger claim (BiMU, 90.3%) is on

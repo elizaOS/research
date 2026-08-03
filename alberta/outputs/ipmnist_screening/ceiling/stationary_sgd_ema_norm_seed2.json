@@ -1,0 +1,17 @@
+{
+ "schema": "alberta.ipmnist_ceiling.run.v1",
+ "evidence_class": "development_screening_diagnostic",
+ "development_only": true,
+ "tag": "stationary_sgd_ema_norm",
+ "spec_name": "sgd_ema_norm",
+ "seed": 2,
+ "perm_mode": "identity",
+ "n_tasks": 1,
+ "task_length": 5000,
+ "per_task_accuracy": [
+  0.83279997
+ ],
+ "mean_accuracy": 0.83279997,
+ "wall_clock_seconds": 2.62,
+ "jax": "0.11.0"
+}

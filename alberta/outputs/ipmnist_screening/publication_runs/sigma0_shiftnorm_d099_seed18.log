@@ -1,0 +1,7 @@
+WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-08-02 21:12:42,347 INFO loading MNIST from data_home=/home/shaw/milady/alberta/outputs/step2_published_mnist_openml_cache
+2026-08-02 21:12:46,486 INFO running sigma0_shiftnorm_d099 seed=18 for 200 tasks x 5000 steps (noise_mode=step)
+2026-08-02 21:13:54,382 INFO sigma0_shiftnorm_d099 seed=18 task 20/200 online_acc=0.8656 elapsed=65.1s
+2026-08-02 21:14:56,174 INFO sigma0_shiftnorm_d099 seed=18 task 40/200 online_acc=0.8680 elapsed=126.9s
+2026-08-02 21:16:01,271 INFO sigma0_shiftnorm_d099 seed=18 task 60/200 online_acc=0.8638 elapsed=192.0s
+2026-08-02 21:17:02,016 INFO sigma0_shiftnorm_d099 seed=18 task 80/200 online_acc=0.8692 elapsed=252.7s

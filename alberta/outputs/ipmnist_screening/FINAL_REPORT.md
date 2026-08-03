@@ -43,6 +43,8 @@ Pool64 upgd_w_control: {1: 0.7787729776000001, 2: 0.77910898075, 0: 0.7786109820
 - upgd_ema_norm_wd0005: mean 0.84745 seeds [0.84757997795, 0.8473079781499999, 0.8474579769] -> BEATS-SOTA
 - upgd_idbd: mean 0.77895 seeds [0.7788619779999999, 0.77865597975, 0.7793299802999999] -> TIES
 - upgd_l2init: mean 0.78042 seeds [0.7801939792, 0.7800519805499999, 0.78101797995] -> BEATS-SOTA
+- l2init_ema_norm: mean 0.86457 seeds [0.86446497755, 0.86432397765, 0.8649119754499999] -> BEATS-SOTA (comparison wave; CO-BEST with sigma0_shiftnorm_d099)
+- sgd_ema_norm_d099: mean 0.86168 seeds [0.86189497735, 0.8617749773, 0.86138097585] -> BEATS-SOTA (comparison wave; mechanism-free base)
 - upgd_w_wd0005: mean 0.78431 seeds [0.78418497905, 0.7842689812499999, 0.7844669820500001, 0.7839469789, 0.7847349790500001, 0.7835629804500001, 0.7840389796000001, 0.7841219829499999, 0.7848029797000001, 0.7849659790000001] -> BEATS-SOTA
 
 ## Frontier wave (sigma0 extensions) — NEW CHAMPION
@@ -83,6 +85,118 @@ the campaign champion.**
 
 All frontier numbers are development-grade (`development_screening_diagnostic`),
 seeds 0-2, nonpromoting.
+
+## Shift-triggered normalizer wave (next rung) — NEW CHAMPION
+
+60-task screen (seeds 0-2): the adaptive-normalizer family put the purely
+observational per-feature shift detector on top of the decay star. On the
+0.999 base the detector is flat-to-negative (`sigma0_shiftnorm` 0.85980,
+`sigma0_shiftnorm_k05` 0.86046, both below the 0.86159 champion screen), and
+the global warm-restart variant loses outright (`sigma0_warmnorm` 0.85722) —
+but composed with the champion's fast base decay it wins:
+**`sigma0_shiftnorm_d099` screen 0.86396** (+0.0024 vs the champion's 0.86159
+screen, above the +0.002 auto-confirm bar, all seeds positive).
+
+Full-protocol 200-task confirmation (exact `step` mode — noise-free arm;
+seeds 0-2, the same seeds used for selection, so development-grade tuned
+estimate like the previous champion):
+
+- **sigma0_shiftnorm_d099: mean 0.86459 seeds [0.864213, 0.864415, 0.865129]
+  -> NEW BEST** (+0.00214 vs `sigma0_ndecay099`'s 0.86245, every seed above
+  every champion seed; sd 0.00048, stderr 0.00028)
+
+Mechanism reading: the detector composes with — not substitutes for — fast
+base tracking. A fast per-feature mean EMA (decay 0.9) triggers when it
+diverges from the slow statistics by `k*sigma + delta`, resetting that
+feature's anneal count so its effective decay drops to 1/2 and re-anneals
+toward 0.99: boundary-localized re-conditioning on top of the 100-step
+window, exactly the transient-side mechanism class CEILING_ANALYSIS.md maps
+as the 0.862→0.88 rung (0-500-step window holds 0.0245 of the error budget).
+
+Mini-star around the winner (detector sensitivity `shift_k` {0.5, 2.0},
+detector speed `fast_decay` {0.8, 0.95}, per-feature trigger refractory 200,
+and the d098 base — frontier-2 showed 0.98 ties 0.99):
+`jobs_shiftstar.txt` -> `shards/sigma0_shiftnorm_d099_*` /
+`shards/sigma0_shiftnorm_d098_*`, verdicts appended below when screened.
+
+All numbers development-grade (`development_screening_diagnostic`), seeds
+0-2, nonpromoting.
+
+## Reviewer comparison wave: published mechanisms under our conditioning (2026-08-02)
+
+The comparison table reviewers will ask for — **our conditioning + THEIR
+mechanism vs our conditioning + our gate**. The strongest published
+plasticity mechanisms were re-implemented from their papers (rules verified
+against the sources: Weight Clipping RLC-2024 Algorithm 1 clips weights AND
+biases to ±kappa/sqrt(fan_in) after every step, example kappa=2; SNR
+arXiv:2410.20098 Algorithm 1 + its own geometric reduction, eta from the
+paper's PM sweep grid; FADE arXiv:2604.27063 final-layer-only adaptive
+decay, published constants; L2-Init Kumar et al. decay-toward-init) and run
+BEHIND the champion's EMA input normalizer (decay 0.99) on a plain-SGD base
+(lr 0.01) — no utility gate, no perturbation on any comparison row.
+`sgd_ema_norm_d099` is the mechanism-free floor. Every factory reduces
+bit-exactly to that shared base with its mechanism constant inert
+(`TestComparisonArms` pins); the 60-task screens of both confirmed rows are
+bitwise prefixes of their 200-task confirms (max abs diff 0.0). Screen =
+60 tasks, seeds 0-2, paired; confirmations = 200 tasks, exact `step` mode,
+same seeds 0-2 (development-grade tuned estimates, the standing caveat).
+
+| conditioning + | screen 60t | vs champion (paired) | 200-task confirm |
+|---|---|---|---|
+| **L2-Init (`l2init_ema_norm`), decay→init 0.01** | **0.86408** | **+0.00249 [+0.0025/+0.0023/+0.0027]** | **0.86457 [0.864465, 0.864324, 0.864912] — CO-BEST** (+0.00212 vs 0.86245, all seeds +; ties `sigma0_shiftnorm_d099` 0.86459) |
+| OUR utility gate (`sigma0_ndecay099`, prior champion) | 0.86159 | — | 0.86245 |
+| nothing (`sgd_ema_norm_d099`, wd 0.01 floor) | 0.86160 | +0.00002 [+0.0006/+0.0005/−0.0010] | 0.86168 (−0.00077 vs champion) |
+| Weight Clipping kappa=2, wd 0 (`wclip_ema_norm`) | 0.85029 | −0.01130 | — |
+| FADE head decay (`fade_head_ema_norm`) | 0.81620 | −0.04538 | — |
+| SNR resets eta=0.005 (`snr_ema_norm`) | 0.77885 | −0.08273 | — |
+
+Raw-input references for the same mechanisms (earlier waves):
+`upgd_w_wclip_k2` 0.77211 / `k2_wd0` 0.77091, `upgd_w_fade_head` 0.75871,
+`upgd_l2init` 0.77920 (confirmed 0.78042). Verdicts:
+
+1. **Conditioning lifts every mechanism it doesn't outright replace.**
+   Clipping +0.079 (0.77091 → 0.85029), FADE +0.058, L2-Init +0.086 over
+   their raw-input selves. "Does conditioning rescue clipping?" — it
+   restores clipping to the SOTA-plus band, but clipping still costs
+   −0.011 against the mechanism-free base (row confound, disclosed: the
+   paper's standalone method has wd 0, the base has wd 0.01).
+2. **The utility gate is not load-bearing under fast conditioning.** The
+   bare base ties the gate champion at the screen (+0.00002) and gives
+   back only 0.0008 at 200 tasks. The gate's +0.011 measured at decay
+   0.999 (`sgd_ema_norm` 0.83991 vs `upgd_ema_norm_sigma0` 0.85051)
+   shrinks ~15x at decay 0.99: fast input tracking substitutes for
+   utility protection on this stream. (Label-permuted EMNIST is the
+   counterexample where the gate IS load-bearing — `sgd_ema_norm` 0.5037
+   there; the gate's value is stream-dependent.)
+3. **L2-Init is the one published mechanism ADDITIVE on top of our
+   conditioning: normalize (0.99) + SGD + decay-toward-init = 0.86457
+   with no gate and no noise** — +0.00288 vs the identical base per seed
+   (all +, isolating the decay *target* as the mechanism: toward-init
+   beats toward-zero), +0.00212 vs the gate champion, statistically tied
+   with the concurrent `sigma0_shiftnorm_d099` 0.86459 (two independent
+   +0.002-class wins: detector-side and decay-target-side; their
+   composition is the obvious next arm). Reading: decay toward w0
+   preserves init-scale variance in low-gradient weights (regenerative
+   regularization) where decay-to-zero erodes it — CBP/SNR's
+   re-init-from-init-distribution logic made continuous, cheap, and
+   churn-free. No late-life drift (plateau tasks 20-60 = 0.86482,
+   160-200 = 0.86430).
+4. **SNR's honest transplant to one-example steps churns to the raw
+   baseline** (0.77885 ≈ control +0.0011; the resets erase the entire
+   +0.083 conditioning gain). Cause, documented in the arm docstring: the
+   paper's experiments batch 16 examples per step, so a healthy unit is
+   ~never batch-silent (estimated firing rate ~1, false rejections
+   vanish); at batch 1 a mid-rate unit fails the same eta=0.005
+   geometric-tail test on ordinary silence runs, so healthy units are
+   mass-recycled. This is a protocol-transfer failure of the mechanism at
+   the paper's own hyperparameter range, not an implementation defect
+   (eta=0 reduction and reset semantics are unit-pinned).
+
+Receipts: `jobs_comparison.txt`, `confirm_full/jobs_comparison_confirm.txt`,
+merged rankings `summary_comparison.json` (control `upgd_w_control`) and
+`summary_comparison_vs_champion.json` (control `sigma0_ndecay099`). All
+numbers development-grade (`development_screening_diagnostic`), seeds 0-2,
+nonpromoting.
 
 ## Update-rule wave (wave A) + tracking controls — verdicts
 

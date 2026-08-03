@@ -214,3 +214,55 @@ different control).
   normalize + SGD + decay; a drop toward the raw-input UPGD/AdamW band
   (~0.75-0.78) means the utility gate IS the mechanism and
   normalized-gated-SGD stands as the method.
+
+## Comparison wave (`jobs_comparison.txt`, 2026-08-02): published mechanisms under our conditioning
+
+The reviewer-demanded comparison rows — "our conditioning + THEIR mechanism
+vs our conditioning + our gate". Five arms, seeds 0-2 (15 jobs in
+`jobs_comparison.txt`), all behind the champion's EMA input normalizer
+(decay 0.99, eps 1e-8) on a plain-SGD base (lr 0.01): no utility gate, no
+perturbation. Mechanism rules verified against the source papers
+(2026-08-02); every factory reduces bit-exactly to the shared
+normalized-SGD base when its mechanism constant is inert (pinned in
+`tests/test_ipmnist_screening.py::TestComparisonArms`).
+
+- `sgd_ema_norm_d099` — the mechanism-free floor: plain SGD + decoupled
+  wd 0.01 (`sgd_ema_norm` retimed to the champion's decay-0.99 conditioning).
+- `wclip_ema_norm` — Weight Clipping (Elsayed, Lan, Lyle & Mahmood, RLC
+  2024, Algorithm 1): SGD then per-layer clip of weights AND biases to
+  ±2/sqrt(fan_in) (kappa=2, the paper's example); wd 0 (their standalone
+  configuration — clipping is their alternative to decay-family
+  regularizers). kappa=inf reduces to the base (pinned).
+- `fade_head_ema_norm` — FADE meta-learned per-parameter weight decay on
+  the output layer only (arXiv 2604.27063; published alpha=0.005,
+  gamma0=-6.9, theta=0.1), hidden layers undecayed (the paper adapts the
+  final layer only). theta=0 + gamma0=-inf reduces to the base (pinned).
+- `snr_ema_norm` — Self-Normalized Resets (Farias & Jozefiak, arXiv
+  2410.20098, Algorithm 1): per-unit geometric-tail test P(A >= a) <= eta
+  on the unit's estimated firing rate; rejected units re-init incoming
+  weights+bias from the protocol uniform and zero outgoing. eta=0.005
+  (inside the paper's PM sweep grid 0.08..0.00125); firing rate = bias-
+  corrected EMA (decay 0.999) of the per-step firing indicator — the
+  streaming stand-in for their fixed trailing window (their own geometric
+  reduction), documented deviation. NOTE their experiments batch 16
+  examples/step (healthy units ~never batch-silent); at one example/step
+  the same eta is necessarily more trigger-happy — that protocol
+  difference is part of what the row measures. eta=0 reduces to the base
+  (pinned). Cost note: the faithful full re-init draw (~282k uniforms/step)
+  makes this the slowest comparison arm (~40-70s/task vs ~1.5s/task for
+  the other rows on the same box).
+- `l2init_ema_norm` — L2-Init (Kumar et al.): decoupled decay pulls toward
+  the initial weights, lambda = wd = 0.01 (the raw-input `upgd_l2init`
+  value). wd=0 reduces to the base (pinned).
+
+Ops: launched detached 2026-08-02 via
+`xargs -P 5 -n 2 bash worker.sh < jobs_comparison.txt` (idempotent; launch
+log `comparison_launch.log`). 200-task step-mode confirmations for the two
+rows at/above the champion (`l2init_ema_norm` cleared the +0.002 auto-
+confirm bar; `sgd_ema_norm_d099` tied the champion and is the ablation
+needed to attribute the l2init win): `confirm_full/jobs_comparison_confirm.txt`
+via `worker_confirm.sh` (pool64 attempt falls back to exact step — all five
+arms are noise-free). Results + interpretation: `FINAL_REPORT.md`
+comparison section; merged rankings in `summary_comparison.json` (control
+`upgd_w_control`) and `summary_comparison_vs_champion.json` (control
+`sigma0_ndecay099`) — separate files, `summary.json` untouched.

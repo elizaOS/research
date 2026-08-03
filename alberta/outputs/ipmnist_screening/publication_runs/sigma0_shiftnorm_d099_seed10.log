@@ -1,0 +1,14 @@
+WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-08-02 21:00:00,692 INFO loading MNIST from data_home=/home/shaw/milady/alberta/outputs/step2_published_mnist_openml_cache
+2026-08-02 21:00:05,157 INFO running sigma0_shiftnorm_d099 seed=10 for 200 tasks x 5000 steps (noise_mode=step)
+2026-08-02 21:01:41,316 INFO sigma0_shiftnorm_d099 seed=10 task 20/200 online_acc=0.8678 elapsed=92.2s
+2026-08-02 21:03:02,979 INFO sigma0_shiftnorm_d099 seed=10 task 40/200 online_acc=0.8690 elapsed=173.9s
+2026-08-02 21:04:26,347 INFO sigma0_shiftnorm_d099 seed=10 task 60/200 online_acc=0.8654 elapsed=257.2s
+2026-08-02 21:05:43,807 INFO sigma0_shiftnorm_d099 seed=10 task 80/200 online_acc=0.8584 elapsed=334.7s
+2026-08-02 21:07:01,706 INFO sigma0_shiftnorm_d099 seed=10 task 100/200 online_acc=0.8576 elapsed=412.6s
+2026-08-02 21:08:18,033 INFO sigma0_shiftnorm_d099 seed=10 task 120/200 online_acc=0.8698 elapsed=488.9s
+2026-08-02 21:09:35,582 INFO sigma0_shiftnorm_d099 seed=10 task 140/200 online_acc=0.8656 elapsed=566.5s
+2026-08-02 21:10:51,093 INFO sigma0_shiftnorm_d099 seed=10 task 160/200 online_acc=0.8636 elapsed=642.0s
+2026-08-02 21:11:48,910 INFO sigma0_shiftnorm_d099 seed=10 task 180/200 online_acc=0.8634 elapsed=699.8s
+2026-08-02 21:12:43,790 INFO sigma0_shiftnorm_d099 seed=10 task 200/200 online_acc=0.8630 elapsed=754.7s
+2026-08-02 21:12:43,823 INFO sigma0_shiftnorm_d099 seed=10 done: avg online acc 0.8641 (wall 754.7s) -> outputs/ipmnist_screening/publication_runs/sigma0_shiftnorm_d099_seed10.json

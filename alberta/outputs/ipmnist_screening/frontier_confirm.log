@@ -1,5 +1,0 @@
-relaunching missing sigma0 screening shards (0/24 done)
-retrying sigma0_ndecay099 seed 1 with --noise-mode step (noise-free arm)
-retrying sigma0_ndecay099 seed 0 with --noise-mode step (noise-free arm)
-retrying sigma0_ndecay099 seed 2 with --noise-mode step (noise-free arm)
-frontier pipeline complete 2026-08-02T16:52:56Z

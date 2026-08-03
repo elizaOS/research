@@ -1,0 +1,14 @@
+WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-08-02 20:49:48,189 INFO loading MNIST from data_home=/home/shaw/milady/alberta/outputs/step2_published_mnist_openml_cache
+2026-08-02 20:49:55,180 INFO running l2init_ema_norm seed=2 for 200 tasks x 5000 steps (noise_mode=step)
+2026-08-02 20:50:47,533 INFO l2init_ema_norm seed=2 task 20/200 online_acc=0.8636 elapsed=46.8s
+2026-08-02 20:51:30,944 INFO l2init_ema_norm seed=2 task 40/200 online_acc=0.8668 elapsed=90.2s
+2026-08-02 20:52:11,578 INFO l2init_ema_norm seed=2 task 60/200 online_acc=0.8704 elapsed=130.8s
+2026-08-02 20:52:51,971 INFO l2init_ema_norm seed=2 task 80/200 online_acc=0.8638 elapsed=171.2s
+2026-08-02 20:53:32,782 INFO l2init_ema_norm seed=2 task 100/200 online_acc=0.8674 elapsed=212.0s
+2026-08-02 20:54:12,420 INFO l2init_ema_norm seed=2 task 120/200 online_acc=0.8624 elapsed=251.7s
+2026-08-02 20:54:52,389 INFO l2init_ema_norm seed=2 task 140/200 online_acc=0.8646 elapsed=291.6s
+2026-08-02 20:55:33,503 INFO l2init_ema_norm seed=2 task 160/200 online_acc=0.8610 elapsed=332.7s
+2026-08-02 20:56:11,932 INFO l2init_ema_norm seed=2 task 180/200 online_acc=0.8604 elapsed=371.2s
+2026-08-02 20:56:48,525 INFO l2init_ema_norm seed=2 task 200/200 online_acc=0.8580 elapsed=407.8s
+2026-08-02 20:56:48,684 INFO l2init_ema_norm seed=2 done: avg online acc 0.8649 (wall 407.8s) -> outputs/ipmnist_screening/confirm_full/l2init_ema_norm_seed2.json
