@@ -39,6 +39,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     _make_l2init_ema_norm_learner,
     _make_lion_gate_learner,
     _make_muon_gate_learner,
+    _make_naive_bayes_learner,
     _make_norm_adam_fastv_learner,
     _make_norm_apollo_gate_learner,
     _make_norm_rmsprop_gate_learner,
@@ -65,6 +66,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     load_shard,
     main,
     merge_shards,
+    naive_bayes_logits,
     run_screening_config,
     screening_spec,
     shard_payload,
@@ -185,6 +187,7 @@ class TestRegistry:
             "norm_apollo_gate",
             "sgd_momentum_gate",
             "sgd_momentum_gate_m099",
+            "naive_bayes",
         }
         assert expected == set(SCREENING_REGISTRY)
 
@@ -3219,3 +3222,135 @@ class TestComparisonArms:
             assert not np.array_equal(
                 result.per_task_loss, base.per_task_loss
             ), name
+
+
+class TestNaiveBayes:
+    """V3 (NEW_DIRECTIONS.md): streaming class-conditional diagonal Gaussians.
+
+    No gradients, no MLP — prediction is the argmax class posterior under
+    annealed fast-EMA per-class feature statistics (equation parity with
+    ``ema_normalize``, conditioned on the observed label).
+    """
+
+    def test_registry_config(self):
+        spec = screening_spec("naive_bayes")
+        assert spec.mechanism == "streaming_generative_classifier"
+        assert spec.factory is _make_naive_bayes_learner
+        assert spec.hyperparameters["noise_std"] == 0.0
+        assert 0.0 < spec.hyperparameters["nb_decay"] < 1.0
+        assert spec.hyperparameters["nb_var_epsilon"] > 0.0
+        assert spec.noise_update is None
+        with pytest.raises(NotImplementedError):
+            spec.frozen_probe_input(None, jnp.zeros(4), spec.hyperparameters)
+
+    def test_first_update_hand_computed(self):
+        """One step from init: annealed EMA gives running-average semantics."""
+        spec = screening_spec("naive_bayes")
+        hp = dict(spec.hyperparameters)
+        eps = hp["nb_var_epsilon"]
+        params = init_mlp_params(jr.key(0), SMALL)
+        init_fn, step_fn = spec.factory(hp)
+        state = init_fn(params)
+        n_classes = SMALL.n_classes
+        np.testing.assert_allclose(np.asarray(state.prior), np.full(n_classes, 1.0 / n_classes))
+        x = jnp.linspace(-1.0, 1.0, SMALL.input_dim, dtype=jnp.float32)
+        y = jnp.array(1, jnp.int32)
+        _, new_state, metrics = step_fn(params, state, x, y, jr.key(9))
+        xf = np.asarray(x, dtype=np.float64)
+        # Class 1: count 0 -> 1; effective decay min(decay, 1 - 1/2) = 0.5.
+        np.testing.assert_allclose(np.asarray(new_state.cmean[1]), 0.5 * xf, rtol=1e-6)
+        np.testing.assert_allclose(
+            np.asarray(new_state.cvar[1]),
+            np.maximum(0.5 + 0.5 * xf * 0.5 * xf, eps),
+            rtol=1e-6,
+        )
+        assert float(new_state.ccount[1]) == 1.0
+        # Untouched class rows stay bitwise at init.
+        for c in range(n_classes):
+            if c == 1:
+                continue
+            np.testing.assert_array_equal(np.asarray(new_state.cmean[c]), 0.0)
+            np.testing.assert_array_equal(np.asarray(new_state.cvar[c]), 1.0)
+            assert float(new_state.ccount[c]) == 0.0
+        # Prior: annealed one-hot EMA, effective decay 0.5 at step 1.
+        expected_prior = 0.5 * np.full(n_classes, 1.0 / n_classes)
+        expected_prior[1] += 0.5
+        np.testing.assert_allclose(np.asarray(new_state.prior), expected_prior, rtol=1e-6)
+        accuracy, loss, plasticity = metrics
+        assert float(loss) > 0.0 and np.isfinite(float(loss))
+        assert float(accuracy) in (0.0, 1.0)
+        assert 0.0 <= float(plasticity) <= 1.0
+
+    def test_logits_match_manual_posterior(self):
+        spec = screening_spec("naive_bayes")
+        params = init_mlp_params(jr.key(4), SMALL)
+        init_fn, step_fn = spec.factory(spec.hyperparameters)
+        state = init_fn(params)
+        # Drive a few updates so statistics differ across classes.
+        key = jr.key(77)
+        for t in range(20):
+            key, kx = jr.split(key)
+            x = jr.uniform(kx, (SMALL.input_dim,), jnp.float32, -1.0, 1.0)
+            y = jnp.array(t % SMALL.n_classes, jnp.int32)
+            _, state, _ = step_fn(params, state, x, y, jr.key(t))
+        x = jr.uniform(jr.key(123), (SMALL.input_dim,), jnp.float32, -1.0, 1.0)
+        logits = np.asarray(naive_bayes_logits(state, x), dtype=np.float64)
+        mu = np.asarray(state.cmean, dtype=np.float64)
+        var = np.asarray(state.cvar, dtype=np.float64)
+        prior = np.asarray(state.prior, dtype=np.float64)
+        xf = np.asarray(x, dtype=np.float64)
+        manual = np.log(prior) - 0.5 * np.sum(
+            np.log(2.0 * math.pi * var) + (xf[None, :] - mu) ** 2 / var, axis=1
+        )
+        np.testing.assert_allclose(logits, manual, rtol=1e-5)
+
+    def test_params_untouched_and_key_unused(self):
+        spec = screening_spec("naive_bayes")
+        params = init_mlp_params(jr.key(5), SMALL)
+        init_fn, step_fn = spec.factory(spec.hyperparameters)
+        state = init_fn(params)
+        x = jr.uniform(jr.key(6), (SMALL.input_dim,), jnp.float32, -1.0, 1.0)
+        y = jnp.array(3, jnp.int32)
+        p_a, s_a, m_a = step_fn(params, state, x, y, jr.key(0))
+        p_b, s_b, m_b = step_fn(params, state, x, y, jr.key(424242))
+        for n in params:
+            np.testing.assert_array_equal(np.asarray(p_a[n]), np.asarray(params[n]))
+            np.testing.assert_array_equal(np.asarray(p_a[n]), np.asarray(p_b[n]))
+        np.testing.assert_array_equal(np.asarray(s_a.cmean), np.asarray(s_b.cmean))
+        assert float(m_a[1]) == float(m_b[1])
+
+    def test_permutation_covariance(self):
+        """Permuting the input features permutes the learned means and leaves
+        the posterior (hence the accuracy stream) unchanged."""
+        spec = screening_spec("naive_bayes")
+        params = init_mlp_params(jr.key(8), SMALL)
+        init_fn, step_fn = spec.factory(spec.hyperparameters)
+        perm = np.asarray(jr.permutation(jr.key(21), SMALL.input_dim))
+        key = jr.key(31)
+        state_raw = init_fn(params)
+        state_perm = init_fn(params)
+        for t in range(30):
+            key, kx = jr.split(key)
+            x = jr.uniform(kx, (SMALL.input_dim,), jnp.float32, -1.0, 1.0)
+            y = jnp.array(t % SMALL.n_classes, jnp.int32)
+            _, state_raw, m_raw = step_fn(params, state_raw, x, y, jr.key(t))
+            _, state_perm, m_perm = step_fn(params, state_perm, x[perm], y, jr.key(t))
+            np.testing.assert_allclose(
+                float(m_raw[1]), float(m_perm[1]), rtol=1e-4
+            )
+        np.testing.assert_array_equal(
+            np.asarray(state_raw.cmean)[:, perm], np.asarray(state_perm.cmean)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(state_raw.cvar)[:, perm], np.asarray(state_perm.cvar)
+        )
+
+    def test_smoke_run_finite(self, small_data):
+        x, y = small_data
+        result = run_screening_config(
+            x, y, screening_spec("naive_bayes"), seed=11, config=SMALL
+        )
+        assert np.all(np.isfinite(result.per_task_accuracy))
+        assert np.all(np.isfinite(result.per_task_loss))
+        assert np.all(result.per_task_accuracy >= 0.0)
+        assert np.all(result.per_task_accuracy <= 1.0)

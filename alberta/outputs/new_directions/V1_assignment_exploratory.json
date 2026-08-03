@@ -1,0 +1,510 @@
+{
+ "aggregates": [
+  {
+   "accuracy_all_mean": 0.00892857142857143,
+   "accuracy_relevant_var0.01_mean": 0.01122895779968147,
+   "accuracy_relevant_var0.01_min": 0.005917159763313609,
+   "fingerprint": "meanvar",
+   "n_samples": 50,
+   "solver": "hungarian"
+  },
+  {
+   "accuracy_all_mean": 0.12266156462585036,
+   "accuracy_relevant_var0.01_mean": 0.18924278676610376,
+   "accuracy_relevant_var0.01_min": 0.10059171597633136,
+   "fingerprint": "meanvar_class",
+   "n_samples": 50,
+   "solver": "hungarian"
+  },
+  {
+   "accuracy_all_mean": 0.01594387755102041,
+   "accuracy_relevant_var0.01_mean": 0.023483752062867513,
+   "accuracy_relevant_var0.01_min": 0.01195219123505976,
+   "fingerprint": "meanvar",
+   "n_samples": 200,
+   "solver": "hungarian"
+  },
+  {
+   "accuracy_all_mean": 0.4036989795918367,
+   "accuracy_relevant_var0.01_mean": 0.6228589861621852,
+   "accuracy_relevant_var0.01_min": 0.5895372233400402,
+   "fingerprint": "meanvar_class",
+   "n_samples": 200,
+   "solver": "hungarian"
+  },
+  {
+   "accuracy_all_mean": 0.03252551020408163,
+   "accuracy_relevant_var0.01_mean": 0.044955466679927496,
+   "accuracy_relevant_var0.01_min": 0.03155818540433925,
+   "fingerprint": "meanvar",
+   "n_samples": 500,
+   "solver": "hungarian"
+  },
+  {
+   "accuracy_all_mean": 0.5233843537414966,
+   "accuracy_relevant_var0.01_mean": 0.8013874726082372,
+   "accuracy_relevant_var0.01_min": 0.7712031558185405,
+   "fingerprint": "meanvar_class",
+   "n_samples": 500,
+   "solver": "hungarian"
+  },
+  {
+   "accuracy_all_mean": 0.0625,
+   "accuracy_relevant_var0.01_mean": 0.09229146506593566,
+   "accuracy_relevant_var0.01_min": 0.0611439842209073,
+   "fingerprint": "meanvar",
+   "n_samples": 2000,
+   "solver": "hungarian"
+  },
+  {
+   "accuracy_all_mean": 0.6041666666666666,
+   "accuracy_relevant_var0.01_mean": 0.9095217094069633,
+   "accuracy_relevant_var0.01_min": 0.8875739644970414,
+   "fingerprint": "meanvar_class",
+   "n_samples": 2000,
+   "solver": "hungarian"
+  }
+ ],
+ "cells": [
+  {
+   "accuracy_all": 0.00510204081632653,
+   "accuracy_relevant_var0.01": 0.005917159763313609,
+   "boundary_task": 0,
+   "fingerprint": "meanvar",
+   "n_relevant": 507,
+   "n_samples": 50,
+   "seed": 0
+  },
+  {
+   "accuracy_all": 0.17091836734693877,
+   "accuracy_relevant_var0.01": 0.26429980276134124,
+   "boundary_task": 0,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 507,
+   "n_samples": 50,
+   "seed": 0
+  },
+  {
+   "accuracy_all": 0.017857142857142856,
+   "accuracy_relevant_var0.01": 0.02564102564102564,
+   "boundary_task": 0,
+   "fingerprint": "meanvar",
+   "n_relevant": 507,
+   "n_samples": 200,
+   "seed": 0
+  },
+  {
+   "accuracy_all": 0.4107142857142857,
+   "accuracy_relevant_var0.01": 0.631163708086785,
+   "boundary_task": 0,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 507,
+   "n_samples": 200,
+   "seed": 0
+  },
+  {
+   "accuracy_all": 0.036989795918367346,
+   "accuracy_relevant_var0.01": 0.055226824457593686,
+   "boundary_task": 0,
+   "fingerprint": "meanvar",
+   "n_relevant": 507,
+   "n_samples": 500,
+   "seed": 0
+  },
+  {
+   "accuracy_all": 0.5153061224489796,
+   "accuracy_relevant_var0.01": 0.7909270216962525,
+   "boundary_task": 0,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 507,
+   "n_samples": 500,
+   "seed": 0
+  },
+  {
+   "accuracy_all": 0.039540816326530615,
+   "accuracy_relevant_var0.01": 0.0611439842209073,
+   "boundary_task": 0,
+   "fingerprint": "meanvar",
+   "n_relevant": 507,
+   "n_samples": 2000,
+   "seed": 0
+  },
+  {
+   "accuracy_all": 0.6147959183673469,
+   "accuracy_relevant_var0.01": 0.9151873767258383,
+   "boundary_task": 0,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 507,
+   "n_samples": 2000,
+   "seed": 0
+  },
+  {
+   "accuracy_all": 0.011479591836734694,
+   "accuracy_relevant_var0.01": 0.01195219123505976,
+   "boundary_task": 1,
+   "fingerprint": "meanvar",
+   "n_relevant": 502,
+   "n_samples": 50,
+   "seed": 0
+  },
+  {
+   "accuracy_all": 0.16581632653061223,
+   "accuracy_relevant_var0.01": 0.2549800796812749,
+   "boundary_task": 1,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 502,
+   "n_samples": 50,
+   "seed": 0
+  },
+  {
+   "accuracy_all": 0.01020408163265306,
+   "accuracy_relevant_var0.01": 0.01195219123505976,
+   "boundary_task": 1,
+   "fingerprint": "meanvar",
+   "n_relevant": 502,
+   "n_samples": 200,
+   "seed": 0
+  },
+  {
+   "accuracy_all": 0.4017857142857143,
+   "accuracy_relevant_var0.01": 0.6155378486055777,
+   "boundary_task": 1,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 502,
+   "n_samples": 200,
+   "seed": 0
+  },
+  {
+   "accuracy_all": 0.025510204081632654,
+   "accuracy_relevant_var0.01": 0.035856573705179286,
+   "boundary_task": 1,
+   "fingerprint": "meanvar",
+   "n_relevant": 502,
+   "n_samples": 500,
+   "seed": 0
+  },
+  {
+   "accuracy_all": 0.5178571428571429,
+   "accuracy_relevant_var0.01": 0.7948207171314741,
+   "boundary_task": 1,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 502,
+   "n_samples": 500,
+   "seed": 0
+  },
+  {
+   "accuracy_all": 0.10714285714285714,
+   "accuracy_relevant_var0.01": 0.16135458167330677,
+   "boundary_task": 1,
+   "fingerprint": "meanvar",
+   "n_relevant": 502,
+   "n_samples": 2000,
+   "seed": 0
+  },
+  {
+   "accuracy_all": 0.6071428571428571,
+   "accuracy_relevant_var0.01": 0.9183266932270916,
+   "boundary_task": 1,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 502,
+   "n_samples": 2000,
+   "seed": 0
+  },
+  {
+   "accuracy_all": 0.011479591836734694,
+   "accuracy_relevant_var0.01": 0.017716535433070866,
+   "boundary_task": 0,
+   "fingerprint": "meanvar",
+   "n_relevant": 508,
+   "n_samples": 50,
+   "seed": 1
+  },
+  {
+   "accuracy_all": 0.10204081632653061,
+   "accuracy_relevant_var0.01": 0.15551181102362205,
+   "boundary_task": 0,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 508,
+   "n_samples": 50,
+   "seed": 1
+  },
+  {
+   "accuracy_all": 0.012755102040816327,
+   "accuracy_relevant_var0.01": 0.01968503937007874,
+   "boundary_task": 0,
+   "fingerprint": "meanvar",
+   "n_relevant": 508,
+   "n_samples": 200,
+   "seed": 1
+  },
+  {
+   "accuracy_all": 0.3903061224489796,
+   "accuracy_relevant_var0.01": 0.6023622047244095,
+   "boundary_task": 0,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 508,
+   "n_samples": 200,
+   "seed": 1
+  },
+  {
+   "accuracy_all": 0.03443877551020408,
+   "accuracy_relevant_var0.01": 0.051181102362204724,
+   "boundary_task": 0,
+   "fingerprint": "meanvar",
+   "n_relevant": 508,
+   "n_samples": 500,
+   "seed": 1
+  },
+  {
+   "accuracy_all": 0.5369897959183674,
+   "accuracy_relevant_var0.01": 0.8208661417322834,
+   "boundary_task": 0,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 508,
+   "n_samples": 500,
+   "seed": 1
+  },
+  {
+   "accuracy_all": 0.05102040816326531,
+   "accuracy_relevant_var0.01": 0.07086614173228346,
+   "boundary_task": 0,
+   "fingerprint": "meanvar",
+   "n_relevant": 508,
+   "n_samples": 2000,
+   "seed": 1
+  },
+  {
+   "accuracy_all": 0.5994897959183674,
+   "accuracy_relevant_var0.01": 0.8956692913385826,
+   "boundary_task": 0,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 508,
+   "n_samples": 2000,
+   "seed": 1
+  },
+  {
+   "accuracy_all": 0.011479591836734694,
+   "accuracy_relevant_var0.01": 0.013806706114398421,
+   "boundary_task": 1,
+   "fingerprint": "meanvar",
+   "n_relevant": 507,
+   "n_samples": 50,
+   "seed": 1
+  },
+  {
+   "accuracy_all": 0.06505102040816327,
+   "accuracy_relevant_var0.01": 0.10059171597633136,
+   "boundary_task": 1,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 507,
+   "n_samples": 50,
+   "seed": 1
+  },
+  {
+   "accuracy_all": 0.015306122448979591,
+   "accuracy_relevant_var0.01": 0.021696252465483234,
+   "boundary_task": 1,
+   "fingerprint": "meanvar",
+   "n_relevant": 507,
+   "n_samples": 200,
+   "seed": 1
+  },
+  {
+   "accuracy_all": 0.4005102040816326,
+   "accuracy_relevant_var0.01": 0.6153846153846154,
+   "boundary_task": 1,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 507,
+   "n_samples": 200,
+   "seed": 1
+  },
+  {
+   "accuracy_all": 0.026785714285714284,
+   "accuracy_relevant_var0.01": 0.03155818540433925,
+   "boundary_task": 1,
+   "fingerprint": "meanvar",
+   "n_relevant": 507,
+   "n_samples": 500,
+   "seed": 1
+  },
+  {
+   "accuracy_all": 0.5038265306122449,
+   "accuracy_relevant_var0.01": 0.7712031558185405,
+   "boundary_task": 1,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 507,
+   "n_samples": 500,
+   "seed": 1
+  },
+  {
+   "accuracy_all": 0.05102040816326531,
+   "accuracy_relevant_var0.01": 0.07495069033530571,
+   "boundary_task": 1,
+   "fingerprint": "meanvar",
+   "n_relevant": 507,
+   "n_samples": 2000,
+   "seed": 1
+  },
+  {
+   "accuracy_all": 0.5867346938775511,
+   "accuracy_relevant_var0.01": 0.8875739644970414,
+   "boundary_task": 1,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 507,
+   "n_samples": 2000,
+   "seed": 1
+  },
+  {
+   "accuracy_all": 0.007653061224489796,
+   "accuracy_relevant_var0.01": 0.007920792079207921,
+   "boundary_task": 0,
+   "fingerprint": "meanvar",
+   "n_relevant": 505,
+   "n_samples": 50,
+   "seed": 2
+  },
+  {
+   "accuracy_all": 0.16581632653061223,
+   "accuracy_relevant_var0.01": 0.25544554455445545,
+   "boundary_task": 0,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 505,
+   "n_samples": 50,
+   "seed": 2
+  },
+  {
+   "accuracy_all": 0.017857142857142856,
+   "accuracy_relevant_var0.01": 0.027722772277227723,
+   "boundary_task": 0,
+   "fingerprint": "meanvar",
+   "n_relevant": 505,
+   "n_samples": 200,
+   "seed": 2
+  },
+  {
+   "accuracy_all": 0.4413265306122449,
+   "accuracy_relevant_var0.01": 0.6831683168316832,
+   "boundary_task": 0,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 505,
+   "n_samples": 200,
+   "seed": 2
+  },
+  {
+   "accuracy_all": 0.030612244897959183,
+   "accuracy_relevant_var0.01": 0.041584158415841586,
+   "boundary_task": 0,
+   "fingerprint": "meanvar",
+   "n_relevant": 505,
+   "n_samples": 500,
+   "seed": 2
+  },
+  {
+   "accuracy_all": 0.548469387755102,
+   "accuracy_relevant_var0.01": 0.8297029702970297,
+   "boundary_task": 0,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 505,
+   "n_samples": 500,
+   "seed": 2
+  },
+  {
+   "accuracy_all": 0.07397959183673469,
+   "accuracy_relevant_var0.01": 0.10495049504950495,
+   "boundary_task": 0,
+   "fingerprint": "meanvar",
+   "n_relevant": 505,
+   "n_samples": 2000,
+   "seed": 2
+  },
+  {
+   "accuracy_all": 0.6084183673469388,
+   "accuracy_relevant_var0.01": 0.9168316831683169,
+   "boundary_task": 0,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 505,
+   "n_samples": 2000,
+   "seed": 2
+  },
+  {
+   "accuracy_all": 0.006377551020408163,
+   "accuracy_relevant_var0.01": 0.01006036217303823,
+   "boundary_task": 1,
+   "fingerprint": "meanvar",
+   "n_relevant": 497,
+   "n_samples": 50,
+   "seed": 2
+  },
+  {
+   "accuracy_all": 0.0663265306122449,
+   "accuracy_relevant_var0.01": 0.10462776659959759,
+   "boundary_task": 1,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 497,
+   "n_samples": 50,
+   "seed": 2
+  },
+  {
+   "accuracy_all": 0.021683673469387755,
+   "accuracy_relevant_var0.01": 0.03420523138832998,
+   "boundary_task": 1,
+   "fingerprint": "meanvar",
+   "n_relevant": 497,
+   "n_samples": 200,
+   "seed": 2
+  },
+  {
+   "accuracy_all": 0.37755102040816324,
+   "accuracy_relevant_var0.01": 0.5895372233400402,
+   "boundary_task": 1,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 497,
+   "n_samples": 200,
+   "seed": 2
+  },
+  {
+   "accuracy_all": 0.04081632653061224,
+   "accuracy_relevant_var0.01": 0.05432595573440644,
+   "boundary_task": 1,
+   "fingerprint": "meanvar",
+   "n_relevant": 497,
+   "n_samples": 500,
+   "seed": 2
+  },
+  {
+   "accuracy_all": 0.5178571428571429,
+   "accuracy_relevant_var0.01": 0.8008048289738431,
+   "boundary_task": 1,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 497,
+   "n_samples": 500,
+   "seed": 2
+  },
+  {
+   "accuracy_all": 0.05229591836734694,
+   "accuracy_relevant_var0.01": 0.08048289738430583,
+   "boundary_task": 1,
+   "fingerprint": "meanvar",
+   "n_relevant": 497,
+   "n_samples": 2000,
+   "seed": 2
+  },
+  {
+   "accuracy_all": 0.6084183673469388,
+   "accuracy_relevant_var0.01": 0.9235412474849095,
+   "boundary_task": 1,
+   "fingerprint": "meanvar_class",
+   "n_relevant": 497,
+   "n_samples": 2000,
+   "seed": 2
+  }
+ ],
+ "evidence_policy": {
+  "development_only": true,
+  "evidence_class": "development_screening_diagnostic",
+  "note": "NOT pre-registered: estimator swapped from the champion's fast EMA (decay 0.99) to plain sample statistics with a 5000-sample frozen reference. Cannot gate V2 (pre-registered V1 refuted); recorded as the diagnostic for the next rung.",
+  "post_hoc": true,
+  "scientific_promotion_allowed": false
+ },
+ "schema": "alberta.new_directions.v1_assignment_exploratory.v1"
+}

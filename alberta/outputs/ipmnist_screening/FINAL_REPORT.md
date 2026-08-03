@@ -592,3 +592,42 @@ general stream-optimization conditioner, not only an input-shift fix.
     "control": "upgd_w_control",
     "mean_diff": 0.01875444644444439,
 ```
+
+## Shift-detector mini-star verdicts (auto-appended)
+
+60-task screen, seeds 0-2, paired vs `sigma0_shiftnorm_d099`
+(incumbent screen 0.863962), bar +0.002:
+
+- `sigma0_shiftnorm_d099_k05` screen 0.860873 (paired -0.003089 vs incumbent, all-seeds-positive=False)
+- `sigma0_shiftnorm_d099_k2` screen 0.863017 (paired -0.000946 vs incumbent, all-seeds-positive=False)
+- `sigma0_shiftnorm_d098` screen 0.862491 (paired -0.001471 vs incumbent, all-seeds-positive=False)
+- `sigma0_shiftnorm_d099_f08` screen 0.861997 (paired -0.001966 vs incumbent, all-seeds-positive=False)
+- `sigma0_shiftnorm_d099_f095` screen 0.863196 (paired -0.000767 vs incumbent, all-seeds-positive=False)
+- `sigma0_shiftnorm_d099_r200` screen 0.863862 (paired -0.0001 vs incumbent, all-seeds-positive=False)
+
+Final best arm by 200-task confirmed mean: **`sigma0_shiftnorm_d099`**.
+20-seed publication runs (final best + `sigma0_ndecay099`, seeds 0-19,
+200 tasks, exact step mode): `publication_runs/RESULTS.md`.
+
+## NEW_DIRECTIONS.md validation wave (2026-08-03): naive-Bayes baseline row
+
+Pre-registered V3 (`NEW_DIRECTIONS.md`, artifacts
+`outputs/new_directions/`): streaming naive Bayes — online
+class-conditional diagonal Gaussians with annealed fast-EMA statistics
+(nb_decay 0.98, var floor 0.1, frozen by a 2-task seed-0 diagnostic),
+argmax posterior, no gradients, no network. 60-task screen, paired seeds
+0-2 (`summary_naive_bayes.json`):
+
+- `naive_bayes` screen **0.78510** [0.784617, 0.78512, 0.785567] —
+  **+0.00734 paired over `upgd_w_control` (0.77776), all seeds improve**:
+  a closed-form statistic tracker beats the published-configuration
+  UPGD-W on its own protocol with no network. Below the pre-registered
+  0.80 method bar (no 200-task confirmation triggered) and below both
+  `rff_rls` (0.8490 screen) and every conditioned arm — the baseline
+  ordering the tracking-not-learning reading predicts.
+
+Same wave: pre-registered V1 (permutation recovery from per-feature
+statistics) **refuted** — relevant-pixel assignment reaches only 0.785 at
+500 samples (bar: >0.90), with a measured ~2,000-sample identification
+floor; the conditional V2 alignment arm was therefore gated out. Details:
+`outputs/new_directions/V1_assignment.md`.

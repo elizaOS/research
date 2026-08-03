@@ -157,3 +157,78 @@ scale, divide it out). Alignment is the second (identify the relabeling,
 invert it). Context-indexed memory is the general case — and it is,
 recognizably, the Alberta Plan's own thesis arrived at from the opposite
 direction: through 60 arms of supervised-stream evidence.
+
+## Validation results (2026-08-03, development, nonpromoting)
+
+Executed in pre-registered order; artifacts under `outputs/new_directions/`
+plus screening shards under `outputs/ipmnist_screening/`. Refutations are
+reported at the same rank as promotions.
+
+**V1 — Assignment recovery: REFUTED.** Protocol data + protocol
+permutations, seeds 0-2 x boundaries 0-2, champion fast-EMA (decay 0.99)
+statistics on both sides, Hungarian + global-greedy assignment
+(`outputs/new_directions/V1_assignment.{json,md}`). Relevant-pixel
+(reference var > 0.01, ~507/784) assignment accuracy vs the
+pre-registered >0.90-within-500-samples bar:
+
+| N | mean/var | + class-conditional means |
+|---|---|---|
+| 50 | 0.010 | 0.197 |
+| 200 | 0.017 | 0.619 |
+| 500 | 0.019 | **0.785** |
+| 2000 | 0.015 | 0.840 |
+
+The sanity/oracle probes localize the failure precisely: with exact
+full-dataset statistics the assignment IS fully recoverable (99.2%
+relevant from marginal mean/std; 100% with class means), and the
+no-shift control clears 99.6% — the mapping and machinery are correct.
+The binding constraint is estimator precision: MNIST marginal statistics
+are nearly radially symmetric, with inter-pixel separations below the
+~100-sample-window EMA noise, and even a frozen 5,000-sample reference
+with plain sample statistics post-shift
+(`V1_assignment_exploratory.json`, post-hoc) reaches only 0.80 at N=500
+and crosses 0.91 only at N≈2000. **Identifying the permutation from
+first-moment fingerprints costs ~2,000 samples — the same order as the
+gradient transient it was meant to replace.** Section 3's "200-sample
+closed-form answer" does not exist at this protocol's noise level; the
+next rung requires richer fingerprints (pairwise/model-side statistics)
+and must beat that measured ~2,000-sample information floor to matter.
+
+**V2 — Alignment-composition arm: GATED OUT (not executed).** The
+pre-registration makes V2 conditional on V1 promotion; V1 refuted, so no
+`align_champion` arm was implemented or screened. Given V1's measured
+identification lag (~2,000 samples for ~0.9 relevant accuracy), the arm's
+predicted mechanism — solve the assignment inside the first ~500
+post-shift steps and skip the transient — is not available: by the time
+the assignment is solvable, the champion's own re-adaptation has already
+re-converged most of the transient.
+
+**V3 — Streaming naive Bayes: baseline row promoted; method bar NOT
+met.** Registered as screening arm `naive_bayes` (class-conditional
+diagonal Gaussians, annealed fast-EMA statistics, argmax posterior, no
+gradients, no MLP; `nb_decay` 0.98 / var floor 0.1 frozen by a 2-task
+seed-0 diagnostic before the screen). 60-task screen, paired seeds 0-2
+(`outputs/ipmnist_screening/summary_naive_bayes.json`,
+`outputs/new_directions/V3_naive_bayes.json`): **0.78510** per-seed
+[0.784617, 0.78512, 0.785567] — below the pre-registered 0.80 method bar
+(no 200-task confirmation triggered), but **+0.00734 paired over the
+published-configuration UPGD-W control (0.77776), all seeds improve**. A
+closed-form statistic tracker with no network beats the published deep
+SOTA configuration on its own protocol, while remaining ~0.064 below the
+rff_rls tracking control (0.8490) and ~0.079 below the conditioned
+champion (0.86396): exactly the ordering the tracking-not-learning thesis
+predicts — and standalone direction B is refuted as a record path.
+
+**V4 — Dual-speed RFF+RLS readout cache: not executed** (out of scope of
+this validation pass; remains pre-registered).
+
+Net verdict for section 4: direction A's cheap-identification premise is
+refuted at the first-moment fingerprint class on this protocol; direction
+B survives only as a strong baseline, not a method. The measured
+~2,000-sample identification floor is itself the new result: on IPMNIST,
+*re-learning the input layer by conditioned gradient descent is
+information-theoretically competitive with explicitly identifying the
+permutation from first-order statistics* — the transient is not a
+combinatorial free lunch. Identification-first architectures need either
+higher-order fingerprints or recurrence (context re-use, direction D)
+to pay for themselves.

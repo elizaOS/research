@@ -2655,6 +2655,148 @@ def _make_lin_rls_learner(
 
 
 # =============================================================================
+# (v) Streaming naive Bayes: class-conditional diagonal Gaussians, no gradients
+# =============================================================================
+
+
+@chex.dataclass(frozen=True)
+class NaiveBayesState:
+    """Streaming class-conditional Gaussian statistics (no MLP is trained).
+
+    ``cmean``/``cvar`` are ``(n_classes, input_dim)`` per-class feature means
+    and variances under the annealed fast-EMA recurrence (equation parity
+    with :func:`ema_normalize`, applied to the observed class's row only);
+    ``ccount`` is each class's observed-example count (its anneal clock);
+    ``prior`` is an annealed one-hot EMA class prior with scalar clock
+    ``step``.
+    """
+
+    cmean: Array
+    cvar: Array
+    ccount: Array
+    prior: Array
+    step: Array
+
+
+def naive_bayes_logits(state: NaiveBayesState, x: Array) -> Array:
+    """Class log-posteriors (up to a shared constant) for one example.
+
+    ``log prior_c - 0.5 * sum_i [log(2 pi var_ci) + (x_i - mu_ci)^2 / var_ci]``
+    -- the diagonal-Gaussian class-conditional log-likelihood plus the log
+    prior. Variances already carry the ``nb_var_epsilon`` floor from the
+    update, so degenerate (constant) features contribute equally to every
+    class and cancel in the argmax.
+    """
+    log_lik = -0.5 * jnp.sum(
+        jnp.log(2.0 * math.pi * state.cvar)
+        + (x[None, :] - state.cmean) ** 2 / state.cvar,
+        axis=1,
+    )
+    return jnp.log(state.prior) + log_lik
+
+
+def _make_naive_bayes_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """V3 of NEW_DIRECTIONS.md: streaming generative classifier, no gradients.
+
+    Direction (B) made protocol-exact: online class-conditional diagonal
+    Gaussians with the campaign's own annealed fast-EMA statistics. Per
+    step (predict-then-update, the protocol ordering):
+
+    1. Pre-update prediction ``argmax_c`` of :func:`naive_bayes_logits`
+       scores the protocol's online accuracy; the reported loss is the
+       cross-entropy of the softmax posterior at the true label (a proper
+       probabilistic-classifier loss, but NOT comparable with the MLP arms'
+       CE -- accuracy is the protocol metric).
+    2. The observed label's row updates with the annealed fast-EMA
+       (:func:`ema_normalize` equations conditioned on the class):
+       effective decay ``min(nb_decay, 1 - 1/(count_c + 1))`` with count_c
+       the class's own sample clock, Welford-style EMA variance floored at
+       ``nb_var_epsilon``. Other class rows are bitwise untouched.
+    3. The class prior is an annealed one-hot EMA on the total-step clock
+       (it stays a probability vector exactly).
+
+    Everything is closed-form and per-feature: no gradients, no backprop,
+    no MLP (the protocol params pass through untouched, like ``rff_rls``),
+    and the RNG key is deliberately unused. A pixel permutation permutes
+    the stored per-class means/variances -- the statistics re-estimate at
+    the fast-EMA timescale per class (~1/n_classes of the stream each).
+
+    Plasticity is the protocol's post-update one-step improvement ratio on
+    the same posterior cross-entropy.
+    """
+    decay = hp["nb_decay"]
+    epsilon = hp["nb_var_epsilon"]
+
+    def init_fn(params: dict[str, Array]) -> NaiveBayesState:
+        input_dim = params["w1"].shape[0]
+        n_classes = params["w3"].shape[1]
+        return NaiveBayesState(  # type: ignore[call-arg]
+            cmean=jnp.zeros((n_classes, input_dim), dtype=jnp.float32),
+            cvar=jnp.ones((n_classes, input_dim), dtype=jnp.float32),
+            ccount=jnp.zeros(n_classes, dtype=jnp.float32),
+            prior=jnp.full((n_classes,), 1.0 / n_classes, dtype=jnp.float32),
+            step=jnp.array(0.0, dtype=jnp.float32),
+        )
+
+    def full_step(
+        params: dict[str, Array], state: NaiveBayesState, x: Array, y: Array, key: Array
+    ) -> tuple[dict[str, Array], NaiveBayesState, StepMetrics]:
+        del key  # closed-form: the step consumes no randomness
+        logits = naive_bayes_logits(state, x)
+        accuracy = (jnp.argmax(logits) == y).astype(jnp.float32)
+        loss = -jax.nn.log_softmax(logits)[y]
+        n_classes = state.prior.shape[0]
+        onehot = jax.nn.one_hot(y, n_classes, dtype=jnp.float32)
+        mask = onehot[:, None]
+        new_ccount = state.ccount + onehot
+        eff = jnp.minimum(decay, 1.0 - 1.0 / (new_ccount + 1.0))[:, None]
+        delta = x[None, :] - state.cmean
+        new_cmean = state.cmean + mask * (1.0 - eff) * delta
+        delta2 = x[None, :] - new_cmean
+        cand_var = jnp.maximum(
+            eff * state.cvar + (1.0 - eff) * delta * delta2, epsilon
+        )
+        new_cvar = jnp.where(mask > 0.0, cand_var, state.cvar)
+        new_step = state.step + 1.0
+        prior_eff = jnp.minimum(decay, 1.0 - 1.0 / (new_step + 1.0))
+        new_prior = prior_eff * state.prior + (1.0 - prior_eff) * onehot
+        new_state = NaiveBayesState(  # type: ignore[call-arg]
+            cmean=new_cmean,
+            cvar=new_cvar,
+            ccount=new_ccount,
+            prior=new_prior,
+            step=new_step,
+        )
+        loss_after = -jax.nn.log_softmax(naive_bayes_logits(new_state, x))[y]
+        plasticity = jnp.clip(
+            1.0 - loss_after / jnp.maximum(loss, _PLASTICITY_LOSS_FLOOR), 0.0, 1.0
+        )
+        return params, new_state, (accuracy, loss, plasticity)
+
+    return init_fn, full_step
+
+
+def _naive_bayes_frozen_probe_input(
+    state: Any, observation: Array, hyperparameters: Mapping[str, float]
+) -> Array:
+    """Refuse sentinel probes for the gradient-free naive-Bayes arm.
+
+    Exactly the :func:`_rff_frozen_probe_input` situation: the deployed
+    model is the streaming Gaussian statistics, not the (untouched,
+    randomly initialized) protocol MLP, so probing ``mlp_logits`` would
+    silently score a model that does not exist. Fail closed.
+    """
+    del state, observation, hyperparameters
+    raise NotImplementedError(
+        "sentinel probes are unsupported for the naive_bayes arm: there is "
+        "no trained protocol MLP to probe (the deployed model is the "
+        "streaming class-conditional Gaussian statistics)"
+    )
+
+
+# =============================================================================
 # (s) Optimizer-floor hybrids: Adam-class step adaptation + champion stability
 # =============================================================================
 #
@@ -4283,6 +4425,35 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 "1/sqrt(784) with a bias feature, streaming one-vs-all RLS "
                 "readout (forgetting 0.999). No features at all — measures "
                 "how far pure linear tracking goes on this protocol."
+            ),
+        )
+    )
+    # --- NEW_DIRECTIONS.md V3: streaming generative classifier (no network).
+    specs.append(
+        ScreeningSpec(
+            name="naive_bayes",
+            # Reporting/cost bucket only (schema allows upgd_w|adamw; every
+            # candidate arm pairs against upgd_w_control); no gradient
+            # plumbing is engaged — the arm ignores the MLP entirely.
+            base_learner="upgd_w",
+            mechanism="streaming_generative_classifier",
+            hyperparameters={
+                "nb_decay": 0.98,
+                "nb_var_epsilon": 0.1,
+                "noise_std": 0.0,
+            },
+            factory=_make_naive_bayes_learner,
+            frozen_probe_input=_naive_bayes_frozen_probe_input,
+            description=(
+                "Streaming naive Bayes (NEW_DIRECTIONS.md V3): online "
+                "class-conditional diagonal Gaussians with annealed "
+                "fast-EMA statistics, prediction = argmax posterior; no "
+                "gradients, no MLP. nb_decay 0.98 / var floor 0.1 from the "
+                "2-task seed-0 diagnostic (decay {0.95..0.9999} x floor "
+                "{0.001..0.5}: floor 0.1 dominates every decay; 0.98 edges "
+                "0.99 .7939/.7915 with the best post-shift task-2 recovery "
+                ".7892 — the same 0.98-0.99 plateau as the champion's "
+                "conditioning-decay star)."
             ),
         )
     )
