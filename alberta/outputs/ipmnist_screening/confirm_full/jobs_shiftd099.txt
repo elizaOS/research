@@ -1,0 +1,3 @@
+sigma0_shiftnorm_d099 0
+sigma0_shiftnorm_d099 1
+sigma0_shiftnorm_d099 2
