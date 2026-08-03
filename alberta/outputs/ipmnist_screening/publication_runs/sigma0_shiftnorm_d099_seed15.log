@@ -6,3 +6,9 @@ WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a 
 2026-08-02 21:15:23,129 INFO sigma0_shiftnorm_d099 seed=15 task 60/200 online_acc=0.8606 elapsed=186.6s
 2026-08-02 21:16:25,940 INFO sigma0_shiftnorm_d099 seed=15 task 80/200 online_acc=0.8672 elapsed=249.4s
 2026-08-02 21:17:25,593 INFO sigma0_shiftnorm_d099 seed=15 task 100/200 online_acc=0.8676 elapsed=309.0s
+2026-08-02 21:18:23,098 INFO sigma0_shiftnorm_d099 seed=15 task 120/200 online_acc=0.8590 elapsed=366.5s
+2026-08-02 21:19:23,276 INFO sigma0_shiftnorm_d099 seed=15 task 140/200 online_acc=0.8622 elapsed=426.7s
+2026-08-02 21:20:22,655 INFO sigma0_shiftnorm_d099 seed=15 task 160/200 online_acc=0.8690 elapsed=486.1s
+2026-08-02 21:21:21,296 INFO sigma0_shiftnorm_d099 seed=15 task 180/200 online_acc=0.8682 elapsed=544.7s
+2026-08-02 21:22:20,858 INFO sigma0_shiftnorm_d099 seed=15 task 200/200 online_acc=0.8662 elapsed=604.3s
+2026-08-02 21:22:20,906 INFO sigma0_shiftnorm_d099 seed=15 done: avg online acc 0.8654 (wall 604.3s) -> outputs/ipmnist_screening/publication_runs/sigma0_shiftnorm_d099_seed15.json
