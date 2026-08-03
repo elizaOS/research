@@ -1,0 +1,14 @@
+WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-08-02 11:50:23,518 INFO loading MNIST from data_home=/home/shaw/milady/alberta/outputs/step2_published_mnist_openml_cache
+2026-08-02 11:50:27,857 INFO running rff_rls seed=2 for 200 tasks x 5000 steps (noise_mode=step)
+2026-08-02 11:56:00,237 INFO rff_rls seed=2 task 20/200 online_acc=0.8476 elapsed=328.7s
+2026-08-02 12:01:37,954 INFO rff_rls seed=2 task 40/200 online_acc=0.8442 elapsed=666.4s
+2026-08-02 12:08:37,368 INFO rff_rls seed=2 task 60/200 online_acc=0.8540 elapsed=1085.9s
+2026-08-02 12:14:20,073 INFO rff_rls seed=2 task 80/200 online_acc=0.8536 elapsed=1428.6s
+2026-08-02 12:19:08,868 INFO rff_rls seed=2 task 100/200 online_acc=0.8466 elapsed=1717.4s
+2026-08-02 12:23:51,349 INFO rff_rls seed=2 task 120/200 online_acc=0.8486 elapsed=1999.8s
+2026-08-02 12:28:20,809 INFO rff_rls seed=2 task 140/200 online_acc=0.8430 elapsed=2269.3s
+2026-08-02 12:33:03,975 INFO rff_rls seed=2 task 160/200 online_acc=0.8414 elapsed=2552.5s
+2026-08-02 12:37:58,890 INFO rff_rls seed=2 task 180/200 online_acc=0.8544 elapsed=2847.4s
+2026-08-02 12:42:49,436 INFO rff_rls seed=2 task 200/200 online_acc=0.8380 elapsed=3137.9s
+2026-08-02 12:42:49,817 INFO rff_rls seed=2 done: avg online acc 0.8487 (wall 3137.9s) -> outputs/ipmnist_screening/confirm_full/rff_rls_seed2.json
