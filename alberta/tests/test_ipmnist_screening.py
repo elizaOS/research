@@ -111,6 +111,11 @@ def small_data():
 class TestRegistry:
     def test_expected_configs_present(self):
         expected = {
+            "disc_r1",
+            "disc_r2",
+            "disc_r3",
+            "disc_r1_pscale",
+            "disc_r1_pscale_norms",
             "upgd_w_control",
             "adamw_control",
             "upgd_idbd",
@@ -3354,3 +3359,239 @@ class TestNaiveBayes:
         assert np.all(np.isfinite(result.per_task_loss))
         assert np.all(result.per_task_accuracy >= 0.0)
         assert np.all(result.per_task_accuracy <= 1.0)
+
+
+class TestDiscoveredRuleFactory:
+    """Discovered-rule translation factory (rule_discovery -> screening arm).
+
+    The factory materializes a rule-DSL genome (mechanism flags + constants)
+    as a protocol-scale screening learner. Champion-form flags must reduce
+    bit-exactly to the registered ``sigma0_shiftnorm_d099`` champion step.
+    """
+
+    def _hp(self, **overrides):
+        from alberta_framework.benchmarks.ipmnist_screening import _discovered_rule_hp
+
+        return _discovered_rule_hp(**overrides)
+
+    def _setup(self, seed=0):
+        from alberta_framework.benchmarks.upgd_ipmnist import init_mlp_params
+
+        config = SMALL
+        params = init_mlp_params(jr.key(seed), config)
+        return config, params
+
+    def test_champion_form_reduces_bitexact_to_shiftnorm_champion(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_discovered_rule_learner,
+            _make_upgd_shiftnorm_learner,
+            _sigma0_ext_hp,
+        )
+
+        champ_hp = _sigma0_ext_hp(
+            norm_decay=0.99,
+            fast_decay=0.9,
+            shift_k=1.0,
+            shift_delta=0.02,
+            shift_refractory=0.0,
+        )
+        champ_init, champ_step = _make_upgd_shiftnorm_learner(champ_hp)
+        disc_init, disc_step = _make_discovered_rule_learner(
+            self._hp(flag_norm=1.0, flag_shift_reset=1.0, flag_gate=1.0)
+        )
+        config, params = self._setup(seed=5)
+        champ_params, disc_params = params, params
+        champ_state, disc_state = champ_init(params), disc_init(params)
+        key = jr.key(3)
+        for step in range(12):
+            key, kx = jr.split(key)
+            x = jr.uniform(kx, (config.input_dim,), jnp.float32, -1.0, 1.0) * (
+                1.0 + step % 3
+            )
+            y = jnp.array(step % config.n_classes, jnp.int32)
+            champ_params, champ_state, m_champ = champ_step(
+                champ_params, champ_state, x, y, jr.key(step)
+            )
+            disc_params, disc_state, m_disc = disc_step(
+                disc_params, disc_state, x, y, jr.key(step)
+            )
+            for name in sorted(params):
+                np.testing.assert_array_equal(
+                    np.asarray(disc_params[name]), np.asarray(champ_params[name])
+                )
+            for a, b in zip(m_disc, m_champ):
+                np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+    def test_surprise_budget_scales_applied_delta(self):
+        import dataclasses as _dc
+
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_discovered_rule_learner,
+        )
+
+        base_hp = self._hp(surprise_gain=1.0, weight_decay=0.0001)
+        on_init, on_step = _make_discovered_rule_learner(
+            {**base_hp, "flag_surprise_budget": 1.0}
+        )
+        off_init, off_step = _make_discovered_rule_learner(base_hp)
+        config, params = self._setup(seed=6)
+        surprised_on = _dc.replace(
+            on_init(params),
+            err_fast=jnp.asarray(4.0, jnp.float32),
+            err_slow=jnp.asarray(1.0, jnp.float32),
+        )
+        surprised_off = _dc.replace(
+            off_init(params),
+            err_fast=jnp.asarray(4.0, jnp.float32),
+            err_slow=jnp.asarray(1.0, jnp.float32),
+        )
+        x = jnp.linspace(0.1, 1.0, config.input_dim, dtype=jnp.float32)
+        y = jnp.array(1, jnp.int32)
+        stepped_on, _, _ = on_step(params, surprised_on, x, y, jr.key(0))
+        stepped_off, _, _ = off_step(params, surprised_off, x, y, jr.key(0))
+        delta_on = float(jnp.abs(stepped_on["w3"] - params["w3"]).sum())
+        delta_off = float(jnp.abs(stepped_off["w3"] - params["w3"]).sum())
+        assert delta_on == pytest.approx(4.0 * delta_off, rel=1e-3)
+
+    def test_w1_shift_reset_restores_init_rows(self):
+        import dataclasses as _dc
+
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_discovered_rule_learner,
+        )
+
+        init_fn, step_fn = _make_discovered_rule_learner(
+            self._hp(flag_norm=1.0, flag_w1_shift_reset=1.0, shift_k=0.5)
+        )
+        config, params = self._setup(seed=7)
+        drifted = {
+            name: value + 0.25 if name == "w1" else value
+            for name, value in params.items()
+        }
+        state = init_fn(drifted)
+        mature = _dc.replace(
+            state,
+            init_params=dict(params),
+            norm=_dc.replace(
+                state.norm,
+                mean=jnp.zeros(config.input_dim, jnp.float32),
+                var=jnp.full((config.input_dim,), 1e-4, jnp.float32),
+                count=jnp.full((config.input_dim,), 1000.0, jnp.float32),
+            ),
+            fast_mean=jnp.zeros(config.input_dim, jnp.float32),
+        )
+        x = jnp.full((config.input_dim,), 10.0, jnp.float32)
+        y = jnp.array(0, jnp.int32)
+        new_params, _, _ = step_fn(drifted, mature, x, y, jr.key(0))
+        np.testing.assert_allclose(
+            np.asarray(new_params["w1"]), np.asarray(params["w1"]), rtol=0, atol=1e-7
+        )
+
+    def test_decay_to_init_holds_w1_at_init_under_zero_input(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_discovered_rule_learner,
+        )
+
+        init_fn, step_fn = _make_discovered_rule_learner(
+            self._hp(flag_decay_to_init=1.0, weight_decay=0.03)
+        )
+        config, params = self._setup(seed=8)
+        state = init_fn(params)
+        x = jnp.zeros((config.input_dim,), jnp.float32)
+        y = jnp.array(0, jnp.int32)
+        new_params, _, _ = step_fn(params, state, x, y, jr.key(0))
+        np.testing.assert_allclose(
+            np.asarray(new_params["w1"]), np.asarray(params["w1"]), rtol=0, atol=1e-7
+        )
+
+    @pytest.mark.parametrize(
+        ("name", "flags", "lr"),
+        [
+            (
+                "disc_r1",
+                {
+                    "flag_norm": 1.0,
+                    "flag_shift_reset": 1.0,
+                    "flag_surprise_budget": 1.0,
+                    "flag_hidden_rms": 1.0,
+                    "flag_gate": 0.0,
+                    "flag_decay_to_init": 0.0,
+                    "flag_w1_shift_reset": 0.0,
+                },
+                0.0370901404621786,
+            ),
+            (
+                "disc_r2",
+                {
+                    "flag_norm": 1.0,
+                    "flag_shift_reset": 1.0,
+                    "flag_decay_to_init": 1.0,
+                    "flag_surprise_budget": 1.0,
+                    "flag_hidden_rms": 1.0,
+                    "flag_gate": 0.0,
+                },
+                0.04385333652867646,
+            ),
+            (
+                "disc_r3",
+                {
+                    "flag_norm": 1.0,
+                    "flag_shift_reset": 0.0,
+                    "flag_decay_to_init": 1.0,
+                    "flag_surprise_budget": 1.0,
+                    "flag_w1_shift_reset": 1.0,
+                    "flag_hidden_rms": 1.0,
+                    "flag_gate": 0.0,
+                },
+                0.04512338013332415,
+            ),
+        ],
+    )
+    def test_discovered_arms_registered(self, name, flags, lr):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _ema_frozen_probe_input,
+            _make_discovered_rule_learner,
+        )
+
+        spec = screening_spec(name)
+        assert spec.mechanism == "discovered_rule"
+        assert spec.factory is _make_discovered_rule_learner
+        assert spec.frozen_probe_input is _ema_frozen_probe_input
+        assert spec.hyperparameters["step_size"] == pytest.approx(lr, rel=1e-12)
+        for key, value in flags.items():
+            assert spec.hyperparameters[key] == value
+        # Smoke: one finite step at protocol-small scale.
+        from alberta_framework.benchmarks.upgd_ipmnist import init_mlp_params
+
+        params = init_mlp_params(jr.key(0), SMALL)
+        init_fn, step_fn = spec.factory(spec.hyperparameters)
+        state = init_fn(params)
+        x = jnp.linspace(-1.0, 1.0, SMALL.input_dim, dtype=jnp.float32)
+        y = jnp.array(1, jnp.int32)
+        new_params, _, metrics = step_fn(params, state, x, y, jr.key(1))
+        for name_ in sorted(new_params):
+            assert bool(jnp.all(jnp.isfinite(new_params[name_])))
+        assert all(bool(jnp.isfinite(m)) for m in metrics)
+
+    @pytest.mark.parametrize(
+        ("name", "rms"),
+        [("disc_r1_pscale", 1.0), ("disc_r1_pscale_norms", 0.0)],
+    )
+    def test_disc_r1_protocol_scale_diagnostics_registered(self, name, rms):
+        """Structure-vs-constants dissection of the discovered rule disc_r1:
+        same flags (surprise budget, no gate) at champion-scale constants,
+        with hidden RMS isolated as its own axis."""
+        spec = screening_spec(name)
+        assert spec.mechanism == "discovered_rule_diagnostic"
+        hp = spec.hyperparameters
+        assert hp["flag_surprise_budget"] == 1.0
+        assert hp["flag_gate"] == 0.0
+        assert hp["flag_hidden_rms"] == rms
+        # Champion-scale constants replace the micro-tuned ones.
+        assert hp["step_size"] == pytest.approx(0.01)
+        assert hp["weight_decay"] == pytest.approx(0.01)
+        assert hp["norm_decay"] == pytest.approx(0.99)
+        assert hp["fast_decay"] == pytest.approx(0.9)
+        assert hp["shift_k"] == pytest.approx(1.0)
+        # The discovered surprise constants carry over unchanged.
+        assert hp["surprise_gain"] == pytest.approx(0.8360796272754669)

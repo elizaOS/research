@@ -1,0 +1,24 @@
+An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-08-03 18:45:43,356 INFO label_permutation/sgd_raw seed=0 overall=0.6408 wall=1.10s -> outputs/micro_continual/families_r40/label_permutation_sgd_raw_seed0.json
+2026-08-03 18:45:48,930 INFO label_permutation/adamw seed=0 overall=0.2431 wall=4.98s -> outputs/micro_continual/families_r40/label_permutation_adamw_seed0.json
+2026-08-03 18:47:00,579 INFO label_permutation/upgd_raw seed=0 overall=0.3020 wall=71.16s -> outputs/micro_continual/families_r40/label_permutation_upgd_raw_seed0.json
+2026-08-03 18:47:02,415 INFO label_permutation/sgd_norm seed=0 overall=0.8242 wall=1.30s -> outputs/micro_continual/families_r40/label_permutation_sgd_norm_seed0.json
+2026-08-03 18:47:08,648 INFO label_permutation/gated_norm seed=0 overall=0.7879 wall=5.75s -> outputs/micro_continual/families_r40/label_permutation_gated_norm_seed0.json
+2026-08-03 18:47:09,938 INFO label_permutation/naive_bayes seed=0 overall=0.7952 wall=0.81s -> outputs/micro_continual/families_r40/label_permutation_naive_bayes_seed0.json
+2026-08-03 18:47:11,172 INFO merged 6 shards -> outputs/micro_continual/families_r40/summary_label_permutation.json
+An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-08-03 18:47:18,131 INFO scale_shift/sgd_raw seed=0 overall=0.7095 wall=1.54s -> outputs/micro_continual/families_r40/scale_shift_sgd_raw_seed0.json
+2026-08-03 18:47:23,943 INFO scale_shift/adamw seed=0 overall=0.7850 wall=5.20s -> outputs/micro_continual/families_r40/scale_shift_adamw_seed0.json
+2026-08-03 18:48:39,243 INFO scale_shift/upgd_raw seed=0 overall=0.5013 wall=74.78s -> outputs/micro_continual/families_r40/scale_shift_upgd_raw_seed0.json
+2026-08-03 18:48:41,551 INFO scale_shift/sgd_norm seed=0 overall=0.8494 wall=1.79s -> outputs/micro_continual/families_r40/scale_shift_sgd_norm_seed0.json
+2026-08-03 18:48:49,810 INFO scale_shift/gated_norm seed=0 overall=0.8660 wall=7.78s -> outputs/micro_continual/families_r40/scale_shift_gated_norm_seed0.json
+2026-08-03 18:48:51,168 INFO scale_shift/naive_bayes seed=0 overall=0.7395 wall=0.83s -> outputs/micro_continual/families_r40/scale_shift_naive_bayes_seed0.json
+2026-08-03 18:48:52,431 INFO merged 6 shards -> outputs/micro_continual/families_r40/summary_scale_shift.json
+An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-08-03 18:48:59,717 INFO recurrence/sgd_raw seed=0 overall=0.5692 wall=1.61s -> outputs/micro_continual/families_r40/recurrence_sgd_raw_seed0.json
+2026-08-03 18:49:05,542 INFO recurrence/adamw seed=0 overall=0.4639 wall=5.21s -> outputs/micro_continual/families_r40/recurrence_adamw_seed0.json
+2026-08-03 18:50:22,624 INFO recurrence/upgd_raw seed=0 overall=0.3264 wall=76.55s -> outputs/micro_continual/families_r40/recurrence_upgd_raw_seed0.json
+2026-08-03 18:50:24,823 INFO recurrence/sgd_norm seed=0 overall=0.7169 wall=1.63s -> outputs/micro_continual/families_r40/recurrence_sgd_norm_seed0.json
+2026-08-03 18:50:32,629 INFO recurrence/gated_norm seed=0 overall=0.7154 wall=7.26s -> outputs/micro_continual/families_r40/recurrence_gated_norm_seed0.json
+2026-08-03 18:50:34,034 INFO recurrence/naive_bayes seed=0 overall=0.6210 wall=0.88s -> outputs/micro_continual/families_r40/recurrence_naive_bayes_seed0.json
+2026-08-03 18:50:35,193 INFO merged 6 shards -> outputs/micro_continual/families_r40/summary_recurrence.json

@@ -1353,6 +1353,283 @@ def _make_upgd_warmnorm_learner(
 
 
 # =============================================================================
+# (o2) Discovered-rule translation factory (rule_discovery promotion lane)
+# =============================================================================
+#
+# The automated update-rule discovery lane
+# (:mod:`alberta_framework.benchmarks.rule_discovery`) searches a composable
+# DSL over the campaign's primitive vocabulary on the micro continual suite.
+# Candidates that beat the budget-matched champion-form baseline on the
+# held-out micro tasks are translated verbatim into screening arms through
+# this factory: one hyperparameter dict carries the mechanism flags
+# (``flag_*`` as 0/1 floats) plus the discovered constants. With the
+# champion-form flags (norm + shift_reset + gate, everything else off) the
+# step is bit-exact against the registered ``sigma0_shiftnorm_d099``
+# champion (pinned), so screened differences are attributable to the
+# discovered composition alone.
+
+
+@chex.dataclass(frozen=True)
+class DiscoveredRuleState:
+    """Discovered-rule carry: champion normalizer statistics + init snapshot
+    + error-signal scalars (surprise-budget and meta-decay inputs)."""
+
+    utility: dict[str, Array]
+    step: Array
+    norm: EMANormState
+    fast_mean: Array
+    init_params: dict[str, Array]
+    err_fast: Array
+    err_slow: Array
+    err_autocorr: Array
+    err_var: Array
+    err_prev_delta: Array
+
+
+_DISCOVERED_RULE_DEFAULTS: dict[str, float] = {
+    "flag_norm": 0.0,
+    "flag_shift_reset": 0.0,
+    "flag_gate": 0.0,
+    "flag_decay_to_init": 0.0,
+    "flag_surprise_budget": 0.0,
+    "flag_meta_decay": 0.0,
+    "flag_utility_shift_reset": 0.0,
+    "flag_w1_shift_reset": 0.0,
+    "flag_hidden_rms": 0.0,
+    "step_size": 0.01,
+    "weight_decay": 0.01,
+    "norm_decay": 0.99,
+    "fast_decay": 0.9,
+    "shift_k": 1.0,
+    "shift_delta": 0.02,
+    "norm_epsilon": 1e-8,
+    "utility_decay": 0.9999,
+    "gate_beta": 1.0,
+    "surprise_gain": 1.0,
+    "surprise_fast": 0.95,
+    "surprise_slow": 0.999,
+    "meta_gain": 2.0,
+    "hidden_rms_epsilon": 1e-8,
+    "noise_std": 0.0,
+}
+
+#: Fixed decay of the error autocorrelation/variance EMAs (meta-decay input);
+#: mirrors ``rule_discovery._AUTOCORR_DECAY``.
+_DISCOVERED_AUTOCORR_DECAY = 0.99
+
+
+def _discovered_rule_hp(**overrides: float) -> dict[str, float]:
+    """Discovered-rule hyperparameters: champion-form constants + inert flags."""
+    merged = dict(_DISCOVERED_RULE_DEFAULTS)
+    merged.update(overrides)
+    return merged
+
+
+def _make_discovered_rule_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Materialize one discovered rule-DSL composition as a screening learner.
+
+    Mechanism flags are read at build time (Python-level composition, the
+    ``vreset_enabled`` precedent), so inactive mechanisms leave the traced
+    step untouched: with ``flag_norm/flag_shift_reset/flag_gate`` set and
+    everything else off, the arithmetic is exactly
+    :func:`_make_upgd_shiftnorm_learner`'s champion step (bit-exact, pinned).
+    Active extensions follow the rule-DSL semantics of
+    :func:`alberta_framework.benchmarks.rule_discovery.rule_step`. The RNG
+    key is deliberately unused (sigma-0 family).
+    """
+    f_norm = hp["flag_norm"] != 0.0
+    f_shift_reset = hp["flag_shift_reset"] != 0.0
+    f_gate = hp["flag_gate"] != 0.0
+    f_init = hp["flag_decay_to_init"] != 0.0
+    f_budget = hp["flag_surprise_budget"] != 0.0
+    f_meta = hp["flag_meta_decay"] != 0.0
+    f_ureset = hp["flag_utility_shift_reset"] != 0.0
+    f_wreset = hp["flag_w1_shift_reset"] != 0.0
+    f_rms = hp["flag_hidden_rms"] != 0.0
+    step_size = hp["step_size"]
+    weight_decay = hp["weight_decay"]
+    param_decay = 1.0 - step_size * weight_decay
+    utility_decay = hp["utility_decay"]
+    gate_beta = hp["gate_beta"]
+    norm_decay = hp["norm_decay"]
+    fast_decay = hp["fast_decay"]
+    shift_k = hp["shift_k"]
+    shift_delta = hp["shift_delta"]
+    norm_epsilon = hp["norm_epsilon"]
+    surprise_gain = hp["surprise_gain"]
+    surprise_fast = hp["surprise_fast"]
+    surprise_slow = hp["surprise_slow"]
+    meta_gain = hp["meta_gain"]
+    rms_epsilon = hp["hidden_rms_epsilon"]
+
+    def _rms_loss(params: dict[str, Array], x: Array, y: Array) -> tuple[Array, Array]:
+        z1 = x @ params["w1"] + params["b1"]
+        h1 = _hidden_rms_normalize(jax.nn.relu(z1), rms_epsilon)
+        z2 = h1 @ params["w2"] + params["b2"]
+        h2 = _hidden_rms_normalize(jax.nn.relu(z2), rms_epsilon)
+        logits = h2 @ params["w3"] + params["b3"]
+        return -jax.nn.log_softmax(logits)[y], logits
+
+    loss_fn = _rms_loss if f_rms else cross_entropy_loss
+
+    def init_fn(params: dict[str, Array]) -> DiscoveredRuleState:
+        input_dim = params["w1"].shape[0]
+        n_classes = params["b3"].shape[0]
+        chance = jnp.asarray(math.log(float(n_classes)), jnp.float32)
+        return DiscoveredRuleState(  # type: ignore[call-arg]
+            utility={name: jnp.zeros_like(value) for name, value in params.items()},
+            step=jnp.array(0, dtype=jnp.int32),
+            norm=EMANormState(  # type: ignore[call-arg]
+                mean=jnp.zeros(input_dim, dtype=jnp.float32),
+                var=jnp.ones(input_dim, dtype=jnp.float32),
+                count=jnp.zeros(input_dim, dtype=jnp.float32),
+            ),
+            fast_mean=jnp.zeros(input_dim, dtype=jnp.float32),
+            init_params={name: value for name, value in params.items()},
+            err_fast=chance,
+            err_slow=chance,
+            err_autocorr=jnp.asarray(0.0, jnp.float32),
+            err_var=jnp.asarray(0.0, jnp.float32),
+            err_prev_delta=jnp.asarray(0.0, jnp.float32),
+        )
+
+    def _general_normalize(
+        norm: EMANormState, fast_mean: Array, x: Array,
+        err_autocorr: Array, err_var: Array,
+    ) -> tuple[Array, EMANormState, Array, Array]:
+        """Detector + EMA statistics for the non-champion flag combinations
+        (count reset and meta decay composable independently)."""
+        effective_fast = jnp.minimum(fast_decay, 1.0 - 1.0 / (norm.count + 2.0))
+        new_fast = effective_fast * fast_mean + (1.0 - effective_fast) * x
+        threshold = shift_k * jnp.sqrt(norm.var) + shift_delta
+        shifted = jnp.abs(new_fast - norm.mean) > threshold
+        count_base = jnp.where(shifted, 0.0, norm.count) if f_shift_reset else norm.count
+        new_count = count_base + 1.0
+        if f_meta:
+            autocorr_score = jnp.clip(err_autocorr / (err_var + 1e-8), 0.0, 1.0)
+            decay_used = jnp.clip(
+                1.0 - (1.0 - norm_decay) * (1.0 + meta_gain * autocorr_score),
+                0.5,
+                norm_decay,
+            )
+        else:
+            decay_used = jnp.asarray(norm_decay, jnp.float32)
+        effective_decay = jnp.minimum(decay_used, 1.0 - 1.0 / (new_count + 1.0))
+        delta = x - norm.mean
+        new_mean = norm.mean + (1.0 - effective_decay) * delta
+        delta2 = x - new_mean
+        new_var = jnp.maximum(
+            effective_decay * norm.var + (1.0 - effective_decay) * delta * delta2,
+            norm_epsilon,
+        )
+        normalized = (x - new_mean) / (jnp.sqrt(new_var) + norm_epsilon)
+        return normalized, EMANormState(  # type: ignore[call-arg]
+            mean=new_mean, var=new_var, count=new_count
+        ), new_fast, shifted
+
+    def full_step(
+        params: dict[str, Array],
+        state: DiscoveredRuleState,
+        x: Array,
+        y: Array,
+        key: Array,
+    ) -> tuple[dict[str, Array], DiscoveredRuleState, StepMetrics]:
+        del key  # sigma-0 family: no perturbation, no randomness
+        if f_shift_reset and not f_meta:
+            # Exact champion normalizer call (bit-exact reduction path).
+            x_norm, new_norm, new_fast, shifted = shift_adaptive_normalize(
+                state.norm, state.fast_mean, x,
+                decay=norm_decay,
+                fast_decay=fast_decay,
+                epsilon=norm_epsilon,
+                shift_k=shift_k,
+                shift_delta=shift_delta,
+                shift_refractory=0.0,
+            )
+        else:
+            x_norm, new_norm, new_fast, shifted = _general_normalize(
+                state.norm, state.fast_mean, x, state.err_autocorr, state.err_var
+            )
+        x_used = x_norm if f_norm else x
+        (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+            params, x_used, y
+        )
+        count = state.step + jnp.array(1, dtype=jnp.int32)
+        prev_utility = state.utility
+        if f_ureset:
+            prev_utility = dict(prev_utility)
+            prev_utility["w1"] = prev_utility["w1"] * (
+                1.0 - shifted[:, None].astype(jnp.float32)
+            )
+        utility = {
+            name: utility_decay * prev_utility[name]
+            + (1.0 - utility_decay) * (-grads[name] * params[name])
+            for name in params
+        }
+        bias_correction = 1.0 - jnp.power(
+            jnp.asarray(utility_decay, dtype=jnp.float32), count.astype(jnp.float32)
+        )
+        global_max = jnp.max(
+            jnp.stack([jnp.max(utility[name]) for name in sorted(params)])
+        )
+        if f_budget:
+            ratio = (state.err_fast + 1e-8) / (state.err_slow + 1e-8)
+            budget = jnp.clip(
+                jnp.exp(surprise_gain * jnp.log(jnp.maximum(ratio, 1e-8))), 0.25, 4.0
+            )
+            lr_eff: Array | float = step_size * budget
+            decay_eff: Array | float = 1.0 - lr_eff * weight_decay
+        else:
+            lr_eff = step_size
+            decay_eff = param_decay
+        new_params: dict[str, Array] = {}
+        for name in params:
+            if f_gate:
+                scaled = (utility[name] / bias_correction) / global_max
+                if gate_beta != 1.0:
+                    scaled = gate_beta * scaled
+                descent = grads[name] * (1.0 - jax.nn.sigmoid(scaled))
+            else:
+                descent = grads[name]
+            value = params[name] * decay_eff - lr_eff * descent
+            if f_init:
+                value = value + (lr_eff * weight_decay) * state.init_params[name]
+            new_params[name] = value
+        if f_wreset:
+            new_params["w1"] = jnp.where(
+                shifted[:, None], state.init_params["w1"], new_params["w1"]
+            )
+        if f_rms:
+            accuracy = (jnp.argmax(logits) == y).astype(jnp.float32)
+            loss_after, _ = loss_fn(new_params, x_used, y)
+            plasticity = jnp.clip(
+                1.0 - loss_after / jnp.maximum(loss, _PLASTICITY_LOSS_FLOOR), 0.0, 1.0
+            )
+            metrics: StepMetrics = (accuracy, loss, plasticity)
+        else:
+            metrics = _step_metrics(new_params, x_used, y, loss, logits)
+        delta_e = loss - state.err_slow
+        return new_params, DiscoveredRuleState(  # type: ignore[call-arg]
+            utility=utility,
+            step=count,
+            norm=new_norm,
+            fast_mean=new_fast,
+            init_params=state.init_params,
+            err_fast=surprise_fast * state.err_fast + (1.0 - surprise_fast) * loss,
+            err_slow=surprise_slow * state.err_slow + (1.0 - surprise_slow) * loss,
+            err_autocorr=_DISCOVERED_AUTOCORR_DECAY * state.err_autocorr
+            + (1.0 - _DISCOVERED_AUTOCORR_DECAY) * (delta_e * state.err_prev_delta),
+            err_var=_DISCOVERED_AUTOCORR_DECAY * state.err_var
+            + (1.0 - _DISCOVERED_AUTOCORR_DECAY) * (delta_e * delta_e),
+            err_prev_delta=delta_e,
+        ), metrics
+
+    return init_fn, full_step
+
+
+# =============================================================================
 # (f) UPGD-W + per-layer weight clipping (Elsayed, Lan, Lyle & Mahmood, 2024)
 # =============================================================================
 
@@ -4370,6 +4647,133 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             ),
         )
     )
+    # --- Automated update-rule discovery promotions (rule_discovery lane).
+    # Top-3 discovered compositions from the micro-suite search
+    # (outputs/rule_discovery/search_v1.json): every one beat the
+    # budget-matched tuned champion-form baseline on the held-out micro
+    # tasks (M4 + M1', disjoint seeds) AND on the canonical Gaussian
+    # cross-suite (incl. the recurrence family). Constants are translated
+    # VERBATIM from the discovered genomes (micro-scale-tuned; that
+    # timescale mismatch is part of what this screen measures). All three
+    # dropped the utility gate and adopted the error-gated plasticity
+    # budget (surprise_budget) + hidden RMS normalization.
+    discovered_rules: tuple[tuple[str, dict[str, float], str], ...] = (
+        (
+            "disc_r1",
+            {
+                "flag_norm": 1.0, "flag_shift_reset": 1.0, "flag_gate": 0.0,
+                "flag_decay_to_init": 0.0, "flag_surprise_budget": 1.0,
+                "flag_meta_decay": 0.0, "flag_utility_shift_reset": 0.0,
+                "flag_w1_shift_reset": 0.0, "flag_hidden_rms": 1.0,
+                "step_size": 0.0370901404621786,
+                "weight_decay": 0.0001,
+                "norm_decay": 0.9911066947977325,
+                "fast_decay": 0.8549893343448638,
+                "shift_k": 0.7131297990024876,
+                "utility_decay": 0.9998283837753099,
+                "gate_beta": 0.3374290896461889,
+                "surprise_gain": 0.8360796272754669,
+                "surprise_fast": 0.9642297768592835,
+                "surprise_slow": 0.9996305719081341,
+                "meta_gain": 2.142298936843872,
+            },
+            "Discovered rule 1 (micro holdout 0.6859 vs tuned baseline "
+            "0.6165): shift-adaptive input norm + surprise-gated global "
+            "step-size budget + hidden RMS; no utility gate.",
+        ),
+        (
+            "disc_r2",
+            {
+                "flag_norm": 1.0, "flag_shift_reset": 1.0, "flag_gate": 0.0,
+                "flag_decay_to_init": 1.0, "flag_surprise_budget": 1.0,
+                "flag_meta_decay": 0.0, "flag_utility_shift_reset": 0.0,
+                "flag_w1_shift_reset": 0.0, "flag_hidden_rms": 1.0,
+                "step_size": 0.04385333652867646,
+                "weight_decay": 0.008445640828094932,
+                "norm_decay": 0.9645936290647181,
+                "fast_decay": 0.9056834226846695,
+                "shift_k": 0.6461113343143648,
+                "utility_decay": 0.9999295508763486,
+                "gate_beta": 0.4251058611416944,
+                "surprise_gain": 0.5519864782691002,
+                "surprise_fast": 0.9655785930156708,
+                "surprise_slow": 0.9996083702106141,
+                "meta_gain": 0.5,
+            },
+            "Discovered rule 2 (micro holdout 0.6763): shift-adaptive norm "
+            "+ L2-Init pull (decay-to-init) + surprise budget + hidden RMS; "
+            "no utility gate.",
+        ),
+        (
+            "disc_r3",
+            {
+                "flag_norm": 1.0, "flag_shift_reset": 0.0, "flag_gate": 0.0,
+                "flag_decay_to_init": 1.0, "flag_surprise_budget": 1.0,
+                "flag_meta_decay": 0.0, "flag_utility_shift_reset": 0.0,
+                "flag_w1_shift_reset": 1.0, "flag_hidden_rms": 1.0,
+                "step_size": 0.04512338013332415,
+                "weight_decay": 0.0004368518845358173,
+                "norm_decay": 0.9405970575467439,
+                "fast_decay": 0.8795402854681015,
+                "shift_k": 1.6857961908692085,
+                "utility_decay": 0.9,
+                "gate_beta": 0.28608835742384475,
+                "surprise_gain": 0.5698174573481083,
+                "surprise_fast": 0.9263452136516571,
+                "surprise_slow": 0.9996180875840047,
+                "meta_gain": 2.1990984678268433,
+            },
+            "Discovered rule 3 (micro holdout 0.6752): fast EMA norm (no "
+            "count reset) + detector-triggered w1 row reinit + L2-Init "
+            "pull + surprise budget + hidden RMS; no utility gate.",
+        ),
+    )
+    for disc_name, disc_hp, disc_description in discovered_rules:
+        specs.append(
+            ScreeningSpec(
+                name=disc_name,
+                base_learner="upgd_w",
+                mechanism="discovered_rule",
+                hyperparameters=_discovered_rule_hp(**disc_hp),
+                factory=_make_discovered_rule_learner,
+                frozen_probe_input=_ema_frozen_probe_input,
+                description=disc_description,
+            )
+        )
+    # Structure-vs-constants dissection of disc_r1 (the strongest discovered
+    # rule, which lost -0.080 to the champion at its verbatim micro-tuned
+    # constants while beating the published UPGD-W control +0.006): the same
+    # discovered composition (surprise budget, no utility gate) at the
+    # champion-scale constants, with hidden RMS isolated as its own axis
+    # (hidden RMS measured -0.0186 on the champion in the sigma0 star).
+    for diag_name, diag_rms, diag_axis in (
+        ("disc_r1_pscale", 1.0, "with hidden RMS"),
+        ("disc_r1_pscale_norms", 0.0, "without hidden RMS"),
+    ):
+        specs.append(
+            ScreeningSpec(
+                name=diag_name,
+                base_learner="upgd_w",
+                mechanism="discovered_rule_diagnostic",
+                hyperparameters=_discovered_rule_hp(
+                    flag_norm=1.0,
+                    flag_shift_reset=1.0,
+                    flag_surprise_budget=1.0,
+                    flag_hidden_rms=diag_rms,
+                    surprise_gain=0.8360796272754669,
+                    surprise_fast=0.9642297768592835,
+                    surprise_slow=0.9996305719081341,
+                ),
+                factory=_make_discovered_rule_learner,
+                frozen_probe_input=_ema_frozen_probe_input,
+                description=(
+                    "disc_r1 structure at champion-scale constants "
+                    f"({diag_axis}): shift-adaptive norm + surprise-gated "
+                    "step-size budget, no utility gate; lr/wd/decays from "
+                    "sigma0_shiftnorm_d099."
+                ),
+            )
+        )
     # --- Pre-registered existential control: no backprop, no MLP.
     specs.append(
         ScreeningSpec(
