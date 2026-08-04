@@ -232,3 +232,62 @@ permutation from first-order statistics* — the transient is not a
 combinatorial free lunch. Identification-first architectures need either
 higher-order fingerprints or recurrence (context re-use, direction D)
 to pay for themselves.
+
+## Automated discovery results (2026-08-03, finalize lane — no lane artifacts)
+
+Two automated-discovery lanes were scheduled to extend the validation wave
+above: (1) a **`micro_continual`** lane — a micro continual-learning suite
+(new module + tests) intended to measure suite transfer-validity and report
+discovered rules to `outputs/micro_continual/`; (2) a further
+**`ipmnist_screening`** lane — new arms screened against the incumbent's
+0.86396 (~0.8640) 60-task screen (`sigma0_shiftnorm_d099`), with promotion
+on the standing +0.002 paired bar. This section is the honest close-out by
+the finalize lane at its poll deadline; refutations and no-results are
+reported at the same rank as promotions.
+
+- **`micro_continual` lane: NO ARTIFACTS.** At the deadline no module, no
+  tests, and no `outputs/micro_continual/` directory exist anywhere in the
+  tree, and no lane process was running at any poll. Suite transfer-validity
+  is therefore **unassessed**, no rules were discovered, and nothing is
+  promoted. This is a no-start/no-artifact report, not an in-flight
+  snapshot.
+- **`ipmnist_screening` lane: NO NEW SHARDS.** The newest shards remain the
+  `naive_bayes` round committed at 14:11 (d5e5269); zero shards, logs, or
+  job files appeared after 14:12. **No promotion attempt against the 0.8640
+  screen bar occurred**, so the outcome column is empty by absence, not by
+  rejection: **the champion stands — `sigma0_shiftnorm_d099` 0.86449 ±
+  0.00009 (n=20, 200 tasks; held-out seeds 3-19: 0.86447 ± 0.00009)**, with
+  `l2init_ema_norm` 0.86457 (seeds 0-2) statistically tied as CO-BEST.
+- **Verified green on the committed state (this finalize pass):** 161
+  screening tests pass (`tests/test_ipmnist_screening.py`, includes the
+  `naive_bayes` pins) and ruff is clean on the lane files
+  (`alberta_framework/benchmarks/ipmnist_screening.py`,
+  `tests/test_ipmnist_screening.py`). Nothing here upgrades any claim:
+  all campaign numbers remain `development_screening_diagnostic`,
+  nonpromoting.
+
+Resume commands (for whoever restarts the lanes):
+
+```bash
+# poll targets (what this lane watched):
+ls outputs/micro_continual/ 2>/dev/null
+find outputs/ipmnist_screening/shards -newermt "2026-08-03 14:12" -type f
+
+# screening lane — one atomic idempotent shard per (arm, seed):
+.venv/bin/python -m alberta_framework.benchmarks.ipmnist_screening run \
+  --config-name <arm-in-SCREENING_REGISTRY> --seed <s> \
+  --out outputs/ipmnist_screening/shards/<arm>_seed<s>.json
+
+# merge to a NEW summary path (never overwrite pinned summaries):
+.venv/bin/python -m alberta_framework.benchmarks.ipmnist_screening merge \
+  --shards outputs/ipmnist_screening/shards/*.json \
+  --control-name upgd_w_control \
+  --output outputs/ipmnist_screening/summary_<new_wave>.json
+
+# micro_continual lane — no partial state exists to resume; rebuild
+# failing-test-first (tests/test_micro_continual*.py + module), write
+# artifacts only under outputs/micro_continual/ (a NEW path).
+```
+
+`FINAL_REPORT.md` is unchanged by this pass — its update was conditional on
+a confirmed promotion, and none occurred.
