@@ -1372,7 +1372,15 @@ def _make_upgd_warmnorm_learner(
 @chex.dataclass(frozen=True)
 class DiscoveredRuleState:
     """Discovered-rule carry: champion normalizer statistics + init snapshot
-    + error-signal scalars (surprise-budget and meta-decay inputs)."""
+    + error-signal scalars (surprise-budget and meta-decay inputs).
+
+    Wave-2 fields (rule-DSL expansion): per-feature Kalman posterior
+    uncertainty, the closed-form RLS ensemble head over the last hidden
+    layer, the streaming naive-Bayes ensemble member, and the vote-accuracy
+    EMAs (net, rls, nb). All are always allocated (cheap at protocol scale);
+    only enabled mechanisms touch them, so disabled flags leave the traced
+    champion step bit-exact.
+    """
 
     utility: dict[str, Array]
     step: Array
@@ -1384,6 +1392,13 @@ class DiscoveredRuleState:
     err_autocorr: Array
     err_var: Array
     err_prev_delta: Array
+    kalman_p: Array
+    rls_p: Array
+    rls_w: Array
+    nb_mean: Array
+    nb_var: Array
+    nb_count: Array
+    member_acc: Array
 
 
 _DISCOVERED_RULE_DEFAULTS: dict[str, float] = {
@@ -1396,6 +1411,12 @@ _DISCOVERED_RULE_DEFAULTS: dict[str, float] = {
     "flag_utility_shift_reset": 0.0,
     "flag_w1_shift_reset": 0.0,
     "flag_hidden_rms": 0.0,
+    "flag_rls_head": 0.0,
+    "flag_rls_reset_p": 0.0,
+    "flag_nb_member": 0.0,
+    "flag_lr_anneal": 0.0,
+    "flag_layer_lr": 0.0,
+    "flag_kalman_norm": 0.0,
     "step_size": 0.01,
     "weight_decay": 0.01,
     "norm_decay": 0.99,
@@ -1410,12 +1431,30 @@ _DISCOVERED_RULE_DEFAULTS: dict[str, float] = {
     "surprise_slow": 0.999,
     "meta_gain": 2.0,
     "hidden_rms_epsilon": 1e-8,
+    "rls_lambda": 0.999,
+    "nb_decay": 0.98,
+    "vote_decay": 0.99,
+    "anneal_lo": 0.5,
+    "anneal_hi": 2.0,
+    "layer_lr_ratio": 1.0,
+    "kalman_q": 0.001,
     "noise_std": 0.0,
 }
 
 #: Fixed decay of the error autocorrelation/variance EMAs (meta-decay input);
 #: mirrors ``rule_discovery._AUTOCORR_DECAY``.
 _DISCOVERED_AUTOCORR_DECAY = 0.99
+#: Wave-2 rule-DSL constants; mirror their ``rule_discovery`` twins exactly
+#: so translated genomes reproduce the searched semantics.
+_DISCOVERED_RLS_P0 = 10.0
+_DISCOVERED_RLS_VOTE_TEMP = 4.0
+_DISCOVERED_RLS_SCORE_CLIP = 25.0
+_DISCOVERED_NB_VAR_FLOOR = 1e-3
+_DISCOVERED_ANNEAL_R_HI = 2.0
+_DISCOVERED_KALMAN_SHIFT_BOOST = 25.0
+_DISCOVERED_LAYER_EXPONENT: dict[str, float] = {
+    "w1": -1.0, "b1": -1.0, "w2": 0.0, "b2": 0.0, "w3": 1.0, "b3": 1.0,
+}
 
 
 def _discovered_rule_hp(**overrides: float) -> dict[str, float]:
@@ -1448,6 +1487,12 @@ def _make_discovered_rule_learner(
     f_ureset = hp["flag_utility_shift_reset"] != 0.0
     f_wreset = hp["flag_w1_shift_reset"] != 0.0
     f_rms = hp["flag_hidden_rms"] != 0.0
+    f_rls = hp["flag_rls_head"] != 0.0
+    f_rls_reset = hp["flag_rls_reset_p"] != 0.0
+    f_nb = hp["flag_nb_member"] != 0.0
+    f_anneal = hp["flag_lr_anneal"] != 0.0
+    f_layer = hp["flag_layer_lr"] != 0.0
+    f_kalman = hp["flag_kalman_norm"] != 0.0
     step_size = hp["step_size"]
     weight_decay = hp["weight_decay"]
     param_decay = 1.0 - step_size * weight_decay
@@ -1463,6 +1508,13 @@ def _make_discovered_rule_learner(
     surprise_slow = hp["surprise_slow"]
     meta_gain = hp["meta_gain"]
     rms_epsilon = hp["hidden_rms_epsilon"]
+    rls_lambda = hp["rls_lambda"]
+    nb_decay = hp["nb_decay"]
+    vote_decay = hp["vote_decay"]
+    anneal_lo = hp["anneal_lo"]
+    anneal_hi = hp["anneal_hi"]
+    layer_lr_ratio = hp["layer_lr_ratio"]
+    kalman_q = hp["kalman_q"]
 
     def _rms_loss(params: dict[str, Array], x: Array, y: Array) -> tuple[Array, Array]:
         z1 = x @ params["w1"] + params["b1"]
@@ -1474,9 +1526,23 @@ def _make_discovered_rule_learner(
 
     loss_fn = _rms_loss if f_rms else cross_entropy_loss
 
+    def _loss_with_hidden(
+        params: dict[str, Array], x: Array, y: Array
+    ) -> tuple[Array, tuple[Array, Array]]:
+        """Loss + (logits, penultimate activation) — the RLS head's feature."""
+        h1 = jax.nn.relu(x @ params["w1"] + params["b1"])
+        if f_rms:
+            h1 = _hidden_rms_normalize(h1, rms_epsilon)
+        h2 = jax.nn.relu(h1 @ params["w2"] + params["b2"])
+        if f_rms:
+            h2 = _hidden_rms_normalize(h2, rms_epsilon)
+        logits = h2 @ params["w3"] + params["b3"]
+        return -jax.nn.log_softmax(logits)[y], (logits, h2)
+
     def init_fn(params: dict[str, Array]) -> DiscoveredRuleState:
         input_dim = params["w1"].shape[0]
         n_classes = params["b3"].shape[0]
+        rls_dim = params["b2"].shape[0] + 1
         chance = jnp.asarray(math.log(float(n_classes)), jnp.float32)
         return DiscoveredRuleState(  # type: ignore[call-arg]
             utility={name: jnp.zeros_like(value) for name, value in params.items()},
@@ -1493,6 +1559,13 @@ def _make_discovered_rule_learner(
             err_autocorr=jnp.asarray(0.0, jnp.float32),
             err_var=jnp.asarray(0.0, jnp.float32),
             err_prev_delta=jnp.asarray(0.0, jnp.float32),
+            kalman_p=jnp.ones(input_dim, dtype=jnp.float32),
+            rls_p=_DISCOVERED_RLS_P0 * jnp.eye(rls_dim, dtype=jnp.float32),
+            rls_w=jnp.zeros((rls_dim, n_classes), dtype=jnp.float32),
+            nb_mean=jnp.zeros((n_classes, input_dim), dtype=jnp.float32),
+            nb_var=jnp.ones((n_classes, input_dim), dtype=jnp.float32),
+            nb_count=jnp.zeros(n_classes, dtype=jnp.float32),
+            member_acc=jnp.full((3,), 1.0 / float(n_classes), dtype=jnp.float32),
         )
 
     def _general_normalize(
@@ -1529,6 +1602,51 @@ def _make_discovered_rule_learner(
             mean=new_mean, var=new_var, count=new_count
         ), new_fast, shifted
 
+    def _kalman_normalize(
+        norm: EMANormState, fast_mean: Array, kalman_p: Array, x: Array,
+        err_autocorr: Array, err_var: Array,
+    ) -> tuple[Array, EMANormState, Array, Array, Array]:
+        """Wave-2 conditioning alternative: per-feature predict-update Kalman
+        mean tracking (process noise ``kalman_q`` scaled to the tracked
+        variance; detected shifts reinflate the posterior uncertainty when
+        ``flag_shift_reset`` composes), EMA variance as the observation-noise
+        estimate. Mirrors ``rule_discovery.rule_step``'s kalman path."""
+        effective_fast = jnp.minimum(fast_decay, 1.0 - 1.0 / (norm.count + 2.0))
+        new_fast = effective_fast * fast_mean + (1.0 - effective_fast) * x
+        threshold = shift_k * jnp.sqrt(norm.var) + shift_delta
+        shifted = jnp.abs(new_fast - norm.mean) > threshold
+        count_base = jnp.where(shifted, 0.0, norm.count) if f_shift_reset else norm.count
+        new_count = count_base + 1.0
+        if f_meta:
+            autocorr_score = jnp.clip(err_autocorr / (err_var + 1e-8), 0.0, 1.0)
+            decay_used = jnp.clip(
+                1.0 - (1.0 - norm_decay) * (1.0 + meta_gain * autocorr_score),
+                0.5,
+                norm_decay,
+            )
+        else:
+            decay_used = jnp.asarray(norm_decay, jnp.float32)
+        effective_decay = jnp.minimum(decay_used, 1.0 - 1.0 / (new_count + 1.0))
+        delta = x - norm.mean
+        r_obs = jnp.maximum(norm.var, 1e-8)
+        p_pred = kalman_p + kalman_q * r_obs
+        if f_shift_reset:
+            p_pred = p_pred + (
+                shifted.astype(jnp.float32) * _DISCOVERED_KALMAN_SHIFT_BOOST * r_obs
+            )
+        gain = p_pred / (p_pred + r_obs)
+        new_mean = norm.mean + gain * delta
+        new_kalman_p = (1.0 - gain) * p_pred
+        delta2 = x - new_mean
+        new_var = jnp.maximum(
+            effective_decay * norm.var + (1.0 - effective_decay) * delta * delta2,
+            norm_epsilon,
+        )
+        normalized = (x - new_mean) / (jnp.sqrt(new_var) + norm_epsilon)
+        return normalized, EMANormState(  # type: ignore[call-arg]
+            mean=new_mean, var=new_var, count=new_count
+        ), new_fast, shifted, new_kalman_p
+
     def full_step(
         params: dict[str, Array],
         state: DiscoveredRuleState,
@@ -1537,7 +1655,13 @@ def _make_discovered_rule_learner(
         key: Array,
     ) -> tuple[dict[str, Array], DiscoveredRuleState, StepMetrics]:
         del key  # sigma-0 family: no perturbation, no randomness
-        if f_shift_reset and not f_meta:
+        new_kalman_p = state.kalman_p
+        if f_kalman:
+            x_norm, new_norm, new_fast, shifted, new_kalman_p = _kalman_normalize(
+                state.norm, state.fast_mean, state.kalman_p, x,
+                state.err_autocorr, state.err_var,
+            )
+        elif f_shift_reset and not f_meta:
             # Exact champion normalizer call (bit-exact reduction path).
             x_norm, new_norm, new_fast, shifted = shift_adaptive_normalize(
                 state.norm, state.fast_mean, x,
@@ -1553,9 +1677,15 @@ def _make_discovered_rule_learner(
                 state.norm, state.fast_mean, x, state.err_autocorr, state.err_var
             )
         x_used = x_norm if f_norm else x
-        (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-            params, x_used, y
-        )
+        hidden2: Array | None = None
+        if f_rls:
+            (loss, (logits, hidden2)), grads = jax.value_and_grad(
+                _loss_with_hidden, has_aux=True
+            )(params, x_used, y)
+        else:
+            (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+                params, x_used, y
+            )
         count = state.step + jnp.array(1, dtype=jnp.int32)
         prev_utility = state.utility
         if f_ureset:
@@ -1574,18 +1704,92 @@ def _make_discovered_rule_learner(
         global_max = jnp.max(
             jnp.stack([jnp.max(utility[name]) for name in sorted(params)])
         )
-        if f_budget:
+        ratio: Array | None = None
+        if f_budget or f_anneal:
             ratio = (state.err_fast + 1e-8) / (state.err_slow + 1e-8)
+        if f_budget:
+            assert ratio is not None
             budget = jnp.clip(
                 jnp.exp(surprise_gain * jnp.log(jnp.maximum(ratio, 1e-8))), 0.25, 4.0
             )
             lr_eff: Array | float = step_size * budget
-            decay_eff: Array | float = 1.0 - lr_eff * weight_decay
         else:
             lr_eff = step_size
+        if f_anneal:
+            # Task-clock-free within-task annealing: error ratio 1 (converged)
+            # runs at anneal_lo, ratio >= _DISCOVERED_ANNEAL_R_HI (fresh
+            # surprise) at anneal_hi. Mirrors rule_discovery.rule_step.
+            assert ratio is not None
+            surprise_score = jnp.clip(
+                (ratio - 1.0) / (_DISCOVERED_ANNEAL_R_HI - 1.0), 0.0, 1.0
+            )
+            lr_eff = lr_eff * (anneal_lo + (anneal_hi - anneal_lo) * surprise_score)
+        if f_budget or f_anneal:
+            decay_eff: Array | float = 1.0 - lr_eff * weight_decay
+        else:
             decay_eff = param_decay
+
+        # --- ensemble members (wave-2): pre-update readout state, the
+        # protocol's predict-then-update convention. Net member always votes.
+        rls_scores: Array | None = None
+        nb_ll: Array | None = None
+        ens_accuracy: Array | None = None
+        new_member_acc = state.member_acc
+        if f_rls or f_nb:
+            n_classes = state.rls_w.shape[1]
+            s_net = jax.nn.log_softmax(logits)
+            members = [s_net]
+            weights = [state.member_acc[0]]
+            if f_rls:
+                assert hidden2 is not None
+                h_aug = jnp.concatenate(
+                    [hidden2, jnp.ones((1,), dtype=jnp.float32)]
+                )
+                rls_scores = jnp.clip(
+                    h_aug @ state.rls_w,
+                    -_DISCOVERED_RLS_SCORE_CLIP,
+                    _DISCOVERED_RLS_SCORE_CLIP,
+                )
+                members.append(
+                    jax.nn.log_softmax(_DISCOVERED_RLS_VOTE_TEMP * rls_scores)
+                )
+                weights.append(state.member_acc[1])
+            if f_nb:
+                nb_var_safe = jnp.maximum(state.nb_var, _DISCOVERED_NB_VAR_FLOOR)
+                nb_ll = -0.5 * jnp.sum(
+                    jnp.log(nb_var_safe)
+                    + (x_used[None, :] - state.nb_mean) ** 2 / nb_var_safe,
+                    axis=1,
+                )
+                members.append(jax.nn.log_softmax(nb_ll / float(x_used.shape[0])))
+                weights.append(state.member_acc[2])
+            w_sum = sum(weights) + 1e-8
+            combined = sum(w * s for w, s in zip(weights, members)) / w_sum
+            ens_accuracy = (jnp.argmax(combined) == y).astype(jnp.float32)
+            hit_net = (jnp.argmax(s_net) == y).astype(jnp.float32)
+            hit_rls = (
+                (jnp.argmax(rls_scores) == y).astype(jnp.float32)
+                if rls_scores is not None
+                else state.member_acc[1]
+            )
+            hit_nb = (
+                (jnp.argmax(nb_ll) == y).astype(jnp.float32)
+                if nb_ll is not None
+                else state.member_acc[2]
+            )
+            hits = jnp.stack([hit_net, hit_rls, hit_nb])
+            new_member_acc = vote_decay * state.member_acc + (1.0 - vote_decay) * hits
+            del n_classes
+
         new_params: dict[str, Array] = {}
         for name in params:
+            if f_layer:
+                lr_name: Array | float = lr_eff * (
+                    layer_lr_ratio ** _DISCOVERED_LAYER_EXPONENT[name]
+                )
+                decay_name: Array | float = 1.0 - lr_name * weight_decay
+            else:
+                lr_name, decay_name = lr_eff, decay_eff
             if f_gate:
                 scaled = (utility[name] / bias_correction) / global_max
                 if gate_beta != 1.0:
@@ -1593,21 +1797,72 @@ def _make_discovered_rule_learner(
                 descent = grads[name] * (1.0 - jax.nn.sigmoid(scaled))
             else:
                 descent = grads[name]
-            value = params[name] * decay_eff - lr_eff * descent
+            value = params[name] * decay_name - lr_name * descent
             if f_init:
-                value = value + (lr_eff * weight_decay) * state.init_params[name]
+                value = value + (lr_name * weight_decay) * state.init_params[name]
             new_params[name] = value
         if f_wreset:
             new_params["w1"] = jnp.where(
                 shifted[:, None], state.init_params["w1"], new_params["w1"]
             )
-        if f_rms:
+
+        # --- wave-2 readout-state updates (post-prediction).
+        new_rls_p, new_rls_w = state.rls_p, state.rls_w
+        if f_rls:
+            assert hidden2 is not None
+            h_aug = jnp.concatenate([hidden2, jnp.ones((1,), dtype=jnp.float32)])
+            ph = state.rls_p @ h_aug
+            k_rls = ph / (rls_lambda + h_aug @ ph)
+            rls_err = (
+                jax.nn.one_hot(y, state.rls_w.shape[1], dtype=jnp.float32)
+                - h_aug @ state.rls_w
+            )
+            new_rls_w = state.rls_w + jnp.outer(k_rls, rls_err)
+            p_upd = (state.rls_p - jnp.outer(k_rls, ph)) / rls_lambda
+            rls_eye = _DISCOVERED_RLS_P0 * jnp.eye(
+                state.rls_p.shape[0], dtype=jnp.float32
+            )
+            leak = 2.0 * (1.0 - rls_lambda)
+            p_upd = (1.0 - leak) * p_upd + leak * rls_eye
+            p_upd = 0.5 * (p_upd + p_upd.T)
+            if f_rls_reset:
+                reset_p = jnp.max(shifted.astype(jnp.float32))
+                p_upd = (1.0 - reset_p) * p_upd + reset_p * rls_eye
+            new_rls_p = p_upd
+        new_nb_mean, new_nb_var, new_nb_count = (
+            state.nb_mean, state.nb_var, state.nb_count
+        )
+        if f_nb:
+            n_classes_nb = state.nb_mean.shape[0]
+            sel = jax.nn.one_hot(y, n_classes_nb, dtype=jnp.float32)
+            eff_nb = jnp.minimum(
+                nb_decay, 1.0 - 1.0 / (state.nb_count + 2.0)
+            )[:, None]
+            delta_nb = x_used[None, :] - state.nb_mean
+            mean_cand = state.nb_mean + (1.0 - eff_nb) * delta_nb
+            new_nb_mean = state.nb_mean + sel[:, None] * (mean_cand - state.nb_mean)
+            delta2_nb = x_used[None, :] - new_nb_mean
+            var_cand = jnp.maximum(
+                eff_nb * state.nb_var + (1.0 - eff_nb) * delta_nb * delta2_nb,
+                _DISCOVERED_NB_VAR_FLOOR,
+            )
+            new_nb_var = state.nb_var + sel[:, None] * (var_cand - state.nb_var)
+            new_nb_count = state.nb_count + sel
+
+        if f_rls or f_nb:
+            assert ens_accuracy is not None
+            loss_after, _ = loss_fn(new_params, x_used, y)
+            plasticity = jnp.clip(
+                1.0 - loss_after / jnp.maximum(loss, _PLASTICITY_LOSS_FLOOR), 0.0, 1.0
+            )
+            metrics: StepMetrics = (ens_accuracy, loss, plasticity)
+        elif f_rms:
             accuracy = (jnp.argmax(logits) == y).astype(jnp.float32)
             loss_after, _ = loss_fn(new_params, x_used, y)
             plasticity = jnp.clip(
                 1.0 - loss_after / jnp.maximum(loss, _PLASTICITY_LOSS_FLOOR), 0.0, 1.0
             )
-            metrics: StepMetrics = (accuracy, loss, plasticity)
+            metrics = (accuracy, loss, plasticity)
         else:
             metrics = _step_metrics(new_params, x_used, y, loss, logits)
         delta_e = loss - state.err_slow
@@ -1624,6 +1879,13 @@ def _make_discovered_rule_learner(
             err_var=_DISCOVERED_AUTOCORR_DECAY * state.err_var
             + (1.0 - _DISCOVERED_AUTOCORR_DECAY) * (delta_e * delta_e),
             err_prev_delta=delta_e,
+            kalman_p=new_kalman_p,
+            rls_p=new_rls_p,
+            rls_w=new_rls_w,
+            nb_mean=new_nb_mean,
+            nb_var=new_nb_var,
+            nb_count=new_nb_count,
+            member_acc=new_member_acc,
         ), metrics
 
     return init_fn, full_step
@@ -3070,6 +3332,633 @@ def _naive_bayes_frozen_probe_input(
         "sentinel probes are unsupported for the naive_bayes arm: there is "
         "no trained protocol MLP to probe (the deployed model is the "
         "streaming class-conditional Gaussian statistics)"
+    )
+
+
+# =============================================================================
+# (w) rls_head — champion body + recursive-least-squares readout
+# =============================================================================
+#
+# The convergence-shortfall attack (CEILING_ANALYSIS.md maps 0.029 of the
+# champion's error to within-task convergence speed: plateau 0.9037 vs the
+# 0.933 family asymptote).  The ``sigma0_shiftnorm_d099`` champion body
+# (shift-adaptive EMA-norm decay 0.99 + utility-gated sigma-0 SGD + decoupled
+# decay) is kept; the deployed readout becomes streaming recursive least
+# squares on the 150-dim penultimate ReLU features (bias-augmented), which is
+# exactly optimal for its squared-error objective at every step and converges
+# in ~d samples instead of the SGD head's thousands (RFF+RLS precedent:
+# 0.848 with a *random* 1024-dim body).
+#
+# Design decisions (probed by the arm family):
+#
+# (a) Targets: one-hot least-squares regression + argmax — the standard
+#     streaming-classification practice (the rff_rls/lin_rls precedent).
+#     Softmax/logistic targets admit no exact RLS recursion (IRLS-style
+#     approximations forfeit the closed-form optimality that motivates the
+#     arm), and distilling the parallel SGD head's softmax outputs cannot
+#     beat its teacher; one-hot regression is therefore fixed by design.
+# (b) Forgetting factor ``rls_lambda`` in {0.995, 0.999, 1.0} — RLS's own
+#     staleness knob — plus an optional detector-driven P reset
+#     (``rls_reset_frac`` <= 1 enables): when the champion's own per-feature
+#     shift detector flags more than that fraction of input features in one
+#     step, P resets to ``eye/ridge`` (readout weights are KEPT — the reset
+#     restores estimation gain without discarding the mapping, mirroring the
+#     normalizer's count reset).
+# (c) Body error signal: ``head_resid=0`` trains body AND a parallel SGD
+#     head with the exact champion update (safer; the six MLP tensors are
+#     bit-exact the champion trajectory, pinned) — the RLS head is a pure
+#     passenger readout.  ``head_resid=1`` backpropagates the RLS head's own
+#     squared-error residual into the body (cleanest single error signal);
+#     w3/b3 then pass through untouched, and the utility gate's global-max
+#     normalization is guarded at zero utility (neutral gate 0.5) because a
+#     zero readout yields exactly zero body gradients at stream start.
+#
+# Reduction pin: ``rls_ridge_init = inf`` gives P = 0 exactly, so the head
+# is frozen at wout = 0 and every prediction is the degenerate constant
+# argmax(0) = class 0 (measurable: accuracy = P[y == 0]).  The reported loss
+# is the pre-update squared error 0.5*||onehot - logits||^2 (NOT comparable
+# with the MLP arms' CE; accuracy is the protocol metric) and plasticity is
+# the protocol's post-update one-step improvement on that same loss
+# (head update only — the rff_rls precedent).
+
+
+@chex.dataclass(frozen=True)
+class RLSHeadState:
+    """Champion-body carry plus the RLS readout on penultimate features.
+
+    ``utility``/``step`` are the champion's utility EMA and clock (over all
+    six tensors in parallel mode; the four body tensors in resid mode carry
+    the signal, the head tensors' utility stays zero).  ``norm``/``fast_mean``
+    are the shift-adaptive normalizer.  ``p`` is the (h2+1, h2+1) inverse
+    feature-correlation matrix and ``wout`` the (h2+1, n_classes) one-vs-all
+    readout on bias-augmented penultimate features.
+    """
+
+    utility: dict[str, Array]
+    step: Array
+    norm: EMANormState
+    fast_mean: Array
+    p: Array
+    wout: Array
+
+
+_RLS_HEAD_BODY = ("w1", "b1", "w2", "b2")
+
+
+def _rls_head_hp(**overrides: float) -> dict[str, float]:
+    """Champion (``sigma0_shiftnorm_d099``) constants plus RLS-head defaults.
+
+    ``rls_reset_frac`` defaults untriggerable (2.0 > any shifted fraction),
+    which is bitwise the plain no-reset path (build-time composition,
+    pinned).  ``head_resid`` selects the body error signal (0 = parallel
+    champion SGD head, 1 = RLS residual).
+    """
+    merged = {
+        "step_size": 0.01,
+        "weight_decay": 0.01,
+        "utility_decay": 0.9999,
+        "noise_std": 0.0,
+        "norm_decay": 0.99,
+        "norm_epsilon": 1e-8,
+        "fast_decay": 0.9,
+        "shift_k": 1.0,
+        "shift_delta": 0.02,
+        "shift_refractory": 0.0,
+        "rls_lambda": 0.999,
+        "rls_ridge_init": 1.0,
+        "rls_reset_frac": 2.0,
+        "rls_p_trace_cap": 0.0,
+        "head_resid": 0.0,
+    }
+    merged.update(overrides)
+    return merged
+
+
+def _make_rls_head_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Champion body + streaming-RLS readout on the penultimate features.
+
+    Per step (predict-then-update, the protocol ordering):
+
+    1. ``x_norm`` via the champion's :func:`shift_adaptive_normalize`
+       (identical constants and call).
+    2. ``phi = concat(a2 / sqrt(h2 + 1), [1])`` from the PRE-update body
+       (``a2`` = second hidden ReLU activation); pre-update prediction
+       ``argmax(wout.T @ phi)`` scores the protocol's online accuracy.
+    3. Body update — ``head_resid = 0``: exact champion arithmetic (the
+       gated sigma-0 SGD step of ``_make_adaptive_norm_sigma0_learner``) on
+       the cross-entropy gradient through the parallel SGD head w3/b3;
+       ``head_resid = 1``: the same gated step on
+       ``d(0.5*||onehot - wout.T @ phi||^2)/d(body)`` with ``wout`` held
+       constant (w3/b3 untouched, zero-utility gate guarded to 0.5).
+    4. Sherman-Morrison RLS with forgetting ``rls_lambda`` (symmetrized P,
+       the rff_rls equations), then the optional detector-driven P reset
+       (``mean(shifted) >= rls_reset_frac`` => ``p = eye/ridge``, wout kept).
+
+    The harness RNG key is deliberately unused (sigma-0 family, closed-form
+    head).
+    """
+    step_size = hp["step_size"]
+    utility_decay = hp["utility_decay"]
+    param_decay = 1.0 - step_size * hp["weight_decay"]
+    rls_lambda = hp["rls_lambda"]
+    ridge_init = hp["rls_ridge_init"]
+    reset_frac = hp["rls_reset_frac"]
+    reset_enabled = reset_frac <= 1.0
+    trace_cap = hp["rls_p_trace_cap"]
+    cap_enabled = trace_cap > 0.0
+    resid = hp["head_resid"] != 0.0
+
+    def normalize(
+        state: EMANormState, fast_mean: Array, x: Array
+    ) -> tuple[Array, EMANormState, Array, Array]:
+        return shift_adaptive_normalize(
+            state, fast_mean, x,
+            decay=hp["norm_decay"],
+            fast_decay=hp["fast_decay"],
+            epsilon=hp["norm_epsilon"],
+            shift_k=hp["shift_k"],
+            shift_delta=hp["shift_delta"],
+            shift_refractory=hp["shift_refractory"],
+        )
+
+    def init_fn(params: dict[str, Array]) -> RLSHeadState:
+        input_dim = params["w1"].shape[0]
+        m = params["w2"].shape[1] + 1
+        n_classes = params["w3"].shape[1]
+        return RLSHeadState(  # type: ignore[call-arg]
+            utility={name: jnp.zeros_like(value) for name, value in params.items()},
+            step=jnp.array(0, dtype=jnp.int32),
+            norm=EMANormState(  # type: ignore[call-arg]
+                mean=jnp.zeros(input_dim, dtype=jnp.float32),
+                var=jnp.ones(input_dim, dtype=jnp.float32),
+                count=jnp.zeros(input_dim, dtype=jnp.float32),
+            ),
+            fast_mean=jnp.zeros(input_dim, dtype=jnp.float32),
+            p=jnp.eye(m, dtype=jnp.float32) / ridge_init,
+            wout=jnp.zeros((m, n_classes), dtype=jnp.float32),
+        )
+
+    def _phi(params: dict[str, Array], x_norm: Array) -> Array:
+        m = params["w2"].shape[1] + 1
+        a1 = jax.nn.relu(x_norm @ params["w1"] + params["b1"])
+        a2 = jax.nn.relu(a1 @ params["w2"] + params["b2"])
+        scale = 1.0 / math.sqrt(m)
+        return jnp.concatenate([a2 * scale, jnp.ones((1,), jnp.float32)])
+
+    def _gated_sgd(
+        params: dict[str, Array],
+        grads: dict[str, Array],
+        utility: dict[str, Array],
+        count: Array,
+        names: tuple[str, ...],
+        guard_zero_max: bool,
+    ) -> tuple[dict[str, Array], dict[str, Array]]:
+        """Champion utility-EMA + global-max sigmoid gate + gated decayed SGD
+        over ``names``; other tensors pass through with untouched utility."""
+        new_utility = dict(utility)
+        for name in names:
+            new_utility[name] = utility_decay * utility[name] + (
+                1.0 - utility_decay
+            ) * (-grads[name] * params[name])
+        bias_correction = 1.0 - jnp.power(
+            jnp.asarray(utility_decay, dtype=jnp.float32), count.astype(jnp.float32)
+        )
+        global_max = jnp.max(
+            jnp.stack([jnp.max(new_utility[name]) for name in sorted(names)])
+        )
+        if guard_zero_max:
+            global_max = jnp.where(global_max == 0.0, 1.0, global_max)
+        new_params = dict(params)
+        for name in names:
+            new_params[name] = params[name] * param_decay - step_size * (
+                grads[name]
+                * (
+                    1.0
+                    - jax.nn.sigmoid(
+                        (new_utility[name] / bias_correction) / global_max
+                    )
+                )
+            )
+        return new_params, new_utility
+
+    def full_step(
+        params: dict[str, Array],
+        state: RLSHeadState,
+        x: Array,
+        y: Array,
+        key: Array,
+    ) -> tuple[dict[str, Array], RLSHeadState, StepMetrics]:
+        del key  # sigma-0 body, closed-form head: no randomness consumed
+        x_norm, new_norm, new_fast, shifted = normalize(
+            state.norm, state.fast_mean, x
+        )
+        count = state.step + jnp.array(1, dtype=jnp.int32)
+        n_classes = state.wout.shape[1]
+        y_onehot = jax.nn.one_hot(y, n_classes, dtype=jnp.float32)
+        if resid:
+            body = {name: params[name] for name in _RLS_HEAD_BODY}
+
+            def head_loss(
+                body_params: dict[str, Array],
+            ) -> tuple[Array, tuple[Array, Array]]:
+                merged = dict(params)
+                merged.update(body_params)
+                phi = _phi(merged, x_norm)
+                logits = state.wout.T @ phi
+                err = y_onehot - logits
+                return 0.5 * jnp.sum(err * err), (logits, phi)
+
+            (loss, (logits, phi)), body_grads = jax.value_and_grad(
+                head_loss, has_aux=True
+            )(body)
+            new_params, new_utility = _gated_sgd(
+                params, body_grads, state.utility, count,
+                _RLS_HEAD_BODY, guard_zero_max=True,
+            )
+        else:
+            _, grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+                params, x_norm, y
+            )
+            new_params, new_utility = _gated_sgd(
+                params, grads, state.utility, count,
+                tuple(sorted(params)), guard_zero_max=False,
+            )
+            phi = _phi(params, x_norm)
+            logits = state.wout.T @ phi
+            err_pre = y_onehot - logits
+            loss = 0.5 * jnp.sum(err_pre * err_pre)
+        accuracy = (jnp.argmax(logits) == y).astype(jnp.float32)
+        err = y_onehot - logits
+        pp = state.p @ phi
+        gain = pp / (rls_lambda + phi @ pp)
+        new_wout = state.wout + jnp.outer(gain, err)
+        new_p = (state.p - jnp.outer(gain, pp)) / rls_lambda
+        new_p = 0.5 * (new_p + new_p.T)
+        if reset_enabled:
+            m = new_p.shape[0]
+            trigger = jnp.mean(shifted.astype(jnp.float32)) >= reset_frac
+            new_p = jnp.where(
+                trigger, jnp.eye(m, dtype=jnp.float32) / ridge_init, new_p
+            )
+        if cap_enabled:
+            # Covariance wind-up guard: exponential forgetting grows P as
+            # (1/lambda)^t along unexcited (dead-ReLU) feature directions —
+            # float32 overflow and prediction collapse (wave-1 measurement:
+            # onset ~ task 18 at lambda 0.999, exactly the e^88.7 overflow
+            # horizon).  Rescale P to the trace cap whenever it exceeds it;
+            # under the cap the step is bitwise untouched.
+            new_p = new_p * jnp.minimum(1.0, trace_cap / jnp.trace(new_p))
+        err_after = y_onehot - new_wout.T @ phi
+        loss_after = 0.5 * jnp.sum(err_after * err_after)
+        plasticity = jnp.clip(
+            1.0 - loss_after / jnp.maximum(loss, _PLASTICITY_LOSS_FLOOR), 0.0, 1.0
+        )
+        return new_params, RLSHeadState(  # type: ignore[call-arg]
+            utility=new_utility,
+            step=count,
+            norm=new_norm,
+            fast_mean=new_fast,
+            p=new_p,
+            wout=new_wout,
+        ), (accuracy, loss, plasticity)
+
+    return init_fn, full_step
+
+
+def _rls_head_frozen_probe_input(
+    state: Any, observation: Array, hyperparameters: Mapping[str, float]
+) -> Array:
+    """Refuse sentinel probes for the RLS-readout arms.
+
+    The deployed prediction is ``argmax(wout.T @ phi)``, not ``mlp_logits``:
+    in resid mode w3/b3 are never trained, and in parallel mode probing the
+    SGD head would silently score the passenger model instead of the
+    deployed readout.  Fail closed, the rff_rls/naive_bayes precedent.
+    """
+    del state, observation, hyperparameters
+    raise NotImplementedError(
+        "sentinel probes are unsupported for the rls_head arms: the deployed "
+        "model is the champion body + RLS readout, not the protocol MLP head "
+        "that the probe harness would score"
+    )
+
+
+# =============================================================================
+# (v2) Transient attack: champion/NB ensemble with online learned vote weights
+# =============================================================================
+#
+# CEILING_ANALYSIS.md budget (i): the champion pays 0.041 of the metric in
+# within-task re-adaptation transient (first-500-step accuracy 0.659 vs its
+# 0.904 plateau), while the naive_bayes arm is FLAT from the first task
+# (~0.785 per-task from t1, no transient) because its per-class statistics
+# re-estimate at the fast-EMA timescale.  The ensemble deploys an
+# accuracy-weighted probability mixture whose weights are learned ONLINE from
+# the stream itself: per-member annealed EMAs of each member's own pre-update
+# correctness (fast decay, no oracle, no task-boundary signal), squashed
+# through a softmax with temperature ``ens_beta``.  Right after a permutation
+# the champion's recent-accuracy EMA collapses within tens of steps while the
+# NB member's holds, so the vote swings to NB; mid-task the champion
+# re-converges above NB and takes the vote back.  Probes: (b) detector-driven
+# NB anneal-clock reset (make the NB member itself shift-robust) and (c) a
+# third closed-form fast-converging member, linear RLS over normalized pixels
+# (the ``lin_rls`` pipeline verbatim).
+
+
+@chex.dataclass(frozen=True)
+class NBEnsembleState:
+    """Member states + online vote-weight statistics for the NB ensemble.
+
+    ``member_acc`` holds one annealed recent-accuracy EMA per member in the
+    fixed order (champion MLP, naive Bayes[, linear RLS]); ``ens_step`` is
+    its scalar anneal clock.  ``det_norm``/``det_fast`` are the raw-input
+    shift detector for the NB reset probe (``None`` when the probe is off);
+    ``reset_age`` counts steps since the last NB clock reset (refractory).
+    ``rls`` is the optional third member's state (``None`` on 2-member arms).
+    """
+
+    net: UPGDAdaptiveNormState
+    nb: NaiveBayesState
+    rls: RFFRLSState | None
+    member_acc: Array
+    ens_step: Array
+    det_norm: EMANormState | None
+    det_fast: Array | None
+    reset_age: Array
+
+
+def _nb_ensemble_hp(**overrides: float) -> dict[str, float]:
+    """Ensemble hyperparameters: champion + NB + lin_rls constants verbatim,
+    plus the ensemble's own vote/probe knobs (inert flags default off)."""
+    merged = _sigma0_ext_hp(
+        # Champion member: verbatim sigma0_shiftnorm_d099.
+        norm_decay=0.99,
+        fast_decay=0.9,
+        shift_k=1.0,
+        shift_delta=0.02,
+        shift_refractory=0.0,
+        # NB member: verbatim naive_bayes.
+        nb_decay=0.98,
+        nb_var_epsilon=0.1,
+        # Online vote weights, frozen by the 3-round 2-task seed-0
+        # diagnostic (decay {0.95,0.98,0.99,0.995,0.999} x beta
+        # {10,20,40,80,160}): mean rises monotonically to (0.995, 80) =
+        # 0.8496 (t1 .8328/t2 .8664 vs champion .7848/.8652 in the same
+        # loop); beta 160 and decay 0.999 both turn down.
+        ens_decay=0.995,
+        ens_beta=80.0,
+        # Reduction pin + probe flags.
+        ens_lock_network=0.0,
+        ens_use_rls=0.0,
+        ens_nb_reset=0.0,
+        # Reset trigger, calibrated on the seed-0 raw-pixel detector trace:
+        # boundary-step shifted-feature fraction .034-.061 vs mid-task p99
+        # .0077 (max .0179) — 0.03 separates them with ~2x margin both ways.
+        ens_reset_frac=0.03,
+        ens_reset_refractory=500.0,
+        # Linear-RLS member: verbatim lin_rls.
+        rff_clip=3.0,
+        rls_lambda=0.999,
+        rls_ridge_init=1.0,
+    )
+    merged.update(overrides)
+    return merged
+
+
+def _make_nb_ensemble_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Adaptive ensemble of the shiftnorm champion and streaming naive Bayes.
+
+    Per step (predict-then-update, the protocol ordering):
+
+    1. Each member's pre-update class log-posterior is computed exactly as
+       that member's own arm computes it (champion: ``mlp_logits`` on the
+       shift-adaptive-normalized input; NB: :func:`naive_bayes_logits`;
+       optional RLS: readout on clipped z-scores).  The deployed prediction
+       is the log-domain accuracy-weighted probability mixture
+       ``log sum_m w_m p_m(c)`` with ``w = softmax(ens_beta * member_acc)``;
+       the reported loss is the mixture cross-entropy at the true label.
+    2. Every member then runs its own arm's exact update on ``(x, y)``.
+       Member correctness (each member's own pre-update accuracy metric)
+       updates ``member_acc`` with the annealed recurrence
+       ``min(ens_decay, 1 - 1/(t + 1))`` — running-average semantics early,
+       fast fixed-decay tracking later.  No oracle anywhere: the weights are
+       learned from the stream.
+    3. Probe (b) (``ens_nb_reset``): a raw-input
+       :func:`shift_adaptive_normalize` detector (champion constants)
+       reports the per-feature shifted mask; when more than
+       ``ens_reset_frac`` of features shift and the last reset is at least
+       ``ens_reset_refractory`` steps old, the NB member's class anneal
+       clocks reset to zero so its statistics re-estimate at effective decay
+       1/2 (means/variances are not zeroed).
+    4. Probe (c) (``ens_use_rls``): a third member, the ``lin_rls`` pipeline
+       verbatim (bias-augmented clipped z-scores, Sherman-Morrison RLS).
+
+    ``ens_lock_network=1`` is the reduction pin: the deployed prediction,
+    loss, and plasticity are the champion member's own metrics bit-for-bit
+    (the registered ``sigma0_shiftnorm_d099`` step), while the member EMAs
+    still learn passively.  Plasticity in ensemble mode is the protocol's
+    post-update one-step improvement ratio on the same mixture cross-entropy
+    at unchanged vote weights.  The RNG key is deliberately unused (all
+    members are closed-form or sigma-0).
+    """
+    lock = hp["ens_lock_network"] != 0.0
+    use_rls = hp["ens_use_rls"] != 0.0
+    nb_reset = hp["ens_nb_reset"] != 0.0
+    ens_decay = hp["ens_decay"]
+    ens_beta = hp["ens_beta"]
+    reset_frac = hp["ens_reset_frac"]
+    reset_refractory = hp["ens_reset_refractory"]
+    norm_decay = hp["norm_decay"]
+    norm_epsilon = hp["norm_epsilon"]
+    fast_decay = hp["fast_decay"]
+    shift_k = hp["shift_k"]
+    shift_delta = hp["shift_delta"]
+    shift_refractory = hp["shift_refractory"]
+    rls_clip = hp["rff_clip"]
+    n_members = 3 if use_rls else 2
+
+    net_init, net_step = _make_upgd_shiftnorm_learner(hp)
+    nb_init, nb_step = _make_naive_bayes_learner(hp)
+    lin_init, lin_step = _make_lin_rls_learner(hp)
+
+    def init_fn(params: dict[str, Array]) -> NBEnsembleState:
+        input_dim = params["w1"].shape[0]
+        det_norm: EMANormState | None = None
+        det_fast: Array | None = None
+        if nb_reset:
+            det_norm = EMANormState(  # type: ignore[call-arg]
+                mean=jnp.zeros(input_dim, dtype=jnp.float32),
+                var=jnp.ones(input_dim, dtype=jnp.float32),
+                count=jnp.zeros(input_dim, dtype=jnp.float32),
+            )
+            det_fast = jnp.zeros(input_dim, dtype=jnp.float32)
+        return NBEnsembleState(  # type: ignore[call-arg]
+            net=net_init(params),
+            nb=nb_init(params),
+            rls=lin_init(params) if use_rls else None,
+            member_acc=jnp.zeros(n_members, dtype=jnp.float32),
+            ens_step=jnp.asarray(0.0, jnp.float32),
+            det_norm=det_norm,
+            det_fast=det_fast,
+            # Armed at init: the first mature detected shift may reset.
+            reset_age=jnp.asarray(reset_refractory, jnp.float32),
+        )
+
+    def _lin_features(state: RFFRLSState, x: Array) -> Array:
+        """The lin_rls feature map (pre-update statistics, no state write)."""
+        x_norm, _ = ema_normalize(state.norm, x, norm_decay, norm_epsilon)
+        z = jnp.clip(x_norm, -rls_clip, rls_clip)
+        return jnp.concatenate(
+            [z / jnp.sqrt(jnp.float32(z.shape[0])), jnp.ones((1,), jnp.float32)]
+        )
+
+    def _members_update(
+        params: dict[str, Array],
+        state: NBEnsembleState,
+        x: Array,
+        y: Array,
+        key: Array,
+    ) -> tuple[dict[str, Array], NBEnsembleState, StepMetrics]:
+        """Run every member's own update; learn the vote weights passively."""
+        new_params, new_net, net_metrics = net_step(params, state.net, x, y, key)
+        _, new_nb, nb_metrics = nb_step(params, state.nb, x, y, key)
+        member_correct = [net_metrics[0], nb_metrics[0]]
+        new_rls = state.rls
+        if use_rls:
+            assert state.rls is not None
+            _, new_rls, rls_metrics = lin_step(params, state.rls, x, y, key)
+            member_correct.append(rls_metrics[0])
+        det_norm, det_fast, reset_age = state.det_norm, state.det_fast, state.reset_age
+        if nb_reset:
+            assert state.det_norm is not None and state.det_fast is not None
+            _, det_norm, det_fast, shifted = shift_adaptive_normalize(
+                state.det_norm,
+                state.det_fast,
+                x,
+                decay=norm_decay,
+                fast_decay=fast_decay,
+                epsilon=norm_epsilon,
+                shift_k=shift_k,
+                shift_delta=shift_delta,
+                shift_refractory=0.0,
+            )
+            frac = jnp.mean(shifted.astype(jnp.float32))
+            trigger = (frac > reset_frac) & (state.reset_age >= reset_refractory)
+            new_nb = NaiveBayesState(  # type: ignore[call-arg]
+                cmean=new_nb.cmean,
+                cvar=new_nb.cvar,
+                ccount=jnp.where(trigger, 0.0, new_nb.ccount),
+                prior=new_nb.prior,
+                step=new_nb.step,
+            )
+            reset_age = jnp.where(trigger, 0.0, state.reset_age + 1.0)
+        count = state.ens_step + 1.0
+        eff = jnp.minimum(ens_decay, 1.0 - 1.0 / (count + 1.0))
+        member_acc = eff * state.member_acc + (1.0 - eff) * jnp.stack(member_correct)
+        new_state = NBEnsembleState(  # type: ignore[call-arg]
+            net=new_net,
+            nb=new_nb,
+            rls=new_rls,
+            member_acc=member_acc,
+            ens_step=count,
+            det_norm=det_norm,
+            det_fast=det_fast,
+            reset_age=reset_age,
+        )
+        return new_params, new_state, net_metrics
+
+    if lock:
+
+        def lock_step(
+            params: dict[str, Array],
+            state: NBEnsembleState,
+            x: Array,
+            y: Array,
+            key: Array,
+        ) -> tuple[dict[str, Array], NBEnsembleState, StepMetrics]:
+            # Reduction pin: metrics AND params are the champion member's
+            # bit-for-bit; the ensemble statistics still learn passively.
+            return _members_update(params, state, x, y, key)
+
+        return init_fn, lock_step
+
+    def full_step(
+        params: dict[str, Array],
+        state: NBEnsembleState,
+        x: Array,
+        y: Array,
+        key: Array,
+    ) -> tuple[dict[str, Array], NBEnsembleState, StepMetrics]:
+        # Pre-update member posteriors: each computed exactly as the member's
+        # own arm computes them (the normalize call is re-derived, not
+        # state-written; the member update below performs the real write).
+        x_norm, _, _, _ = shift_adaptive_normalize(
+            state.net.norm,
+            state.net.fast_mean,
+            x,
+            decay=norm_decay,
+            fast_decay=fast_decay,
+            epsilon=norm_epsilon,
+            shift_k=shift_k,
+            shift_delta=shift_delta,
+            shift_refractory=shift_refractory,
+        )
+        member_logp = [
+            jax.nn.log_softmax(mlp_logits(params, x_norm)),
+            jax.nn.log_softmax(naive_bayes_logits(state.nb, x)),
+        ]
+        phi: Array | None = None
+        if use_rls:
+            assert state.rls is not None
+            phi = _lin_features(state.rls, x)
+            member_logp.append(jax.nn.log_softmax(state.rls.wout.T @ phi))
+        log_w = jax.nn.log_softmax(ens_beta * state.member_acc)
+        mixture = jax.nn.log_softmax(
+            jax.nn.logsumexp(jnp.stack(member_logp) + log_w[:, None], axis=0)
+        )
+        accuracy = (jnp.argmax(mixture) == y).astype(jnp.float32)
+        loss = -mixture[y]
+        new_params, new_state, _ = _members_update(params, state, x, y, key)
+        # Plasticity: post-update mixture improvement at unchanged weights.
+        member_logp_after = [
+            jax.nn.log_softmax(mlp_logits(new_params, x_norm)),
+            jax.nn.log_softmax(naive_bayes_logits(new_state.nb, x)),
+        ]
+        if use_rls:
+            assert new_state.rls is not None and phi is not None
+            member_logp_after.append(
+                jax.nn.log_softmax(new_state.rls.wout.T @ phi)
+            )
+        mixture_after = jax.nn.log_softmax(
+            jax.nn.logsumexp(jnp.stack(member_logp_after) + log_w[:, None], axis=0)
+        )
+        loss_after = -mixture_after[y]
+        plasticity = jnp.clip(
+            1.0 - loss_after / jnp.maximum(loss, _PLASTICITY_LOSS_FLOOR), 0.0, 1.0
+        )
+        return new_params, new_state, (accuracy, loss, plasticity)
+
+    return init_fn, full_step
+
+
+def _nb_ensemble_frozen_probe_input(
+    state: Any, observation: Array, hyperparameters: Mapping[str, float]
+) -> Array:
+    """Refuse sentinel probes for the nb_ensemble arms.
+
+    The deployed predictor is the accuracy-weighted member mixture, not the
+    protocol MLP alone: probing ``mlp_logits`` on the champion member would
+    silently score a different model than the one the arm deploys.  Fail
+    closed, exactly like the other non-MLP deployments.
+    """
+    del state, observation, hyperparameters
+    raise NotImplementedError(
+        "sentinel probes are unsupported for the nb_ensemble arms: the "
+        "deployed predictor is the accuracy-weighted member mixture, not "
+        "the protocol MLP alone"
     )
 
 
@@ -4861,6 +5750,190 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             ),
         )
     )
+    # --- Transient attack (CEILING_ANALYSIS budget (i)): adaptive ensemble
+    # of the sigma0_shiftnorm_d099 champion and the naive_bayes tracker.
+    # Vote weights are learned ONLINE from per-member recent-accuracy EMAs
+    # (softmax temperature ens_beta); no oracle, no task-boundary signal.
+    for ens_name, ens_overrides, ens_extra in (
+        (
+            "nb_ensemble_champion",
+            {},
+            "the base two-member vote (champion MLP + naive Bayes)",
+        ),
+        (
+            "nb_ensemble_nbreset",
+            {"ens_nb_reset": 1.0},
+            "plus detector-driven NB anneal-clock resets (probe b: "
+            "shift-robust NB statistics; champion detector constants, "
+            "trigger frac 0.03 from the seed-0 boundary/mid-task "
+            "separation, refractory 500)",
+        ),
+        (
+            "nb_ensemble_rls3",
+            {"ens_use_rls": 1.0},
+            "plus a third closed-form member, linear RLS over normalized "
+            "pixels (probe c: lin_rls pipeline verbatim)",
+        ),
+    ):
+        specs.append(
+            ScreeningSpec(
+                name=ens_name,
+                base_learner="upgd_w",
+                mechanism="transient_ensemble",
+                hyperparameters=_nb_ensemble_hp(**ens_overrides),
+                factory=_make_nb_ensemble_learner,
+                frozen_probe_input=_nb_ensemble_frozen_probe_input,
+                description=(
+                    "Adaptive champion/NB ensemble (transient attack): "
+                    "accuracy-weighted probability mixture with online vote "
+                    "weights from annealed per-member correctness EMAs — "
+                    + ens_extra
+                    + ". Member constants verbatim from their arms; "
+                    "ens_decay 0.995 / ens_beta 80 frozen at the 3-round "
+                    "2-task seed-0 diagnostic argmax (0.8496 vs champion "
+                    "0.8250 in the same loop) before the screen."
+                ),
+            )
+        )
+    # --- Convergence-shortfall attack (CEILING_ANALYSIS budget: 0.904
+    # plateau vs 0.933 family asymptote): champion body + streaming-RLS
+    # readout on the penultimate features (section (w) factory).  Constants
+    # frozen by the 2-task seed-0 diagnostic (champion 0.825 in the same
+    # loop): lambda star .8302/.8361/.8217 for 0.995/0.999/1.0 with the
+    # task-1 AND task-2 gains the mechanism predicts; P-reset threshold
+    # 0.05 calibrated from the detector's shifted fraction (within-task max
+    # 0.018, boundary step 0.061 — 2.8x margin); residual-driven body kept
+    # at lambda 0.999 only (its lambda-0.995 variant collapsed to 0.105 on
+    # task 2 — a fast-forgetting head is unstable as the body's error
+    # signal; ledgered, not registered).
+    for rls_name, rls_overrides, rls_extra in (
+        (
+            "rls_head_l0999",
+            {"rls_lambda": 0.999},
+            "forgetting 0.999 (the diagnostic winner, +0.011 over the "
+            "champion at 2 tasks)",
+        ),
+        (
+            "rls_head_l0995",
+            {"rls_lambda": 0.995},
+            "forgetting 0.995 (fast staleness discount; best diagnostic "
+            "task-1)",
+        ),
+        (
+            "rls_head_l1",
+            {"rls_lambda": 1.0},
+            "no forgetting (growing-window exact least squares; the "
+            "staleness control)",
+        ),
+        (
+            "rls_head_l0999_preset005",
+            {"rls_lambda": 0.999, "rls_reset_frac": 0.05},
+            "forgetting 0.999 plus the detector-driven P reset (probe b: "
+            "reuse the champion's shift detector; 2-task read -0.0066 on "
+            "task 2, screened across 59 boundaries anyway)",
+        ),
+        (
+            "rls_head_resid",
+            {"rls_lambda": 0.999, "head_resid": 1.0},
+            "body trained from the RLS head's own residual (probe c, "
+            "cleanest error signal; best diagnostic task-2, 0.8774)",
+        ),
+        # Wave 2 — wind-up stabilized.  Wave-1 measurement: every lambda<1
+        # arm collapsed to chance mid-screen (P grows as (1/lambda)^t along
+        # unexcited dead-ReLU feature directions; float32 overflow ~ e^88.7
+        # ~ 88k steps ~ task 18 at lambda 0.999 — the observed onset), a
+        # failure mode the dense-feature rff_rls precedent could never see.
+        # lambda=1 cannot wind up (P is nonincreasing PSD); staleness is
+        # handled by the detector-driven P reset instead of by forgetting.
+        (
+            "rls_head_l1_preset005",
+            {"rls_lambda": 1.0, "rls_reset_frac": 0.05},
+            "no forgetting + detector-driven P reset at the calibrated 0.05 "
+            "fraction (wind-up-immune staleness handling: exact LS within a "
+            "task, fresh gain at detected shifts)",
+        ),
+        (
+            "rls_head_l1_preset003",
+            {"rls_lambda": 1.0, "rls_reset_frac": 0.03},
+            "no forgetting + P reset at the more sensitive 0.03 fraction "
+            "(1.7x margin over the within-task detector maximum; catches "
+            "weaker boundaries at 59-boundary scale)",
+        ),
+        (
+            "rls_head_l0999_pcap",
+            {"rls_lambda": 0.999, "rls_p_trace_cap": 1e4},
+            "forgetting 0.999 with the P trace cap 1e4 (66x the init trace; "
+            "salvages the forgetting mechanism as a bounded probe)",
+        ),
+        (
+            "rls_head_resid_l1_preset005",
+            {"rls_lambda": 1.0, "rls_reset_frac": 0.05, "head_resid": 1.0},
+            "residual-driven body on the wind-up-immune head (probe c "
+            "rerun on the stable configuration)",
+        ),
+        # Wave 3 — ridge star.  2-task seed-0 diagnostic: the initial/reset
+        # ridge is the head's convergence-speed knob (P0 = I/ridge bounds
+        # the earliest gains); means .8328/.8465/.8530/.8578/.8596 for
+        # ridge 1.0/0.3/0.1/0.03/0.01 (champion 0.825), monotone toward
+        # small ridge, with the gain on BOTH the from-scratch task (t1
+        # .8426 at 0.01 vs champion .7848) and the post-shift task.  The
+        # residual body reruns at small ridge (.8648 at 2 tasks, family
+        # best: a fast-converging head makes its residual reliable early).
+        (
+            "rls_head_l0999_preset005_r01",
+            {"rls_lambda": 0.999, "rls_reset_frac": 0.05,
+             "rls_ridge_init": 0.1},
+            "forgetting 0.999 + P reset 0.05 + ridge 0.1 (diag2 ridge-star "
+            "winner)",
+        ),
+        (
+            "rls_head_l0999_preset005_r003",
+            {"rls_lambda": 0.999, "rls_reset_frac": 0.05,
+             "rls_ridge_init": 0.03},
+            "forgetting 0.999 + P reset 0.05 + ridge 0.03",
+        ),
+        (
+            "rls_head_l0999_preset005_r001",
+            {"rls_lambda": 0.999, "rls_reset_frac": 0.05,
+             "rls_ridge_init": 0.01},
+            "forgetting 0.999 + P reset 0.05 + ridge 0.01 (smallest probed "
+            "ridge; frontier still rising at 2 tasks)",
+        ),
+        (
+            "rls_head_resid_preset005_r01",
+            {"rls_lambda": 0.999, "rls_reset_frac": 0.05,
+             "rls_ridge_init": 0.1, "head_resid": 1.0},
+            "residual-driven body at ridge 0.1 + P reset (family-best "
+            "2-task diagnostic 0.8648; tests whether the small-ridge head "
+            "stabilizes the body-chases-head feedback loop that collapsed "
+            "at ridge 1.0 without resets)",
+        ),
+        (
+            "rls_head_resid_preset005_r001",
+            {"rls_lambda": 0.999, "rls_reset_frac": 0.05,
+             "rls_ridge_init": 0.01, "head_resid": 1.0},
+            "residual-driven body at ridge 0.01 + P reset (ridge direction "
+            "probe on the residual loop)",
+        ),
+    ):
+        specs.append(
+            ScreeningSpec(
+                name=rls_name,
+                base_learner="upgd_w",
+                mechanism="rls_readout",
+                hyperparameters=_rls_head_hp(**rls_overrides),
+                factory=_make_rls_head_learner,
+                frozen_probe_input=_rls_head_frozen_probe_input,
+                description=(
+                    "Champion body (shift-adaptive EMA-norm d099 + "
+                    "utility-gated sigma-0 SGD) with a streaming-RLS "
+                    "one-hot readout on the bias-augmented 150-dim "
+                    "penultimate features — " + rls_extra + ". One-hot LS "
+                    "regression + argmax by design (softmax/logistic "
+                    "targets admit no exact RLS recursion)."
+                ),
+            )
+        )
     # --- Optimizer-floor hybrid wave (section (s) factories): Adam-class
     # step adaptation under the champion's full stability package.  The
     # naive composition adamw_cbp_ema_norm proved Adam-class task-1

@@ -196,3 +196,102 @@ and the transient/optimizer terms dominate the deficit.
   *analytic* estimate of the unavoidable permutation-inference cost — the
   transfer-oracle itself was not implemented; carried-oracle horizons are 60
   tasks (curves flat well before the end).
+
+---
+
+## What number do we need
+
+**(2026-08-03 addendum — the honest target ladder, written after the
+transient-attack wave. All numbers are development diagnostics; artifacts in
+`outputs/ipmnist_screening/nb_ensemble/` and `confirm_full/`.)**
+
+The question section (3) leaves open is not "is 0.95 reachable" (settled: not
+in this family) but *what target is worth aiming at and what each rung
+actually means*. The record is **0.86449 ± 0.00009** (`sigma0_shiftnorm_d099`,
+n=20). Its residual error decomposes, freshly measured on the record champion
+itself (seed-0 per-step trace, 60 tasks, shifted tasks only):
+
+- within-task plateau **0.9015** (the shift-adaptive detector's mid-task
+  false triggers price ~0.002 of the 0.9037 family plateau — the detector
+  buys its boundary speed with a small stationary tax);
+- residual re-adaptation transient **0.0366** of the metric, of which
+  **0.0223 sits in the first 500 post-shift steps** and 0.0143 in the
+  500-4000 tail;
+- beyond the transient: the 5000-step convergence shortfall (plateau → 0.933
+  family asymptote, ~0.031 from this champion) and the optimizer floor
+  (0.933 → 0.974), proven non-importable by seven hybrid negatives.
+
+**The ladder** (each rung = a mechanism class fully cashed in, from 0.86449):
+
+| rung | number | what it means |
+|---|---|---|
+| record | 0.86449 | current champion, n=20 |
+| screen co-best | 0.8657 | `disc_r1_pscale_norms` (structure transfer) |
+| **this wave** | **0.86671 / 0.86678** | `nb_ensemble_nbreset` 60-task screen / 200-task confirm (seeds 0-2): +0.0022 paired over the champion on ALL seeds, 59/59 shifted tasks improved, horizon-stable (+0.0018 late-window) |
+| early window zeroed | ~0.887 | first-500 transient fully captured (+0.0223) — the ceiling of "fast member" ensembles/switches whose members re-estimate in ≤500 steps |
+| transient zeroed | ~0.9015 | the champion's own plateau; nothing left of budget (i) |
+| **0.90 (target)** | — | = capturing **97% of the measured residual transient** (0.0355/0.0366), or equivalently ~86% of the family's original 0.0413 transient budget; within 0.001 of the transient-zeroed line |
+| 0.8925 (milestone) | — | 76% of the residual transient: the whole 0-500 window plus ~half the tail |
+| solved-problem-class | 0.933 | family asymptote: transient AND 5000-step shortfall both zeroed; only the (unimportable) optimizer floor remains |
+| any-online-method | 0.974 | protocol AdamW stationary asymptote |
+| architecture cap | 0.981 | batch-converged 300x150 |
+
+So **0.90 is not an arbitrary round number: it is the transient-solved line**
+— and simultaneously the "within 0.03 of the 0.933 family asymptote" line,
+which is the natural *publish-grade* bar: a method scoring ≥0.90 here
+demonstrably operates within noise of its own measured mechanism ceiling,
+and the demonstration becomes defensible when paired with cross-protocol
+generality (the label-permuted EMNIST lane, where the same conditioning
+mechanisms must not collapse).
+
+**What this wave measured about reachability.** The adaptive champion/NB
+ensemble (`nb_ensemble_champion`: accuracy-weighted probability mixture,
+vote weights = online annealed per-member correctness EMAs, decay 0.995 /
+softmax temperature 80, no oracle) plus two probes:
+
+1. **The "flat naive Bayes" premise is refuted at step granularity.** The
+   standalone NB tracker looks flat per task (~0.785 from t1), but per-step
+   it has its own post-shift transient — first-500 shifted-task accuracy
+   0.634 vs the champion's 0.678. Task-level flatness was aliasing: NB's
+   class statistics are as stale after a permutation as anyone's; they just
+   re-estimate on a ~500-step window that a per-task average hides. A vote
+   between two similarly-transient members has almost nothing to switch to:
+   the bare ensemble gains only +0.00096 (mostly task-0 warmup, where NB
+   genuinely is ahead of a from-scratch net by +0.048).
+2. **Making the NB member itself shift-robust is what pays**
+   (`nb_ensemble_nbreset`): the raw-pixel shift detector (boundary
+   shifted-feature fraction 0.034-0.061 vs mid-task p99 0.0077 — a >2x
+   separation both ways, trigger frozen at 0.03) resets NB's per-class
+   anneal clocks, so its statistics re-estimate at effective decay 1/2.
+   Post-shift buckets vs champion: +0.069 (steps 50-100), +0.063 (100-250),
+   tie from 250 on; the vote swings to NB in 98% of tasks at mean step 121
+   (vs 15%/307 without the reset) and hands back with a measured -0.006
+   switch-back lag at 500-1000. Screen 0.86671, confirm 0.86678 ± 0.00037.
+3. **A third closed-form member (linear RLS over normalized pixels) adds
+   warmup only** (`nb_ensemble_rls3`: t1 +0.056, shifted tasks +0.0001):
+   its sufficient statistics are exactly as permutation-stale as NB's.
+
+**The measured wall.** Even a per-example oracle over {champion, NB} — pick
+whichever is right at every step — reaches only **0.8975** on shifted tasks
+(0.43/0.65/0.76 in the 0-50/50-100/100-250 buckets): in the first ~100
+post-shift steps *no member in the pool is right*, because every member's
+sufficient statistics were permuted. Ensembling redistributes accuracy that
+exists in the pool; it cannot create post-shift accuracy no member has. The
+nbreset ensemble captured 5.3% of the residual transient; the remaining 95%
+lives mostly below step 250. Reaching 0.90 therefore needs a mechanism whose
+*state survives the permutation*: identification is information-bounded at
+~2,000 samples for first-order statistics (NEW_DIRECTIONS V1), so the live
+candidates are higher-order/model-side identification, recurrence-indexed
+context reuse (direction D), or attacking the other budget entirely — the
+0.029 convergence shortfall (the `rls_head` lane). The honest reading: 0.90
+is reachable only if one of those classes lands; without them, the
+transient-attack ceiling for fast-member ensembles is the ~0.887 early-window
+line, and the measured state of the art on it is 0.8668.
+
+Reproduction: runner/analyzer + per-step and vote-weight traces in
+`outputs/ipmnist_screening/nb_ensemble/` (`nb_ensemble_runs.py`,
+`nb_ensemble_analyze.py`, `analysis_nb_ensemble_{champion,nbreset}_seed0.json`);
+screen shards `shards/nb_ensemble_*_seed{0,1,2}.json` merged in
+`summary_nb_ensemble.json`; 200-task confirmations
+`confirm_full/nb_ensemble_nbreset_seed*.json` (seeds 3-19 running at close of
+this pass — the 20-seed publication read follows their completion).

@@ -266,3 +266,45 @@ arms are noise-free). Results + interpretation: `FINAL_REPORT.md`
 comparison section; merged rankings in `summary_comparison.json` (control
 `upgd_w_control`) and `summary_comparison_vs_champion.json` (control
 `sigma0_ndecay099`) — separate files, `summary.json` untouched.
+
+## rls_head wave (2026-08-03) — champion body + streaming-RLS readout
+
+Convergence-shortfall attack (section (w) of `ipmnist_screening.py`):
+the `sigma0_shiftnorm_d099` champion body with a streaming recursive-
+least-squares one-hot readout on the bias-augmented 150-dim penultimate
+features. Design axes: forgetting factor `rls_lambda` {0.995, 0.999, 1.0},
+detector-driven P reset (`rls_reset_frac`, reusing the champion's shift
+detector; threshold 0.05 calibrated at 2.8x margin over the within-task
+detector maximum), initial/reset ridge, P trace cap, and the body error
+signal (`head_resid`: parallel champion SGD head vs the RLS residual).
+
+Verdicts (60-task screen, paired seeds 0-2; summary_rls_head.json):
+
+- **`rls_head_resid_l1_preset005` 0.86938 — new screen leader** (+0.0054
+  vs the champion 0.86396, +0.0037 vs `disc_r1_pscale_norms` 0.8657, all
+  seeds improve on both): residual-driven body on the wind-up-immune
+  head (lambda 1.0 + P reset). **200-task confirmation, n=20 (seeds
+  0-19, held-out 3-19 untouched until the screen passed): 0.87114 +/-
+  0.00010 vs the champion's 0.86449 +/- 0.00009 on the same seeds —
+  paired +0.00665 +/- 0.00013, all 20 seeds improve (min +0.0055),
+  late-window (t181-200) paired diff +0.0064 all-positive (drift-free),
+  no run collapses (min per-task 0.7322 = its own task 1).** Shards:
+  `confirm_rls_head/`; merged paired summary:
+  `summary_rls_head_confirm.json`. The 60-task screen is a bitwise
+  prefix of the 200-task runs (max abs diff 0.0, seeds 0-2). All
+  numbers remain development_screening_diagnostic, nonpromoting.
+- Every lambda<1 arm without resets collapsed (covariance wind-up on
+  sparse learned features; ledger #26); resid at ridge 1.0 without
+  resets collapsed by task 5-9 (ledger #27); small ridge won 2-task
+  diagnostics and lost the horizon (ledger #28).
+- The plateau question splits by mechanism (ledger #29): the readout
+  ALONE does not move the 0.904 within-task plateau (parallel arms
+  0.90443/0.90195), but the residual-trained body does — the winner
+  measures plateau 0.91490 (+0.0107, 37% of the 0.029 convergence
+  shortfall), a uniform ~+0.011 lift across steps 1000-5000 at a small
+  0-100-step boundary cost.
+
+Ops: shards via `worker.sh` (waves rls_jobs{,2,3}.txt, scratchpad);
+collapsed shards keep non-finite per-task losses and are excluded from
+merges by the validator. Merged ranking: `summary_rls_head.json`
+(control `upgd_w_control`; `summary.json` untouched).

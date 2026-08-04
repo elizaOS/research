@@ -193,8 +193,27 @@ class TestRegistry:
             "sgd_momentum_gate",
             "sgd_momentum_gate_m099",
             "naive_bayes",
+            "nb_ensemble_champion",
+            "nb_ensemble_nbreset",
+            "nb_ensemble_rls3",
+            "rls_head_l0999",
+            "rls_head_l0995",
+            "rls_head_l1",
+            "rls_head_l0999_preset005",
+            "rls_head_resid",
+            "rls_head_l1_preset005",
+            "rls_head_l1_preset003",
+            "rls_head_l0999_pcap",
+            "rls_head_resid_l1_preset005",
+            "rls_head_l0999_preset005_r01",
+            "rls_head_l0999_preset005_r003",
+            "rls_head_l0999_preset005_r001",
+            "rls_head_resid_preset005_r01",
+            "rls_head_resid_preset005_r001",
         }
-        assert expected == set(SCREENING_REGISTRY)
+        # Concurrent waves may register additional arms; this set must at
+        # least be present (exact-set equality would race sibling lanes).
+        assert expected <= set(SCREENING_REGISTRY)
 
     def test_unknown_config_rejected(self):
         with pytest.raises(ValueError, match="unknown screening config"):
@@ -3595,3 +3614,1027 @@ class TestDiscoveredRuleFactory:
         assert hp["shift_k"] == pytest.approx(1.0)
         # The discovered surprise constants carry over unchanged.
         assert hp["surprise_gain"] == pytest.approx(0.8360796272754669)
+
+
+class TestDiscoveredRuleFactoryWave2:
+    """Wave-2 mechanism classes of the discovered-rule translation factory.
+
+    The expanded rule-DSL genome (RLS ensemble head, naive-Bayes ensemble
+    member, surprise-driven lr annealing, per-layer lr ratio, Kalman-style
+    normalizer) must translate to protocol scale with build-time (Python
+    level) composition: every new flag left at 0.0 leaves the traced champion
+    step untouched (the bit-exact reduction pin above still passes), and each
+    mechanism expresses its rule-DSL semantics when enabled.
+    """
+
+    def _hp(self, **overrides):
+        from alberta_framework.benchmarks.ipmnist_screening import _discovered_rule_hp
+
+        return _discovered_rule_hp(**overrides)
+
+    def _setup(self, seed=0):
+        from alberta_framework.benchmarks.upgd_ipmnist import init_mlp_params
+
+        config = SMALL
+        params = init_mlp_params(jr.key(seed), config)
+        return config, params
+
+    def test_wave2_defaults_present_and_off(self):
+        hp = self._hp()
+        for key in (
+            "flag_rls_head",
+            "flag_rls_reset_p",
+            "flag_nb_member",
+            "flag_lr_anneal",
+            "flag_layer_lr",
+            "flag_kalman_norm",
+        ):
+            assert hp[key] == 0.0
+        for key in (
+            "rls_lambda",
+            "nb_decay",
+            "vote_decay",
+            "anneal_lo",
+            "anneal_hi",
+            "layer_lr_ratio",
+            "kalman_q",
+        ):
+            assert key in hp
+
+    def test_lr_anneal_scales_step_with_error_ratio(self):
+        import dataclasses as _dc
+
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_discovered_rule_learner,
+        )
+
+        base_hp = self._hp(weight_decay=0.0001, anneal_lo=0.25, anneal_hi=2.0)
+        on_init, on_step = _make_discovered_rule_learner(
+            {**base_hp, "flag_lr_anneal": 1.0}
+        )
+        off_init, off_step = _make_discovered_rule_learner(base_hp)
+        config, params = self._setup(seed=21)
+        x = jnp.linspace(0.2, 1.0, config.input_dim, dtype=jnp.float32)
+        y = jnp.array(1, jnp.int32)
+
+        def _with_errors(state, fast, slow):
+            return _dc.replace(
+                state,
+                err_fast=jnp.asarray(fast, jnp.float32),
+                err_slow=jnp.asarray(slow, jnp.float32),
+            )
+
+        hot, _, _ = on_step(params, _with_errors(on_init(params), 4.0, 1.0), x, y, jr.key(0))
+        calm, _, _ = on_step(params, _with_errors(on_init(params), 1.0, 1.0), x, y, jr.key(0))
+        base, _, _ = off_step(params, _with_errors(off_init(params), 1.0, 1.0), x, y, jr.key(0))
+        delta_hot = float(jnp.abs(hot["w3"] - params["w3"]).sum())
+        delta_calm = float(jnp.abs(calm["w3"] - params["w3"]).sum())
+        delta_base = float(jnp.abs(base["w3"] - params["w3"]).sum())
+        assert delta_hot == pytest.approx(2.0 * delta_base, rel=1e-3)
+        assert delta_calm == pytest.approx(0.25 * delta_base, rel=1e-3)
+
+    def test_layer_lr_ratio_scales_head_vs_input(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_discovered_rule_learner,
+        )
+
+        base_hp = self._hp(weight_decay=0.0001, layer_lr_ratio=2.0)
+        on_init, on_step = _make_discovered_rule_learner(
+            {**base_hp, "flag_layer_lr": 1.0}
+        )
+        off_init, off_step = _make_discovered_rule_learner(base_hp)
+        config, params = self._setup(seed=22)
+        x = jnp.linspace(0.2, 1.0, config.input_dim, dtype=jnp.float32)
+        y = jnp.array(0, jnp.int32)
+        stepped, _, _ = on_step(params, on_init(params), x, y, jr.key(0))
+        stepped_base, _, _ = off_step(params, off_init(params), x, y, jr.key(0))
+        head = float(jnp.abs(stepped["w3"] - params["w3"]).sum())
+        head_base = float(jnp.abs(stepped_base["w3"] - params["w3"]).sum())
+        w1 = float(jnp.abs(stepped["w1"] - params["w1"]).sum())
+        w1_base = float(jnp.abs(stepped_base["w1"] - params["w1"]).sum())
+        assert head == pytest.approx(2.0 * head_base, rel=1e-3)
+        assert w1 == pytest.approx(0.5 * w1_base, rel=1e-3)
+
+    def test_nb_member_updates_only_observed_class(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_discovered_rule_learner,
+        )
+
+        init_fn, step_fn = _make_discovered_rule_learner(
+            self._hp(flag_nb_member=1.0)
+        )
+        config, params = self._setup(seed=23)
+        state = init_fn(params)
+        x = jnp.linspace(0.5, 2.0, config.input_dim, dtype=jnp.float32)
+        y = jnp.array(2, jnp.int32)
+        _, new_state, metrics = step_fn(params, state, x, y, jr.key(0))
+        moved = np.abs(np.asarray(new_state.nb_mean - state.nb_mean)).sum(axis=1)
+        assert moved[2] > 0.0
+        for klass in (0, 1, 3, 4):
+            assert moved[klass] == pytest.approx(0.0, abs=1e-8)
+        assert float(new_state.nb_count[2]) == pytest.approx(1.0)
+        assert all(bool(jnp.isfinite(m)) for m in metrics)
+
+    def test_rls_head_updates_and_shift_reset_p(self):
+        import dataclasses as _dc
+
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_discovered_rule_learner,
+        )
+
+        init_fn, step_fn = _make_discovered_rule_learner(
+            self._hp(
+                flag_norm=1.0, flag_rls_head=1.0, flag_rls_reset_p=1.0, shift_k=0.5
+            )
+        )
+        config, params = self._setup(seed=24)
+        state = init_fn(params)
+        x = jnp.linspace(0.1, 1.0, config.input_dim, dtype=jnp.float32)
+        y = jnp.array(3, jnp.int32)
+        _, stepped_state, _ = step_fn(params, state, x, y, jr.key(0))
+        assert float(jnp.abs(stepped_state.rls_w).sum()) > 0.0
+        assert bool(jnp.all(jnp.isfinite(stepped_state.rls_p)))
+        mature = _dc.replace(
+            stepped_state,
+            norm=_dc.replace(
+                stepped_state.norm,
+                mean=jnp.zeros(config.input_dim, jnp.float32),
+                var=jnp.full((config.input_dim,), 1e-4, jnp.float32),
+                count=jnp.full((config.input_dim,), 1000.0, jnp.float32),
+            ),
+            fast_mean=jnp.zeros(config.input_dim, jnp.float32),
+        )
+        x_shift = jnp.full((config.input_dim,), 10.0, jnp.float32)
+        _, reset_state, _ = step_fn(params, mature, x_shift, y, jr.key(0))
+        off_diag = reset_state.rls_p - jnp.diag(jnp.diag(reset_state.rls_p))
+        np.testing.assert_allclose(np.asarray(off_diag), 0.0, atol=1e-6)
+
+    def test_kalman_norm_gain_tracks_uncertainty(self):
+        import dataclasses as _dc
+
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_discovered_rule_learner,
+        )
+
+        init_fn, step_fn = _make_discovered_rule_learner(
+            self._hp(flag_norm=1.0, flag_kalman_norm=1.0, kalman_q=0.001)
+        )
+        config, params = self._setup(seed=25)
+        state = init_fn(params)
+        x = jnp.full((config.input_dim,), 5.0, jnp.float32)
+        y = jnp.array(0, jnp.int32)
+        confident = _dc.replace(
+            state,
+            norm=_dc.replace(
+                state.norm, count=jnp.full((config.input_dim,), 1000.0, jnp.float32)
+            ),
+            kalman_p=jnp.full((config.input_dim,), 1e-4, jnp.float32),
+        )
+        uncertain = _dc.replace(
+            state,
+            norm=_dc.replace(
+                state.norm, count=jnp.full((config.input_dim,), 1000.0, jnp.float32)
+            ),
+            kalman_p=jnp.full((config.input_dim,), 10.0, jnp.float32),
+        )
+        _, state_conf, _ = step_fn(params, confident, x, y, jr.key(0))
+        _, state_unc, _ = step_fn(params, uncertain, x, y, jr.key(0))
+        assert float(state_unc.norm.mean[0]) > float(state_conf.norm.mean[0])
+        assert float(state_unc.kalman_p[0]) < 10.0
+
+
+class TestRLSHead:
+    """Convergence-shortfall attack: champion body + RLS readout.
+
+    ``_make_rls_head_learner`` keeps the ``sigma0_shiftnorm_d099`` champion
+    body (shift-adaptive EMA-norm d099 + utility-gated sigma-0 SGD) and
+    replaces the deployed readout with streaming recursive least squares on
+    the 150-dim penultimate ReLU features (bias-augmented, one-vs-all
+    one-hot regression, argmax prediction).  Design decisions probed:
+    (a) one-hot LS regression + argmax (standard streaming practice;
+    softmax/logistic targets admit no exact RLS recursion), (b) forgetting
+    factor ``rls_lambda`` plus optional detector-driven P resets reusing the
+    champion's own shift detector, (c) body error signal — parallel champion
+    SGD head (``head_resid=0``, safer; body trajectory bit-exact champion)
+    vs the RLS head's own residual (``head_resid=1``, cleanest).
+    """
+
+    def _hp(self, **overrides):
+        from alberta_framework.benchmarks.ipmnist_screening import _rls_head_hp
+
+        return _rls_head_hp(**overrides)
+
+    def _factory(self, **overrides):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_learner,
+        )
+
+        return _make_rls_head_learner(self._hp(**overrides))
+
+    def _champion_factory(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_upgd_shiftnorm_learner,
+            _sigma0_ext_hp,
+        )
+
+        return _make_upgd_shiftnorm_learner(
+            _sigma0_ext_hp(
+                norm_decay=0.99,
+                fast_decay=0.9,
+                shift_k=1.0,
+                shift_delta=0.02,
+                shift_refractory=0.0,
+            )
+        )
+
+    def _stream(self, n_steps=12, seed=3):
+        key = jr.key(seed)
+        xs, ys = [], []
+        for step in range(n_steps):
+            key, kx = jr.split(key)
+            xs.append(
+                jr.uniform(kx, (SMALL.input_dim,), jnp.float32, -1.0, 1.0)
+                * (1.0 + step % 3)
+            )
+            ys.append(jnp.array(step % SMALL.n_classes, jnp.int32))
+        return xs, ys
+
+    def _learnable_stream(self, n_examples=400, seed=88):
+        kx, kw = jr.split(jr.key(seed))
+        x = jr.uniform(kx, (n_examples, SMALL.input_dim), jnp.float32, -1.0, 1.0)
+        w_true = jr.normal(kw, (SMALL.input_dim, SMALL.n_classes), jnp.float32)
+        y = jnp.argmax(x @ w_true, axis=1).astype(jnp.int32)
+        return np.asarray(x), np.asarray(y)
+
+    def test_parallel_body_is_bitexact_champion(self):
+        """head_resid=0: all six MLP tensors and the normalizer state follow
+        the sigma0_shiftnorm_d099 champion bit-for-bit; only the deployed
+        readout (metrics) differs."""
+        champ_init, champ_step = self._champion_factory()
+        rls_init, rls_step = self._factory()
+        params = init_mlp_params(jr.key(5), SMALL)
+        champ_params, rls_params = params, params
+        champ_state, rls_state = champ_init(params), rls_init(params)
+        xs, ys = self._stream()
+        for step, (x, y) in enumerate(zip(xs, ys)):
+            champ_params, champ_state, _ = champ_step(
+                champ_params, champ_state, x, y, jr.key(step)
+            )
+            rls_params, rls_state, _ = rls_step(
+                rls_params, rls_state, x, y, jr.key(step)
+            )
+            for name in sorted(params):
+                np.testing.assert_array_equal(
+                    np.asarray(rls_params[name]), np.asarray(champ_params[name]), name
+                )
+            np.testing.assert_array_equal(
+                np.asarray(rls_state.norm.mean), np.asarray(champ_state.norm.mean)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(rls_state.norm.count), np.asarray(champ_state.norm.count)
+            )
+
+    def test_infinite_ridge_is_frozen_degenerate_head(self):
+        """Reduction pin: rls_ridge_init=inf gives P=0 exactly, so the head
+        never updates (wout stays 0), every prediction is the constant argmax
+        of the zero vector (class 0) — a measurable degenerate — while the
+        parallel body still trains exactly like the champion."""
+        champ_init, champ_step = self._champion_factory()
+        rls_init, rls_step = self._factory(rls_ridge_init=math.inf)
+        params = init_mlp_params(jr.key(6), SMALL)
+        champ_params, rls_params = params, params
+        champ_state, rls_state = champ_init(params), rls_init(params)
+        assert not np.any(np.asarray(rls_state.p))
+        xs, ys = self._stream(n_steps=8, seed=11)
+        for step, (x, y) in enumerate(zip(xs, ys)):
+            champ_params, champ_state, _ = champ_step(
+                champ_params, champ_state, x, y, jr.key(step)
+            )
+            rls_params, rls_state, metrics = rls_step(
+                rls_params, rls_state, x, y, jr.key(step)
+            )
+            assert not np.any(np.asarray(rls_state.p))
+            assert not np.any(np.asarray(rls_state.wout))
+            expected_acc = 1.0 if int(y) == 0 else 0.0
+            assert float(metrics[0]) == expected_acc
+            assert all(bool(jnp.isfinite(m)) for m in metrics)
+            for name in sorted(params):
+                np.testing.assert_array_equal(
+                    np.asarray(rls_params[name]), np.asarray(champ_params[name]), name
+                )
+
+    def test_lambda1_frozen_body_matches_closed_form_ridge(self):
+        """RLS exactness pin: with lambda=1 and a frozen body (step_size=0)
+        the streaming head equals closed-form ridge regression on the exact
+        phi sequence it consumed."""
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            EMANormState,
+            shift_adaptive_normalize,
+        )
+
+        hp = self._hp(rls_lambda=1.0, step_size=0.0)
+        init_fn, step_fn = self._factory(rls_lambda=1.0, step_size=0.0)
+        params = init_mlp_params(jr.key(7), SMALL)
+        state = init_fn(params)
+        m = SMALL.hidden2 + 1
+        scale = 1.0 / math.sqrt(m)
+        norm = EMANormState(
+            mean=jnp.zeros(SMALL.input_dim, jnp.float32),
+            var=jnp.ones(SMALL.input_dim, jnp.float32),
+            count=jnp.zeros(SMALL.input_dim, jnp.float32),
+        )
+        fast_mean = jnp.zeros(SMALL.input_dim, jnp.float32)
+        phis, targets = [], []
+        xs, ys = self._stream(n_steps=40, seed=13)
+        for step, (x, y) in enumerate(zip(xs, ys)):
+            x_norm, norm, fast_mean, _ = shift_adaptive_normalize(
+                norm, fast_mean, x,
+                decay=hp["norm_decay"],
+                fast_decay=hp["fast_decay"],
+                epsilon=hp["norm_epsilon"],
+                shift_k=hp["shift_k"],
+                shift_delta=hp["shift_delta"],
+                shift_refractory=hp["shift_refractory"],
+            )
+            a1 = jax.nn.relu(x_norm @ params["w1"] + params["b1"])
+            a2 = jax.nn.relu(a1 @ params["w2"] + params["b2"])
+            phis.append(
+                np.concatenate([np.asarray(a2) * scale, np.ones(1, np.float32)])
+            )
+            targets.append(np.eye(SMALL.n_classes, dtype=np.float32)[int(y)])
+            params, state, _ = step_fn(params, state, x, y, jr.key(step))
+        phi_mat = np.stack(phis).astype(np.float64)
+        target_mat = np.stack(targets).astype(np.float64)
+        ridge = float(self._hp()["rls_ridge_init"])
+        closed_form = np.linalg.solve(
+            ridge * np.eye(m) + phi_mat.T @ phi_mat, phi_mat.T @ target_mat
+        )
+        np.testing.assert_allclose(
+            np.asarray(state.wout, dtype=np.float64), closed_form, atol=2e-3
+        )
+
+    def test_p_reset_untriggerable_is_bitexact_off(self):
+        """rls_reset_frac > 1 can never fire (the shifted fraction is <= 1),
+        and must be bitwise the plain no-reset path."""
+        init_off, step_off = self._factory()
+        init_on, step_on = self._factory(rls_reset_frac=2.0)
+        params = init_mlp_params(jr.key(9), SMALL)
+        state_off, state_on = init_off(params), init_on(params)
+        params_off = params_on = params
+        xs, ys = self._stream(n_steps=10, seed=17)
+        for step, (x, y) in enumerate(zip(xs, ys)):
+            params_off, state_off, m_off = step_off(
+                params_off, state_off, x, y, jr.key(step)
+            )
+            params_on, state_on, m_on = step_on(
+                params_on, state_on, x, y, jr.key(step)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(state_on.p), np.asarray(state_off.p)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(state_on.wout), np.asarray(state_off.wout)
+            )
+            for a, b in zip(m_on, m_off):
+                np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+    def test_p_reset_fires_on_detected_shift_and_keeps_wout(self):
+        """A mature normalizer hit with a far-shifted input trips the
+        detector on every feature; with the reset enabled P returns exactly
+        to eye/ridge while the readout weights are kept."""
+        import dataclasses as _dc
+
+        init_fn, step_fn = self._factory(rls_reset_frac=0.5)
+        params = init_mlp_params(jr.key(10), SMALL)
+        state = init_fn(params)
+        # Run a few normal steps so wout and P move off their init.
+        xs, ys = self._stream(n_steps=5, seed=19)
+        for step, (x, y) in enumerate(zip(xs, ys)):
+            params, state, _ = step_fn(params, state, x, y, jr.key(step))
+        assert np.any(np.asarray(state.wout))
+        m = SMALL.hidden2 + 1
+        ridge = float(self._hp()["rls_ridge_init"])
+        assert not np.allclose(
+            np.asarray(state.p), np.eye(m, dtype=np.float32) / ridge
+        )
+        mature = _dc.replace(
+            state,
+            norm=_dc.replace(
+                state.norm,
+                mean=jnp.zeros(SMALL.input_dim, jnp.float32),
+                var=jnp.full((SMALL.input_dim,), 1e-4, jnp.float32),
+                count=jnp.full((SMALL.input_dim,), 1000.0, jnp.float32),
+            ),
+            fast_mean=jnp.zeros(SMALL.input_dim, jnp.float32),
+        )
+        wout_before = np.asarray(mature.wout)
+        x_shift = jnp.full((SMALL.input_dim,), 10.0, jnp.float32)
+        _, shifted_state, _ = step_fn(
+            params, mature, x_shift, jnp.array(0, jnp.int32), jr.key(99)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(shifted_state.p), np.eye(m, dtype=np.float32) / ridge
+        )
+        # wout was updated by the step (kept + one RLS update), not zeroed.
+        assert np.any(np.asarray(shifted_state.wout))
+        assert not np.array_equal(np.asarray(shifted_state.wout), wout_before)
+
+    def test_resid_trains_body_and_never_touches_sgd_head(self):
+        """head_resid=1: the body error signal is the RLS residual — body
+        tensors move off the pure-decay path once wout is nonzero, while
+        w3/b3 (no SGD head exists) pass through bitwise untouched."""
+        init_fn, step_fn = self._factory(head_resid=1.0)
+        params = init_mlp_params(jr.key(12), SMALL)
+        state = init_fn(params)
+        hp = self._hp()
+        param_decay = 1.0 - hp["step_size"] * hp["weight_decay"]
+        decay_only = {k: jnp.asarray(v) for k, v in params.items()}
+        run_params = params
+        xs, ys = self._stream(n_steps=6, seed=23)
+        for step, (x, y) in enumerate(zip(xs, ys)):
+            run_params, state, metrics = step_fn(run_params, state, x, y, jr.key(step))
+            decay_only = {
+                k: (v * param_decay if k in ("w1", "b1", "w2", "b2") else v)
+                for k, v in decay_only.items()
+            }
+            assert all(bool(jnp.isfinite(m)) for m in metrics)
+        np.testing.assert_array_equal(
+            np.asarray(run_params["w3"]), np.asarray(params["w3"])
+        )
+        np.testing.assert_array_equal(
+            np.asarray(run_params["b3"]), np.asarray(params["b3"])
+        )
+        assert np.any(np.asarray(state.wout))
+        assert not np.allclose(
+            np.asarray(run_params["w1"]), np.asarray(decay_only["w1"]), atol=1e-7
+        )
+
+    def test_resid_frozen_head_is_pure_decay_no_nan(self):
+        """Guard pin: head_resid=1 with rls_ridge_init=inf keeps wout at 0,
+        so the residual gradient is exactly zero — the zero-utility gate must
+        be guarded (0.5, not NaN) and the body follows pure decoupled decay
+        bit-for-bit."""
+        init_fn, step_fn = self._factory(head_resid=1.0, rls_ridge_init=math.inf)
+        params = init_mlp_params(jr.key(14), SMALL)
+        state = init_fn(params)
+        hp = self._hp()
+        param_decay = jnp.asarray(
+            1.0 - hp["step_size"] * hp["weight_decay"], jnp.float32
+        )
+        expected = {k: jnp.asarray(v) for k, v in params.items()}
+        run_params = params
+        xs, ys = self._stream(n_steps=4, seed=29)
+        for step, (x, y) in enumerate(zip(xs, ys)):
+            run_params, state, metrics = step_fn(run_params, state, x, y, jr.key(step))
+            expected = {
+                k: (v * param_decay if k in ("w1", "b1", "w2", "b2") else v)
+                for k, v in expected.items()
+            }
+            for name in sorted(params):
+                assert bool(jnp.all(jnp.isfinite(run_params[name]))), name
+                np.testing.assert_array_equal(
+                    np.asarray(run_params[name]), np.asarray(expected[name]), name
+                )
+            assert all(bool(jnp.isfinite(m)) for m in metrics)
+
+    def test_key_is_unused_in_both_modes(self):
+        for overrides in ({}, {"head_resid": 1.0}):
+            init_fn, step_fn = self._factory(**overrides)
+            params = init_mlp_params(jr.key(15), SMALL)
+            state = init_fn(params)
+            x = jnp.linspace(-1.0, 1.0, SMALL.input_dim, dtype=jnp.float32)
+            y = jnp.array(2, jnp.int32)
+            params_a, state_a, m_a = step_fn(params, state, x, y, jr.key(0))
+            params_b, state_b, m_b = step_fn(params, state, x, y, jr.key(987654))
+            for name in sorted(params):
+                np.testing.assert_array_equal(
+                    np.asarray(params_a[name]), np.asarray(params_b[name])
+                )
+            np.testing.assert_array_equal(
+                np.asarray(state_a.wout), np.asarray(state_b.wout)
+            )
+            for a, b in zip(m_a, m_b):
+                np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+    def test_state_shapes_and_p_symmetry(self):
+        init_fn, step_fn = self._factory()
+        params = init_mlp_params(jr.key(16), SMALL)
+        state = init_fn(params)
+        m = SMALL.hidden2 + 1
+        assert state.p.shape == (m, m)
+        assert state.wout.shape == (m, SMALL.n_classes)
+        assert state.p.dtype == jnp.float32
+        ridge = float(self._hp()["rls_ridge_init"])
+        np.testing.assert_array_equal(
+            np.asarray(state.p), np.eye(m, dtype=np.float32) / ridge
+        )
+        assert not np.any(np.asarray(state.wout))
+        x = jr.normal(jr.key(30), (SMALL.input_dim,))
+        _, new_state, _ = step_fn(params, state, x, jnp.array(1, jnp.int32), jr.key(0))
+        np.testing.assert_array_equal(
+            np.asarray(new_state.p), np.asarray(new_state.p).T
+        )
+        assert bool(jnp.all(jnp.isfinite(new_state.p)))
+
+    def test_smoke_runs_above_chance_both_modes(self):
+        x, y = self._learnable_stream()
+        config = IPMNISTConfig(
+            n_tasks=2, task_length=200, input_dim=12, hidden1=8, hidden2=6, n_classes=5
+        )
+        from alberta_framework.benchmarks.ipmnist_screening import _rls_head_hp
+
+        for overrides in ({}, {"head_resid": 1.0}):
+            spec = ScreeningSpec(
+                name="rls_head_smoke",
+                base_learner="upgd_w",
+                mechanism="rls_readout",
+                hyperparameters=_rls_head_hp(**overrides),
+                factory=__import__(
+                    "alberta_framework.benchmarks.ipmnist_screening",
+                    fromlist=["_make_rls_head_learner"],
+                )._make_rls_head_learner,
+            )
+            result = run_screening_config(x, y, spec, seed=2, config=config)
+            acc = np.asarray(result.per_task_accuracy)
+            assert np.all(np.isfinite(acc)), overrides
+            assert np.all(np.isfinite(np.asarray(result.per_task_loss))), overrides
+            plas = np.asarray(result.per_task_plasticity)
+            assert np.all((plas >= 0.0) & (plas <= 1.0)), overrides
+            assert float(acc.mean()) > 1.0 / config.n_classes, overrides
+
+    def test_frozen_probe_fails_closed(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _rls_head_frozen_probe_input,
+        )
+
+        init_fn, _ = self._factory()
+        state = init_fn(init_mlp_params(jr.key(0), SMALL))
+        with pytest.raises(NotImplementedError, match="rls_head"):
+            _rls_head_frozen_probe_input(
+                state, jnp.zeros((3, SMALL.input_dim)), self._hp()
+            )
+
+    def test_p_trace_cap_zero_is_bitexact_off(self):
+        """rls_p_trace_cap=0 disables the cap at build time and must be
+        bitwise the uncapped path."""
+        init_off, step_off = self._factory()
+        init_on, step_on = self._factory(rls_p_trace_cap=0.0)
+        params = init_mlp_params(jr.key(21), SMALL)
+        state_off, state_on = init_off(params), init_on(params)
+        params_off = params_on = params
+        xs, ys = self._stream(n_steps=8, seed=31)
+        for step, (x, y) in enumerate(zip(xs, ys)):
+            params_off, state_off, m_off = step_off(
+                params_off, state_off, x, y, jr.key(step)
+            )
+            params_on, state_on, m_on = step_on(
+                params_on, state_on, x, y, jr.key(step)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(state_on.p), np.asarray(state_off.p)
+            )
+            for a, b in zip(m_on, m_off):
+                np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+    def test_p_trace_cap_rescales_oversized_p(self):
+        """Covariance wind-up guard: when trace(P) exceeds the cap after the
+        RLS update, P is rescaled to trace == cap exactly (direction
+        preserved); an under-cap P passes through untouched."""
+        import dataclasses as _dc
+
+        cap = 3.0
+        init_fn, step_fn = self._factory(rls_p_trace_cap=cap)
+        params = init_mlp_params(jr.key(22), SMALL)
+        state = init_fn(params)
+        m = SMALL.hidden2 + 1
+        blown = _dc.replace(
+            state, p=jnp.eye(m, dtype=jnp.float32) * 1e6
+        )
+        x = jr.normal(jr.key(41), (SMALL.input_dim,))
+        y = jnp.array(1, jnp.int32)
+        _, capped_state, metrics = step_fn(params, blown, x, y, jr.key(0))
+        trace = float(jnp.trace(capped_state.p))
+        assert trace == pytest.approx(cap, rel=1e-4)
+        assert all(bool(jnp.isfinite(v)) for v in metrics)
+        # Under the cap (cap far above the trajectory's traces): bitwise
+        # identical to the uncapped step (scale is exactly 1.0).
+        init_off, step_off = self._factory()
+        _, big_cap_step = self._factory(rls_p_trace_cap=1e6)
+        _, plain_state, _ = step_off(params, state, x, y, jr.key(0))
+        _, small_state, _ = big_cap_step(params, state, x, y, jr.key(0))
+        np.testing.assert_array_equal(
+            np.asarray(small_state.p), np.asarray(plain_state.p)
+        )
+
+    def test_registry_arms(self):
+        """Screen wave frozen by the 2-task seed-0 diagnostic (champion
+        reference 0.825 in the same loop): lambda star {0.995, 0.999, 1.0}
+        (2-task means .8302/.8361/.8217 — the head helps at every lambda's
+        task-2 and lambda 0.999 wins overall), the detector-driven P reset at
+        the calibrated 0.05 fraction (within-task shifted fraction <= 0.018,
+        boundary step 0.061 — 2.8x margin; 2-task read -0.0066 on task 2 at
+        lambda 0.999, screened anyway across 59 boundaries), and the
+        residual-driven body at lambda 0.999 (best task-2 of the diagnostic,
+        0.8774; its lambda-0.995 variant COLLAPSED to 0.105 on task 2 —
+        fast-forgetting heads are unstable as the body's error signal — and
+        is deliberately not registered)."""
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_learner,
+            _rls_head_frozen_probe_input,
+            _rls_head_hp,
+        )
+
+        expected = {
+            "rls_head_l0999": {"rls_lambda": 0.999},
+            "rls_head_l0995": {"rls_lambda": 0.995},
+            "rls_head_l1": {"rls_lambda": 1.0},
+            "rls_head_l0999_preset005": {
+                "rls_lambda": 0.999, "rls_reset_frac": 0.05
+            },
+            "rls_head_resid": {"rls_lambda": 0.999, "head_resid": 1.0},
+            # Wave 2 — wind-up stabilized: exponential forgetting (lambda<1)
+            # overflows P along unexcited (dead-ReLU) feature directions at
+            # (1/lambda)^t (float32 overflow ~ e^88.7 ~ task 18 at 0.999 —
+            # the wave-1 collapse). lambda=1 cannot wind up (P is
+            # nonincreasing PSD); staleness is handled by the detector-driven
+            # P reset instead, and the trace cap salvages the forgetting
+            # mechanism as a bounded probe.
+            "rls_head_l1_preset005": {
+                "rls_lambda": 1.0, "rls_reset_frac": 0.05
+            },
+            "rls_head_l1_preset003": {
+                "rls_lambda": 1.0, "rls_reset_frac": 0.03
+            },
+            "rls_head_l0999_pcap": {
+                "rls_lambda": 0.999, "rls_p_trace_cap": 1e4
+            },
+            "rls_head_resid_l1_preset005": {
+                "rls_lambda": 1.0, "rls_reset_frac": 0.05, "head_resid": 1.0
+            },
+            # Wave 3 — ridge star (2-task seed-0 diagnostic: smaller initial
+            # ridge = larger early/post-reset gains; .8328/.8465/.853/.8578/
+            # .8596 for ridge 1.0/0.3/0.1/0.03/0.01, monotone), plus the
+            # residual body rerun at small ridge (0.8648 at 2 tasks, the
+            # family's best diagnostic number: a fast-converging head makes
+            # the residual signal reliable early).
+            "rls_head_l0999_preset005_r01": {
+                "rls_lambda": 0.999, "rls_reset_frac": 0.05,
+                "rls_ridge_init": 0.1,
+            },
+            "rls_head_l0999_preset005_r003": {
+                "rls_lambda": 0.999, "rls_reset_frac": 0.05,
+                "rls_ridge_init": 0.03,
+            },
+            "rls_head_l0999_preset005_r001": {
+                "rls_lambda": 0.999, "rls_reset_frac": 0.05,
+                "rls_ridge_init": 0.01,
+            },
+            "rls_head_resid_preset005_r01": {
+                "rls_lambda": 0.999, "rls_reset_frac": 0.05,
+                "rls_ridge_init": 0.1, "head_resid": 1.0,
+            },
+            "rls_head_resid_preset005_r001": {
+                "rls_lambda": 0.999, "rls_reset_frac": 0.05,
+                "rls_ridge_init": 0.01, "head_resid": 1.0,
+            },
+        }
+        for name, overrides in expected.items():
+            spec = screening_spec(name)
+            assert spec.base_learner == "upgd_w", name
+            assert spec.mechanism == "rls_readout", name
+            assert spec.factory is _make_rls_head_learner, name
+            assert spec.frozen_probe_input is _rls_head_frozen_probe_input, name
+            assert spec.noise_update is None, name
+            assert spec.hyperparameters == _rls_head_hp(**overrides), name
+            # Champion-body constants are intact on every arm.
+            hp = spec.hyperparameters
+            assert hp["step_size"] == pytest.approx(0.01), name
+            assert hp["weight_decay"] == pytest.approx(0.01), name
+            assert hp["utility_decay"] == pytest.approx(0.9999), name
+            assert hp["norm_decay"] == pytest.approx(0.99), name
+            assert hp["fast_decay"] == pytest.approx(0.9), name
+            assert hp["shift_k"] == pytest.approx(1.0), name
+            assert hp["shift_delta"] == pytest.approx(0.02), name
+            assert hp["noise_std"] == 0.0, name
+
+
+class TestNBEnsemble:
+    """Transient attack: adaptive ensemble of the shiftnorm champion and the
+    streaming naive-Bayes tracker (``nb_ensemble_champion`` family).
+
+    Prediction is an accuracy-weighted probability mixture whose weights are
+    learned ONLINE from the stream itself: per-member annealed EMAs of each
+    member's own pre-update correctness (fast decay, no oracle, no task
+    boundaries), squashed through a softmax with temperature ``ens_beta``.
+    Right after a permutation the champion's recent-accuracy EMA collapses
+    while naive Bayes stays flat, so the vote swings to NB; mid-task the
+    champion re-converges and takes the vote back.  Probes: (b) detector-
+    driven NB statistics reset (``nb_ensemble_nbreset``), (c) a third
+    closed-form fast-converging member — linear RLS over normalized pixels
+    (``nb_ensemble_rls3``).
+    """
+
+    _ARMS = ("nb_ensemble_champion", "nb_ensemble_nbreset", "nb_ensemble_rls3")
+
+    def _hp(self, **overrides):
+        from alberta_framework.benchmarks.ipmnist_screening import _nb_ensemble_hp
+
+        return _nb_ensemble_hp(**overrides)
+
+    def _factory(self, **overrides):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_nb_ensemble_learner,
+        )
+
+        return _make_nb_ensemble_learner(self._hp(**overrides))
+
+    def _champion_factory(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_upgd_shiftnorm_learner,
+            _sigma0_ext_hp,
+        )
+
+        return _make_upgd_shiftnorm_learner(
+            _sigma0_ext_hp(
+                norm_decay=0.99,
+                fast_decay=0.9,
+                shift_k=1.0,
+                shift_delta=0.02,
+                shift_refractory=0.0,
+            )
+        )
+
+    def _stream(self, n_steps=12, seed=3):
+        key = jr.key(seed)
+        xs, ys = [], []
+        for step in range(n_steps):
+            key, kx = jr.split(key)
+            xs.append(
+                jr.uniform(kx, (SMALL.input_dim,), jnp.float32, -1.0, 1.0)
+                * (1.0 + step % 3)
+            )
+            ys.append(jnp.array(step % SMALL.n_classes, jnp.int32))
+        return xs, ys
+
+    def test_registry_configs(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_nb_ensemble_learner,
+        )
+
+        for name in self._ARMS:
+            spec = screening_spec(name)
+            assert spec.mechanism == "transient_ensemble", name
+            assert spec.factory is _make_nb_ensemble_learner, name
+            assert spec.noise_update is None, name
+            hp = spec.hyperparameters
+            # Champion-member constants are verbatim sigma0_shiftnorm_d099.
+            champ = screening_spec("sigma0_shiftnorm_d099").hyperparameters
+            for k in (
+                "step_size", "weight_decay", "utility_decay", "norm_decay",
+                "norm_epsilon", "fast_decay", "shift_k", "shift_delta",
+                "shift_refractory",
+            ):
+                assert hp[k] == champ[k], (name, k)
+            # NB-member constants are verbatim the naive_bayes arm.
+            nb = screening_spec("naive_bayes").hyperparameters
+            assert hp["nb_decay"] == nb["nb_decay"], name
+            assert hp["nb_var_epsilon"] == nb["nb_var_epsilon"], name
+            assert 0.0 < hp["ens_decay"] < 1.0, name
+            assert hp["ens_beta"] > 0.0, name
+            assert hp["ens_lock_network"] == 0.0, name
+            with pytest.raises(NotImplementedError, match="nb_ensemble"):
+                spec.frozen_probe_input(None, jnp.zeros(4), hp)
+        assert screening_spec("nb_ensemble_champion").hyperparameters[
+            "ens_nb_reset"
+        ] == 0.0
+        assert screening_spec("nb_ensemble_nbreset").hyperparameters[
+            "ens_nb_reset"
+        ] == 1.0
+        assert screening_spec("nb_ensemble_rls3").hyperparameters[
+            "ens_use_rls"
+        ] == 1.0
+        # The RLS member's constants are verbatim the lin_rls arm.
+        lin = screening_spec("lin_rls").hyperparameters
+        hp3 = screening_spec("nb_ensemble_rls3").hyperparameters
+        for k in ("rff_clip", "rls_lambda", "rls_ridge_init"):
+            assert hp3[k] == lin[k], k
+
+    def test_lock_network_reduces_to_shiftnorm_champion_bitwise(self):
+        """ens_lock_network=1: params AND metrics follow the registered
+        sigma0_shiftnorm_d099 champion bit-for-bit (the reduction pin)."""
+        champ_init, champ_step = self._champion_factory()
+        ens_init, ens_step = self._factory(ens_lock_network=1.0)
+        params = init_mlp_params(jr.key(5), SMALL)
+        champ_params, ens_params = params, params
+        champ_state, ens_state = champ_init(params), ens_init(params)
+        xs, ys = self._stream()
+        for step, (x, y) in enumerate(zip(xs, ys)):
+            champ_params, champ_state, m_champ = champ_step(
+                champ_params, champ_state, x, y, jr.key(step)
+            )
+            ens_params, ens_state, m_ens = ens_step(
+                ens_params, ens_state, x, y, jr.key(step)
+            )
+            for name in sorted(params):
+                np.testing.assert_array_equal(
+                    np.asarray(ens_params[name]), np.asarray(champ_params[name]), name
+                )
+            for a, b in zip(m_ens, m_champ):
+                np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+        # The lock changes only the deployed prediction: the member EMAs
+        # still learned from the stream.
+        assert float(jnp.sum(ens_state.member_acc)) >= 0.0
+
+    def test_mixture_and_weight_update_hand_computed(self):
+        """One step from a crafted state: the ensemble prediction is the
+        log-domain accuracy-weighted probability mixture of the members'
+        pre-update posteriors, and the member EMAs update with the annealed
+        recurrence min(ens_decay, 1 - 1/(t+1)) on each member's own
+        correctness."""
+        import dataclasses as _dc
+
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            naive_bayes_logits as _nb_logits,
+        )
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            shift_adaptive_normalize as _shift_norm,
+        )
+        from alberta_framework.benchmarks.upgd_ipmnist import mlp_logits as _mlp_logits
+
+        hp = self._hp(ens_beta=7.0, ens_decay=0.9)
+        ens_init, ens_step = self._factory(ens_beta=7.0, ens_decay=0.9)
+        params = init_mlp_params(jr.key(11), SMALL)
+        state = ens_init(params)
+        # Drive a few steps so NB statistics and the normalizer are nontrivial.
+        xs, ys = self._stream(n_steps=6, seed=21)
+        p = params
+        for step, (x, y) in enumerate(zip(xs, ys)):
+            p, state, _ = ens_step(p, state, x, y, jr.key(step))
+        # Craft asymmetric member EMAs so the weights are far from uniform.
+        state = _dc.replace(
+            state, member_acc=jnp.array([0.9, 0.2], dtype=jnp.float32)
+        )
+        x = jr.uniform(jr.key(99), (SMALL.input_dim,), jnp.float32, -1.0, 1.0)
+        y = jnp.array(2, jnp.int32)
+        # Hand-computed member posteriors (pre-update).
+        x_norm, _, _, _ = _shift_norm(
+            state.net.norm, state.net.fast_mean, x,
+            decay=hp["norm_decay"], fast_decay=hp["fast_decay"],
+            epsilon=hp["norm_epsilon"], shift_k=hp["shift_k"],
+            shift_delta=hp["shift_delta"],
+            shift_refractory=hp["shift_refractory"],
+        )
+        net_logits = _mlp_logits(p, x_norm)
+        nb_logits = _nb_logits(state.nb, x)
+        log_w = jax.nn.log_softmax(7.0 * state.member_acc)
+        stacked = jnp.stack(
+            [jax.nn.log_softmax(net_logits), jax.nn.log_softmax(nb_logits)]
+        )
+        mixture = jax.nn.logsumexp(stacked + log_w[:, None], axis=0)
+        expected_pred = int(jnp.argmax(mixture))
+        expected_loss = float(-jax.nn.log_softmax(mixture)[y])
+        new_p, new_state, (acc, loss, plasticity) = ens_step(
+            p, state, x, y, jr.key(123)
+        )
+        assert float(acc) == float(expected_pred == int(y))
+        np.testing.assert_allclose(float(loss), expected_loss, rtol=1e-5)
+        assert 0.0 <= float(plasticity) <= 1.0
+        # Member EMA update: annealed recurrence on each member's own
+        # pre-update correctness.
+        t = float(state.ens_step) + 1.0
+        eff = min(0.9, 1.0 - 1.0 / (t + 1.0))
+        net_correct = float(jnp.argmax(net_logits) == y)
+        nb_correct = float(jnp.argmax(nb_logits) == y)
+        expected_acc = np.array(
+            [
+                eff * 0.9 + (1.0 - eff) * net_correct,
+                eff * 0.2 + (1.0 - eff) * nb_correct,
+            ],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(
+            np.asarray(new_state.member_acc), expected_acc, rtol=1e-6
+        )
+        assert float(new_state.ens_step) == t
+
+    def test_weights_swing_to_nb_when_network_is_wrong(self):
+        """Feed a stream the NB member predicts correctly while the champion
+        member is wrong: the NB weight must rise above the network's."""
+        ens_init, ens_step = self._factory(ens_decay=0.99)
+        params = init_mlp_params(jr.key(1), SMALL)
+        state = ens_init(params)
+        # A fixed input whose label is the class the init network is most
+        # biased AGAINST (argmin of the output bias): under a constant input
+        # the normalized features collapse toward zero, so the network's
+        # prediction is bias-driven and wrong for many steps, while NB locks
+        # on after one observation.
+        x = jnp.linspace(-1.0, 1.0, SMALL.input_dim, dtype=jnp.float32)
+        y = jnp.argmin(params["b3"]).astype(jnp.int32)
+        p = params
+        for step in range(40):
+            p, state, _ = ens_step(p, state, x, y, jr.key(step))
+        acc = np.asarray(state.member_acc)
+        assert acc[1] > 0.8  # NB is essentially always right on this stream
+        assert acc[1] > acc[0] + 0.2  # ... and the vote must reflect it
+
+    def test_nb_reset_triggers_on_global_shift_and_respects_refractory(self):
+        """nb_ensemble_nbreset: a global input-statistics shift resets the NB
+        class-count anneal clocks exactly once per refractory window; means
+        and variances are never zeroed by the reset."""
+        ens_init, ens_step = self._factory(
+            ens_nb_reset=1.0, ens_reset_frac=0.25, ens_reset_refractory=8.0
+        )
+        params = init_mlp_params(jr.key(2), SMALL)
+        state = ens_init(params)
+        p = params
+        key = jr.key(7)
+        # Mature the detector on a stationary stream.
+        for step in range(30):
+            key, kx = jr.split(key)
+            x = jr.uniform(kx, (SMALL.input_dim,), jnp.float32, -1.0, 1.0)
+            p, state, _ = ens_step(
+                p, state, x, jnp.array(step % SMALL.n_classes, jnp.int32),
+                jr.key(step),
+            )
+        counts_before = np.asarray(state.nb.ccount)
+        assert counts_before.sum() > 0.0
+        means_before = np.asarray(state.nb.cmean)
+        # A gross global shift: every feature jumps by +10.
+        x_shift = jnp.full((SMALL.input_dim,), 10.0, dtype=jnp.float32)
+        p, state, _ = ens_step(p, state, x_shift, jnp.array(0, jnp.int32), jr.key(90))
+        counts_after = np.asarray(state.nb.ccount)
+        # All class clocks reset to zero except the observed class's +1 is
+        # also wiped (reset applies after the member update).
+        np.testing.assert_array_equal(counts_after, 0.0)
+        assert float(state.reset_age) == 0.0
+        # Means were NOT zeroed by the reset (only clocks).
+        assert np.any(np.asarray(state.nb.cmean) != 0.0) or np.any(means_before == 0.0)
+        # Within the refractory window an equally-shifted step cannot re-trigger:
+        # clocks accumulate again immediately.
+        x_shift2 = jnp.full((SMALL.input_dim,), -10.0, dtype=jnp.float32)
+        p, state, _ = ens_step(p, state, x_shift2, jnp.array(1, jnp.int32), jr.key(91))
+        assert float(np.asarray(state.nb.ccount).sum()) > 0.0
+        assert float(state.reset_age) == 1.0
+        # The plain arm never resets: same stream, clocks keep accumulating.
+        plain_init, plain_step = self._factory()
+        pstate = plain_init(params)
+        pp = params
+        key = jr.key(7)
+        for step in range(30):
+            key, kx = jr.split(key)
+            x = jr.uniform(kx, (SMALL.input_dim,), jnp.float32, -1.0, 1.0)
+            pp, pstate, _ = plain_step(
+                pp, pstate, x, jnp.array(step % SMALL.n_classes, jnp.int32),
+                jr.key(step),
+            )
+        pp, pstate, _ = plain_step(
+            pp, pstate, x_shift, jnp.array(0, jnp.int32), jr.key(90)
+        )
+        assert float(np.asarray(pstate.nb.ccount).sum()) == 31.0
+
+    def test_rls3_carries_lin_rls_member(self):
+        """nb_ensemble_rls3: the third member is the lin_rls pipeline (bias-
+        augmented normalized pixels, Sherman-Morrison RLS) and its EMA slot
+        exists; the 2-member arms carry no RLS state."""
+        ens_init, _ = self._factory(ens_use_rls=1.0)
+        params = init_mlp_params(jr.key(3), SMALL)
+        state = ens_init(params)
+        assert state.rls is not None
+        assert state.rls.p.shape == (SMALL.input_dim + 1, SMALL.input_dim + 1)
+        assert state.rls.wout.shape == (SMALL.input_dim + 1, SMALL.n_classes)
+        assert state.member_acc.shape == (3,)
+        plain_init, _ = self._factory()
+        plain_state = plain_init(params)
+        assert plain_state.rls is None
+        assert plain_state.member_acc.shape == (2,)
+
+    def test_key_is_unused_on_every_arm(self):
+        """All members are closed-form or sigma-0: the RNG key is inert."""
+        params = init_mlp_params(jr.key(4), SMALL)
+        for overrides in ({}, {"ens_nb_reset": 1.0}, {"ens_use_rls": 1.0}):
+            ens_init, ens_step = self._factory(**overrides)
+            state = ens_init(params)
+            x = jr.uniform(jr.key(6), (SMALL.input_dim,), jnp.float32, -1.0, 1.0)
+            y = jnp.array(3, jnp.int32)
+            p_a, s_a, m_a = ens_step(params, state, x, y, jr.key(0))
+            p_b, s_b, m_b = ens_step(params, state, x, y, jr.key(424242))
+            for n in params:
+                np.testing.assert_array_equal(np.asarray(p_a[n]), np.asarray(p_b[n]))
+            np.testing.assert_array_equal(
+                np.asarray(s_a.member_acc), np.asarray(s_b.member_acc)
+            )
+            for a, b in zip(m_a, m_b):
+                np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+    def test_smoke_runs_finite(self, small_data):
+        x, y = small_data
+        for name in self._ARMS:
+            result = run_screening_config(
+                x, y, screening_spec(name), seed=2, config=SMALL
+            )
+            acc = np.asarray(result.per_task_accuracy)
+            assert np.all(np.isfinite(acc)), name
+            assert np.all((acc >= 0.0) & (acc <= 1.0)), name
+            assert np.all(np.isfinite(np.asarray(result.per_task_loss))), name
+            plas = np.asarray(result.per_task_plasticity)
+            assert np.all((plas >= 0.0) & (plas <= 1.0)), name

@@ -23,7 +23,17 @@ Genome layout (``GENOME_SIZE`` raw floats in ``[0, 1]``):
   ``utility_shift_reset`` (stale-utility cleanup on detected feature
   shifts), ``w1_shift_reset`` (input-layer rows of detected-shift features
   reset to init), ``hidden_rms`` (stateless hidden-layer RMS
-  normalization).
+  normalization). Wave-2 mechanism classes: ``rls_head`` (closed-form
+  exponentially-forgetting RLS readout over the last hidden layer, ensemble
+  member), ``rls_reset_p`` (detected-shift reset of the RLS precision to
+  its ridge prior), ``nb_member`` (streaming naive-Bayes ensemble member
+  over the conditioned input, recent-accuracy vote weighting),
+  ``lr_anneal`` (task-clock-free within-task lr annealing driven by the
+  fast/slow error ratio: fast early, low late), ``layer_lr`` (per-layer lr
+  ratio: input layer at ``ratio**-1``, head at ``ratio**+1``), and
+  ``kalman_norm`` (per-feature predict-update Kalman mean tracking as the
+  conditioning alternative to the EMA, detected shifts reinflating its
+  posterior uncertainty).
 - ``PARAM_NAMES``: bounded transforms of the raw genes (log/linear/
   one-minus-power-of-ten decays), documented in ``_PARAM_BOUNDS``.
 
@@ -33,10 +43,14 @@ step-for-step (pinned in ``tests/test_rule_discovery.py``), so the search
 space *contains* the record holder and every fitness gain is a genuine
 composition discovery, not a reparameterization artifact.
 
-Overfitting guard: search fitness reads only the search tasks (M1+M2+M3);
-M4 and the differently-parameterized M1' are **held out** for selection
-validation, and promotion to the real 60-task protocol goes through
-``ipmnist_screening`` arms (failing-test-first) against the champion bar.
+Overfitting guard: search fitness reads only the search tasks (digits lane
+M1+M2+M3; gauss lane G1+G3); the recurrence family and a
+differently-parameterized twin of the permutation family are **held out**
+for selection validation, and promotion to the real 60-task protocol goes
+through ``ipmnist_screening`` arms (failing-test-first) against the
+champion bar. The wave-2 fitness (``--suite gauss``) runs on the
+transfer-validated gauss-v1 streams of
+:mod:`alberta_framework.benchmarks.micro_continual`.
 
 Everything here is a development diagnostic — never promotable evidence.
 Search executions happen through the CLI, never inside pytest.
@@ -63,12 +77,16 @@ from jax import Array
 
 from alberta_framework.benchmarks.ipmnist_screening import _atomic_write_json
 from alberta_framework.benchmarks.micro_continual import (
+    _INIT_DOMAIN,
     HOLDOUT_TASKS,
+    MICRO_GAUSS_SUITE_VERSION,
     MICRO_SUITE,
     MICRO_SUITE_VERSION,
     SEARCH_TASKS,
+    MicroStreamConfig,
     MicroTaskConfig,
     build_micro_stream,
+    generate_stream,
 )
 from alberta_framework.benchmarks.upgd_ipmnist import (
     IPMNISTConfig,
@@ -95,6 +113,13 @@ FLAG_NAMES: tuple[str, ...] = (
     "utility_shift_reset",
     "w1_shift_reset",
     "hidden_rms",
+    # --- wave-2 mechanism classes (expanded search).
+    "rls_head",
+    "rls_reset_p",
+    "nb_member",
+    "lr_anneal",
+    "layer_lr",
+    "kalman_norm",
 )
 
 PARAM_NAMES: tuple[str, ...] = (
@@ -109,6 +134,14 @@ PARAM_NAMES: tuple[str, ...] = (
     "surprise_fast",
     "surprise_slow",
     "meta_gain",
+    # --- wave-2 constants.
+    "rls_lambda",
+    "nb_decay",
+    "vote_decay",
+    "anneal_lo",
+    "anneal_hi",
+    "layer_lr_ratio",
+    "kalman_q",
 )
 
 #: value = mode(lo + raw * (hi - lo)); modes: 0 = 10**u, 1 = linear, 2 = 1 - 10**-u.
@@ -127,6 +160,13 @@ _PARAM_BOUNDS: dict[str, tuple[int, float, float]] = {
     "surprise_fast": (_MODE_LINEAR, 0.8, 0.99),
     "surprise_slow": (_MODE_OMP10, 2.0, 4.0),  # 0.99 .. 0.9999
     "meta_gain": (_MODE_LINEAR, 0.5, 4.0),
+    "rls_lambda": (_MODE_OMP10, 2.0, 4.0),  # 0.99 .. 0.9999
+    "nb_decay": (_MODE_OMP10, 1.0, 3.0),  # 0.9 .. 0.999
+    "vote_decay": (_MODE_OMP10, 1.0, 3.0),  # 0.9 .. 0.999
+    "anneal_lo": (_MODE_LINEAR, 0.05, 1.0),
+    "anneal_hi": (_MODE_LINEAR, 1.0, 4.0),
+    "layer_lr_ratio": (_MODE_LOG10, math.log10(0.25), math.log10(4.0)),
+    "kalman_q": (_MODE_LOG10, -5.0, -1.0),
 }
 
 _N_FLAGS = len(FLAG_NAMES)
@@ -143,6 +183,22 @@ _AUTOCORR_DECAY = 0.99
 #: Surprise-budget clip range (multiplier on the global step size).
 _BUDGET_LO = 0.25
 _BUDGET_HI = 4.0
+#: RLS-head constants: ridge prior scale, vote temperature on the regression
+#: scores, score clip (NaN guard while the flag is off), and the shift-boost
+#: reinflation applied to the Kalman normalizer's uncertainty on detection.
+_RLS_P0 = 10.0
+_RLS_VOTE_TEMP = 4.0
+_RLS_SCORE_CLIP = 25.0
+_NB_VAR_FLOOR = 1e-3
+#: lr-anneal surprise mapping: error ratio 1 -> anneal_lo, ratio >= this ->
+#: anneal_hi (task-clock-free within-task annealing).
+_ANNEAL_R_HI = 2.0
+_KALMAN_SHIFT_BOOST = 25.0
+#: Per-tensor exponent of the layer-lr ratio (input layer slow, head fast
+#: when ratio > 1; the single gene spans both directions).
+_LAYER_EXPONENT: dict[str, float] = {
+    "w1": -1.0, "b1": -1.0, "w2": 0.0, "b2": 0.0, "w3": 1.0, "b3": 1.0,
+}
 
 _MODES = np.asarray([_PARAM_BOUNDS[name][0] for name in PARAM_NAMES])
 _LOS = np.asarray([_PARAM_BOUNDS[name][1] for name in PARAM_NAMES])
@@ -221,6 +277,31 @@ _CHAMPION_CONFIG: dict[str, float] = {
     "surprise_fast": 0.95,
     "surprise_slow": 0.999,
     "meta_gain": 2.0,
+    # Wave-2 flags (all off in the champion form) and their defaults.
+    "rls_head": 0.0,
+    "rls_reset_p": 0.0,
+    "nb_member": 0.0,
+    "lr_anneal": 0.0,
+    "layer_lr": 0.0,
+    "kalman_norm": 0.0,
+    "rls_lambda": 0.999,
+    "nb_decay": 0.98,
+    "vote_decay": 0.99,
+    "anneal_lo": 0.5,
+    "anneal_hi": 2.0,
+    "layer_lr_ratio": 1.0,
+    "kalman_q": 0.001,
+}
+
+#: The strongest wave-1 discovery at champion-scale constants
+#: (``disc_r1_pscale_norms``): surprise budget replaces the utility gate.
+_DISC_SURPRISE_CONFIG: dict[str, float] = {
+    **_CHAMPION_CONFIG,
+    "gate": 0.0,
+    "surprise_budget": 1.0,
+    "surprise_gain": 0.8360796272754669,
+    "surprise_fast": 0.9642297768592835,
+    "surprise_slow": 0.9996305719081341,
 }
 
 
@@ -253,6 +334,22 @@ def seed_genomes() -> Array:
     l2init = dict(_CHAMPION_CONFIG)
     l2init["decay_to_init"] = 1.0
     rows.append(genome_from_config(l2init))
+    # Wave-1 discovery (champion-scale constants) + wave-2 mechanism seeds:
+    # each new mechanism enters the initial population on both the champion
+    # form and the discovered gate-free form.
+    rows.append(genome_from_config(_DISC_SURPRISE_CONFIG))
+    for base in (_CHAMPION_CONFIG, _DISC_SURPRISE_CONFIG):
+        for extra in (
+            {"rls_head": 1.0},
+            {"rls_head": 1.0, "rls_reset_p": 1.0},
+            {"nb_member": 1.0},
+            {"lr_anneal": 1.0},
+            {"layer_lr": 1.0, "layer_lr_ratio": 2.0},
+            {"kalman_norm": 1.0},
+        ):
+            variant = dict(base)
+            variant.update(extra)
+            rows.append(genome_from_config(variant))
     return jnp.asarray(np.stack(rows), dtype=jnp.float32)
 
 
@@ -271,6 +368,18 @@ def describe_genome(genome: np.ndarray | Array) -> str:
         relevant.extend(["surprise_gain", "surprise_fast", "surprise_slow"])
     if config["meta_decay"]:
         relevant.append("meta_gain")
+    if config["rls_head"]:
+        relevant.append("rls_lambda")
+    if config["nb_member"]:
+        relevant.append("nb_decay")
+    if config["rls_head"] or config["nb_member"]:
+        relevant.append("vote_decay")
+    if config["lr_anneal"]:
+        relevant.extend(["anneal_lo", "anneal_hi"])
+    if config["layer_lr"]:
+        relevant.append("layer_lr_ratio")
+    if config["kalman_norm"]:
+        relevant.append("kalman_q")
     flags_text = "+".join(active) if active else "(bare sgd)"
     params_text = " ".join(f"{name}={config[name]:.4g}" for name in relevant)
     return f"{flags_text} | {params_text}"
@@ -283,7 +392,11 @@ class RuleState:
     ``init_params`` is the frozen init snapshot (L2-init target and reset
     source); the error scalars drive the surprise-budget and meta-decay
     mechanisms; the normalizer statistics mirror the champion's
-    shift-adaptive EMA normalizer.
+    shift-adaptive EMA normalizer. Wave-2 state: per-feature Kalman
+    uncertainty (``kalman_p``), the closed-form RLS head over the last
+    hidden layer (``rls_p``/``rls_w``), the streaming naive-Bayes member
+    (``nb_mean``/``nb_var``/``nb_count``), and the ensemble vote-accuracy
+    EMAs (``member_acc``: net, rls, nb).
     """
 
     utility: dict[str, Array]
@@ -298,12 +411,20 @@ class RuleState:
     err_autocorr: Array
     err_var: Array
     err_prev_delta: Array
+    kalman_p: Array
+    rls_p: Array
+    rls_w: Array
+    nb_mean: Array
+    nb_var: Array
+    nb_count: Array
+    member_acc: Array
 
 
 def init_rule_state(params: dict[str, Array]) -> RuleState:
     """Fresh rule state for an initialized parameter tree."""
     input_dim = params["w1"].shape[0]
     n_classes = params["b3"].shape[0]
+    rls_dim = params["b2"].shape[0] + 1  # last hidden layer + bias feature
     chance_loss = jnp.asarray(math.log(float(n_classes)), jnp.float32)
     return RuleState(  # type: ignore[call-arg]
         utility={name: jnp.zeros_like(value) for name, value in params.items()},
@@ -318,6 +439,13 @@ def init_rule_state(params: dict[str, Array]) -> RuleState:
         err_autocorr=jnp.asarray(0.0, jnp.float32),
         err_var=jnp.asarray(0.0, jnp.float32),
         err_prev_delta=jnp.asarray(0.0, jnp.float32),
+        kalman_p=jnp.ones(input_dim, dtype=jnp.float32),
+        rls_p=_RLS_P0 * jnp.eye(rls_dim, dtype=jnp.float32),
+        rls_w=jnp.zeros((rls_dim, n_classes), dtype=jnp.float32),
+        nb_mean=jnp.zeros((n_classes, input_dim), dtype=jnp.float32),
+        nb_var=jnp.ones((n_classes, input_dim), dtype=jnp.float32),
+        nb_count=jnp.zeros(n_classes, dtype=jnp.float32),
+        member_acc=jnp.full((3,), 1.0 / float(n_classes), dtype=jnp.float32),
     )
 
 
@@ -328,13 +456,13 @@ def _rms_mix(hidden: Array, f_rms: Array) -> Array:
 
 def _loss_logits(
     params: dict[str, Array], x: Array, y: Array, f_rms: Array
-) -> tuple[Array, Array]:
+) -> tuple[Array, tuple[Array, Array]]:
     hidden = jax.nn.relu(x @ params["w1"] + params["b1"])
     hidden = _rms_mix(hidden, f_rms)
     hidden = jax.nn.relu(hidden @ params["w2"] + params["b2"])
     hidden = _rms_mix(hidden, f_rms)
     logits = hidden @ params["w3"] + params["b3"]
-    return -jax.nn.log_softmax(logits)[y], logits
+    return -jax.nn.log_softmax(logits)[y], (logits, hidden)
 
 
 def rule_step(
@@ -357,16 +485,24 @@ def rule_step(
         flags[0], flags[1], flags[2], flags[3], flags[4], flags[5], flags[6], flags[7],
         flags[8],
     )
+    f_rls, f_rls_reset, f_nb, f_anneal, f_layer, f_kalman = (
+        flags[9], flags[10], flags[11], flags[12], flags[13], flags[14],
+    )
     p_lr, p_wd, p_ndecay, p_fast, p_shift_k, p_udecay, p_beta = (
         values[0], values[1], values[2], values[3], values[4], values[5], values[6],
     )
     p_sgain, p_sfast, p_sslow, p_mgain = values[7], values[8], values[9], values[10]
+    p_rlam, p_nbdecay, p_vote, p_alo, p_ahi, p_lratio, p_kq = (
+        values[11], values[12], values[13], values[14], values[15], values[16],
+        values[17],
+    )
 
     # --- shift-adaptive per-feature statistics (champion normalizer parity).
     effective_fast = jnp.minimum(p_fast, 1.0 - 1.0 / (state.norm_count + 2.0))
     new_fast = effective_fast * state.fast_mean + (1.0 - effective_fast) * x
     threshold = p_shift_k * jnp.sqrt(state.norm_var) + SHIFT_DELTA
     shifted = jnp.abs(new_fast - state.norm_mean) > threshold
+    shifted_f = shifted.astype(jnp.float32)
     count_reset = jnp.where(shifted, 0.0, state.norm_count)
     new_count = (
         f_shift_reset * count_reset + (1.0 - f_shift_reset) * state.norm_count
@@ -379,7 +515,20 @@ def rule_step(
     decay_used = f_meta * meta_target + (1.0 - f_meta) * p_ndecay
     effective_decay = jnp.minimum(decay_used, 1.0 - 1.0 / (new_count + 1.0))
     delta = x - state.norm_mean
-    new_mean = state.norm_mean + (1.0 - effective_decay) * delta
+    ema_mean = state.norm_mean + (1.0 - effective_decay) * delta
+    # Kalman-style predict-update mean tracking (wave-2 conditioning
+    # alternative): process noise scaled to the tracked variance, detected
+    # shifts reinflate the posterior uncertainty (composes with shift_reset).
+    r_obs = jnp.maximum(state.norm_var, _EPS)
+    p_pred = (
+        state.kalman_p
+        + p_kq * r_obs
+        + f_shift_reset * shifted_f * _KALMAN_SHIFT_BOOST * r_obs
+    )
+    kalman_gain = p_pred / (p_pred + r_obs)
+    kalman_mean = state.norm_mean + kalman_gain * delta
+    new_kalman_p = (1.0 - kalman_gain) * p_pred
+    new_mean = f_kalman * kalman_mean + (1.0 - f_kalman) * ema_mean
     delta2 = x - new_mean
     new_var = jnp.maximum(
         effective_decay * state.norm_var + (1.0 - effective_decay) * delta * delta2,
@@ -389,10 +538,41 @@ def rule_step(
     x_used = f_norm * x_norm + (1.0 - f_norm) * x
 
     # --- forward + gradients (pre-update prediction = online accuracy).
-    (loss, logits), grads = jax.value_and_grad(_loss_logits, has_aux=True)(
+    (loss, (logits, hidden2)), grads = jax.value_and_grad(_loss_logits, has_aux=True)(
         params, x_used, y, f_rms
     )
-    correct = (jnp.argmax(logits) == y).astype(jnp.float32)
+
+    # --- ensemble members (pre-update readout state; the protocol's
+    # predict-then-update convention). The net member is always active;
+    # rls/nb join the vote when their flags are on, weighted by their
+    # recent-accuracy EMAs.
+    n_classes = state.rls_w.shape[1]
+    h_aug = jnp.concatenate([hidden2, jnp.ones((1,), dtype=jnp.float32)])
+    rls_scores = jnp.clip(h_aug @ state.rls_w, -_RLS_SCORE_CLIP, _RLS_SCORE_CLIP)
+    input_dim = x_used.shape[0]
+    nb_var_safe = jnp.maximum(state.nb_var, _NB_VAR_FLOOR)
+    nb_ll = -0.5 * jnp.sum(
+        jnp.log(nb_var_safe)
+        + (x_used[None, :] - state.nb_mean) ** 2 / nb_var_safe,
+        axis=1,
+    )
+    s_net = jax.nn.log_softmax(logits)
+    s_rls = jax.nn.log_softmax(_RLS_VOTE_TEMP * rls_scores)
+    s_nb = jax.nn.log_softmax(nb_ll / float(input_dim))
+    w_net = state.member_acc[0]
+    w_rls = f_rls * state.member_acc[1]
+    w_nb = f_nb * state.member_acc[2]
+    w_sum = w_net + w_rls + w_nb + _EPS
+    combined = (w_net * s_net + w_rls * s_rls + w_nb * s_nb) / w_sum
+    correct = (jnp.argmax(combined) == y).astype(jnp.float32)
+    member_hits = jnp.stack(
+        [
+            (jnp.argmax(s_net) == y).astype(jnp.float32),
+            (jnp.argmax(s_rls) == y).astype(jnp.float32),
+            (jnp.argmax(s_nb) == y).astype(jnp.float32),
+        ]
+    )
+    new_member_acc = p_vote * state.member_acc + (1.0 - p_vote) * member_hits
 
     # --- utility gate (champion equations; optional stale-utility cleanup).
     clock = state.step + jnp.array(1, dtype=jnp.int32)
@@ -409,17 +589,26 @@ def rule_step(
     budget = jnp.clip(
         jnp.exp(p_sgain * jnp.log(jnp.maximum(ratio, _EPS))), _BUDGET_LO, _BUDGET_HI
     )
-    lr_eff = p_lr * (1.0 + f_budget * (budget - 1.0))
-    decay_factor = 1.0 - lr_eff * p_wd
+    # --- within-task lr annealing (wave-2, task-clock-free): the fast/slow
+    # error ratio maps [1, _ANNEAL_R_HI] onto [anneal_lo, anneal_hi] —
+    # fast right after a surprise spike, low once the task converges.
+    surprise_score = jnp.clip((ratio - 1.0) / (_ANNEAL_R_HI - 1.0), 0.0, 1.0)
+    anneal_value = p_alo + (p_ahi - p_alo) * surprise_score
+    anneal_mult = 1.0 + f_anneal * (anneal_value - 1.0)
+    lr_eff = p_lr * (1.0 + f_budget * (budget - 1.0)) * anneal_mult
     new_params: dict[str, Array] = {}
     for name in params:
+        # Per-layer lr ratio (wave-2): input layer at ratio**-1, head at
+        # ratio**+1; exponent zero (flag off) is exactly 1.0.
+        lr_name = lr_eff * jnp.power(p_lratio, f_layer * _LAYER_EXPONENT[name])
+        decay_factor = 1.0 - lr_name * p_wd
         gate = jax.nn.sigmoid(
             p_beta * (utility[name] / bias_correction) / global_max
         )
         stepped = (
             params[name] * decay_factor
-            - lr_eff * grads[name] * (1.0 - f_gate * gate)
-            + lr_eff * p_wd * f_init * state.init_params[name]
+            - lr_name * grads[name] * (1.0 - f_gate * gate)
+            + lr_name * p_wd * f_init * state.init_params[name]
         )
         new_params[name] = stepped
     new_params["w1"] = jnp.where(
@@ -427,6 +616,38 @@ def rule_step(
         state.init_params["w1"],
         new_params["w1"],
     )
+
+    # --- RLS head update (wave-2): exponentially-forgetting recursive least
+    # squares on one-hot targets over the last hidden layer, with a leak
+    # toward the ridge prior (bounds P under weak excitation) and an
+    # optional detected-shift reset of P (uncertainty reinflation).
+    ph = state.rls_p @ h_aug
+    rls_denom = p_rlam + h_aug @ ph
+    k_rls = ph / rls_denom
+    rls_err = jax.nn.one_hot(y, n_classes, dtype=jnp.float32) - h_aug @ state.rls_w
+    new_rls_w = state.rls_w + jnp.outer(k_rls, rls_err)
+    p_upd = (state.rls_p - jnp.outer(k_rls, ph)) / p_rlam
+    rls_eye = _RLS_P0 * jnp.eye(state.rls_p.shape[0], dtype=jnp.float32)
+    leak = 2.0 * (1.0 - p_rlam)
+    p_upd = (1.0 - leak) * p_upd + leak * rls_eye
+    p_upd = 0.5 * (p_upd + p_upd.T)
+    reset_p = f_rls_reset * jnp.max(shifted_f)
+    new_rls_p = (1.0 - reset_p) * p_upd + reset_p * rls_eye
+
+    # --- streaming naive-Bayes member update (wave-2): count-annealed EMA
+    # class-conditional diagonal Gaussians over the conditioned input.
+    sel = jax.nn.one_hot(y, n_classes, dtype=jnp.float32)
+    eff_nb = jnp.minimum(p_nbdecay, 1.0 - 1.0 / (state.nb_count + 2.0))[:, None]
+    delta_nb = x_used[None, :] - state.nb_mean
+    mean_cand = state.nb_mean + (1.0 - eff_nb) * delta_nb
+    new_nb_mean = state.nb_mean + sel[:, None] * (mean_cand - state.nb_mean)
+    delta2_nb = x_used[None, :] - new_nb_mean
+    var_cand = jnp.maximum(
+        eff_nb * state.nb_var + (1.0 - eff_nb) * delta_nb * delta2_nb,
+        _NB_VAR_FLOOR,
+    )
+    new_nb_var = state.nb_var + sel[:, None] * (var_cand - state.nb_var)
+    new_nb_count = state.nb_count + sel
 
     # --- error-signal statistics (surprise + autocorrelation trackers).
     delta_e = loss - state.err_slow
@@ -445,6 +666,13 @@ def rule_step(
         err_var=_AUTOCORR_DECAY * state.err_var
         + (1.0 - _AUTOCORR_DECAY) * (delta_e * delta_e),
         err_prev_delta=delta_e,
+        kalman_p=new_kalman_p,
+        rls_p=new_rls_p,
+        rls_w=new_rls_w,
+        nb_mean=new_nb_mean,
+        nb_var=new_nb_var,
+        nb_count=new_nb_count,
+        member_acc=new_member_acc,
     )
     return new_params, new_state, correct, loss
 
@@ -496,9 +724,51 @@ def _net_config(config: MicroTaskConfig) -> IPMNISTConfig:
     )
 
 
+#: Micro-MLP widths on the gauss suite (the transfer-validated operating
+#: point of ``outputs/micro_continual/SUITE.md``).
+_GAUSS_HIDDEN1 = 75
+_GAUSS_HIDDEN2 = 38
+
+#: Either micro-suite family: the provisional digits tasks or the canonical
+#: transfer-validated Gaussian streams.
+EvalConfig = MicroTaskConfig | MicroStreamConfig
+
+
+def _materialize_eval(
+    config: EvalConfig, seed: int
+) -> tuple[Array, Array, dict[str, Array], int]:
+    """Stream + paired network init for one ``(config, seed)``.
+
+    Digits tasks keep the provisional-suite RNG chain (``key(seed)``); gauss
+    streams use the canonical suite's ``_INIT_DOMAIN`` chain so genome runs
+    are init-paired with the ladder anchors of ``run_micro_arm``.
+    """
+    if isinstance(config, MicroStreamConfig):
+        stream = generate_stream(config, int(seed))
+        net = IPMNISTConfig(
+            n_tasks=config.n_regimes,
+            task_length=config.regime_length,
+            input_dim=config.dim,
+            hidden1=_GAUSS_HIDDEN1,
+            hidden2=_GAUSS_HIDDEN2,
+            n_classes=config.n_classes,
+        )
+        key_init = jr.fold_in(jr.key(jnp.uint32(seed)), _INIT_DOMAIN)
+        params = init_mlp_params(key_init, net)
+        return jnp.asarray(stream.x), jnp.asarray(stream.y), params, config.regime_length
+    stream_digits = build_micro_stream(config, int(seed))
+    params = init_mlp_params(jr.key(np.uint32(seed)), _net_config(config))
+    return (
+        jnp.asarray(stream_digits.xs),
+        jnp.asarray(stream_digits.ys),
+        params,
+        config.task_length,
+    )
+
+
 def evaluate_population(
     genomes: Array,
-    config: MicroTaskConfig,
+    config: EvalConfig,
     *,
     seeds: Sequence[int],
     batch_size: int = 256,
@@ -511,12 +781,8 @@ def evaluate_population(
     genomes = jnp.asarray(genomes, dtype=jnp.float32)
     n_genomes = int(genomes.shape[0])
     total = np.zeros((n_genomes,), dtype=np.float64)
-    net = _net_config(config)
     for seed in seeds:
-        stream = build_micro_stream(config, int(seed))
-        params = init_mlp_params(jr.key(np.uint32(seed)), net)
-        xs = jnp.asarray(stream.xs)
-        ys = jnp.asarray(stream.ys)
+        xs, ys, params, task_length = _materialize_eval(config, int(seed))
         start = 0
         while start < n_genomes:
             stop = min(start + batch_size, n_genomes)
@@ -525,7 +791,7 @@ def evaluate_population(
             if stop - start < batch_size and n_genomes > batch_size:
                 pad = batch_size - (stop - start)
                 chunk = jnp.concatenate([chunk, chunk[-1:].repeat(pad, axis=0)])
-            mean_accuracy, _ = _batched_run(chunk, params, xs, ys, config.task_length)
+            mean_accuracy, _ = _batched_run(chunk, params, xs, ys, task_length)
             block = np.asarray(mean_accuracy, dtype=np.float64)
             if pad:
                 block = block[: stop - start]
@@ -584,7 +850,7 @@ def evaluate_suite(
     *,
     seeds: Sequence[int],
     batch_size: int = 256,
-    suite: Mapping[str, MicroTaskConfig] | None = None,
+    suite: Mapping[str, EvalConfig] | None = None,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """Mean accuracy across the named micro tasks; also per-task vectors."""
     registry = MICRO_SUITE if suite is None else suite
@@ -597,12 +863,83 @@ def evaluate_suite(
     return mean, per_task
 
 
+#: Gauss-suite fitness lanes (wave-2 search): fitness reads G1+G3 only;
+#: G4 (recurrence) and the perturbed-geometry G1p are selection holdouts.
+GAUSS_SEARCH_TASKS: tuple[str, ...] = ("G1", "G3")
+GAUSS_HOLDOUT_TASKS: tuple[str, ...] = ("G4", "G1p")
+
+#: Search-lane regime count on the frozen gauss-v1 geometry. SUITE.md's
+#: guidance: the validated structure lives in the geometry, not the
+#: horizon, so fitness runs shrink ``n_regimes`` (16 x 5000 steps here)
+#: while keeping the protocol regime length (Adam-class operating regime).
+GAUSS_SEARCH_REGIMES = 16
+
+
+def gauss_suite(n_regimes: int = GAUSS_SEARCH_REGIMES) -> dict[str, MicroStreamConfig]:
+    """The wave-2 fitness registry on the transfer-validated gauss-v1 suite.
+
+    ``G1``/``G3``/``G4`` freeze the validated M1 geometry
+    (``MicroStreamConfig`` defaults) on their families; ``G1p`` perturbs the
+    geometry itself (dim 192, 4 components, 1.5-decade spectrum, wider
+    separation) so holdout survival requires transfer across operating
+    points, not seed luck.
+    """
+    return {
+        "G1": MicroStreamConfig(
+            family="input_permutation", n_regimes=n_regimes, regime_length=5000
+        ),
+        "G3": MicroStreamConfig(
+            family="scale_shift", n_regimes=n_regimes, regime_length=5000
+        ),
+        "G4": MicroStreamConfig(
+            family="recurrence", n_regimes=n_regimes, regime_length=5000,
+            recurrence_pool=max(2, min(4, n_regimes)),
+        ),
+        "G1p": MicroStreamConfig(
+            family="input_permutation", n_regimes=n_regimes, regime_length=5000,
+            dim=192, n_components=4, spectrum_decades=1.5, mean_separation=0.5,
+            component_sparsity=8,
+        ),
+    }
+
+
+def _suite_geometry(config: EvalConfig) -> dict[str, Any]:
+    """JSON geometry row for either suite family."""
+    if isinstance(config, MicroStreamConfig):
+        return {
+            "suite": "gauss",
+            "family": config.family,
+            "n_tasks": config.n_regimes,
+            "task_length": config.regime_length,
+            "input_dim": config.dim,
+        }
+    return {
+        "suite": "digits",
+        "family": config.kind,
+        "n_tasks": config.n_tasks,
+        "task_length": config.task_length,
+        "input_dim": config.input_dim,
+    }
+
+
 def _resolved_suite(
-    n_tasks: int | None, task_length: int | None
-) -> dict[str, MicroTaskConfig]:
+    n_tasks: int | None, task_length: int | None, suite_kind: str = "digits"
+) -> dict[str, EvalConfig]:
+    suite: dict[str, EvalConfig]
+    if suite_kind == "gauss":
+        suite = dict(gauss_suite(n_tasks if n_tasks is not None else GAUSS_SEARCH_REGIMES))
+        if task_length is not None:
+            for name, config in suite.items():
+                assert isinstance(config, MicroStreamConfig)
+                pool = min(config.recurrence_pool, max(2, config.n_regimes))
+                suite[name] = dataclasses.replace(
+                    config, regime_length=task_length, recurrence_pool=pool
+                )
+        return suite
     suite = dict(MICRO_SUITE)
     if n_tasks is not None or task_length is not None:
         for name, config in suite.items():
+            assert isinstance(config, MicroTaskConfig)
             suite[name] = dataclasses.replace(
                 config,
                 n_tasks=n_tasks if n_tasks is not None else config.n_tasks,
@@ -619,7 +956,7 @@ def tune_champion_baseline(
     task_names: Sequence[str],
     eval_seeds: Sequence[int],
     batch_size: int,
-    suite: Mapping[str, MicroTaskConfig],
+    suite: Mapping[str, EvalConfig],
     n_random: int = 256,
     generations: int = 4,
     children: int = 64,
@@ -688,7 +1025,7 @@ def run_search(
     search_seed: int = 0,
     task_names: Sequence[str] = SEARCH_TASKS,
     holdout_names: Sequence[str] = HOLDOUT_TASKS,
-    suite: Mapping[str, MicroTaskConfig] | None = None,
+    suite: Mapping[str, EvalConfig] | None = None,
 ) -> dict[str, Any]:
     """Random + evolutionary search over the rule DSL with holdout validation.
 
@@ -857,10 +1194,16 @@ def run_search(
         key=lambda row: -float(row["holdout_accuracy"]),
     )[:3]
 
+    gauss_lane = any(
+        isinstance(registry[name], MicroStreamConfig)
+        for name in list(task_names) + list(holdout_names)
+    )
     payload: dict[str, Any] = {
         "schema": RESULT_SCHEMA,
         "evidence_policy": dict(NONPROMOTING_POLICY),
-        "micro_suite_version": MICRO_SUITE_VERSION,
+        "micro_suite_version": (
+            MICRO_GAUSS_SUITE_VERSION if gauss_lane else MICRO_SUITE_VERSION
+        ),
         "settings": {
             "n_random": n_random,
             "population": population,
@@ -875,11 +1218,7 @@ def run_search(
             "holdout_names": list(holdout_names),
             "flag_penalty": FLAG_PENALTY,
             "suite_geometry": {
-                name: {
-                    "n_tasks": registry[name].n_tasks,
-                    "task_length": registry[name].task_length,
-                    "input_dim": registry[name].input_dim,
-                }
+                name: _suite_geometry(registry[name])
                 for name in list(task_names) + list(holdout_names)
             },
         },
@@ -933,22 +1272,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     search_p.add_argument("--top-k", type=int, default=12)
     search_p.add_argument("--batch-size", type=int, default=256)
     search_p.add_argument("--search-seed", type=int, default=0)
-    search_p.add_argument("--tasks", nargs="+", default=list(SEARCH_TASKS))
-    search_p.add_argument("--holdout-tasks", nargs="+", default=list(HOLDOUT_TASKS))
+    search_p.add_argument(
+        "--suite", choices=("digits", "gauss"), default="digits",
+        help=(
+            "fitness suite: the provisional digits tasks (M1..M1p) or the "
+            "transfer-validated gauss-v1 streams (G1/G3 search, G4/G1p holdout)"
+        ),
+    )
+    search_p.add_argument("--tasks", nargs="+", default=None)
+    search_p.add_argument("--holdout-tasks", nargs="+", default=None)
     search_p.add_argument(
         "--micro-n-tasks", type=int, default=None,
-        help="override every micro task's n_tasks (smoke runs only)",
+        help=(
+            "override every micro task's n_tasks/n_regimes (gauss-lane "
+            "budget knob per SUITE.md; smoke-only on the digits lane)"
+        ),
     )
     search_p.add_argument(
         "--micro-task-length", type=int, default=None,
-        help="override every micro task's task_length (smoke runs only)",
+        help="override every micro task's task/regime length (smoke runs only)",
     )
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True
     )
     if args.command == "search":
-        suite = _resolved_suite(args.micro_n_tasks, args.micro_task_length)
+        suite = _resolved_suite(args.micro_n_tasks, args.micro_task_length, args.suite)
+        if args.suite == "gauss":
+            default_tasks, default_holdout = GAUSS_SEARCH_TASKS, GAUSS_HOLDOUT_TASKS
+        else:
+            default_tasks, default_holdout = SEARCH_TASKS, HOLDOUT_TASKS
+        tasks = tuple(args.tasks) if args.tasks else default_tasks
+        holdout_tasks = (
+            tuple(args.holdout_tasks) if args.holdout_tasks else default_holdout
+        )
         payload = run_search(
             n_random=args.n_random,
             population=args.population,
@@ -959,8 +1316,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             top_k=args.top_k,
             batch_size=args.batch_size,
             search_seed=args.search_seed,
-            task_names=tuple(args.tasks),
-            holdout_names=tuple(args.holdout_tasks),
+            task_names=tasks,
+            holdout_names=holdout_tasks,
             suite=suite,
         )
         _atomic_write_json(args.out, payload)

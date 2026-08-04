@@ -387,6 +387,258 @@ def test_cli_search_smoke(tmp_path) -> None:
     assert set(payload["settings"]["holdout_names"]) == {"M1p"}
 
 
+class TestExpandedMechanisms:
+    """Wave-2 genome expansion: RLS head, NB ensemble member, surprise-driven
+    lr annealing, per-layer lr ratio, Kalman-style normalizer.
+
+    Every new mechanism must be inert (bit-parity-preserving) when its flag
+    is off — the champion-parity test above stays the reduction pin — and
+    must express its documented behavior when on.
+    """
+
+    def _flagless_config(self) -> dict[str, float]:
+        config = dict(decode_genome(champion_form_genome()))
+        for flag in FLAG_NAMES:
+            config[flag] = 0.0
+        return config
+
+    def test_new_genes_present(self) -> None:
+        for flag in (
+            "rls_head",
+            "rls_reset_p",
+            "nb_member",
+            "lr_anneal",
+            "layer_lr",
+            "kalman_norm",
+        ):
+            assert flag in FLAG_NAMES
+        for name in (
+            "rls_lambda",
+            "nb_decay",
+            "vote_decay",
+            "anneal_lo",
+            "anneal_hi",
+            "layer_lr_ratio",
+            "kalman_q",
+        ):
+            assert name in PARAM_NAMES
+
+    def test_rls_head_tracks_targets_and_shift_resets_p(self) -> None:
+        config = self._flagless_config()
+        config["rls_head"] = 1.0
+        config["rls_reset_p"] = 1.0
+        config["norm"] = 1.0
+        config["shift_k"] = 0.5
+        config["rls_lambda"] = 0.999
+        genome = jnp.asarray(genome_from_config(config))
+        params, state = _tiny_setup(seed=11)
+        x = jnp.linspace(0.1, 1.0, _TINY.input_dim, dtype=jnp.float32)
+        y = jnp.asarray(3, dtype=jnp.int32)
+        _, new_state, _, _ = rule_step(genome, params, state, x, y)
+        # The RLS readout moves (W picks up the one-hot target).
+        assert float(jnp.abs(new_state.rls_w).sum()) > 0.0
+        assert bool(jnp.all(jnp.isfinite(new_state.rls_p)))
+        # A detected shift on every feature resets P to its prior.
+        mature = dataclasses.replace(
+            new_state,
+            norm_count=jnp.full((_TINY.input_dim,), 1000.0, jnp.float32),
+            norm_mean=jnp.zeros((_TINY.input_dim,), jnp.float32),
+            norm_var=jnp.full((_TINY.input_dim,), 1e-4, jnp.float32),
+            fast_mean=jnp.zeros((_TINY.input_dim,), jnp.float32),
+        )
+        x_shift = jnp.full((_TINY.input_dim,), 10.0, jnp.float32)
+        _, reset_state, _, _ = rule_step(genome, params, mature, x_shift, y)
+        off_diag = reset_state.rls_p - jnp.diag(jnp.diag(reset_state.rls_p))
+        np.testing.assert_allclose(np.asarray(off_diag), 0.0, atol=1e-6)
+
+    def test_nb_member_updates_only_observed_class(self) -> None:
+        config = self._flagless_config()
+        config["nb_member"] = 1.0
+        genome = jnp.asarray(genome_from_config(config))
+        params, state = _tiny_setup(seed=12)
+        x = jnp.linspace(0.5, 2.0, _TINY.input_dim, dtype=jnp.float32)
+        y = jnp.asarray(2, dtype=jnp.int32)
+        _, new_state, _, _ = rule_step(genome, params, state, x, y)
+        moved = np.abs(np.asarray(new_state.nb_mean - state.nb_mean)).sum(axis=1)
+        assert moved[2] > 0.0
+        for klass in (0, 1, 3, 4):
+            assert moved[klass] == pytest.approx(0.0, abs=1e-8)
+        assert float(new_state.nb_count[2]) == pytest.approx(1.0)
+
+    def test_lr_anneal_fast_when_surprised_slow_when_calm(self) -> None:
+        config = self._flagless_config()
+        config["lr_anneal"] = 1.0
+        config["weight_decay"] = 1e-4
+        config["anneal_lo"] = 0.25
+        config["anneal_hi"] = 2.0
+        genome = jnp.asarray(genome_from_config(config))
+        base = dict(config)
+        base["lr_anneal"] = 0.0
+        genome_base = jnp.asarray(genome_from_config(base))
+        params, state = _tiny_setup(seed=13)
+        x = jnp.linspace(0.2, 1.0, _TINY.input_dim, dtype=jnp.float32)
+        y = jnp.asarray(1, dtype=jnp.int32)
+        surprised = dataclasses.replace(
+            state,
+            err_fast=jnp.asarray(4.0, jnp.float32),
+            err_slow=jnp.asarray(1.0, jnp.float32),
+        )
+        calm = dataclasses.replace(
+            state,
+            err_fast=jnp.asarray(1.0, jnp.float32),
+            err_slow=jnp.asarray(1.0, jnp.float32),
+        )
+        step_hot, _, _, _ = rule_step(genome, params, surprised, x, y)
+        step_calm, _, _, _ = rule_step(genome, params, calm, x, y)
+        step_base, _, _, _ = rule_step(genome_base, params, calm, x, y)
+        delta_hot = float(jnp.abs(step_hot["w3"] - params["w3"]).sum())
+        delta_calm = float(jnp.abs(step_calm["w3"] - params["w3"]).sum())
+        delta_base = float(jnp.abs(step_base["w3"] - params["w3"]).sum())
+        # Surprised (ratio >= 2) runs at anneal_hi; calm runs at anneal_lo.
+        assert delta_hot == pytest.approx(2.0 * delta_base, rel=1e-3)
+        assert delta_calm == pytest.approx(0.25 * delta_base, rel=1e-3)
+
+    def test_layer_lr_ratio_scales_head_vs_input(self) -> None:
+        config = self._flagless_config()
+        config["layer_lr"] = 1.0
+        config["layer_lr_ratio"] = 2.0
+        config["weight_decay"] = 1e-4
+        genome = jnp.asarray(genome_from_config(config))
+        base = dict(config)
+        base["layer_lr"] = 0.0
+        genome_base = jnp.asarray(genome_from_config(base))
+        params, state = _tiny_setup(seed=14)
+        x = jnp.linspace(0.2, 1.0, _TINY.input_dim, dtype=jnp.float32)
+        y = jnp.asarray(0, dtype=jnp.int32)
+        stepped, _, _, _ = rule_step(genome, params, state, x, y)
+        stepped_base, _, _, _ = rule_step(genome_base, params, state, x, y)
+        head = float(jnp.abs(stepped["w3"] - params["w3"]).sum())
+        head_base = float(jnp.abs(stepped_base["w3"] - params["w3"]).sum())
+        w1 = float(jnp.abs(stepped["w1"] - params["w1"]).sum())
+        w1_base = float(jnp.abs(stepped_base["w1"] - params["w1"]).sum())
+        assert head == pytest.approx(2.0 * head_base, rel=1e-3)
+        assert w1 == pytest.approx(0.5 * w1_base, rel=1e-3)
+
+    def test_kalman_norm_uncertainty_drives_tracking_speed(self) -> None:
+        config = self._flagless_config()
+        config["norm"] = 1.0
+        config["kalman_norm"] = 1.0
+        config["kalman_q"] = 1e-3
+        genome = jnp.asarray(genome_from_config(config))
+        params, state = _tiny_setup(seed=15)
+        x = jnp.full((_TINY.input_dim,), 5.0, jnp.float32)
+        y = jnp.asarray(0, dtype=jnp.int32)
+        confident = dataclasses.replace(
+            state,
+            norm_count=jnp.full((_TINY.input_dim,), 1000.0, jnp.float32),
+            kalman_p=jnp.full((_TINY.input_dim,), 1e-4, jnp.float32),
+        )
+        uncertain = dataclasses.replace(
+            state,
+            norm_count=jnp.full((_TINY.input_dim,), 1000.0, jnp.float32),
+            kalman_p=jnp.full((_TINY.input_dim,), 10.0, jnp.float32),
+        )
+        _, state_conf, _, _ = rule_step(genome, params, confident, x, y)
+        _, state_unc, _, _ = rule_step(genome, params, uncertain, x, y)
+        # High posterior uncertainty => larger Kalman gain => faster tracking.
+        assert float(state_unc.norm_mean[0]) > float(state_conf.norm_mean[0])
+        # Posterior uncertainty contracts after the update.
+        assert float(state_unc.kalman_p[0]) < 10.0
+
+    def test_member_vote_accuracy_updates_with_vote_decay(self) -> None:
+        config = self._flagless_config()
+        config["nb_member"] = 1.0
+        config["vote_decay"] = 0.9
+        genome = jnp.asarray(genome_from_config(config))
+        params, state = _tiny_setup(seed=16)
+        x = jnp.linspace(0.1, 0.9, _TINY.input_dim, dtype=jnp.float32)
+        y = jnp.asarray(1, dtype=jnp.int32)
+        _, new_state, _, _ = rule_step(genome, params, state, x, y)
+        assert new_state.member_acc.shape == (3,)
+        assert bool(jnp.all(new_state.member_acc >= 0.0))
+        assert bool(jnp.all(new_state.member_acc <= 1.0))
+        assert float(jnp.abs(new_state.member_acc - state.member_acc).sum()) > 0.0
+
+
+class TestGaussFitness:
+    """The search fitness migrates to the transfer-validated gauss-v1 suite."""
+
+    def test_gauss_suite_registry_families(self) -> None:
+        from alberta_framework.benchmarks.rule_discovery import (
+            GAUSS_HOLDOUT_TASKS,
+            GAUSS_SEARCH_TASKS,
+            gauss_suite,
+        )
+
+        suite = gauss_suite()
+        assert set(GAUSS_SEARCH_TASKS) == {"G1", "G3"}
+        assert set(GAUSS_HOLDOUT_TASKS) == {"G4", "G1p"}
+        assert suite["G1"].family == "input_permutation"
+        assert suite["G3"].family == "scale_shift"
+        assert suite["G4"].family == "recurrence"
+        assert suite["G1p"].family == "input_permutation"
+        # The perturbed-M1 holdout runs a genuinely different geometry.
+        assert suite["G1p"].dim != suite["G1"].dim
+
+    def test_evaluate_population_on_gauss_stream_is_paired_and_bounded(self) -> None:
+        from alberta_framework.benchmarks.micro_continual import MicroStreamConfig
+
+        config = MicroStreamConfig(
+            family="input_permutation", n_regimes=2, regime_length=25, dim=16,
+            component_sparsity=4,
+        )
+        genomes = jnp.stack(
+            [jnp.asarray(champion_form_genome()), jnp.asarray(champion_form_genome())]
+        )
+        accuracy = evaluate_population(genomes, config, seeds=(0,))
+        assert accuracy.shape == (2,)
+        assert float(accuracy[0]) == pytest.approx(float(accuracy[1]), abs=1e-7)
+        assert 0.0 <= float(accuracy[0]) <= 1.0
+
+    @pytest.mark.integration
+    def test_cli_search_gauss_smoke(self, tmp_path) -> None:
+        import json
+
+        from alberta_framework.benchmarks.rule_discovery import RESULT_SCHEMA, main
+
+        out = tmp_path / "search_gauss_smoke.json"
+        code = main(
+            [
+                "search",
+                "--suite", "gauss",
+                "--out", str(out),
+                "--n-random", "8",
+                "--population", "6",
+                "--generations", "1",
+                "--elite", "3",
+                "--eval-seeds", "0",
+                "--holdout-seeds", "201",
+                "--top-k", "4",
+                "--batch-size", "8",
+                "--micro-n-tasks", "2",
+                "--micro-task-length", "30",
+            ]
+        )
+        assert code == 0
+        payload = json.loads(out.read_text())
+        assert payload["schema"] == RESULT_SCHEMA
+        assert payload["evidence_policy"]["scientific_promotion_allowed"] is False
+        assert set(payload["settings"]["task_names"]) == {"G1", "G3"}
+        assert set(payload["settings"]["holdout_names"]) == {"G4", "G1p"}
+        assert len(payload["candidates"]) == 4
+
+
+def test_seed_genomes_include_discovered_and_new_mechanism_rows() -> None:
+    configs = [decode_genome(np.asarray(g)) for g in seed_genomes()]
+    # The disc_r1_pscale_norms survivor: surprise budget without the gate.
+    assert any(
+        c["surprise_budget"] == 1.0 and c["gate"] == 0.0 and c["norm"] == 1.0
+        for c in configs
+    )
+    for flag in ("rls_head", "nb_member", "lr_anneal", "layer_lr", "kalman_norm"):
+        assert any(c[flag] == 1.0 for c in configs), flag
+
+
 def test_run_stream_reports_per_task_accuracy() -> None:
     config = dataclasses.replace(MICRO_SUITE["M1"], n_tasks=2, task_length=15)
     from alberta_framework.benchmarks.micro_continual import build_micro_stream
