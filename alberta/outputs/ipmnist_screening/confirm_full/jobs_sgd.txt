@@ -1,3 +1,0 @@
-sgd_ema_norm 0
-sgd_ema_norm 1
-sgd_ema_norm 2

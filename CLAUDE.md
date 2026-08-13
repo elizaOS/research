@@ -23,10 +23,12 @@ downstream product names out of it.
 ```
 chip/           Eliza E1 SoC — RTL, verification (cocotb/formal), BSP, PD, board/package artifacts
 robot/          @elizaos/robot — Python robotics stack (MuJoCo/Brax/MJX, bridge, perception) + thin TS surface
-alberta/        Alberta Framework — JAX continual-RL (The Alberta Plan); trains robot policies
+alberta/        ASI (Alberta Framework) — JAX continual-RL (The Alberta Plan); trains robot
+                policies. Git submodule of github.com/elizaOS/asi, mounted here so
+                robot/'s editable `../alberta` dependency keeps resolving
 plugin-ainex/   @elizaos/plugin-ainex — elizaOS plugin driving the Hiwonder AiNex humanoid via the robot bridge
 docs/           chip/ track, robot.mdx embodiment doc, tee-native/ security design notes
-.github/workflows/  CI: typescript · alberta · robot (light lane) · e1-chip-fast
+.github/workflows/  CI: typescript · robot (light lane) · e1-chip-fast
                     (per-PR make lint typecheck) · e1-chip (heavy Docker regression,
                     workflow_dispatch + monthly cron)
 ```
@@ -37,7 +39,9 @@ docs/           chip/ track, robot.mdx embodiment doc, tee-native/ security desi
   built by `e1-chip.yml`. Native builds are preferred on Linux x86_64.
 - **robot/** — Python 3 + JAX/MuJoCo/Brax; profile-driven (`RobotProfileId`).
   Heavy logic in the `eliza_robot` Python package; TS `src/` is a thin surface.
-- **alberta/** — Python 3.12+, JAX 0.4+. `pip install -e alberta/`.
+- **alberta/** — Python 3.12+, JAX 0.4+. `git submodule update --init alberta`,
+  then `pip install -e alberta/`. Develops upstream in `elizaOS/asi` (CI lives
+  there); bump the submodule pointer here to pull changes in.
 - **plugin-ainex/** — TypeScript elizaOS plugin; `bun run build`. Depends on the
   `eliza_robot` bridge (`python -m eliza_robot.bridge.server`).
 

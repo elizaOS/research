@@ -1,9 +1,0 @@
-retrying adamw_cbp seed 2 with --noise-mode step (noise-free arm)
-retrying adamw_cbp seed 0 with --noise-mode step (noise-free arm)
-retrying adamw_cbp seed 1 with --noise-mode step (noise-free arm)
-Terminated
-Terminated
-FAILED adamw_cbp seed 0 (exit 143) — see outputs/ipmnist_screening/confirm_full/adamw_cbp_seed0.log
-FAILED adamw_cbp seed 2 (exit 143) — see outputs/ipmnist_screening/confirm_full/adamw_cbp_seed2.log
-Terminated
-FAILED adamw_cbp seed 1 (exit 143) — see outputs/ipmnist_screening/confirm_full/adamw_cbp_seed1.log

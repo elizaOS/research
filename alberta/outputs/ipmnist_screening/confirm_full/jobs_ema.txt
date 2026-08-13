@@ -1,3 +1,0 @@
-upgd_ema_norm 0
-upgd_ema_norm 1
-upgd_ema_norm 2

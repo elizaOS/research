@@ -1,3 +1,0 @@
-sigma0_ndecay099 0
-sigma0_ndecay099 1
-sigma0_ndecay099 2

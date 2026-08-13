@@ -2,3 +2,7 @@
 	path = robot/vendor/asimov-1
 	url = https://github.com/asimovinc/asimov-1.git
 	branch = main
+[submodule "alberta"]
+	path = alberta
+	url = https://github.com/elizaOS/asi.git
+	branch = main

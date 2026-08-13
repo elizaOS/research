@@ -1,7 +1,0 @@
-upgd_ema_norm 3
-upgd_ema_norm 4
-upgd_ema_norm 5
-upgd_ema_norm 6
-upgd_ema_norm 7
-upgd_ema_norm 8
-upgd_ema_norm 9
