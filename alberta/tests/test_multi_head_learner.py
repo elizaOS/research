@@ -686,6 +686,8 @@ class TestRunMultiHeadLearningLoop:
         chex.assert_shape(
             result.per_head_metrics, (num_steps, n_heads, 3)
         )
+        chex.assert_shape(result.updates_applied, (num_steps,))
+        assert bool(jnp.all(result.updates_applied))
 
     def test_deterministic(self):
         """Same inputs should give identical results."""
@@ -790,6 +792,8 @@ class TestRunMultiHeadLearningLoopBatched:
         chex.assert_shape(
             result.per_head_metrics, (n_seeds, num_steps, n_heads, 3)
         )
+        chex.assert_shape(result.updates_applied, (n_seeds, num_steps))
+        assert bool(jnp.all(result.updates_applied))
 
     def test_matches_sequential(self):
         """Batched results should match sequential for each seed."""
@@ -824,6 +828,10 @@ class TestRunMultiHeadLearningLoopBatched:
                 batched_result.per_head_metrics[i],
                 seq_result.per_head_metrics,
                 rtol=1e-4,
+            )
+            chex.assert_trees_all_equal(
+                batched_result.updates_applied[i],
+                seq_result.updates_applied,
             )
 
     def test_different_seeds_different_results(self):

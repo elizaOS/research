@@ -15,15 +15,16 @@ import alberta_framework as alberta
 import alberta_framework.core as core
 import alberta_framework.core.delight as delight_module
 from alberta_framework.core.delight import (
+    CandidateUpdateAuditApplicationResult,
+    CandidateUpdateAuditAssessment,
+    CandidateUpdateAuditConfig,
+    CandidateUpdateAuditDiagnostics,
+    CandidateUpdateAuditEvidence,
     DelightfulPolicyGradientConfig,
-    GradientJoyApplicationResult,
-    GradientJoyAssessment,
-    GradientJoyConfig,
-    GradientJoyEvidence,
     LearningValue,
     LearningValueAvailability,
-    apply_gradient_joy_update,
-    assess_gradient_joy,
+    apply_candidate_update,
+    assess_candidate_update,
     discrete_delightful_policy_gradient,
     stratify_delight_outcomes,
 )
@@ -38,6 +39,27 @@ def test_delight_public_exports_resolve_to_core_implementation() -> None:
         assert name in alberta.__all__
         assert getattr(core, name) is implementation
         assert getattr(alberta, name) is implementation
+
+
+def test_candidate_update_audit_api_owns_canonical_names_and_legacy_aliases() -> None:
+    assert delight_module.GradientJoyConfig is CandidateUpdateAuditConfig
+    assert delight_module.GradientJoyEvidence is CandidateUpdateAuditEvidence
+    assert delight_module.GradientJoyDiagnostics is CandidateUpdateAuditDiagnostics
+    assert delight_module.GradientJoyAssessment is CandidateUpdateAuditAssessment
+    assert (
+        delight_module.GradientJoyApplicationResult
+        is CandidateUpdateAuditApplicationResult
+    )
+    assert delight_module.assess_gradient_joy is assess_candidate_update
+    assert delight_module.apply_gradient_joy_update is apply_candidate_update
+    assert CandidateUpdateAuditConfig.__name__ == "CandidateUpdateAuditConfig"
+    assert CandidateUpdateAuditEvidence.__name__ == "CandidateUpdateAuditEvidence"
+    assert CandidateUpdateAuditDiagnostics.__name__ == "CandidateUpdateAuditDiagnostics"
+    assert CandidateUpdateAuditAssessment.__name__ == "CandidateUpdateAuditAssessment"
+    assert (
+        CandidateUpdateAuditApplicationResult.__name__
+        == "CandidateUpdateAuditApplicationResult"
+    )
 
 
 def test_delight_config_roundtrip_and_fail_closed_guards() -> None:
@@ -97,7 +119,7 @@ def test_learning_value_is_a_jax_pytree_without_an_implicit_sum() -> None:
     learning_value = LearningValue(
         advantage=values,
         action_surprisal=values + 1.0,
-        delight=values + 2.0,
+        delight=values * (values + 1.0),
         epistemic_surprise=values + 3.0,
         aleatoric_uncertainty=values + 4.0,
         learning_progress=values + 5.0,
@@ -131,7 +153,7 @@ def _scalar_learning_value(**overrides) -> LearningValue:
     return LearningValue(**values)
 
 
-def _gradient_joy_evidence(
+def _candidate_update_audit_evidence(
     *,
     objective_probe_gradient=None,
     retention_probe_gradient=None,
@@ -139,7 +161,7 @@ def _gradient_joy_evidence(
     probe_independence_attested=True,
     learning_value=None,
     learning_value_availability=None,
-) -> GradientJoyEvidence:
+) -> CandidateUpdateAuditEvidence:
     probe = {"weights": jnp.array([1.0, 0.0], dtype=jnp.float32)}
     all_channels_available = LearningValueAvailability(
         advantage=jnp.array(True),
@@ -151,7 +173,7 @@ def _gradient_joy_evidence(
         change_probability=jnp.array(True),
         safety_cost=jnp.array(True),
     )
-    return GradientJoyEvidence(
+    return CandidateUpdateAuditEvidence(
         objective_probe_gradient=(
             probe if objective_probe_gradient is None else objective_probe_gradient
         ),
@@ -172,26 +194,26 @@ def _gradient_joy_evidence(
     )
 
 
-def test_gradient_joy_config_roundtrip_and_fail_closed_contract() -> None:
-    config = GradientJoyConfig(
+def test_candidate_update_audit_config_roundtrip_and_fail_closed_contract() -> None:
+    config = CandidateUpdateAuditConfig(
         candidate_semantics="update",
         max_update_norm=2.0,
         alignment_temperature=0.5,
         norm_temperature=0.5,
     )
 
-    assert GradientJoyConfig.from_config(config.to_config()) == config
+    assert CandidateUpdateAuditConfig.from_config(config.to_config()) == config
     json.dumps(config.to_config())
     with pytest.raises(ValueError, match="candidate_semantics"):
-        GradientJoyConfig(candidate_semantics="unknown")  # type: ignore[arg-type]
+        CandidateUpdateAuditConfig(candidate_semantics="unknown")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="max_update_norm"):
-        GradientJoyConfig(max_update_norm=0.0)
+        CandidateUpdateAuditConfig(max_update_norm=0.0)
     with pytest.raises(ValueError, match="min_objective_decrease"):
-        GradientJoyConfig(min_objective_decrease=-1.0)
+        CandidateUpdateAuditConfig(min_objective_decrease=-1.0)
     with pytest.raises(ValueError, match="alignment"):
-        GradientJoyConfig(min_safety_descent_alignment=1.1)
+        CandidateUpdateAuditConfig(min_safety_descent_alignment=1.1)
     with pytest.raises(ValueError, match="max_update_norm"):
-        GradientJoyConfig(
+        CandidateUpdateAuditConfig(
             max_update_norm=1.0e-8,
             diagnostics_epsilon=1.0e-8,
         )
@@ -214,12 +236,12 @@ def test_gradient_joy_config_roundtrip_and_fail_closed_contract() -> None:
         ("min_safety_descent_alignment", 1.0e-100),
     ),
 )
-def test_gradient_joy_config_rejects_values_that_do_not_survive_float32(
+def test_candidate_update_audit_config_rejects_values_that_do_not_survive_float32(
     field: str,
     value: float,
 ) -> None:
     with pytest.raises(ValueError, match=field):
-        GradientJoyConfig(**{field: value})
+        CandidateUpdateAuditConfig(**{field: value})
 
 
 @pytest.mark.parametrize(
@@ -238,14 +260,14 @@ def test_gradient_joy_config_rejects_values_that_do_not_survive_float32(
         "diagnostics_epsilon",
     ),
 )
-def test_gradient_joy_config_rejects_boolean_numeric_fields(field: str) -> None:
+def test_candidate_update_audit_config_rejects_boolean_numeric_fields(field: str) -> None:
     with pytest.raises(ValueError, match=field):
-        GradientJoyConfig(**{field: True})
+        CandidateUpdateAuditConfig(**{field: True})
 
 
-def test_gradient_joy_hand_calculation_and_eight_channel_separation() -> None:
+def test_candidate_update_audit_hand_calculation_and_eight_channel_separation() -> None:
     """A jointly improving bounded update gets the weakest named factor."""
-    config = GradientJoyConfig(
+    config = CandidateUpdateAuditConfig(
         candidate_semantics="update",
         max_update_norm=2.0,
         alignment_temperature=0.5,
@@ -253,15 +275,15 @@ def test_gradient_joy_hand_calculation_and_eight_channel_separation() -> None:
     )
     candidate_update = {"weights": jnp.array([-1.0, 0.0], dtype=jnp.float32)}
 
-    result = assess_gradient_joy(
+    result = assess_candidate_update(
         candidate_update,
-        _gradient_joy_evidence(),
+        _candidate_update_audit_evidence(),
         config,
     )
 
     expected_factor = jax.nn.sigmoid(jnp.array(2.0, dtype=jnp.float32))
     assert bool(result.accepted)
-    assert bool(result.sparks_joy)
+    assert bool(result.candidate_update_audit_passed)
     assert result.sparks_joy is result.accepted
     assert result.candidate_update_audit_passed is result.accepted
     chex.assert_trees_all_close(result.weight, expected_factor)
@@ -309,15 +331,15 @@ def test_gradient_joy_hand_calculation_and_eight_channel_separation() -> None:
         change_probability=jnp.array(1.0, dtype=jnp.float32),
         safety_cost=jnp.array(1000.0, dtype=jnp.float32),
     )
-    changed_result = assess_gradient_joy(
+    changed_result = assess_candidate_update(
         candidate_update,
-        _gradient_joy_evidence(learning_value=changed_channels),
+        _candidate_update_audit_evidence(learning_value=changed_channels),
         config,
     )
     chex.assert_trees_all_close(changed_result.weight, result.weight)
 
 
-def test_gradient_joy_application_jits_over_nested_pytrees_and_preserves_dtypes() -> None:
+def test_candidate_update_audit_application_jits_over_nested_pytrees_and_preserves_dtypes() -> None:
     parameters = {
         "encoder": {
             "kernel": jnp.array([1.0, -2.0], dtype=jnp.float32),
@@ -331,17 +353,17 @@ def test_gradient_joy_application_jits_over_nested_pytrees_and_preserves_dtypes(
         "head": (jnp.array([-0.05], dtype=jnp.float32),),
     }
     probe = jax.tree_util.tree_map(jnp.ones_like, candidate)
-    evidence = _gradient_joy_evidence(
+    evidence = _candidate_update_audit_evidence(
         objective_probe_gradient=probe,
         retention_probe_gradient=probe,
         safety_cost_gradient=probe,
     )
-    config = GradientJoyConfig(
+    config = CandidateUpdateAuditConfig(
         candidate_semantics="update",
         max_update_norm=1.0,
     )
     compiled = jax.jit(
-        lambda params, update: apply_gradient_joy_update(
+        lambda params, update: apply_candidate_update(
             params,
             update,
             evidence,
@@ -358,7 +380,7 @@ def test_gradient_joy_application_jits_over_nested_pytrees_and_preserves_dtypes(
         assessment.weighted_update,
     )
 
-    assert isinstance(result, GradientJoyApplicationResult)
+    assert isinstance(result, CandidateUpdateAuditApplicationResult)
     assert bool(assessment.accepted)
     assert bool(result.effective_assessment.accepted)
     assert bool(result.applied)
@@ -373,7 +395,7 @@ def test_gradient_joy_application_jits_over_nested_pytrees_and_preserves_dtypes(
     ]
 
 
-def test_gradient_joy_application_rejection_is_an_atomic_noop_under_jit() -> None:
+def test_candidate_update_audit_application_rejection_is_an_atomic_noop_under_jit() -> None:
     parameters = {
         "body": jnp.array([1.0, 2.0], dtype=jnp.float32),
         "head": (jnp.array([-3.0], dtype=jnp.float16),),
@@ -387,24 +409,24 @@ def test_gradient_joy_application_rejection_is_an_atomic_noop_under_jit() -> Non
         lambda leaf: -jnp.ones_like(leaf),
         candidate,
     )
-    evidence = _gradient_joy_evidence(
+    evidence = _candidate_update_audit_evidence(
         objective_probe_gradient=improving_probe,
         retention_probe_gradient=improving_probe,
         safety_cost_gradient=harmful_safety_probe,
     )
     compiled = jax.jit(
-        lambda params: apply_gradient_joy_update(
+        lambda params: apply_candidate_update(
             params,
             candidate,
             evidence,
-            GradientJoyConfig(candidate_semantics="update", max_update_norm=1.0),
+            CandidateUpdateAuditConfig(candidate_semantics="update", max_update_norm=1.0),
         )
     )
 
     result = compiled(parameters)
 
     assert not bool(result.assessment.accepted)
-    assert not bool(result.assessment.sparks_joy)
+    assert not bool(result.assessment.candidate_update_audit_passed)
     assert not bool(result.effective_assessment.accepted)
     assert not bool(result.applied)
     assert bool(result.parameters_finite)
@@ -414,12 +436,12 @@ def test_gradient_joy_application_rejection_is_an_atomic_noop_under_jit() -> Non
     chex.assert_trees_all_equal(result.parameters, parameters)
 
 
-def test_gradient_joy_application_rejects_broadcasting_and_invalid_parameter_trees() -> None:
+def test_candidate_update_application_rejects_broadcasting_and_invalid_trees() -> None:
     candidate = {"weights": jnp.array([-0.5, 0.0], dtype=jnp.float32)}
-    evidence = _gradient_joy_evidence()
-    config = GradientJoyConfig(candidate_semantics="update", max_update_norm=1.0)
+    evidence = _candidate_update_audit_evidence()
+    config = CandidateUpdateAuditConfig(candidate_semantics="update", max_update_norm=1.0)
     compiled = jax.jit(
-        lambda params: apply_gradient_joy_update(
+        lambda params: apply_candidate_update(
             params,
             candidate,
             evidence,
@@ -437,7 +459,7 @@ def test_gradient_joy_application_rejects_broadcasting_and_invalid_parameter_tre
         compiled({})
 
 
-def test_gradient_joy_application_fails_closed_atomically_on_unsafe_values() -> None:
+def test_candidate_update_audit_application_fails_closed_atomically_on_unsafe_values() -> None:
     cast_parameters = {
         "weights": jnp.zeros(2, dtype=jnp.float16),
     }
@@ -445,11 +467,11 @@ def test_gradient_joy_application_fails_closed_atomically_on_unsafe_values() -> 
         "weights": jnp.array([-100000.0, 0.0], dtype=jnp.float32),
     }
     cast_result = jax.jit(
-        lambda params: apply_gradient_joy_update(
+        lambda params: apply_candidate_update(
             params,
             cast_candidate,
-            _gradient_joy_evidence(),
-            GradientJoyConfig(
+            _candidate_update_audit_evidence(),
+            CandidateUpdateAuditConfig(
                 candidate_semantics="update",
                 max_update_norm=200000.0,
                 norm_temperature=1000.0,
@@ -478,17 +500,17 @@ def test_gradient_joy_application_fails_closed_atomically_on_unsafe_values() -> 
         "overflow": jnp.array([-1.0], dtype=jnp.float32),
         "safe": jnp.array([1.0], dtype=jnp.float32),
     }
-    overflow_evidence = _gradient_joy_evidence(
+    overflow_evidence = _candidate_update_audit_evidence(
         objective_probe_gradient=overflow_probe,
         retention_probe_gradient=overflow_probe,
         safety_cost_gradient=overflow_probe,
     )
     overflow_apply = jax.jit(
-        lambda params: apply_gradient_joy_update(
+        lambda params: apply_candidate_update(
             params,
             overflow_candidate,
             overflow_evidence,
-            GradientJoyConfig(
+            CandidateUpdateAuditConfig(
                 candidate_semantics="update",
                 max_update_norm=70000.0,
                 norm_temperature=1000.0,
@@ -518,15 +540,15 @@ def test_gradient_joy_application_fails_closed_atomically_on_unsafe_values() -> 
     }
     finite_probe = jax.tree_util.tree_map(jnp.ones_like, finite_candidate)
     nonfinite_result = jax.jit(
-        lambda params: apply_gradient_joy_update(
+        lambda params: apply_candidate_update(
             params,
             finite_candidate,
-            _gradient_joy_evidence(
+            _candidate_update_audit_evidence(
                 objective_probe_gradient=finite_probe,
                 retention_probe_gradient=finite_probe,
                 safety_cost_gradient=finite_probe,
             ),
-            GradientJoyConfig(candidate_semantics="update", max_update_norm=1.0),
+            CandidateUpdateAuditConfig(candidate_semantics="update", max_update_norm=1.0),
         )
     )(nonfinite_parameters)
 
@@ -550,11 +572,11 @@ def test_gradient_joy_application_fails_closed_atomically_on_unsafe_values() -> 
         "weights": jnp.array([jnp.nan, -0.1], dtype=jnp.float32),
     }
     rejected_result = jax.jit(
-        lambda params: apply_gradient_joy_update(
+        lambda params: apply_candidate_update(
             params,
             nonfinite_candidate,
-            _gradient_joy_evidence(),
-            GradientJoyConfig(candidate_semantics="update", max_update_norm=1.0),
+            _candidate_update_audit_evidence(),
+            CandidateUpdateAuditConfig(candidate_semantics="update", max_update_norm=1.0),
         )
     )(finite_parameters)
 
@@ -570,7 +592,7 @@ def test_gradient_joy_application_fails_closed_atomically_on_unsafe_values() -> 
     chex.assert_trees_all_equal(rejected_result.parameters, finite_parameters)
 
 
-def test_gradient_joy_application_reports_update_lost_to_parameter_precision() -> None:
+def test_candidate_update_audit_application_reports_update_lost_to_parameter_precision() -> None:
     parameters = {
         "weights": jnp.array([1.0], dtype=jnp.float16),
     }
@@ -579,15 +601,15 @@ def test_gradient_joy_application_reports_update_lost_to_parameter_precision() -
     }
     probe = jax.tree_util.tree_map(jnp.ones_like, candidate)
     result = jax.jit(
-        lambda params: apply_gradient_joy_update(
+        lambda params: apply_candidate_update(
             params,
             candidate,
-            _gradient_joy_evidence(
+            _candidate_update_audit_evidence(
                 objective_probe_gradient=probe,
                 retention_probe_gradient=probe,
                 safety_cost_gradient=probe,
             ),
-            GradientJoyConfig(
+            CandidateUpdateAuditConfig(
                 candidate_semantics="update",
                 max_update_norm=1.0e-3,
             ),
@@ -605,7 +627,7 @@ def test_gradient_joy_application_reports_update_lost_to_parameter_precision() -
     chex.assert_trees_all_equal(result.parameters, parameters)
 
 
-def test_gradient_joy_application_vetoes_quantized_delta_outside_trust_bound() -> None:
+def test_candidate_update_audit_application_vetoes_quantized_delta_outside_trust_bound() -> None:
     """A finite stored delta must satisfy the same norm bound as its candidate."""
     parameters = {
         "weights": jnp.array([1.0], dtype=jnp.float16),
@@ -616,17 +638,17 @@ def test_gradient_joy_application_vetoes_quantized_delta_outside_trust_bound() -
     probe = {
         "weights": jnp.ones(1, dtype=jnp.float32),
     }
-    config = GradientJoyConfig(
+    config = CandidateUpdateAuditConfig(
         candidate_semantics="update",
         max_update_norm=2.6e-4,
         alignment_temperature=1.0e-2,
         norm_temperature=1.0e-6,
     )
     result = jax.jit(
-        lambda params: apply_gradient_joy_update(
+        lambda params: apply_candidate_update(
             params,
             candidate,
-            _gradient_joy_evidence(
+            _candidate_update_audit_evidence(
                 objective_probe_gradient=probe,
                 retention_probe_gradient=probe,
                 safety_cost_gradient=probe,
@@ -653,7 +675,7 @@ def test_gradient_joy_application_vetoes_quantized_delta_outside_trust_bound() -
     chex.assert_trees_all_equal(result.parameters, parameters)
 
 
-def test_gradient_joy_application_promotes_stored_endpoints_before_delta_audit() -> None:
+def test_candidate_update_audit_application_promotes_stored_endpoints_before_delta_audit() -> None:
     """Float16 subtraction rounding cannot hide an out-of-bound stored delta."""
     parameters = {
         "weights": jnp.array([10.7421875], dtype=jnp.float16),
@@ -664,17 +686,17 @@ def test_gradient_joy_application_promotes_stored_endpoints_before_delta_audit()
     descending_probe = {
         "weights": jnp.array([-1.0], dtype=jnp.float32),
     }
-    config = GradientJoyConfig(
+    config = CandidateUpdateAuditConfig(
         candidate_semantics="update",
         max_update_norm=16.378,
         alignment_temperature=1.0e-4,
         norm_temperature=1.0e-6,
     )
     result = jax.jit(
-        lambda params: apply_gradient_joy_update(
+        lambda params: apply_candidate_update(
             params,
             candidate,
-            _gradient_joy_evidence(
+            _candidate_update_audit_evidence(
                 objective_probe_gradient=descending_probe,
                 retention_probe_gradient=descending_probe,
                 safety_cost_gradient=descending_probe,
@@ -700,7 +722,7 @@ def test_gradient_joy_application_promotes_stored_endpoints_before_delta_audit()
     chex.assert_trees_all_equal(result.parameters, parameters)
 
 
-def test_gradient_joy_certifies_norm_boundary_in_eager_jit_and_application() -> None:
+def test_candidate_update_audit_certifies_norm_boundary_in_eager_jit_and_application() -> None:
     """A rounded-down norm point cannot cross an exact trust boundary."""
     candidate = {
         "first": jnp.array([-6.4952946559060365e-06], dtype=jnp.float32),
@@ -712,21 +734,21 @@ def test_gradient_joy_certifies_norm_boundary_in_eager_jit_and_application() -> 
         sum(float(value) ** 2 for leaf in jax.tree_util.tree_leaves(candidate) for value in leaf)
     )
     assert exact_norm > max_update_norm
-    config = GradientJoyConfig(
+    config = CandidateUpdateAuditConfig(
         candidate_semantics="update",
         max_update_norm=max_update_norm,
         alignment_temperature=1.0e-8,
         norm_temperature=1.2e-38,
     )
-    evidence = _gradient_joy_evidence(
+    evidence = _candidate_update_audit_evidence(
         objective_probe_gradient=probe,
         retention_probe_gradient=probe,
         safety_cost_gradient=probe,
     )
 
     for result in (
-        assess_gradient_joy(candidate, evidence, config),
-        jax.jit(lambda update: assess_gradient_joy(update, evidence, config))(candidate),
+        assess_candidate_update(candidate, evidence, config),
+        jax.jit(lambda update: assess_candidate_update(update, evidence, config))(candidate),
     ):
         assert float(result.diagnostics.update_norm) < max_update_norm
         assert float(result.diagnostics.update_norm_upper_bound) > max_update_norm
@@ -743,7 +765,7 @@ def test_gradient_joy_certifies_norm_boundary_in_eager_jit_and_application() -> 
     parameters = jax.tree_util.tree_map(jnp.zeros_like, candidate)
 
     def apply(params, update):
-        return apply_gradient_joy_update(params, update, evidence, config)
+        return apply_candidate_update(params, update, evidence, config)
 
     for result in (
         apply(parameters, candidate),
@@ -756,7 +778,7 @@ def test_gradient_joy_certifies_norm_boundary_in_eager_jit_and_application() -> 
         chex.assert_trees_all_equal(result.parameters, parameters)
 
 
-def test_gradient_joy_certifies_alignment_boundary_in_eager_jit_and_application() -> None:
+def test_candidate_update_audit_certifies_alignment_boundary_in_eager_jit_and_application() -> None:
     """A rounded-up point cosine cannot cross an exact alignment threshold."""
     candidate = jnp.array(
         [-0.3096868097782135, 0.3673213720321655],
@@ -773,7 +795,7 @@ def test_gradient_joy_certifies_alignment_boundary_in_eager_jit_and_application(
         * sum(float(value) ** 2 for value in candidate)
     )
     assert exact_alignment < threshold
-    config = GradientJoyConfig(
+    config = CandidateUpdateAuditConfig(
         candidate_semantics="update",
         max_update_norm=1.0,
         min_objective_descent_alignment=threshold,
@@ -781,8 +803,8 @@ def test_gradient_joy_certifies_alignment_boundary_in_eager_jit_and_application(
         min_safety_descent_alignment=threshold,
     )
 
-    def evidence_for(protected_probe: Array) -> GradientJoyEvidence:
-        return _gradient_joy_evidence(
+    def evidence_for(protected_probe: Array) -> CandidateUpdateAuditEvidence:
+        return _candidate_update_audit_evidence(
             objective_probe_gradient=protected_probe,
             retention_probe_gradient=protected_probe,
             safety_cost_gradient=protected_probe,
@@ -790,9 +812,9 @@ def test_gradient_joy_certifies_alignment_boundary_in_eager_jit_and_application(
 
     evidence = evidence_for(probe)
     for result in (
-        assess_gradient_joy(candidate, evidence, config),
+        assess_candidate_update(candidate, evidence, config),
         jax.jit(
-            lambda update, protected_probe: assess_gradient_joy(
+            lambda update, protected_probe: assess_candidate_update(
                 update,
                 evidence_for(protected_probe),
                 config,
@@ -813,7 +835,7 @@ def test_gradient_joy_certifies_alignment_boundary_in_eager_jit_and_application(
     parameters = jnp.zeros_like(candidate)
 
     def apply(params: Array, update: Array, protected_probe: Array):
-        return apply_gradient_joy_update(
+        return apply_candidate_update(
             params,
             update,
             evidence_for(protected_probe),
@@ -830,22 +852,22 @@ def test_gradient_joy_certifies_alignment_boundary_in_eager_jit_and_application(
         chex.assert_trees_all_equal(result.parameters, parameters)
 
 
-def test_gradient_joy_rejects_underflowed_harmful_protected_probe_dot() -> None:
+def test_candidate_update_audit_rejects_underflowed_harmful_protected_probe_dot() -> None:
     """A normal-valued safety probe cannot underflow into a passing zero."""
     parameters = {"weights": jnp.array([0.0], dtype=jnp.float32)}
     candidate = {"weights": jnp.array([-8.0e-8], dtype=jnp.float32)}
     objective_probe = {"weights": jnp.array([1.0e8], dtype=jnp.float32)}
     safety_probe = {"weights": jnp.array([-1.0e-31], dtype=jnp.float32)}
     result = jax.jit(
-        lambda params: apply_gradient_joy_update(
+        lambda params: apply_candidate_update(
             params,
             candidate,
-            _gradient_joy_evidence(
+            _candidate_update_audit_evidence(
                 objective_probe_gradient=objective_probe,
                 retention_probe_gradient=objective_probe,
                 safety_cost_gradient=safety_probe,
             ),
-            GradientJoyConfig(
+            CandidateUpdateAuditConfig(
                 candidate_semantics="update",
                 max_update_norm=1.0e-6,
             ),
@@ -870,7 +892,7 @@ def test_gradient_joy_rejects_underflowed_harmful_protected_probe_dot() -> None:
         ("safety", "safety_preserved", "safety_dot_resolved"),
     ),
 )
-def test_gradient_joy_rejects_cancellation_sensitive_dot(
+def test_candidate_update_audit_rejects_cancellation_sensitive_dot(
     probe_kind: str,
     verdict_field: str,
     resolved_field: str,
@@ -896,10 +918,10 @@ def test_gradient_joy_rejects_cancellation_sensitive_dot(
         }[probe_kind]
     ] = cancellation_probe
 
-    result = assess_gradient_joy(
+    result = assess_candidate_update(
         candidate,
-        _gradient_joy_evidence(**probe_arguments),
-        GradientJoyConfig(candidate_semantics="update", max_update_norm=2.0),
+        _candidate_update_audit_evidence(**probe_arguments),
+        CandidateUpdateAuditConfig(candidate_semantics="update", max_update_norm=2.0),
     )
 
     if probe_kind == "objective":
@@ -918,7 +940,7 @@ def test_gradient_joy_rejects_cancellation_sensitive_dot(
     )
 
 
-def test_gradient_joy_application_vetoes_dot_sign_disagreement_atomically() -> None:
+def test_candidate_update_audit_application_vetoes_dot_sign_disagreement_atomically() -> None:
     """The stored-delta boundary inherits the cancellation fail-closed gate."""
     parameters = {"weights": jnp.zeros(3, dtype=jnp.float32)}
     candidate = {"weights": jnp.array([-1.0, -1.0, -1.0], dtype=jnp.float32)}
@@ -929,15 +951,15 @@ def test_gradient_joy_application_vetoes_dot_sign_disagreement_atomically() -> N
         "weights": jnp.array([1.0, 1.0, 1.0], dtype=jnp.float32),
     }
     result = jax.jit(
-        lambda params: apply_gradient_joy_update(
+        lambda params: apply_candidate_update(
             params,
             candidate,
-            _gradient_joy_evidence(
+            _candidate_update_audit_evidence(
                 objective_probe_gradient=cancellation_probe,
                 retention_probe_gradient=descending_probe,
                 safety_cost_gradient=descending_probe,
             ),
-            GradientJoyConfig(candidate_semantics="update", max_update_norm=2.0),
+            CandidateUpdateAuditConfig(candidate_semantics="update", max_update_norm=2.0),
         )
     )(parameters)
 
@@ -949,7 +971,7 @@ def test_gradient_joy_application_vetoes_dot_sign_disagreement_atomically() -> N
     chex.assert_trees_all_equal(result.parameters, parameters)
 
 
-def test_gradient_joy_rejects_same_sign_cancellation_in_eager_and_jit() -> None:
+def test_candidate_update_audit_rejects_same_sign_cancellation_in_eager_and_jit() -> None:
     """A roundoff interval must catch two reductions agreeing in the wrong sign."""
     candidate = jnp.ones(6, dtype=jnp.float32)
     descending_probe = -jnp.ones(6, dtype=jnp.float32)
@@ -958,16 +980,16 @@ def test_gradient_joy_rejects_same_sign_cancellation_in_eager_and_jit() -> None:
         dtype=jnp.float32,
     )
     assert sum(float(value) for value in cancellation_probe) == 1.0
-    config = GradientJoyConfig(candidate_semantics="update", max_update_norm=3.0)
+    config = CandidateUpdateAuditConfig(candidate_semantics="update", max_update_norm=3.0)
 
     def evaluate(
         update: Array,
         objective: Array,
         safety: Array,
-    ) -> GradientJoyAssessment:
-        return assess_gradient_joy(
+    ) -> CandidateUpdateAuditAssessment:
+        return assess_candidate_update(
             update,
-            _gradient_joy_evidence(
+            _candidate_update_audit_evidence(
                 objective_probe_gradient=objective,
                 retention_probe_gradient=objective,
                 safety_cost_gradient=safety,
@@ -991,7 +1013,7 @@ def test_gradient_joy_rejects_same_sign_cancellation_in_eager_and_jit() -> None:
         )
 
 
-def test_gradient_joy_application_vetoes_same_sign_cancellation_eager_and_jit() -> None:
+def test_candidate_update_audit_application_vetoes_same_sign_cancellation_eager_and_jit() -> None:
     """Unresolved cancellation is an atomic no-op at the stored-delta boundary."""
     parameters = jnp.zeros(6, dtype=jnp.float32)
     candidate = jnp.ones(6, dtype=jnp.float32)
@@ -1000,18 +1022,18 @@ def test_gradient_joy_application_vetoes_same_sign_cancellation_eager_and_jit() 
         [2.0, 1.0e10, -1.0e10, -1.0e10, 1.0e10, -1.0],
         dtype=jnp.float32,
     )
-    config = GradientJoyConfig(candidate_semantics="update", max_update_norm=3.0)
+    config = CandidateUpdateAuditConfig(candidate_semantics="update", max_update_norm=3.0)
 
     def apply(
         params: Array,
         update: Array,
         objective: Array,
         safety: Array,
-    ) -> GradientJoyApplicationResult:
-        return apply_gradient_joy_update(
+    ) -> CandidateUpdateAuditApplicationResult:
+        return apply_candidate_update(
             params,
             update,
-            _gradient_joy_evidence(
+            _candidate_update_audit_evidence(
                 objective_probe_gradient=objective,
                 retention_probe_gradient=objective,
                 safety_cost_gradient=safety,
@@ -1030,22 +1052,22 @@ def test_gradient_joy_application_vetoes_same_sign_cancellation_eager_and_jit() 
         chex.assert_trees_all_equal(result.parameters, parameters)
 
 
-def test_gradient_joy_rejects_overflowed_derived_protected_probe_dot() -> None:
+def test_candidate_update_audit_rejects_overflowed_derived_protected_probe_dot() -> None:
     """Finite leaves whose derived dot overflows must fail the evidence gate."""
     parameters = {"weights": jnp.array([0.0], dtype=jnp.float32)}
     candidate = {"weights": jnp.array([-1.0e10], dtype=jnp.float32)}
     objective_probe = {"weights": jnp.array([1.0], dtype=jnp.float32)}
     safety_probe = {"weights": jnp.array([-1.0e30], dtype=jnp.float32)}
     result = jax.jit(
-        lambda params: apply_gradient_joy_update(
+        lambda params: apply_candidate_update(
             params,
             candidate,
-            _gradient_joy_evidence(
+            _candidate_update_audit_evidence(
                 objective_probe_gradient=objective_probe,
                 retention_probe_gradient=objective_probe,
                 safety_cost_gradient=safety_probe,
             ),
-            GradientJoyConfig(
+            CandidateUpdateAuditConfig(
                 candidate_semantics="update",
                 max_update_norm=2.0e10,
                 norm_temperature=1.0e9,
@@ -1062,7 +1084,7 @@ def test_gradient_joy_rejects_overflowed_derived_protected_probe_dot() -> None:
     chex.assert_trees_all_equal(result.parameters, parameters)
 
 
-def test_gradient_joy_application_vetoes_quantization_that_flips_probe_verdicts() -> None:
+def test_candidate_update_audit_application_vetoes_quantization_that_flips_probe_verdicts() -> None:
     """Partially rounded updates cannot discard benefit while retaining harm."""
     parameters = {
         "weights": jnp.array([1000.0, 0.0], dtype=jnp.float16),
@@ -1077,15 +1099,15 @@ def test_gradient_joy_application_vetoes_quantization_that_flips_probe_verdicts(
         "weights": jnp.array([1.0, 5.0], dtype=jnp.float32),
     }
     result = jax.jit(
-        lambda params: apply_gradient_joy_update(
+        lambda params: apply_candidate_update(
             params,
             candidate,
-            _gradient_joy_evidence(
+            _candidate_update_audit_evidence(
                 objective_probe_gradient=objective_probe,
                 retention_probe_gradient=objective_probe,
                 safety_cost_gradient=safety_probe,
             ),
-            GradientJoyConfig(
+            CandidateUpdateAuditConfig(
                 candidate_semantics="update",
                 max_update_norm=1.0e-2,
             ),
@@ -1112,19 +1134,19 @@ def test_gradient_joy_application_vetoes_quantization_that_flips_probe_verdicts(
     chex.assert_trees_all_equal(result.parameters, parameters)
 
 
-def test_gradient_joy_application_has_identity_parameter_gradient_only() -> None:
+def test_candidate_update_audit_application_has_identity_parameter_gradient_only() -> None:
     parameters = jnp.array([1.0, -2.0], dtype=jnp.float32)
     candidate = jnp.array([-0.2, -0.1], dtype=jnp.float32)
     probe = jnp.ones_like(candidate)
-    evidence = _gradient_joy_evidence(
+    evidence = _candidate_update_audit_evidence(
         objective_probe_gradient=probe,
         retention_probe_gradient=probe,
         safety_cost_gradient=probe,
     )
-    config = GradientJoyConfig(candidate_semantics="update", max_update_norm=1.0)
+    config = CandidateUpdateAuditConfig(candidate_semantics="update", max_update_norm=1.0)
 
     parameter_jacobian = jax.jacrev(
-        lambda params: apply_gradient_joy_update(
+        lambda params: apply_candidate_update(
             params,
             candidate,
             evidence,
@@ -1132,7 +1154,7 @@ def test_gradient_joy_application_has_identity_parameter_gradient_only() -> None
         ).parameters
     )(parameters)
     candidate_jacobian = jax.jacrev(
-        lambda update: apply_gradient_joy_update(
+        lambda update: apply_candidate_update(
             parameters,
             update,
             evidence,
@@ -1140,7 +1162,7 @@ def test_gradient_joy_application_has_identity_parameter_gradient_only() -> None
         ).parameters
     )(candidate)
     effective_candidate_jacobian = jax.jacrev(
-        lambda update: apply_gradient_joy_update(
+        lambda update: apply_candidate_update(
             parameters,
             update,
             evidence,
@@ -1148,7 +1170,7 @@ def test_gradient_joy_application_has_identity_parameter_gradient_only() -> None
         ).effective_assessment.candidate_update
     )(candidate)
     effective_parameter_jacobian = jax.jacrev(
-        lambda params: apply_gradient_joy_update(
+        lambda params: apply_candidate_update(
             params,
             candidate,
             evidence,
@@ -1174,18 +1196,18 @@ def test_gradient_joy_application_has_identity_parameter_gradient_only() -> None
     )
 
 
-def test_gradient_joy_alignment_is_scale_invariant_above_the_norm_floor() -> None:
+def test_candidate_update_audit_alignment_is_scale_invariant_above_the_norm_floor() -> None:
     candidate = {"weights": jnp.array([-1.0e-6], dtype=jnp.float32)}
     tiny_aligned_probe = {"weights": jnp.array([1.0e-12], dtype=jnp.float32)}
-    evidence = _gradient_joy_evidence(
+    evidence = _candidate_update_audit_evidence(
         objective_probe_gradient=tiny_aligned_probe,
         retention_probe_gradient=tiny_aligned_probe,
         safety_cost_gradient=tiny_aligned_probe,
     )
-    result = assess_gradient_joy(
+    result = assess_candidate_update(
         candidate,
         evidence,
-        GradientJoyConfig(
+        CandidateUpdateAuditConfig(
             candidate_semantics="update",
             max_update_norm=1.0e-3,
             min_objective_descent_alignment=0.9,
@@ -1206,7 +1228,7 @@ def test_gradient_joy_alignment_is_scale_invariant_above_the_norm_floor() -> Non
 
 
 @pytest.mark.parametrize("seed", (2, 11))
-def test_gradient_joy_fails_closed_when_endpoint_alignment_is_not_certified(
+def test_candidate_update_audit_fails_closed_when_endpoint_alignment_is_not_certified(
     seed: int,
 ) -> None:
     """A point cosine near one cannot outrun its certified lower endpoint."""
@@ -1217,14 +1239,14 @@ def test_gradient_joy_fails_closed_when_endpoint_alignment_is_not_certified(
     )
     candidate = {"weights": -0.01 * probe_values}
     probe = {"weights": probe_values}
-    result = assess_gradient_joy(
+    result = assess_candidate_update(
         candidate,
-        _gradient_joy_evidence(
+        _candidate_update_audit_evidence(
             objective_probe_gradient=probe,
             retention_probe_gradient=probe,
             safety_cost_gradient=probe,
         ),
-        GradientJoyConfig(
+        CandidateUpdateAuditConfig(
             candidate_semantics="update",
             max_update_norm=1.0,
             min_objective_descent_alignment=1.0,
@@ -1253,18 +1275,18 @@ def test_gradient_joy_fails_closed_when_endpoint_alignment_is_not_certified(
         assert float(lower_bound) < 1.0 - 4.0 * float(jnp.finfo(jnp.float32).eps)
 
 
-def test_gradient_joy_accepts_exact_one_dimensional_endpoint_alignment() -> None:
+def test_candidate_update_audit_accepts_exact_one_dimensional_endpoint_alignment() -> None:
     """An exactly certifiable one-dimensional cosine can meet endpoint one."""
     candidate = {"weights": jnp.array([-0.25], dtype=jnp.float32)}
     probe = {"weights": jnp.array([3.0], dtype=jnp.float32)}
-    result = assess_gradient_joy(
+    result = assess_candidate_update(
         candidate,
-        _gradient_joy_evidence(
+        _candidate_update_audit_evidence(
             objective_probe_gradient=probe,
             retention_probe_gradient=probe,
             safety_cost_gradient=probe,
         ),
-        GradientJoyConfig(
+        CandidateUpdateAuditConfig(
             candidate_semantics="update",
             max_update_norm=1.0,
             min_objective_descent_alignment=1.0,
@@ -1280,17 +1302,17 @@ def test_gradient_joy_accepts_exact_one_dimensional_endpoint_alignment() -> None
     ) >= 1.0 - 4.0 * float(jnp.finfo(jnp.float32).eps)
 
 
-def test_gradient_joy_rejects_tentative_update_below_update_norm_floor() -> None:
+def test_candidate_update_audit_rejects_tentative_update_below_update_norm_floor() -> None:
     candidate = {"weights": jnp.array([-1.5e-8], dtype=jnp.float32)}
     probe = {"weights": jnp.array([1.0e8], dtype=jnp.float32)}
-    result = assess_gradient_joy(
+    result = assess_candidate_update(
         candidate,
-        _gradient_joy_evidence(
+        _candidate_update_audit_evidence(
             objective_probe_gradient=probe,
             retention_probe_gradient=probe,
             safety_cost_gradient=probe,
         ),
-        GradientJoyConfig(
+        CandidateUpdateAuditConfig(
             candidate_semantics="update",
             max_update_norm=1.5e-8,
             diagnostics_epsilon=1.0e-8,
@@ -1307,18 +1329,18 @@ def test_gradient_joy_rejects_tentative_update_below_update_norm_floor() -> None
     )
 
 
-def test_gradient_joy_audits_elementwise_rounded_tentative_update() -> None:
+def test_candidate_update_audit_audits_elementwise_rounded_tentative_update() -> None:
     """Scalar scaling cannot stand in for the actually rounded update tree."""
     candidate = jnp.array([-2.836829920794233e-32], dtype=jnp.float32)
     probe = jnp.array([0.8063097596168518], dtype=jnp.float32)
-    result = assess_gradient_joy(
+    result = assess_candidate_update(
         candidate,
-        _gradient_joy_evidence(
+        _candidate_update_audit_evidence(
             objective_probe_gradient=probe,
             retention_probe_gradient=probe,
             safety_cost_gradient=probe,
         ),
-        GradientJoyConfig(
+        CandidateUpdateAuditConfig(
             candidate_semantics="update",
             max_update_norm=1.0e-30,
             diagnostics_epsilon=1.2e-38,
@@ -1337,7 +1359,7 @@ def test_gradient_joy_audits_elementwise_rounded_tentative_update() -> None:
     chex.assert_trees_all_equal(result.weighted_update, jnp.zeros_like(candidate))
 
 
-def test_gradient_joy_tentative_rounding_boundary_is_atomic_eager_and_jit() -> None:
+def test_candidate_update_audit_tentative_rounding_boundary_is_atomic_eager_and_jit() -> None:
     """A resolved candidate cannot lend its certificate to rounded scaling."""
     candidate = jnp.array(
         [-0.53493332862854, 0.9215275645256042],
@@ -1347,7 +1369,7 @@ def test_gradient_joy_tentative_rounding_boundary_is_atomic_eager_and_jit() -> N
         [-1.6531749943149495e-32, -1.3062328325207423e-32],
         dtype=jnp.float32,
     )
-    config = GradientJoyConfig(
+    config = CandidateUpdateAuditConfig(
         candidate_semantics="update",
         max_update_norm=1.0877355337142944,
         min_objective_decrease=1.7734800820290934e-33,
@@ -1355,15 +1377,15 @@ def test_gradient_joy_tentative_rounding_boundary_is_atomic_eager_and_jit() -> N
         norm_temperature=0.1,
     )
 
-    def evidence_for(protected_probe: Array) -> GradientJoyEvidence:
-        return _gradient_joy_evidence(
+    def evidence_for(protected_probe: Array) -> CandidateUpdateAuditEvidence:
+        return _candidate_update_audit_evidence(
             objective_probe_gradient=protected_probe,
             retention_probe_gradient=protected_probe,
             safety_cost_gradient=protected_probe,
         )
 
-    def assess(update: Array, protected_probe: Array) -> GradientJoyAssessment:
-        return assess_gradient_joy(update, evidence_for(protected_probe), config)
+    def assess(update: Array, protected_probe: Array) -> CandidateUpdateAuditAssessment:
+        return assess_candidate_update(update, evidence_for(protected_probe), config)
 
     for result in (
         assess(candidate, probe),
@@ -1383,7 +1405,7 @@ def test_gradient_joy_tentative_rounding_boundary_is_atomic_eager_and_jit() -> N
     parameters = jnp.zeros_like(candidate)
 
     def apply(params: Array, update: Array, protected_probe: Array):
-        return apply_gradient_joy_update(
+        return apply_candidate_update(
             params,
             update,
             evidence_for(protected_probe),
@@ -1400,22 +1422,22 @@ def test_gradient_joy_tentative_rounding_boundary_is_atomic_eager_and_jit() -> N
         chex.assert_trees_all_equal(result.parameters, parameters)
 
 
-def test_gradient_joy_jits_converts_gradient_and_blocks_meta_gradients() -> None:
-    config = GradientJoyConfig(
+def test_candidate_update_audit_jits_converts_gradient_and_blocks_meta_gradients() -> None:
+    config = CandidateUpdateAuditConfig(
         candidate_semantics="gradient",
         gradient_step_size=0.25,
         max_update_norm=1.0,
         alignment_temperature=0.5,
         norm_temperature=0.5,
     )
-    evidence = _gradient_joy_evidence()
+    evidence = _candidate_update_audit_evidence()
     candidate_gradient = {"weights": jnp.array([2.0, 0.0], dtype=jnp.float32)}
-    compiled = jax.jit(lambda candidate: assess_gradient_joy(candidate, evidence, config))
+    compiled = jax.jit(lambda candidate: assess_candidate_update(candidate, evidence, config))
 
     result = compiled(candidate_gradient)
     weight_gradient = jax.grad(
         lambda candidate: (
-            assess_gradient_joy(
+            assess_candidate_update(
                 {"weights": candidate},
                 evidence,
                 config,
@@ -1423,21 +1445,21 @@ def test_gradient_joy_jits_converts_gradient_and_blocks_meta_gradients() -> None
         )
     )(candidate_gradient["weights"])
     weighted_update_jacobian = jax.jacrev(
-        lambda candidate: assess_gradient_joy(
+        lambda candidate: assess_candidate_update(
             {"weights": candidate},
             evidence,
             config,
         ).weighted_update["weights"]
     )(candidate_gradient["weights"])
     candidate_update_jacobian = jax.jacrev(
-        lambda candidate: assess_gradient_joy(
+        lambda candidate: assess_candidate_update(
             {"weights": candidate},
             evidence,
             config,
         ).candidate_update["weights"]
     )(candidate_gradient["weights"])
     diagnostic_gradient = jax.grad(
-        lambda candidate: assess_gradient_joy(
+        lambda candidate: assess_candidate_update(
             {"weights": candidate},
             evidence,
             config,
@@ -1445,7 +1467,7 @@ def test_gradient_joy_jits_converts_gradient_and_blocks_meta_gradients() -> None
     )(candidate_gradient["weights"])
     probe_meta_gradient = jax.grad(
         lambda probe: (
-            assess_gradient_joy(
+            assess_candidate_update(
                 candidate_gradient,
                 evidence.replace(
                     objective_probe_gradient={"weights": probe},
@@ -1456,7 +1478,7 @@ def test_gradient_joy_jits_converts_gradient_and_blocks_meta_gradients() -> None
     )(evidence.objective_probe_gradient["weights"])
     channel_meta_gradient = jax.grad(
         lambda advantage: (
-            assess_gradient_joy(
+            assess_candidate_update(
                 candidate_gradient,
                 evidence.replace(
                     learning_value=evidence.learning_value.replace(
@@ -1500,13 +1522,13 @@ def test_gradient_joy_jits_converts_gradient_and_blocks_meta_gradients() -> None
     chex.assert_tree_all_finite(result)
 
 
-def test_gradient_joy_safety_conflict_is_a_named_hard_veto() -> None:
-    result = assess_gradient_joy(
+def test_candidate_update_audit_safety_conflict_is_a_named_hard_veto() -> None:
+    result = assess_candidate_update(
         {"weights": jnp.array([-1.0, 0.0], dtype=jnp.float32)},
-        _gradient_joy_evidence(
+        _candidate_update_audit_evidence(
             safety_cost_gradient={"weights": jnp.array([-1.0, 0.0], dtype=jnp.float32)}
         ),
-        GradientJoyConfig(candidate_semantics="update", max_update_norm=2.0),
+        CandidateUpdateAuditConfig(candidate_semantics="update", max_update_norm=2.0),
     )
 
     assert not bool(result.accepted)
@@ -1548,7 +1570,7 @@ def test_gradient_joy_safety_conflict_is_a_named_hard_veto() -> None:
         ),
     ),
 )
-def test_gradient_joy_hard_magnitude_gates_certify_the_weighted_update(
+def test_candidate_update_audit_hard_magnitude_gates_certify_the_weighted_update(
     config_overrides: dict[str, float],
     objective_probe_scale: float,
     raw_field: str,
@@ -1556,19 +1578,19 @@ def test_gradient_joy_hard_magnitude_gates_certify_the_weighted_update(
 ) -> None:
     """Soft scaling must not invalidate a hard improvement requirement."""
     candidate = {"weights": jnp.array([-0.11, 0.0], dtype=jnp.float32)}
-    evidence = _gradient_joy_evidence(
+    evidence = _candidate_update_audit_evidence(
         objective_probe_gradient={
             "weights": jnp.array([objective_probe_scale, 0.0], dtype=jnp.float32)
         },
     )
-    config = GradientJoyConfig(
+    config = CandidateUpdateAuditConfig(
         candidate_semantics="update",
         max_update_norm=0.2,
         norm_temperature=0.1,
         **config_overrides,
     )
 
-    result = assess_gradient_joy(candidate, evidence, config)
+    result = assess_candidate_update(candidate, evidence, config)
 
     assert float(result.diagnostics.tentative_weight) < 1.0
     if raw_field == "predicted_objective_decrease":
@@ -1586,7 +1608,7 @@ def test_gradient_joy_hard_magnitude_gates_certify_the_weighted_update(
 
 
 @pytest.mark.parametrize("protected_probe", ("retention", "safety"))
-def test_gradient_joy_positive_harm_tolerance_checks_raw_and_weighted_update(
+def test_candidate_update_audit_positive_harm_tolerance_checks_raw_and_weighted_update(
     protected_probe: str,
 ) -> None:
     candidate = {"weights": jnp.array([-0.11, 0.0], dtype=jnp.float32)}
@@ -1611,10 +1633,10 @@ def test_gradient_joy_positive_harm_tolerance_checks_raw_and_weighted_update(
     if protected_probe == "safety":
         config_kwargs = {"max_safety_cost_increase": 0.1}
 
-    result = assess_gradient_joy(
+    result = assess_candidate_update(
         candidate,
-        _gradient_joy_evidence(**evidence_kwargs),
-        GradientJoyConfig(
+        _candidate_update_audit_evidence(**evidence_kwargs),
+        CandidateUpdateAuditConfig(
             candidate_semantics="update",
             max_update_norm=0.2,
             norm_temperature=0.1,
@@ -1639,27 +1661,27 @@ def test_gradient_joy_positive_harm_tolerance_checks_raw_and_weighted_update(
     assert not bool(result.accepted)
 
 
-def test_gradient_joy_fails_closed_on_unavailable_or_nonfinite_evidence() -> None:
-    config = GradientJoyConfig(
+def test_candidate_update_audit_fails_closed_on_unavailable_or_nonfinite_evidence() -> None:
+    config = CandidateUpdateAuditConfig(
         candidate_semantics="update",
         max_update_norm=2.0,
     )
     candidate = {"weights": jnp.array([-1.0, 0.0], dtype=jnp.float32)}
-    unavailable = _gradient_joy_evidence().replace(
+    unavailable = _candidate_update_audit_evidence().replace(
         objective_probe_gradient=None,
     )
-    explicitly_unavailable = _gradient_joy_evidence().replace(
+    explicitly_unavailable = _candidate_update_audit_evidence().replace(
         retention_probe_available=jnp.array(False),
     )
-    unattested = _gradient_joy_evidence(
+    unattested = _candidate_update_audit_evidence(
         probe_independence_attested=False,
     )
-    invalid_channel = _gradient_joy_evidence(
+    invalid_channel = _candidate_update_audit_evidence(
         learning_value=_scalar_learning_value(
             epistemic_surprise=jnp.array(jnp.nan, dtype=jnp.float32),
         )
     )
-    finite_but_unavailable = _gradient_joy_evidence(
+    finite_but_unavailable = _candidate_update_audit_evidence(
         learning_value_availability=LearningValueAvailability(
             advantage=jnp.array(True),
             action_surprisal=jnp.array(True),
@@ -1672,34 +1694,34 @@ def test_gradient_joy_fails_closed_on_unavailable_or_nonfinite_evidence() -> Non
         )
     )
 
-    unavailable_result = assess_gradient_joy(
+    unavailable_result = assess_candidate_update(
         candidate,
         unavailable,
         config,
     )
-    unattested_result = assess_gradient_joy(
+    unattested_result = assess_candidate_update(
         candidate,
         unattested,
         config,
     )
-    explicitly_unavailable_result = assess_gradient_joy(
+    explicitly_unavailable_result = assess_candidate_update(
         candidate,
         explicitly_unavailable,
         config,
     )
-    invalid_channel_result = assess_gradient_joy(
+    invalid_channel_result = assess_candidate_update(
         candidate,
         invalid_channel,
         config,
     )
-    unavailable_channel_result = assess_gradient_joy(
+    unavailable_channel_result = assess_candidate_update(
         candidate,
         finite_but_unavailable,
         config,
     )
-    invalid_candidate_result = assess_gradient_joy(
+    invalid_candidate_result = assess_candidate_update(
         {"weights": jnp.array([jnp.nan, 0.0], dtype=jnp.float32)},
-        _gradient_joy_evidence(),
+        _candidate_update_audit_evidence(),
         config,
     )
 
@@ -1735,8 +1757,8 @@ def test_gradient_joy_fails_closed_on_unavailable_or_nonfinite_evidence() -> Non
         )
 
 
-def test_gradient_joy_requires_exact_paper_dg_delight_identity() -> None:
-    """A historical DG field mismatch cannot count as complete joy evidence."""
+def test_candidate_update_audit_requires_exact_paper_dg_delight_identity() -> None:
+    """A paper-delight mismatch cannot count as complete candidate-audit evidence."""
     mismatched = _scalar_learning_value(
         delight=jnp.nextafter(
             jnp.asarray(0.5, dtype=jnp.float32),
@@ -1744,23 +1766,23 @@ def test_gradient_joy_requires_exact_paper_dg_delight_identity() -> None:
         )
     )
 
-    result = assess_gradient_joy(
+    result = assess_candidate_update(
         {"weights": jnp.array([-1.0, 0.0], dtype=jnp.float32)},
-        _gradient_joy_evidence(learning_value=mismatched),
-        GradientJoyConfig(candidate_semantics="update", max_update_norm=2.0),
+        _candidate_update_audit_evidence(learning_value=mismatched),
+        CandidateUpdateAuditConfig(candidate_semantics="update", max_update_norm=2.0),
     )
     compiled = jax.jit(
-        lambda value: assess_gradient_joy(
+        lambda value: assess_candidate_update(
             {"weights": jnp.array([-1.0, 0.0], dtype=jnp.float32)},
-            _gradient_joy_evidence(learning_value=value),
-            GradientJoyConfig(candidate_semantics="update", max_update_norm=2.0),
+            _candidate_update_audit_evidence(learning_value=value),
+            CandidateUpdateAuditConfig(candidate_semantics="update", max_update_norm=2.0),
         )
     )(mismatched)
 
     for assessment in (result, compiled):
         assert not bool(assessment.channel_availability.delight)
         assert not bool(assessment.diagnostics.learning_value_complete)
-        assert not bool(assessment.sparks_joy)
+        assert not bool(assessment.candidate_update_audit_passed)
         chex.assert_trees_all_close(
             assessment.weight,
             jnp.asarray(0.0, dtype=jnp.float32),
@@ -1776,22 +1798,22 @@ def test_gradient_joy_requires_exact_paper_dg_delight_identity() -> None:
     ),
 )
 @pytest.mark.parametrize("bad_value", (jnp.nan, jnp.inf, -jnp.inf))
-def test_gradient_joy_nonfinite_probe_channels_fail_closed(
+def test_candidate_update_audit_nonfinite_probe_channels_fail_closed(
     probe_field: str,
     finite_diagnostic: str,
     bad_value: Array,
 ) -> None:
-    evidence = _gradient_joy_evidence(
+    evidence = _candidate_update_audit_evidence(
         **{
             probe_field: {
                 "weights": jnp.array([bad_value, 0.0], dtype=jnp.float32),
             }
         }
     )
-    result = assess_gradient_joy(
+    result = assess_candidate_update(
         {"weights": jnp.array([-1.0, 0.0], dtype=jnp.float32)},
         evidence,
-        GradientJoyConfig(candidate_semantics="update", max_update_norm=2.0),
+        CandidateUpdateAuditConfig(candidate_semantics="update", max_update_norm=2.0),
     )
 
     assert not bool(result.accepted)
@@ -1804,97 +1826,97 @@ def test_gradient_joy_nonfinite_probe_channels_fail_closed(
     chex.assert_tree_all_finite(result)
 
 
-def test_gradient_joy_rejects_ambiguous_shapes_and_non_scalar_channels() -> None:
+def test_candidate_update_audit_rejects_ambiguous_shapes_and_non_scalar_channels() -> None:
     candidate = {"weights": jnp.array([-1.0, 0.0], dtype=jnp.float32)}
     with pytest.raises(ValueError, match="at least one floating value"):
-        assess_gradient_joy(
+        assess_candidate_update(
             {"weights": jnp.empty((0,), dtype=jnp.float32)},
-            _gradient_joy_evidence(),
+            _candidate_update_audit_evidence(),
         )
     with pytest.raises(ValueError, match="floating dtypes"):
-        assess_gradient_joy(
+        assess_candidate_update(
             {"weights": jnp.array([-1.0 + 1.0j], dtype=jnp.complex64)},
-            _gradient_joy_evidence(),
-            GradientJoyConfig(candidate_semantics="update"),
+            _candidate_update_audit_evidence(),
+            CandidateUpdateAuditConfig(candidate_semantics="update"),
         )
     with pytest.raises(ValueError, match="leaf shapes"):
-        assess_gradient_joy(
+        assess_candidate_update(
             candidate,
-            _gradient_joy_evidence(
+            _candidate_update_audit_evidence(
                 objective_probe_gradient={"weights": jnp.ones(3, dtype=jnp.float32)}
             ),
-            GradientJoyConfig(candidate_semantics="update"),
+            CandidateUpdateAuditConfig(candidate_semantics="update"),
         )
     with pytest.raises(ValueError, match="real-valued"):
-        assess_gradient_joy(
+        assess_candidate_update(
             candidate,
-            _gradient_joy_evidence(
+            _candidate_update_audit_evidence(
                 learning_value=_scalar_learning_value(
                     learning_progress=jnp.array(1.0 + 1.0j, dtype=jnp.complex64),
                 )
             ),
-            GradientJoyConfig(candidate_semantics="update"),
+            CandidateUpdateAuditConfig(candidate_semantics="update"),
         )
     with pytest.raises(ValueError, match="floating dtype"):
-        assess_gradient_joy(
+        assess_candidate_update(
             candidate,
-            _gradient_joy_evidence(
+            _candidate_update_audit_evidence(
                 learning_value=_scalar_learning_value(
                     advantage=jnp.array(True),
                 )
             ),
-            GradientJoyConfig(candidate_semantics="update"),
+            CandidateUpdateAuditConfig(candidate_semantics="update"),
         )
     with pytest.raises(ValueError, match="floating dtype"):
-        assess_gradient_joy(
+        assess_candidate_update(
             candidate,
-            _gradient_joy_evidence(
+            _candidate_update_audit_evidence(
                 learning_value=_scalar_learning_value(
                     advantage=jnp.array(1, dtype=jnp.int32),
                 )
             ),
-            GradientJoyConfig(candidate_semantics="update"),
+            CandidateUpdateAuditConfig(candidate_semantics="update"),
         )
     with pytest.raises(ValueError, match="must be scalar"):
-        assess_gradient_joy(
+        assess_candidate_update(
             candidate,
-            _gradient_joy_evidence(
+            _candidate_update_audit_evidence(
                 learning_value=_scalar_learning_value(
                     learning_progress=jnp.ones(2, dtype=jnp.float32),
                 )
             ),
-            GradientJoyConfig(candidate_semantics="update"),
+            CandidateUpdateAuditConfig(candidate_semantics="update"),
         )
     with pytest.raises(ValueError, match="must be scalar"):
-        assess_gradient_joy(
+        assess_candidate_update(
             candidate,
-            _gradient_joy_evidence(
+            _candidate_update_audit_evidence(
                 learning_value=_scalar_learning_value(
                     learning_progress=jnp.array([0.3], dtype=jnp.float32),
                 )
             ),
-            GradientJoyConfig(candidate_semantics="update"),
+            CandidateUpdateAuditConfig(candidate_semantics="update"),
         )
     with pytest.raises(ValueError, match="must be scalar"):
-        assess_gradient_joy(
+        assess_candidate_update(
             candidate,
-            _gradient_joy_evidence().replace(
+            _candidate_update_audit_evidence().replace(
                 probe_independence_attested=jnp.array([True]),
             ),
-            GradientJoyConfig(candidate_semantics="update"),
+            CandidateUpdateAuditConfig(candidate_semantics="update"),
         )
     with pytest.raises(ValueError, match="boolean dtype"):
-        assess_gradient_joy(
+        assess_candidate_update(
             candidate,
-            _gradient_joy_evidence().replace(
+            _candidate_update_audit_evidence().replace(
                 objective_probe_available=jnp.array(jnp.nan),
             ),
-            GradientJoyConfig(candidate_semantics="update"),
+            CandidateUpdateAuditConfig(candidate_semantics="update"),
         )
     with pytest.raises(ValueError, match="boolean dtype"):
-        assess_gradient_joy(
+        assess_candidate_update(
             candidate,
-            _gradient_joy_evidence(
+            _candidate_update_audit_evidence(
                 learning_value_availability=LearningValueAvailability(
                     advantage=jnp.array(jnp.nan),
                     action_surprisal=jnp.array(True),
@@ -1906,7 +1928,7 @@ def test_gradient_joy_rejects_ambiguous_shapes_and_non_scalar_channels() -> None
                     safety_cost=jnp.array(True),
                 )
             ),
-            GradientJoyConfig(candidate_semantics="update"),
+            CandidateUpdateAuditConfig(candidate_semantics="update"),
         )
 
 
@@ -1931,7 +1953,10 @@ def test_paper_specific_dg_delight_equations_match_definition() -> None:
     expected_ordinary_loss = -jnp.mean(advantages * log_probabilities)
 
     chex.assert_trees_all_close(result.action_surprisal, expected_surprisal)
-    chex.assert_trees_all_close(result.delight, expected_delight)
+    chex.assert_trees_all_equal(
+        jax.lax.bitcast_convert_type(result.delight, jnp.uint32),
+        jax.lax.bitcast_convert_type(expected_delight, jnp.uint32),
+    )
     chex.assert_trees_all_close(result.sample_weights, expected_weights)
     chex.assert_trees_all_close(result.actor_coefficients, expected_coefficients)
     chex.assert_trees_all_close(result.actor_loss, expected_loss)

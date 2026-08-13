@@ -21,17 +21,25 @@ References:
     Dohare et al. (2024). "Loss of Plasticity in Deep Continual Learning."
 """
 
+import dataclasses
 import functools
 import time
-from typing import Any
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Float, Int, PRNGKeyArray
+from jaxtyping import Bool, Float, Int, PRNGKeyArray, UInt
 
+from alberta_framework.core.checkpoints import (
+    load_checkpoint,
+    load_checkpoint_metadata,
+    save_checkpoint,
+)
 from alberta_framework.core.future_utility import (
     contribution_trace_output_loss_reduction,
     normalize_future_utility_signal,
@@ -42,6 +50,90 @@ from alberta_framework.core.future_utility import (
 GENERATOR_RANDOM = 0
 GENERATOR_MUTATE_PARENT = 1
 GENERATOR_IMPRINT = 2
+
+_INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
+
+FEATURE_DISCOVERY_STATE_SCHEMA = "alberta.feature-discovery-state.v2"
+FEATURE_DISCOVERY_CHECKPOINT_SCHEMA = "alberta.feature-discovery-checkpoint.v2"
+FEATURE_DISCOVERY_LIFETIME_COUNTER_NBYTES = 12
+FEATURE_DISCOVERY_LIFETIME_COUNTER_DELTA_NBYTES = 8
+FEATURE_DISCOVERY_TRANSACTION_CLOCK_NBYTES = 16
+FEATURE_DISCOVERY_TRANSACTION_CLOCK_DELTA_NBYTES = 12
+_LEGACY_FEATURE_DISCOVERY_CHECKPOINT_SCHEMA = (
+    "alberta.feature-discovery-checkpoint.v1"
+)
+
+
+def _require_array_contract(
+    value: Any,
+    *,
+    name: str,
+    shape: tuple[int, ...] | None,
+    dtype: jnp.dtype,
+) -> Array:
+    """Return an array after trace-time shape and effective-dtype validation."""
+
+    array = jnp.asarray(value)
+    if shape is None:
+        if array.ndim != 1:
+            raise ValueError(f"{name} must be rank one, got shape {array.shape}")
+    elif array.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {array.shape}")
+    if array.dtype != dtype:
+        raise TypeError(f"{name} must have dtype {dtype}, got {array.dtype}")
+    return array
+
+
+def _saturating_nonnegative_int32_increment(value: Array) -> Int[Array, "..."]:
+    """Advance non-negative int32 maturity telemetry without signed wrap."""
+
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    counter = jnp.asarray(value, dtype=jnp.int32)
+    return jnp.minimum(jnp.maximum(counter, 0), maximum - 1) + 1
+
+
+def _checked_step_words_increment(
+    step_words: Array,
+) -> tuple[UInt[Array, " 2"], Bool[Array, ""]]:
+    """Propose one exact update identity without wrapping the all-ones value."""
+
+    if getattr(step_words, "shape", None) != (2,):
+        raise ValueError("feature-discovery step_words must have shape (2,)")
+    if getattr(step_words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("feature-discovery step_words must have dtype uint32")
+    maximum = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+    capacity_available = ~jnp.all(step_words == maximum)
+    one = jnp.asarray(1, dtype=jnp.uint32)
+    low = step_words[1] + one
+    carry = (low == jnp.asarray(0, dtype=jnp.uint32)).astype(jnp.uint32)
+    candidate = jnp.stack((step_words[0] + carry, low))
+    return (
+        jnp.where(capacity_available, candidate, step_words).astype(jnp.uint32),
+        capacity_available,
+    )
+
+
+def _lifetime_counter_valid(
+    step_words: Array,
+    step_count: Array,
+) -> Bool[Array, ""]:
+    """Authenticate exact lifetime identity against saturating compatibility telemetry."""
+
+    _checked_step_words_increment(step_words)
+    if getattr(step_count, "shape", None) != ():
+        raise ValueError("feature-discovery step_count must be scalar")
+    if getattr(step_count, "dtype", None) != jnp.dtype(jnp.int32):
+        raise TypeError("feature-discovery step_count must have dtype int32")
+    maximum_i32 = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    below_saturation = (step_words[0] == jnp.asarray(0, dtype=jnp.uint32)) & (
+        step_words[1] < jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+    )
+    return (step_count >= 0) & jnp.where(
+        below_saturation,
+        step_count == step_words[1].astype(jnp.int32),
+        step_count == maximum_i32,
+    )
 
 
 @chex.dataclass(frozen=True)
@@ -86,13 +178,20 @@ class FeatureDiscoveryState:
     plasticity_signal_ema: Float[Array, " 3"]
     replacement_accumulator: Float[Array, ""]
     step_count: Int[Array, ""]
-    birth_timestamp: float = 0.0
-    uptime_s: float = 0.0
+    step_words: UInt[Array, " 2"]
+    replacement_phase: Int[Array, ""]
+    birth_timestamp: Float[Array, ""]
+    uptime_s: Float[Array, ""]
 
 
 @chex.dataclass(frozen=True)
 class FeatureDiscoveryUpdateResult:
-    """Result of one feature-discovery update."""
+    """Result of one atomic feature-discovery update.
+
+    Dynamic validation failures and exact-counter exhaustion return the input
+    state unchanged.  ``update_rejected`` makes that outcome explicit under
+    eager execution, :func:`jax.jit`, and :func:`jax.lax.scan`.
+    """
 
     state: FeatureDiscoveryState
     predictions: Float[Array, " n_tasks"]
@@ -100,6 +199,15 @@ class FeatureDiscoveryUpdateResult:
     metrics: Float[Array, " 7"]
     replaced_slot: Int[Array, ""]
     promoted_candidate: Int[Array, ""]
+    curation_attempted: Bool[Array, ""]
+    pre_step_words: UInt[Array, " 2"]
+    post_step_words: UInt[Array, " 2"]
+    lifetime_counter_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    state_valid: Bool[Array, ""]
+    candidate_state_valid: Bool[Array, ""]
+    update_applied: Bool[Array, ""]
+    update_rejected: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -253,8 +361,28 @@ class FixedBudgetFeatureLearner:
             raise ValueError("candidate_count must be non-negative")
         if not 0.0 <= utility_decay < 1.0:
             raise ValueError("utility_decay must be in [0, 1)")
-        if replacement_interval < 0:
-            raise ValueError("replacement_interval must be non-negative")
+        if (
+            isinstance(replacement_interval, bool)
+            or not isinstance(replacement_interval, int)
+            or not 0 <= replacement_interval <= _INT32_MAX
+        ):
+            raise ValueError(
+                "replacement_interval must be an int32-safe non-negative integer"
+            )
+        if (
+            isinstance(min_feature_age, bool)
+            or not isinstance(min_feature_age, int)
+            or not 0 <= min_feature_age <= _INT32_MAX
+        ):
+            raise ValueError("min_feature_age must be an int32-safe non-negative integer")
+        if (
+            isinstance(candidate_min_age, bool)
+            or not isinstance(candidate_min_age, int)
+            or not 0 <= candidate_min_age <= _INT32_MAX
+        ):
+            raise ValueError(
+                "candidate_min_age must be an int32-safe non-negative integer"
+            )
         if not 0.0 <= promotion_blend <= 1.0:
             raise ValueError("promotion_blend must be in [0, 1]")
         if utility_aggregation not in {"mean", "max", "topk"}:
@@ -371,10 +499,318 @@ class FixedBudgetFeatureLearner:
         """Number of output tasks."""
         return self._n_tasks
 
+    def _require_state_contract(
+        self,
+        state: FeatureDiscoveryState,
+        *,
+        feature_dim: int,
+    ) -> None:
+        """Validate the fixed v2 state schema before traced arithmetic."""
+
+        if not isinstance(state, FeatureDiscoveryState):
+            raise TypeError("state must be a FeatureDiscoveryState")
+        if feature_dim < 1:
+            raise ValueError("feature_dim must be positive")
+        key = jnp.asarray(state.key)
+        if key.shape != () or not jnp.issubdtype(key.dtype, jax.dtypes.prng_key):
+            raise TypeError("feature-discovery key must be a scalar PRNG key")
+
+        float_contracts = (
+            (
+                "feature_weights",
+                state.feature_weights,
+                (self._n_features, feature_dim),
+            ),
+            ("feature_biases", state.feature_biases, (self._n_features,)),
+            (
+                "output_weights",
+                state.output_weights,
+                (self._n_tasks, self._n_features),
+            ),
+            ("output_biases", state.output_biases, (self._n_tasks,)),
+            ("utilities", state.utilities, (self._n_features,)),
+            (
+                "utility_contribution_trace",
+                state.utility_contribution_trace,
+                (self._n_tasks, self._n_features),
+            ),
+            (
+                "utility_error_trace",
+                state.utility_error_trace,
+                (self._n_tasks,),
+            ),
+            (
+                "utility_feature_trace",
+                state.utility_feature_trace,
+                (self._n_features,),
+            ),
+            (
+                "utility_feature_energy_trace",
+                state.utility_feature_energy_trace,
+                (self._n_features,),
+            ),
+            (
+                "utility_signal_second_moment",
+                state.utility_signal_second_moment,
+                (self._n_features,),
+            ),
+            ("task_activity_ema", state.task_activity_ema, (self._n_tasks,)),
+            (
+                "candidate_weights",
+                state.candidate_weights,
+                (self._candidate_count, feature_dim),
+            ),
+            (
+                "candidate_biases",
+                state.candidate_biases,
+                (self._candidate_count,),
+            ),
+            (
+                "candidate_output_weights",
+                state.candidate_output_weights,
+                (self._n_tasks, self._candidate_count),
+            ),
+            (
+                "candidate_utilities",
+                state.candidate_utilities,
+                (self._candidate_count,),
+            ),
+            (
+                "candidate_utility_contribution_trace",
+                state.candidate_utility_contribution_trace,
+                (self._n_tasks, self._candidate_count),
+            ),
+            (
+                "candidate_utility_feature_trace",
+                state.candidate_utility_feature_trace,
+                (self._candidate_count,),
+            ),
+            (
+                "candidate_utility_feature_energy_trace",
+                state.candidate_utility_feature_energy_trace,
+                (self._candidate_count,),
+            ),
+            (
+                "candidate_utility_signal_second_moment",
+                state.candidate_utility_signal_second_moment,
+                (self._candidate_count,),
+            ),
+            ("generator_log_weights", state.generator_log_weights, (3,)),
+            ("generator_utility_ema", state.generator_utility_ema, (3,)),
+            ("plasticity_log_weights", state.plasticity_log_weights, (3,)),
+            ("plasticity_signal_ema", state.plasticity_signal_ema, (3,)),
+            ("replacement_accumulator", state.replacement_accumulator, ()),
+            ("birth_timestamp", state.birth_timestamp, ()),
+            ("uptime_s", state.uptime_s, ()),
+        )
+        for name, value, shape in float_contracts:
+            _require_array_contract(
+                value,
+                name=f"state.{name}",
+                shape=shape,
+                dtype=jnp.dtype(jnp.float32),
+            )
+
+        int_contracts = (
+            ("ages", state.ages, (self._n_features,)),
+            ("candidate_ages", state.candidate_ages, (self._candidate_count,)),
+            ("feature_parent_a", state.feature_parent_a, (self._n_features,)),
+            ("feature_parent_b", state.feature_parent_b, (self._n_features,)),
+            ("feature_generator", state.feature_generator, (self._n_features,)),
+            (
+                "candidate_parent_a",
+                state.candidate_parent_a,
+                (self._candidate_count,),
+            ),
+            (
+                "candidate_parent_b",
+                state.candidate_parent_b,
+                (self._candidate_count,),
+            ),
+            (
+                "candidate_generator",
+                state.candidate_generator,
+                (self._candidate_count,),
+            ),
+            ("step_count", state.step_count, ()),
+            ("replacement_phase", state.replacement_phase, ()),
+        )
+        for name, value, shape in int_contracts:
+            _require_array_contract(
+                value,
+                name=f"state.{name}",
+                shape=shape,
+                dtype=jnp.dtype(jnp.int32),
+            )
+        _checked_step_words_increment(state.step_words)
+
+    def _replacement_phase_valid(
+        self,
+        step_words: Array,
+        replacement_phase: Array,
+    ) -> Bool[Array, ""]:
+        """Bind persisted cadence phase to the exact 64-bit update identity."""
+
+        if self._replacement_interval == 0:
+            return replacement_phase == jnp.asarray(0, dtype=jnp.int32)
+        divisor = jnp.asarray(self._replacement_interval, dtype=jnp.uint32)
+
+        def fold_word(remainder: Array, word: Array) -> Array:
+            def fold_bit(bit_index: Array, current: Array) -> Array:
+                shift = jnp.asarray(31, dtype=jnp.int32) - bit_index
+                bit = (word >> shift.astype(jnp.uint32)) & jnp.asarray(
+                    1,
+                    dtype=jnp.uint32,
+                )
+                doubled = current + current + bit
+                return jnp.where(doubled >= divisor, doubled - divisor, doubled)
+
+            return jax.lax.fori_loop(0, 32, fold_bit, remainder)
+
+        exact_phase = fold_word(
+            fold_word(jnp.asarray(0, dtype=jnp.uint32), step_words[0]),
+            step_words[1],
+        )
+        phase_in_range = (replacement_phase >= 0) & (
+            replacement_phase
+            < jnp.asarray(self._replacement_interval, dtype=jnp.int32)
+        )
+        return phase_in_range & (replacement_phase.astype(jnp.uint32) == exact_phase)
+
+    def _next_replacement_phase(self, replacement_phase: Array) -> Int[Array, ""]:
+        """Advance the bounded phase exactly, independent of telemetry saturation."""
+
+        if self._replacement_interval == 0:
+            return jnp.asarray(0, dtype=jnp.int32)
+        final_phase = jnp.asarray(self._replacement_interval - 1, dtype=jnp.int32)
+        return jnp.where(
+            replacement_phase == final_phase,
+            jnp.asarray(0, dtype=jnp.int32),
+            replacement_phase + jnp.asarray(1, dtype=jnp.int32),
+        )
+
+    def _state_values_valid(
+        self,
+        state: FeatureDiscoveryState,
+    ) -> Bool[Array, ""]:
+        """Validate every persisted source or candidate value outside the clock."""
+
+        finite_values = jnp.asarray(True, dtype=jnp.bool_)
+        for value in (
+            state.feature_weights,
+            state.feature_biases,
+            state.output_weights,
+            state.output_biases,
+            state.utilities,
+            state.utility_contribution_trace,
+            state.utility_error_trace,
+            state.utility_feature_trace,
+            state.utility_feature_energy_trace,
+            state.utility_signal_second_moment,
+            state.task_activity_ema,
+            state.candidate_weights,
+            state.candidate_biases,
+            state.candidate_output_weights,
+            state.candidate_utilities,
+            state.candidate_utility_contribution_trace,
+            state.candidate_utility_feature_trace,
+            state.candidate_utility_feature_energy_trace,
+            state.candidate_utility_signal_second_moment,
+            state.generator_log_weights,
+            state.generator_utility_ema,
+            state.plasticity_log_weights,
+            state.plasticity_signal_ema,
+            state.replacement_accumulator,
+            state.birth_timestamp,
+            state.uptime_s,
+        ):
+            finite_values = finite_values & jnp.all(jnp.isfinite(value))
+
+        active_lineage_valid = jnp.all(
+            (state.feature_parent_a >= -1)
+            & (state.feature_parent_a < self._n_features)
+            & (state.feature_parent_b >= -1)
+            & (state.feature_parent_b < self._n_features)
+        )
+        candidate_lineage_valid = jnp.all(
+            (state.candidate_parent_a >= -1)
+            & (state.candidate_parent_a < self._n_features)
+            & (state.candidate_parent_b >= -1)
+            & (state.candidate_parent_b < self._n_features)
+        )
+        generator_domain_valid = jnp.all(
+            (state.feature_generator >= GENERATOR_RANDOM)
+            & (state.feature_generator <= GENERATOR_IMPRINT)
+        ) & jnp.all(
+            (state.candidate_generator >= GENERATOR_RANDOM)
+            & (state.candidate_generator <= GENERATOR_IMPRINT)
+        )
+        bounded_values = (
+            jnp.all(state.utilities >= 0.0)
+            & jnp.all(state.candidate_utilities >= 0.0)
+            & jnp.all(state.utility_feature_energy_trace >= 0.0)
+            & jnp.all(state.utility_signal_second_moment >= 0.0)
+            & jnp.all(state.candidate_utility_feature_energy_trace >= 0.0)
+            & jnp.all(state.candidate_utility_signal_second_moment >= 0.0)
+            & jnp.all(state.task_activity_ema >= 0.0)
+            & jnp.all(state.task_activity_ema <= 1.0)
+            & jnp.all(state.generator_utility_ema >= 0.0)
+            & jnp.all(state.plasticity_signal_ema >= -1.0)
+            & jnp.all(state.plasticity_signal_ema <= 1.0)
+            & (state.replacement_accumulator >= 0.0)
+            & (state.replacement_accumulator < 1.0)
+            & (state.birth_timestamp >= 0.0)
+            & (state.uptime_s >= 0.0)
+            & jnp.all(state.ages >= 0)
+            & jnp.all(state.candidate_ages >= 0)
+        )
+        return (
+            finite_values
+            & bounded_values
+            & active_lineage_valid
+            & candidate_lineage_valid
+            & generator_domain_valid
+        )
+
+    def _transaction_state_valid(
+        self,
+        state: FeatureDiscoveryState,
+    ) -> Bool[Array, ""]:
+        """Validate a whole dynamic state including its authenticated clock."""
+
+        return (
+            _lifetime_counter_valid(state.step_words, state.step_count)
+            & self._replacement_phase_valid(
+                state.step_words,
+                state.replacement_phase,
+            )
+            & self._state_values_valid(state)
+        )
+
+    def memory_accounting(self, state: FeatureDiscoveryState) -> dict[str, int | bool]:
+        """Return exact persistent-array and feature-bank resource accounting."""
+
+        return {
+            "active_feature_slots": self._n_features,
+            "candidate_archive_slots": self._candidate_count,
+            "candidate_archive_is_counted": True,
+            "active_constructor_weight_scalars": int(state.feature_weights.size),
+            "candidate_constructor_weight_scalars": int(state.candidate_weights.size),
+            "active_output_weight_scalars": int(state.output_weights.size),
+            "candidate_output_weight_scalars": int(
+                state.candidate_output_weights.size
+            ),
+            "lifetime_counter_bytes": FEATURE_DISCOVERY_LIFETIME_COUNTER_NBYTES,
+            "replacement_phase_bytes": int(state.replacement_phase.nbytes),
+            "transaction_clock_bytes": FEATURE_DISCOVERY_TRANSACTION_CLOCK_NBYTES,
+            "persistent_array_bytes": measure_feature_discovery_state_nbytes(state),
+        }
+
     def to_config(self) -> dict[str, Any]:
         """Serialize learner configuration."""
         return {
             "type": "FixedBudgetFeatureLearner",
+            "state_schema": FEATURE_DISCOVERY_STATE_SCHEMA,
             "n_features": self._n_features,
             "n_tasks": self._n_tasks,
             "step_size_output": self._step_size_output,
@@ -422,6 +858,8 @@ class FixedBudgetFeatureLearner:
         """Reconstruct learner from ``to_config`` output."""
         config = dict(config)
         config.pop("type", None)
+        if config.pop("state_schema", None) != FEATURE_DISCOVERY_STATE_SCHEMA:
+            raise ValueError("feature-discovery state schema is unsupported")
         # replace_fraction was serialized by older versions but never read by
         # the update path; drop it so old configs keep loading.
         config.pop("replace_fraction", None)
@@ -458,6 +896,8 @@ class FixedBudgetFeatureLearner:
 
     def init(self, feature_dim: int, key: Array) -> FeatureDiscoveryState:
         """Initialize active and candidate feature banks."""
+        if isinstance(feature_dim, bool) or not isinstance(feature_dim, int) or feature_dim < 1:
+            raise ValueError("feature_dim must be a positive integer")
         key, k_active, k_candidate = jr.split(key, 3)
         scale = self._init_scale / jnp.sqrt(float(feature_dim))
         feature_weights = scale * jr.normal(
@@ -530,8 +970,10 @@ class FixedBudgetFeatureLearner:
             plasticity_signal_ema=jnp.zeros(3, dtype=jnp.float32),
             replacement_accumulator=jnp.array(0.0, dtype=jnp.float32),
             step_count=jnp.array(0, dtype=jnp.int32),
-            birth_timestamp=time.time(),
-            uptime_s=0.0,
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
+            replacement_phase=jnp.array(0, dtype=jnp.int32),
+            birth_timestamp=jnp.asarray(time.time(), dtype=jnp.float32),
+            uptime_s=jnp.asarray(0.0, dtype=jnp.float32),
         )
 
     @staticmethod
@@ -912,9 +1354,41 @@ class FixedBudgetFeatureLearner:
         observation: Array,
         targets: Array,
     ) -> FeatureDiscoveryUpdateResult:
-        """Perform one temporally-uniform feature-discovery update."""
-        active_mask = ~jnp.isnan(targets)
-        safe_targets = jnp.where(active_mask, targets, 0.0)
+        """Perform one validated, atomic, temporally-uniform update."""
+        raw_observation = _require_array_contract(
+            observation,
+            name="observation",
+            shape=None,
+            dtype=jnp.dtype(jnp.float32),
+        )
+        raw_targets = _require_array_contract(
+            targets,
+            name="targets",
+            shape=(self._n_tasks,),
+            dtype=jnp.dtype(jnp.float32),
+        )
+        feature_dim = raw_observation.shape[0]
+        self._require_state_contract(state, feature_dim=feature_dim)
+        proposed_step_words, lifetime_capacity_available = (
+            _checked_step_words_increment(state.step_words)
+        )
+        lifetime_counter_valid = _lifetime_counter_valid(
+            state.step_words,
+            state.step_count,
+        )
+        state_valid = self._transaction_state_valid(state)
+        proposed_replacement_phase = self._next_replacement_phase(
+            state.replacement_phase
+        )
+        input_valid = (
+            state_valid
+            & lifetime_capacity_available
+            & jnp.all(jnp.isfinite(raw_observation))
+            & jnp.all(jnp.isfinite(raw_targets) | jnp.isnan(raw_targets))
+        )
+        observation = jnp.where(jnp.isfinite(raw_observation), raw_observation, 0.0)
+        active_mask = jnp.isfinite(raw_targets)
+        safe_targets = jnp.where(active_mask, raw_targets, 0.0)
         active_count = jnp.maximum(jnp.sum(active_mask.astype(jnp.float32)), 1.0)
         task_activity_ema = self._task_activity_update(
             state.task_activity_ema, active_mask
@@ -1113,9 +1587,11 @@ class FixedBudgetFeatureLearner:
         candidate_output_weights = (
             state.candidate_output_weights + candidate_output_delta
         )
-        ages = state.ages + 1
-        candidate_ages = state.candidate_ages + 1
-        step_count = state.step_count + 1
+        ages = _saturating_nonnegative_int32_increment(state.ages)
+        candidate_ages = _saturating_nonnegative_int32_increment(
+            state.candidate_ages
+        )
+        step_count = _saturating_nonnegative_int32_increment(state.step_count)
         key, replacement_key = jr.split(state.key)
 
         replaced_slot = jnp.array(-1, dtype=jnp.int32)
@@ -1127,21 +1603,30 @@ class FixedBudgetFeatureLearner:
                 self._plasticity_replacement_multipliers,
                 dtype=jnp.float32,
             )
-            replacement_rate = (
+            replacement_rate = jnp.minimum(
                 jnp.sum(plasticity_weights * replacement_multipliers)
-                / float(self._replacement_interval)
+                / float(self._replacement_interval),
+                jnp.asarray(1.0, dtype=jnp.float32),
             )
-            replacement_accumulator = replacement_accumulator + replacement_rate
-            should_try_replace = replacement_accumulator >= 1.0
+            proposed_accumulator = replacement_accumulator + replacement_rate
+            should_try_replace = proposed_accumulator >= 1.0
             replacement_accumulator = jnp.where(
                 should_try_replace,
-                replacement_accumulator - 1.0,
+                proposed_accumulator - 1.0,
+                proposed_accumulator,
+            )
+            replacement_accumulator = jnp.clip(
                 replacement_accumulator,
+                jnp.asarray(0.0, dtype=jnp.float32),
+                jnp.nextafter(
+                    jnp.asarray(1.0, dtype=jnp.float32),
+                    jnp.asarray(0.0, dtype=jnp.float32),
+                ),
             )
         else:
             should_try_replace = (
-                (self._replacement_interval > 0)
-                & (step_count % jnp.array(max(self._replacement_interval, 1)) == 0)
+                jnp.asarray(self._replacement_interval > 0, dtype=jnp.bool_)
+                & (proposed_replacement_phase == 0)
             )
 
         eligible_active = ages >= self._min_feature_age
@@ -1595,6 +2080,8 @@ class FixedBudgetFeatureLearner:
             plasticity_signal_ema=plasticity_signal_ema,
             replacement_accumulator=replacement_accumulator,
             step_count=step_count,
+            step_words=proposed_step_words,
+            replacement_phase=proposed_replacement_phase,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
@@ -1620,13 +2107,48 @@ class FixedBudgetFeatureLearner:
             dtype=jnp.float32,
         )
 
+        candidate_state_valid = self._transaction_state_valid(new_state)
+        update_available = input_valid & candidate_state_valid
+        committed_state = jax.lax.cond(
+            update_available,
+            lambda _: new_state,
+            lambda _: state,
+            operand=None,
+        )
+        rejected_index = jnp.asarray(-1, dtype=jnp.int32)
+
         return FeatureDiscoveryUpdateResult(
-            state=new_state,
-            predictions=predictions,
-            errors=reported_errors,
-            metrics=metrics,
-            replaced_slot=replaced_slot,
-            promoted_candidate=promoted_candidate,
+            state=committed_state,
+            predictions=jnp.where(
+                update_available,
+                predictions,
+                jnp.full_like(predictions, jnp.nan),
+            ),
+            errors=jnp.where(
+                update_available,
+                reported_errors,
+                jnp.full_like(reported_errors, jnp.nan),
+            ),
+            metrics=jnp.where(update_available, metrics, jnp.zeros_like(metrics)),
+            replaced_slot=jnp.where(
+                update_available,
+                replaced_slot,
+                rejected_index,
+            ),
+            promoted_candidate=jnp.where(
+                update_available,
+                promoted_candidate,
+                rejected_index,
+            ),
+            curation_attempted=update_available & should_try_replace,
+            pre_step_words=state.step_words,
+            post_step_words=committed_state.step_words,
+            lifetime_counter_valid=lifetime_counter_valid,
+            lifetime_capacity_available=lifetime_capacity_available,
+            state_valid=state_valid,
+            candidate_state_valid=candidate_state_valid,
+            update_applied=update_available,
+            update_rejected=~update_available,
         )
 
 
@@ -1682,3 +2204,179 @@ def run_feature_discovery_loop(
     elapsed = time.time() - t0
     final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)  # type: ignore[attr-defined]
     return FeatureDiscoveryLearningResult(state=final_state, metrics=metrics)
+
+
+def feature_discovery_lifetime_counter_nbytes() -> int:
+    """Return bytes occupied by compatibility telemetry and exact identity."""
+
+    return FEATURE_DISCOVERY_LIFETIME_COUNTER_NBYTES
+
+
+def feature_discovery_transaction_clock_nbytes() -> int:
+    """Return bytes occupied by telemetry, exact identity, and cadence phase."""
+
+    return FEATURE_DISCOVERY_TRANSACTION_CLOCK_NBYTES
+
+
+def measure_feature_discovery_state_nbytes(state: FeatureDiscoveryState) -> int:
+    """Measure every persistent JAX-array byte in one feature-discovery state."""
+
+    return sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree.leaves(state)
+        if isinstance(leaf, Array)
+    )
+
+
+def migrate_legacy_feature_discovery_state(
+    legacy_state: Any,
+    *,
+    replacement_interval: int,
+) -> FeatureDiscoveryState:
+    """Migrate one exact pre-v2 state without inventing saturated history.
+
+    The old field manifest must match exactly.  Wrapped, negative, or saturated
+    compatibility and maturity counters are rejected because their prior
+    lifetime cannot be reconstructed uniquely.
+    """
+
+    if (
+        isinstance(replacement_interval, bool)
+        or not isinstance(replacement_interval, int)
+        or not 0 <= replacement_interval <= _INT32_MAX
+    ):
+        raise ValueError(
+            "replacement_interval must be an int32-safe non-negative integer"
+        )
+    if isinstance(legacy_state, Mapping):
+        fields = dict(legacy_state)
+    elif dataclasses.is_dataclass(legacy_state) and not isinstance(legacy_state, type):
+        fields = {
+            field.name: getattr(legacy_state, field.name)
+            for field in dataclasses.fields(legacy_state)
+        }
+    else:
+        raise TypeError("legacy feature-discovery state must be a mapping or dataclass")
+
+    current_names = {
+        field.name
+        for field in dataclasses.fields(FeatureDiscoveryState)  # type: ignore[arg-type]
+    }
+    legacy_names = current_names - {"step_words", "replacement_phase"}
+    supplied_names = set(fields)
+    if supplied_names != legacy_names:
+        missing = sorted(legacy_names - supplied_names)
+        extra = sorted(supplied_names - legacy_names)
+        raise ValueError(
+            "legacy feature-discovery field manifest is not exact; "
+            f"missing={missing}, extra={extra}"
+        )
+
+    step_count = jnp.asarray(fields["step_count"])
+    if step_count.shape != () or step_count.dtype != jnp.dtype(jnp.int32):
+        raise TypeError("legacy feature-discovery step_count must be scalar int32")
+    step = int(step_count)
+    if step < 0:
+        raise ValueError("negative legacy feature-discovery step_count indicates wrap")
+    if step >= _INT32_MAX:
+        raise ValueError("saturated legacy feature-discovery step_count is ambiguous")
+    for name in ("ages", "candidate_ages"):
+        value = jnp.asarray(fields[name])
+        if value.dtype != jnp.dtype(jnp.int32) or value.ndim != 1:
+            raise TypeError(f"legacy feature-discovery {name} must be rank-one int32")
+        if bool(jnp.any(value < 0)):
+            raise ValueError(f"negative legacy feature-discovery {name} indicates wrap")
+        if bool(jnp.any(value >= _INT32_MAX)):
+            raise ValueError(f"saturated legacy feature-discovery {name} is ambiguous")
+
+    accumulator = jnp.asarray(fields["replacement_accumulator"])
+    if accumulator.shape != () or accumulator.dtype != jnp.dtype(jnp.float32):
+        raise TypeError(
+            "legacy feature-discovery replacement_accumulator must be scalar float32"
+        )
+    if not bool(jnp.isfinite(accumulator)) or not 0.0 <= float(accumulator) < 1.0:
+        raise ValueError(
+            "legacy feature-discovery replacement_accumulator must be in [0, 1)"
+        )
+    for name in ("birth_timestamp", "uptime_s"):
+        value = jnp.asarray(fields[name], dtype=jnp.float32)
+        if value.shape != ():
+            raise TypeError(f"legacy feature-discovery {name} must be scalar")
+        if not bool(jnp.isfinite(value)) or float(value) < 0.0:
+            raise ValueError(f"legacy feature-discovery {name} must be finite nonnegative")
+        fields[name] = value
+
+    fields["step_words"] = jnp.asarray((0, step), dtype=jnp.uint32)
+    fields["replacement_phase"] = jnp.asarray(
+        0 if replacement_interval == 0 else step % replacement_interval,
+        dtype=jnp.int32,
+    )
+    return FeatureDiscoveryState(**fields)
+
+
+def save_feature_discovery_checkpoint(
+    learner: FixedBudgetFeatureLearner,
+    state: FeatureDiscoveryState,
+    path: str | Path,
+    *,
+    feature_dim: int,
+) -> None:
+    """Persist one validated v2 state with its exact resource contract."""
+
+    if isinstance(feature_dim, bool) or not isinstance(feature_dim, int) or feature_dim < 1:
+        raise ValueError("feature_dim must be a positive integer")
+    learner._require_state_contract(state, feature_dim=feature_dim)
+    if not bool(jax.device_get(learner._transaction_state_valid(state))):
+        raise ValueError("feature-discovery checkpoint state is invalid")
+    save_checkpoint(
+        state,
+        path,
+        metadata={
+            "schema": FEATURE_DISCOVERY_CHECKPOINT_SCHEMA,
+            "learner_config": learner.to_config(),
+            "feature_dim": feature_dim,
+            "memory_accounting": learner.memory_accounting(state),
+        },
+    )
+
+
+def load_feature_discovery_checkpoint(
+    path: str | Path,
+) -> tuple[FixedBudgetFeatureLearner, FeatureDiscoveryState]:
+    """Restore only a structurally valid v2 exact-clock checkpoint."""
+
+    metadata = load_checkpoint_metadata(path)
+    expected_fields = {
+        "schema",
+        "learner_config",
+        "feature_dim",
+        "memory_accounting",
+    }
+    if set(metadata) != expected_fields:
+        raise ValueError("feature-discovery checkpoint metadata fields are invalid")
+    checkpoint_schema = metadata.get("schema")
+    if checkpoint_schema == _LEGACY_FEATURE_DISCOVERY_CHECKPOINT_SCHEMA:
+        raise ValueError(
+            "legacy feature-discovery checkpoint v1 lacks exact step_words and "
+            "replacement_phase; migrate its state with "
+            "migrate_legacy_feature_discovery_state and resave it"
+        )
+    if checkpoint_schema != FEATURE_DISCOVERY_CHECKPOINT_SCHEMA:
+        raise ValueError("feature-discovery checkpoint schema is unsupported")
+    config = metadata.get("learner_config")
+    if not isinstance(config, dict):
+        raise ValueError("feature-discovery checkpoint is missing learner_config")
+    learner = FixedBudgetFeatureLearner.from_config(config)
+    feature_dim = metadata.get("feature_dim")
+    if isinstance(feature_dim, bool) or not isinstance(feature_dim, int) or feature_dim < 1:
+        raise ValueError("feature-discovery checkpoint feature_dim is invalid")
+    template = learner.init(feature_dim=feature_dim, key=jr.key(0))
+    restored, restored_metadata = load_checkpoint(template, path)
+    if restored_metadata != metadata:
+        raise ValueError("feature-discovery checkpoint metadata changed between reads")
+    learner._require_state_contract(restored, feature_dim=feature_dim)
+    if not bool(jax.device_get(learner._transaction_state_valid(restored))):
+        raise ValueError("feature-discovery checkpoint state is invalid")
+    if learner.memory_accounting(restored) != metadata.get("memory_accounting"):
+        raise ValueError("feature-discovery checkpoint resource contract does not match")
+    return learner, cast(FeatureDiscoveryState, restored)

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 from typing import Any, cast
 
 import jax
@@ -14,6 +16,10 @@ import pytest
 from alberta_framework.core.partner_policy_fusion import (
     MECHANISM_STATUS,
     PARTNER_POLICY_FUSION_CHECKPOINT_SCHEMA,
+    PARTNER_POLICY_FUSION_CONFIG_SCHEMA,
+    PARTNER_POLICY_FUSION_EXACT_IDENTITY_DELTA_NBYTES,
+    PARTNER_POLICY_FUSION_EXACT_IDENTITY_NBYTES,
+    PARTNER_POLICY_FUSION_STATE_SCHEMA,
     RELIABILITY_HISTORY_DEVELOPMENT_ONLINE,
     RELIABILITY_HISTORY_UNAVAILABLE,
     ROUTE_ACCEPT,
@@ -30,9 +36,23 @@ from alberta_framework.core.partner_policy_fusion import (
     PartnerPolicyFusionConfig,
     PartnerPolicyFusionFeedback,
     PartnerPolicyFusionState,
+    measure_partner_policy_fusion_state_nbytes,
+    migrate_legacy_partner_policy_fusion_checkpoint,
+    partner_policy_fusion_identity_words,
 )
 
 pytestmark = pytest.mark.unit
+
+_INT32_MAX = np.iinfo(np.int32).max
+_UINT32_MAX = np.iinfo(np.uint32).max
+
+
+def _words(value: int) -> jax.Array:
+    return partner_policy_fusion_identity_words(value)
+
+
+def _telemetry(value: int) -> int:
+    return min(value, _INT32_MAX)
 
 
 def _replace[T](value: T, **changes: object) -> T:
@@ -74,6 +94,9 @@ def _messages(
     batch = fusion.empty_messages()
     for slot, entry in enumerate(entries):
         partner_id = int(entry.get("partner_id", slot))
+        issued_decision = int(entry.get("issued_decision_id", decision_id))
+        issued_event = int(entry.get("issued_event_id", event_id))
+        valid_through = int(entry.get("valid_through_event_id", event_id + 1))
         batch = _replace(
             batch,
             available=batch.available.at[slot].set(bool(entry.get("available", True))),
@@ -100,13 +123,22 @@ def _messages(
                 float(entry.get("communication_cost", 0.0))
             ),
             issued_decision_id=batch.issued_decision_id.at[slot].set(
-                int(entry.get("issued_decision_id", decision_id))
+                _telemetry(issued_decision)
             ),
             issued_event_id=batch.issued_event_id.at[slot].set(
-                int(entry.get("issued_event_id", event_id))
+                _telemetry(issued_event)
             ),
             valid_through_event_id=batch.valid_through_event_id.at[slot].set(
-                int(entry.get("valid_through_event_id", event_id + 1))
+                _telemetry(valid_through)
+            ),
+            issued_decision_words=batch.issued_decision_words.at[slot].set(
+                _words(issued_decision)
+            ),
+            issued_event_words=batch.issued_event_words.at[slot].set(
+                _words(issued_event)
+            ),
+            valid_through_event_words=batch.valid_through_event_words.at[slot].set(
+                _words(valid_through)
             ),
         )
     return batch
@@ -129,8 +161,10 @@ def _decide(
 ) -> Any:
     return fusion.decide(
         state,
-        decision_id=jnp.asarray(decision_id, dtype=jnp.int32),
-        event_id=jnp.asarray(event_id, dtype=jnp.int32),
+        decision_id=jnp.asarray(_telemetry(decision_id), dtype=jnp.int32),
+        event_id=jnp.asarray(_telemetry(event_id), dtype=jnp.int32),
+        decision_words=_words(decision_id),
+        event_words=_words(event_id),
         observation_id=jnp.asarray(observation_id, dtype=jnp.int32),
         context_id=jnp.asarray(context_id, dtype=jnp.int32),
         context_features=jnp.asarray(context, dtype=jnp.float32),
@@ -156,8 +190,10 @@ def _feedback(
 ) -> PartnerPolicyFusionFeedback:
     return PartnerPolicyFusionFeedback(
         available=jnp.asarray(available, dtype=jnp.bool_),
-        decision_id=jnp.asarray(decision_id, dtype=jnp.int32),
-        executed_event_id=jnp.asarray(event_id, dtype=jnp.int32),
+        decision_id=jnp.asarray(_telemetry(decision_id), dtype=jnp.int32),
+        executed_event_id=jnp.asarray(_telemetry(event_id), dtype=jnp.int32),
+        decision_words=_words(decision_id),
+        executed_event_words=_words(event_id),
         executed_action=jnp.asarray(action, dtype=jnp.int32),
         partner_id=jnp.asarray(partner_id, dtype=jnp.int32),
         assistance_value_available=jnp.asarray(assistance_available, dtype=jnp.bool_),
@@ -182,6 +218,54 @@ def _assert_float_leaves_finite(value: object) -> None:
             assert np.all(np.isfinite(array))
 
 
+def _digest(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _legacy_v1_checkpoint(
+    fusion: PartnerPolicyFusion,
+    state: PartnerPolicyFusionState,
+) -> dict[str, object]:
+    """Derive the exact historical v1 JSON surface for migration tests."""
+
+    legacy = copy.deepcopy(fusion.checkpoint_payload(state))
+    legacy["schema"] = "alberta.partner-policy-fusion.checkpoint.v1"
+    legacy.pop("state_schema")
+    construction = cast(dict[str, Any], legacy["fusion"])
+    construction.pop("state_schema")
+    config = cast(dict[str, Any], construction["config"])
+    config["schema"] = "alberta.partner-policy-fusion.config.v1"
+    state_payload = cast(dict[str, Any], legacy["state"])
+    for name in (
+        "last_decision_words",
+        "last_event_words",
+        "armed_decision_words",
+        "armed_event_words",
+    ):
+        state_payload.pop(name)
+    resources = cast(dict[str, int], legacy["resource_budget"])
+    exact_scalars = resources.pop("persistent_uint32_scalars")
+    resources.pop("decision_input_uint32_scalars")
+    resources.pop("feedback_input_uint32_scalars")
+    resources.pop("cancellation_input_int32_scalars")
+    resources.pop("cancellation_input_uint32_scalars")
+    resources.pop("cancellation_input_bool_scalars")
+    resources.pop("max_parameter_updates_per_cancellation")
+    resources.pop("max_counter_updates_per_cancellation")
+    resources["persistent_state_scalars"] -= exact_scalars
+    resources["persistent_state_bytes"] -= 4 * exact_scalars
+    legacy["config_digest"] = _digest(construction)
+    legacy["state_digest"] = _digest(state_payload)
+    return legacy
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -190,6 +274,7 @@ def _assert_float_leaves_finite(value: object) -> None:
         ("context_dim", 0),
         ("n_actions", 0),
         ("max_message_horizon", 0),
+        ("max_message_horizon", 1 << 64),
         ("counter_cap", 0),
         ("learning_rate", 0.0),
         ("max_abs_weight", float("nan")),
@@ -213,6 +298,8 @@ def test_strict_config_roundtrip_and_l0_status() -> None:
     assert restored.to_config() == fusion.to_config()
     nested = fusion.to_config()["config"]
     assert isinstance(nested, dict)
+    assert nested["schema"] == PARTNER_POLICY_FUSION_CONFIG_SCHEMA
+    assert fusion.to_config()["state_schema"] == PARTNER_POLICY_FUSION_STATE_SCHEMA
     assert nested["mechanism_status"] == MECHANISM_STATUS
     assert nested["scientific_promotion_allowed"] is SCIENTIFIC_PROMOTION_ALLOWED is False
     assert "task_id" not in str(fusion.to_config())
@@ -235,7 +322,18 @@ def test_resource_budget_matches_fixed_state_exactly() -> None:
     budget = fusion.resource_budget
     actual_bytes = sum(int(np.asarray(leaf).nbytes) for leaf in jax.tree_util.tree_leaves(state))
     assert budget.persistent_state_bytes == actual_bytes
+    assert measure_partner_policy_fusion_state_nbytes(state) == actual_bytes
     assert budget.trainable_float32_scalars == 3 * 4
+    assert budget.persistent_uint32_scalars == 8
+    assert budget.decision_input_uint32_scalars == 4 + 6 * 3
+    assert budget.feedback_input_uint32_scalars == 4
+    assert budget.cancellation_input_int32_scalars == 2
+    assert budget.cancellation_input_uint32_scalars == 4
+    assert budget.cancellation_input_bool_scalars == 1
+    assert budget.max_parameter_updates_per_cancellation == 0
+    assert budget.max_counter_updates_per_cancellation == 0
+    assert PARTNER_POLICY_FUSION_EXACT_IDENTITY_NBYTES == 8
+    assert PARTNER_POLICY_FUSION_EXACT_IDENTITY_DELTA_NBYTES == 4
     assert budget.max_messages_per_decision == 3
     assert budget.partner_id_pairwise_equality_comparisons_per_decision == 9
     assert budget.max_trainable_scalars_touched_per_feedback == 4
@@ -284,6 +382,60 @@ def test_valid_typed_message_is_accepted_and_arms_exact_feedback_record() -> Non
         np.asarray(decision.route_one_hot),
         np.asarray([False, False, True, False, False]),
     )
+
+
+def test_feedback_cancellation_is_exact_owner_and_never_learns() -> None:
+    fusion = _fusion()
+    messages = _messages(
+        fusion,
+        [{"suggested_action": 2, "declared_confidence": 1.0}],
+    )
+    armed = _decide(fusion, fusion.init(), messages).state
+    weights_before = armed.reliability_weights
+    counters_before = (
+        armed.feedback_counts,
+        armed.safe_feedback_counts,
+        armed.decision_count,
+        armed.feedback_applied_count,
+    )
+    stale = fusion.cancel_pending_feedback(
+        armed,
+        cancellation_requested=jnp.asarray(True, dtype=jnp.bool_),
+        decision_words=_words(11),
+        event_words=armed.armed_event_words,
+        effective_action=armed.armed_action,
+        partner_id=armed.armed_partner_id,
+    )
+    assert not bool(stale.cancellation_applied)
+    assert not bool(stale.transaction_satisfied)
+    _assert_tree_equal(stale.state, armed)
+
+    canceled = fusion.cancel_pending_feedback(
+        armed,
+        cancellation_requested=jnp.asarray(True, dtype=jnp.bool_),
+        decision_words=armed.armed_decision_words,
+        event_words=armed.armed_event_words,
+        effective_action=armed.armed_action,
+        partner_id=armed.armed_partner_id,
+    )
+    assert bool(canceled.cancellation_applied)
+    assert bool(canceled.transaction_satisfied)
+    assert not bool(canceled.state.feedback_armed)
+    np.testing.assert_array_equal(canceled.state.reliability_weights, weights_before)
+    for after, before in zip(
+        (
+            canceled.state.feedback_counts,
+            canceled.state.safe_feedback_counts,
+            canceled.state.decision_count,
+            canceled.state.feedback_applied_count,
+        ),
+        counters_before,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(after, before)
+    assert bool(canceled.reliability_unchanged)
+    assert bool(canceled.counters_unchanged)
+    assert not bool(canceled.learning_applied)
 
 
 @pytest.mark.parametrize(
@@ -441,6 +593,8 @@ def _history_ready_zero_state(fusion: PartnerPolicyFusion) -> PartnerPolicyFusio
         has_last_decision=jnp.asarray(True, dtype=jnp.bool_),
         last_decision_id=jnp.asarray(count - 1, dtype=jnp.int32),
         last_event_id=jnp.asarray(count - 1, dtype=jnp.int32),
+        last_decision_words=_words(count - 1),
+        last_event_words=_words(count - 1),
     )
 
 
@@ -724,6 +878,8 @@ def test_jit_and_scan_match_eager_and_keep_outputs_finite() -> None:
     kwargs: dict[str, Any] = {
         "decision_id": jnp.asarray(10, dtype=jnp.int32),
         "event_id": jnp.asarray(20, dtype=jnp.int32),
+        "decision_words": _words(10),
+        "event_words": _words(20),
         "observation_id": jnp.asarray(30, dtype=jnp.int32),
         "context_id": jnp.asarray(40, dtype=jnp.int32),
         "context_features": jnp.asarray([0.25, -0.5], dtype=jnp.float32),
@@ -755,6 +911,8 @@ def test_jit_and_scan_match_eager_and_keep_outputs_finite() -> None:
         state,
         decision_ids=jnp.arange(length, dtype=jnp.int32),
         event_ids=jnp.arange(length, dtype=jnp.int32),
+        decision_words=jnp.stack([_words(index) for index in range(length)]),
+        event_words=jnp.stack([_words(index) for index in range(length)]),
         observation_ids=jnp.zeros((length,), dtype=jnp.int32),
         context_ids=jnp.zeros((length,), dtype=jnp.int32),
         context_features=jnp.zeros((length, 2), dtype=jnp.float32),
@@ -794,9 +952,13 @@ def test_saturating_counters_remain_finite_and_state_valid() -> None:
         has_last_decision=jnp.asarray(True, dtype=jnp.bool_),
         last_decision_id=jnp.asarray(10, dtype=jnp.int32),
         last_event_id=jnp.asarray(20, dtype=jnp.int32),
+        last_decision_words=_words(10),
+        last_event_words=_words(20),
         feedback_armed=jnp.asarray(True, dtype=jnp.bool_),
         armed_decision_id=jnp.asarray(10, dtype=jnp.int32),
         armed_event_id=jnp.asarray(20, dtype=jnp.int32),
+        armed_decision_words=_words(10),
+        armed_event_words=_words(20),
         armed_action=jnp.asarray(1, dtype=jnp.int32),
         armed_partner_id=jnp.asarray(0, dtype=jnp.int32),
         armed_route=jnp.asarray(ROUTE_ACCEPT, dtype=jnp.int32),
@@ -859,3 +1021,277 @@ def test_state_tamper_and_static_shape_mismatch_fail_strict_validation() -> None
                 feedback_counts=jnp.zeros((2,), dtype=jnp.int32),
             )
         )
+
+
+def test_exact_words_cross_low_word_carry_and_keep_saturated_telemetry_authenticated() -> None:
+    fusion = _fusion(max_message_horizon=2)
+    decision = 1 << 32
+    event = 1 << 32
+    messages = _messages(
+        fusion,
+        [
+            {
+                "suggested_action": 1,
+                "issued_event_id": event - 1,
+                "valid_through_event_id": event + 1,
+            }
+        ],
+        decision_id=decision,
+        event_id=event,
+    )
+    result = _decide(
+        fusion,
+        fusion.init(),
+        messages,
+        decision_id=decision,
+        event_id=event,
+    )
+    assert bool(result.decision.applied)
+    assert bool(result.decision.availability.messages_horizon_valid[0])
+    assert int(result.decision.effective_action) == 1
+    assert int(result.state.last_decision_id) == _INT32_MAX
+    assert int(result.state.last_event_id) == _INT32_MAX
+    np.testing.assert_array_equal(np.asarray(result.state.last_decision_words), [1, 0])
+    np.testing.assert_array_equal(np.asarray(result.state.last_event_words), [1, 0])
+    fusion.validate_state(result.state)
+
+
+def test_exact_identity_not_saturated_telemetry_controls_monotonicity() -> None:
+    fusion = _fusion()
+    first_identity = (1 << 31) + 7
+    first = _decide(
+        fusion,
+        fusion.init(),
+        decision_id=first_identity,
+        event_id=first_identity,
+    )
+    second = _decide(
+        fusion,
+        first.state,
+        decision_id=first_identity + 1,
+        event_id=first_identity + 1,
+    )
+    assert bool(first.decision.applied)
+    assert bool(second.decision.applied)
+    assert int(first.state.last_decision_id) == int(second.state.last_decision_id) == _INT32_MAX
+    assert bool(second.decision.availability.decision_identity_telemetry_valid)
+    assert bool(second.decision.availability.decision_identity_order_valid)
+    np.testing.assert_array_equal(
+        np.asarray(second.state.last_decision_words),
+        np.asarray(_words(first_identity + 1)),
+    )
+
+
+def test_uint64_message_horizon_accepts_exact_boundary_and_rejects_one_beyond() -> None:
+    maximum_horizon = (1 << 32) + 5
+    fusion = _fusion(max_message_horizon=maximum_horizon)
+    event = (1 << 32) + 4
+    accepted_messages = _messages(
+        fusion,
+        [
+            {
+                "suggested_action": 1,
+                "issued_event_id": 3,
+                "valid_through_event_id": 3 + maximum_horizon,
+            }
+        ],
+        decision_id=event,
+        event_id=event,
+    )
+    accepted = _decide(
+        fusion,
+        fusion.init(),
+        accepted_messages,
+        decision_id=event,
+        event_id=event,
+    )
+    assert bool(accepted.decision.availability.messages_horizon_valid[0])
+    assert int(accepted.decision.effective_action) == 1
+
+    too_wide_messages = _messages(
+        fusion,
+        [
+            {
+                "suggested_action": 1,
+                "issued_event_id": 3,
+                "valid_through_event_id": 4 + maximum_horizon,
+            }
+        ],
+        decision_id=event,
+        event_id=event,
+    )
+    rejected = _decide(
+        fusion,
+        fusion.init(),
+        too_wide_messages,
+        decision_id=event,
+        event_id=event,
+    )
+    assert not bool(rejected.decision.availability.messages_horizon_valid[0])
+    assert int(rejected.decision.effective_action) == 0
+
+
+def test_terminal_all_ones_identity_commits_once_then_fails_closed_atomically() -> None:
+    fusion = _fusion()
+    terminal = (1 << 64) - 1
+    committed = _decide(
+        fusion,
+        fusion.init(),
+        decision_id=terminal,
+        event_id=terminal,
+    )
+    assert bool(committed.decision.applied)
+    np.testing.assert_array_equal(
+        np.asarray(committed.state.last_decision_words),
+        np.asarray([_UINT32_MAX, _UINT32_MAX]),
+    )
+    repeated = _decide(
+        fusion,
+        committed.state,
+        decision_id=terminal,
+        event_id=terminal,
+    )
+    assert not bool(repeated.decision.applied)
+    assert bool(repeated.decision.shield.failed_closed)
+    assert not bool(repeated.decision.availability.decision_identity_order_valid)
+    _assert_tree_equal(repeated.state, committed.state)
+
+
+def test_identity_telemetry_corruption_fails_closed_and_message_corruption_is_ignored() -> None:
+    fusion = _fusion()
+    state = fusion.init()
+    failed = fusion.decide(
+        state,
+        decision_id=jnp.asarray(9, dtype=jnp.int32),
+        event_id=jnp.asarray(20, dtype=jnp.int32),
+        decision_words=_words(10),
+        event_words=_words(20),
+        observation_id=jnp.asarray(30, dtype=jnp.int32),
+        context_id=jnp.asarray(40, dtype=jnp.int32),
+        context_features=jnp.asarray([0.25, -0.5], dtype=jnp.float32),
+        base_action=jnp.asarray(0, dtype=jnp.int32),
+        base_declared_score=jnp.asarray(0.0, dtype=jnp.float32),
+        safety_action_mask=jnp.ones((4,), dtype=jnp.bool_),
+        option_proposal=fusion.empty_option_proposal(),
+        messages=fusion.empty_messages(),
+    )
+    assert not bool(failed.decision.availability.decision_identity_telemetry_valid)
+    assert bool(failed.decision.shield.failed_closed)
+    _assert_tree_equal(failed.state, state)
+
+    messages = _messages(fusion, [{"suggested_action": 1}])
+    corrupted = _replace(
+        messages,
+        issued_event_id=messages.issued_event_id.at[0].set(19),
+    )
+    ignored = _decide(fusion, state, corrupted)
+    assert not bool(ignored.decision.availability.messages_identity_telemetry_valid[0])
+    assert not bool(ignored.decision.availability.messages_valid[0])
+    assert int(ignored.decision.effective_action) == 0
+
+
+def test_exact_feedback_binding_rejects_aliasing_saturated_telemetry() -> None:
+    fusion = _fusion()
+    identity = (1 << 31) + 10
+    armed = _decide(
+        fusion,
+        fusion.init(),
+        _messages(
+            fusion,
+            [{"suggested_action": 1}],
+            decision_id=identity,
+            event_id=identity,
+        ),
+        decision_id=identity,
+        event_id=identity,
+    ).state
+    aliased = _feedback(
+        decision_id=identity + 1,
+        event_id=identity + 1,
+        action=1,
+    )
+    assert int(aliased.decision_id) == int(armed.armed_decision_id) == _INT32_MAX
+    rejected = fusion.apply_feedback(armed, aliased)
+    assert bool(rejected.identity_telemetry_valid)
+    assert not bool(rejected.identity_match)
+    assert not bool(rejected.applied)
+    _assert_tree_equal(rejected.state, armed)
+
+
+def test_jitted_scan_crosses_word_carry_using_exact_identity_surface() -> None:
+    fusion = _fusion()
+    values = [(1 << 32) - 1, 1 << 32, (1 << 32) + 1]
+    length = len(values)
+    empty_messages = jax.tree_util.tree_map(
+        lambda leaf: jnp.broadcast_to(leaf, (length, *leaf.shape)),
+        fusion.empty_messages(),
+    )
+    empty_options = jax.tree_util.tree_map(
+        lambda leaf: jnp.broadcast_to(leaf, (length, *leaf.shape)),
+        fusion.empty_option_proposal(),
+    )
+    final_state, decisions = jax.jit(fusion.decide_sequence)(
+        fusion.init(),
+        decision_ids=jnp.full((length,), _INT32_MAX, dtype=jnp.int32),
+        event_ids=jnp.full((length,), _INT32_MAX, dtype=jnp.int32),
+        decision_words=jnp.stack([_words(value) for value in values]),
+        event_words=jnp.stack([_words(value) for value in values]),
+        observation_ids=jnp.zeros((length,), dtype=jnp.int32),
+        context_ids=jnp.zeros((length,), dtype=jnp.int32),
+        context_features=jnp.zeros((length, 2), dtype=jnp.float32),
+        base_actions=jnp.zeros((length,), dtype=jnp.int32),
+        base_declared_scores=jnp.zeros((length,), dtype=jnp.float32),
+        safety_action_masks=jnp.ones((length, 4), dtype=jnp.bool_),
+        option_proposals=empty_options,
+        messages=empty_messages,
+    )
+    assert bool(jnp.all(decisions.applied))
+    assert int(final_state.decision_count) == length
+    np.testing.assert_array_equal(
+        np.asarray(final_state.last_decision_words),
+        np.asarray(_words(values[-1])),
+    )
+
+
+def test_state_exact_identity_corruption_is_rejected_and_decision_is_atomic() -> None:
+    fusion = _fusion()
+    valid = _decide(fusion, fusion.init()).state
+    corrupt = _replace(valid, last_decision_words=_words(11))
+    with pytest.raises(ValueError):
+        fusion.validate_state(corrupt)
+    result = _decide(
+        fusion,
+        corrupt,
+        decision_id=12,
+        event_id=22,
+    )
+    assert not bool(result.decision.availability.state_valid)
+    assert bool(result.decision.shield.failed_closed)
+    _assert_tree_equal(result.state, corrupt)
+
+
+def test_v1_checkpoint_migration_is_authenticated_unambiguous_and_semantic() -> None:
+    fusion = _fusion()
+    armed = _decide(
+        fusion,
+        fusion.init(),
+        _messages(fusion, [{"suggested_action": 1}]),
+    ).state
+    legacy = _legacy_v1_checkpoint(fusion, armed)
+    with pytest.raises(ValueError, match="migrate_legacy"):
+        PartnerPolicyFusion.from_checkpoint_payload(legacy)
+    migrated_payload = migrate_legacy_partner_policy_fusion_checkpoint(legacy)
+    assert migrated_payload["schema"] == PARTNER_POLICY_FUSION_CHECKPOINT_SCHEMA
+    assert migrated_payload["state_schema"] == PARTNER_POLICY_FUSION_STATE_SCHEMA
+    restored_fusion, restored = PartnerPolicyFusion.from_checkpoint_payload(
+        migrated_payload
+    )
+    assert restored_fusion.to_config() == fusion.to_config()
+    _assert_tree_equal(restored, armed)
+
+    saturated = copy.deepcopy(legacy)
+    saturated_state = cast(dict[str, Any], saturated["state"])
+    saturated_state["last_decision_id"] = _INT32_MAX
+    saturated["state_digest"] = _digest(saturated_state)
+    with pytest.raises(ValueError, match="saturated"):
+        migrate_legacy_partner_policy_fusion_checkpoint(saturated)

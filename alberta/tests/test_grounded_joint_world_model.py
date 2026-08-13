@@ -13,8 +13,12 @@ import numpy as np
 import pytest
 
 from alberta_framework.core.grounded_joint_world_model import (
+    GROUNDED_JOINT_WORLD_STATE_SCHEMA,
     GroundedJointWorldModel,
     GroundedJointWorldModelConfig,
+    grounded_joint_world_lifetime_counter_nbytes,
+    measure_grounded_joint_world_state_nbytes,
+    migrate_legacy_grounded_joint_world_state,
 )
 
 V6_REPRESENTATION_LOSS_WEIGHTS = (
@@ -812,7 +816,7 @@ def test_positive_scalar_controls_canonicalize_to_json_python_floats() -> None:
     assert json.loads(json.dumps(model.config.to_config())) == model.config.to_config()
 
 
-def test_weighted_config_and_v2_checkpoint_are_strict_json_roundtrips() -> None:
+def test_weighted_config_and_v3_checkpoint_are_strict_json_roundtrips() -> None:
     model = _model(
         target_observation_dim=8,
         representation_loss_weights=V6_REPRESENTATION_LOSS_WEIGHTS,
@@ -826,10 +830,26 @@ def test_weighted_config_and_v2_checkpoint_are_strict_json_roundtrips() -> None:
 
     state = model.init(jax.random.key(49))
     checkpoint = json.loads(json.dumps(model.checkpoint_payload(state)))
-    assert checkpoint["schema"] == "alberta.grounded_joint_world_model.v2"
+    assert checkpoint["schema"] == "alberta.grounded_joint_world_model.v3"
+    assert checkpoint["model"]["state_schema"] == GROUNDED_JOINT_WORLD_STATE_SCHEMA
     restored_model, restored_state = GroundedJointWorldModel.from_checkpoint_payload(checkpoint)
     assert restored_model.config == model.config
     chex.assert_trees_all_equal(restored_state, state)
+
+    legacy_v2 = json.loads(json.dumps(checkpoint))
+    legacy_v2["schema"] = "alberta.grounded_joint_world_model.v2"
+    legacy_v2["model"].pop("state_schema")
+    legacy_v2["state"].pop("update_words")
+    migrated_model, migrated_state = GroundedJointWorldModel.from_checkpoint_payload(
+        legacy_v2
+    )
+    assert migrated_model.config == model.config
+    chex.assert_trees_all_equal(migrated_state, state)
+
+    ambiguous_v2 = json.loads(json.dumps(legacy_v2))
+    ambiguous_v2["state"]["update_count"] = 2**31 - 1
+    with pytest.raises(ValueError, match="ambiguous"):
+        GroundedJointWorldModel.from_checkpoint_payload(ambiguous_v2)
 
     v1_checkpoint = json.loads(json.dumps(checkpoint))
     v1_checkpoint["schema"] = "alberta.grounded_joint_world_model.v1"
@@ -978,11 +998,15 @@ def test_resource_budget_matches_state_bytes_and_exact_update_surface() -> None:
     assert budget.allocated_float32_scalars == expected_parameters
     assert budget.trainable_float32_scalars == expected_parameters
     assert budget.administrative_int32_scalars == 1
-    assert budget.state_nbytes == actual_nbytes == 4 * (expected_parameters + 1)
+    assert budget.administrative_uint32_scalars == 2
+    assert budget.state_nbytes == actual_nbytes == 4 * (expected_parameters + 3)
+    assert budget.state_nbytes == measure_grounded_joint_world_state_nbytes(state)
+    assert grounded_joint_world_lifetime_counter_nbytes() == 12
     assert budget.computed_parameter_gradient_float32_scalars_per_update == expected_touched
     assert budget.learned_float32_scalars_touched_per_update == expected_touched
     assert budget.applied_trainable_float32_scalars_per_update == expected_touched
     assert budget.administrative_int32_scalars_touched_per_update == 1
+    assert budget.administrative_uint32_scalars_touched_per_update == 2
     assert budget.replay_capacity == 0
     assert budget.to_dict()["state_nbytes"] == actual_nbytes
     assert model.representation_indexed_state_leaves == (("weights", -1),)
@@ -1017,7 +1041,10 @@ def test_corrupted_state_and_exhausted_counter_are_atomic_noops() -> None:
     model = _model()
     state = model.init(jax.random.key(35))
     corrupt = state.replace(weights=state.weights.at[0, 0, 0].set(jnp.nan))
-    exhausted = state.replace(update_count=jnp.asarray(2**31 - 1, dtype=jnp.int32))
+    exhausted = state.replace(
+        update_count=jnp.asarray(2**31 - 1, dtype=jnp.int32),
+        update_words=jnp.full((2,), 2**32 - 1, dtype=jnp.uint32),
+    )
 
     corrupt_result = _call_update(model, corrupt)
     exhausted_result = _call_update(model, exhausted)
@@ -1033,9 +1060,85 @@ def test_corrupted_state_and_exhausted_counter_are_atomic_noops() -> None:
     assert not bool(corrupt_result.diagnostics.applied)
     assert bool(corrupt_result.diagnostics.rejected)
     assert bool(exhausted_result.diagnostics.state_valid)
+    assert bool(exhausted_result.diagnostics.lifetime_counter_valid)
     assert not bool(exhausted_result.diagnostics.capacity_available)
     assert not bool(exhausted_result.diagnostics.applied)
+    assert not bool(exhausted_result.update_applied)
     assert bool(exhausted_result.diagnostics.rejected)
+
+
+def test_exact_lifetime_clock_carries_scans_and_rejects_misalignment() -> None:
+    model = _model()
+    initial = model.init(jax.random.key(3_501))
+    near_carry = initial.replace(
+        update_count=jnp.asarray(2**31 - 1, dtype=jnp.int32),
+        update_words=jnp.asarray((0, 2**32 - 1), dtype=jnp.uint32),
+    )
+
+    carried = _call_update(model, near_carry)
+    assert bool(carried.diagnostics.lifetime_counter_valid)
+    assert bool(carried.diagnostics.capacity_available)
+    assert bool(carried.update_applied)
+    chex.assert_trees_all_equal(
+        carried.pre_update_words,
+        jnp.asarray((0, 2**32 - 1), dtype=jnp.uint32),
+    )
+    chex.assert_trees_all_equal(
+        carried.post_update_words,
+        jnp.asarray((1, 0), dtype=jnp.uint32),
+    )
+    assert int(carried.state.update_count) == 2**31 - 1
+
+    def step(state, _):
+        result = _call_update(model, state)
+        return result.state, (result.update_applied, result.post_update_words)
+
+    scanned, (applied, words) = jax.lax.scan(
+        step,
+        near_carry,
+        jnp.arange(2, dtype=jnp.int32),
+    )
+    chex.assert_trees_all_equal(applied, jnp.asarray((True, True), dtype=jnp.bool_))
+    chex.assert_trees_all_equal(
+        words,
+        jnp.asarray(((1, 0), (1, 1)), dtype=jnp.uint32),
+    )
+    chex.assert_trees_all_equal(
+        scanned.update_words,
+        jnp.asarray((1, 1), dtype=jnp.uint32),
+    )
+
+    misaligned = initial.replace(update_count=jnp.asarray(1, dtype=jnp.int32))
+    rejected = _call_update(model, misaligned)
+    assert not bool(rejected.diagnostics.lifetime_counter_valid)
+    assert not bool(rejected.diagnostics.state_valid)
+    assert not bool(rejected.update_applied)
+    chex.assert_trees_all_equal(rejected.state, misaligned)
+
+
+def test_legacy_grounded_state_migration_is_fail_closed() -> None:
+    model = _model()
+    state = model.init(jax.random.key(3_502))
+    legacy = {
+        "weights": state.weights,
+        "bias": state.bias,
+        "update_count": jnp.asarray(19, dtype=jnp.int32),
+    }
+    migrated = migrate_legacy_grounded_joint_world_state(legacy)
+    chex.assert_trees_all_equal(
+        migrated.update_words,
+        jnp.asarray((0, 19), dtype=jnp.uint32),
+    )
+
+    saturated = dict(legacy)
+    saturated["update_count"] = jnp.asarray(2**31 - 1, dtype=jnp.int32)
+    with pytest.raises(ValueError, match="ambiguous"):
+        migrate_legacy_grounded_joint_world_state(saturated)
+
+    negative = dict(legacy)
+    negative["update_count"] = jnp.asarray(-1, dtype=jnp.int32)
+    with pytest.raises(ValueError, match="wrap"):
+        migrate_legacy_grounded_joint_world_state(negative)
 
 
 def test_out_of_bound_candidate_parameter_update_is_atomic_noop() -> None:

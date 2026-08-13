@@ -1,0 +1,23 @@
+WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-08-02 09:21:04,811 INFO shard learner=upgd_ema_norm_sigma0 seed=100 tasks=400 task_length=2500
+2026-08-02 09:31:49,424 INFO upgd_ema_norm_sigma0 task 20/400 online_acc=0.5756 elapsed=638.6s
+2026-08-02 09:42:30,079 INFO upgd_ema_norm_sigma0 task 40/400 online_acc=0.6336 elapsed=1279.3s
+2026-08-02 09:48:21,926 INFO upgd_ema_norm_sigma0 task 60/400 online_acc=0.6696 elapsed=1631.2s
+2026-08-02 09:53:39,840 INFO upgd_ema_norm_sigma0 task 80/400 online_acc=0.6860 elapsed=1949.1s
+2026-08-02 09:57:09,200 INFO upgd_ema_norm_sigma0 task 100/400 online_acc=0.7212 elapsed=2158.5s
+2026-08-02 10:00:53,077 INFO upgd_ema_norm_sigma0 task 120/400 online_acc=0.7056 elapsed=2382.3s
+2026-08-02 10:04:26,566 INFO upgd_ema_norm_sigma0 task 140/400 online_acc=0.7164 elapsed=2595.8s
+2026-08-02 10:08:41,353 INFO upgd_ema_norm_sigma0 task 160/400 online_acc=0.7136 elapsed=2850.6s
+2026-08-02 10:16:27,453 INFO upgd_ema_norm_sigma0 task 180/400 online_acc=0.7200 elapsed=3316.7s
+2026-08-02 10:22:31,499 INFO upgd_ema_norm_sigma0 task 200/400 online_acc=0.7368 elapsed=3680.8s
+2026-08-02 10:26:44,557 INFO upgd_ema_norm_sigma0 task 220/400 online_acc=0.7400 elapsed=3933.8s
+2026-08-02 10:30:24,435 INFO upgd_ema_norm_sigma0 task 240/400 online_acc=0.7520 elapsed=4153.7s
+2026-08-02 10:33:53,162 INFO upgd_ema_norm_sigma0 task 260/400 online_acc=0.7512 elapsed=4362.4s
+2026-08-02 10:39:33,527 INFO upgd_ema_norm_sigma0 task 280/400 online_acc=0.7548 elapsed=4702.8s
+2026-08-02 10:50:32,461 INFO upgd_ema_norm_sigma0 task 300/400 online_acc=0.7460 elapsed=5361.7s
+2026-08-02 10:59:19,653 INFO upgd_ema_norm_sigma0 task 320/400 online_acc=0.7604 elapsed=5888.9s
+2026-08-02 11:06:33,612 INFO upgd_ema_norm_sigma0 task 340/400 online_acc=0.7412 elapsed=6322.9s
+2026-08-02 11:13:55,246 INFO upgd_ema_norm_sigma0 task 360/400 online_acc=0.7524 elapsed=6764.5s
+2026-08-02 11:21:36,795 INFO upgd_ema_norm_sigma0 task 380/400 online_acc=0.7512 elapsed=7226.1s
+2026-08-02 11:28:51,243 INFO upgd_ema_norm_sigma0 task 400/400 online_acc=0.7656 elapsed=7660.5s
+2026-08-02 11:28:52,628 INFO wrote shard outputs/upgd_label_emnist/partials_v2/upgd_ema_norm_sigma0_seed100.json (avg online acc 0.7140, wall 7660.6s)

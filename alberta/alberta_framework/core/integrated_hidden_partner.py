@@ -133,7 +133,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Bool, Float, Int, UInt
 
 from alberta_framework.core.average_reward import (
     DifferentialSARSAAgent,
@@ -181,7 +181,9 @@ from alberta_framework.core.state_builder import (
     StateBuilderLearningDiagnostics,
 )
 
-INTEGRATED_HIDDEN_PARTNER_SCHEMA_VERSION = "alberta.integrated-hidden-partner.l0.v15"
+INTEGRATED_HIDDEN_PARTNER_SCHEMA_VERSION = "alberta.integrated-hidden-partner.l0.v16"
+INTEGRATED_HIDDEN_PARTNER_LIFETIME_COUNTER_NBYTES = 12
+INTEGRATED_HIDDEN_PARTNER_LIFETIME_COUNTER_DELTA_NBYTES = 8
 DEVELOPMENT_LEVEL = "L0"
 
 RAW_OBSERVATION_DIM = 8
@@ -210,6 +212,19 @@ INITIAL_ACTIVE_DESCRIPTORS: tuple[tuple[int, int], ...] = (
 """Unique canonical distractors excluding critical pairs (0, 2) and (4, 5)."""
 
 _INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
+
+INTEGRATED_CHILD_CLOCK_ALIGNMENT_ORDER: tuple[str, ...] = (
+    "behavior_step",
+    "joint_world_step",
+    "control_step",
+    "router_route",
+    "interaction_step",
+    "state_builder_step_plus_one",
+    "state_builder_update_policy",
+    "grounded_world_update_policy",
+    "router_generation_order",
+)
 
 INTEGRATED_DECISION_CACHE_CHECK_ORDER: tuple[str, ...] = (
     "predicted_partner_probabilities",
@@ -230,12 +245,75 @@ INTEGRATED_DECISION_CACHE_CHECK_ORDER: tuple[str, ...] = (
     "control_q_bias_disabled",
     "control_q_trace_bias_disabled",
     "control_step_count",
+    "control_step_words",
     "grounded_evaluation",
     "planner_selection",
     "cached_evaluation_finite",
     "q_value_delta_finite",
     "planner_selection_finite",
 )
+
+
+def _checked_lifetime_words_increment(
+    words: Array,
+) -> tuple[UInt[Array, " 2"], Bool[Array, ""]]:
+    """Propose the next exact integrated transition identity without wrap."""
+
+    array = jnp.asarray(words)
+    if array.shape != (2,):
+        raise ValueError("integrated lifetime words must have shape (2,)")
+    if array.dtype != jnp.dtype(jnp.uint32):
+        raise TypeError("integrated lifetime words must have dtype uint32")
+    maximum = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+    capacity_available = ~jnp.all(array == maximum)
+    low = array[1] + jnp.asarray(1, dtype=jnp.uint32)
+    carry = (low == jnp.asarray(0, dtype=jnp.uint32)).astype(jnp.uint32)
+    proposed = jnp.stack((array[0] + carry, low))
+    return (
+        jnp.where(capacity_available, proposed, array).astype(jnp.uint32),
+        capacity_available,
+    )
+
+
+def _lifetime_counter_valid(words: Array, telemetry: Array) -> Bool[Array, ""]:
+    """Validate exact integrated identity against saturating compatibility telemetry."""
+
+    array = jnp.asarray(words)
+    counter = jnp.asarray(telemetry)
+    if array.shape != (2,):
+        raise ValueError("integrated lifetime words must have shape (2,)")
+    if array.dtype != jnp.dtype(jnp.uint32):
+        raise TypeError("integrated lifetime words must have dtype uint32")
+    if counter.shape != ():
+        raise ValueError("integrated step_count must be scalar")
+    if counter.dtype != jnp.dtype(jnp.int32):
+        raise TypeError("integrated step_count must have dtype int32")
+    maximum_i32 = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    below_saturation = (array[0] == jnp.asarray(0, dtype=jnp.uint32)) & (
+        array[1] < jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+    )
+    return (counter >= 0) & jnp.where(
+        below_saturation,
+        counter == array[1].astype(jnp.int32),
+        counter == maximum_i32,
+    )
+
+
+def _lifetime_words_le(left: Array, right: Array) -> Bool[Array, ""]:
+    """Return the exact unsigned lexicographic order for two-word counters."""
+
+    left_array = jnp.asarray(left)
+    right_array = jnp.asarray(right)
+    if left_array.shape != (2,) or right_array.shape != (2,):
+        raise ValueError("integrated lifetime word comparisons require shape (2,)")
+    if (
+        left_array.dtype != jnp.dtype(jnp.uint32)
+        or right_array.dtype != jnp.dtype(jnp.uint32)
+    ):
+        raise TypeError("integrated lifetime word comparisons require dtype uint32")
+    return (left_array[0] < right_array[0]) | (
+        (left_array[0] == right_array[0]) & (left_array[1] <= right_array[1])
+    )
 
 
 def _require_array_contract(
@@ -646,7 +724,7 @@ class IntegratedHiddenPartnerConfig:
         }
         expected = {field.name for field in dataclasses.fields(cls)} | metadata
         if set(values) != expected:
-            raise ValueError("integrated config fields do not match the v15 schema")
+            raise ValueError("integrated config fields do not match the v16 schema")
         if values.pop("type") != cls.__name__:
             raise ValueError("integrated config type is invalid")
         if values.pop("schema_version") != INTEGRATED_HIDDEN_PARTNER_SCHEMA_VERSION:
@@ -710,6 +788,7 @@ class IntegratedHiddenPartnerResourceBudget:
     consumer_evidence_streak_nbytes: int
     consumer_read_idle_steps_nbytes: int
     decision_cache_nbytes: int
+    integrated_transition_counter_nbytes: int
     total_state_nbytes: int
     legacy_joint_world_cells_per_decision: int
     grounded_world_joint_cells_per_decision: int
@@ -796,6 +875,7 @@ class IntegratedHiddenPartnerState:
     current_q_value_delta: Float[Array, " 2"]
     current_selection: IntegratedPlannerSelection
     step_count: Int[Array, ""]
+    step_words: UInt[Array, " 2"]
 
 
 @chex.dataclass(frozen=True)
@@ -807,6 +887,10 @@ class IntegratedStartDiagnostics:
     descriptors: Int[Array, "12 2"]
     descriptors_valid: Bool[Array, ""]
     state_advances: Int[Array, ""]
+    integrated_step_words: UInt[Array, " 2"]
+    outer_lifetime_counter_valid: Bool[Array, ""]
+    child_clock_alignment_vector: Bool[Array, " 9"]
+    child_clocks_aligned: Bool[Array, ""]
     all_finite: Bool[Array, ""]
 
 
@@ -853,15 +937,41 @@ class IntegratedUpdateDiagnostics:
     behavior_gradient_phi: Float[Array, " 12"]
     grounded_world_update: GroundedJointWorldUpdateResult | None
     grounded_world_learning_enabled: Bool[Array, ""]
+    # Saturating compatibility telemetry; exact capacity below is authoritative.
     grounded_world_counter_saturated: Bool[Array, ""]
+    grounded_world_lifetime_counter_valid: Bool[Array, ""]
+    grounded_world_lifetime_capacity_available: Bool[Array, ""]
+    grounded_world_update_applied: Bool[Array, ""]
+    grounded_world_pre_update_words: UInt[Array, " 2"]
+    grounded_world_proposed_post_update_words: UInt[Array, " 2"]
+    grounded_world_post_update_words: UInt[Array, " 2"]
     grounded_world_prediction_matches_decision: Bool[Array, ""]
     gradient_mix: RepresentationGradientMixResult | None
     mixed_gradient_chi: Float[Array, " 24"] | None
     mixed_gradient_phi: Float[Array, " 12"] | None
     state_learning: StateBuilderLearningDiagnostics
+    state_builder_transition_state_valid: Bool[Array, ""]
+    state_builder_transition_input_valid: Bool[Array, ""]
+    state_builder_step_counter_valid: Bool[Array, ""]
+    state_builder_step_capacity_available: Bool[Array, ""]
+    state_builder_candidate_state_valid: Bool[Array, ""]
+    state_builder_candidate_representation_valid: Bool[Array, ""]
+    state_builder_transition_applied: Bool[Array, ""]
+    state_builder_pre_step_words: UInt[Array, " 2"]
+    state_builder_proposed_post_step_words: UInt[Array, " 2"]
+    state_builder_post_step_words: UInt[Array, " 2"]
     interaction_prediction_preupdate: Float[Array, " 1"]
     interaction_error_preupdate: Float[Array, " 1"]
     interaction_metrics: Float[Array, " 7"]
+    interaction_lifetime_counter_valid: Bool[Array, ""]
+    interaction_lifetime_capacity_available: Bool[Array, ""]
+    interaction_state_valid: Bool[Array, ""]
+    interaction_candidate_state_valid: Bool[Array, ""]
+    interaction_proposal_applied: Bool[Array, ""]
+    interaction_update_applied: Bool[Array, ""]
+    interaction_pre_step_words: UInt[Array, " 2"]
+    interaction_proposed_post_step_words: UInt[Array, " 2"]
+    interaction_post_step_words: UInt[Array, " 2"]
     # Compatibility fields below report the full, ungated curation proposal.
     interaction_replaced_slot: Int[Array, ""]
     interaction_promoted_candidate: Int[Array, ""]
@@ -948,6 +1058,10 @@ class IntegratedUpdateDiagnostics:
     interaction_applied_descriptors: Int[Array, "12 2"]
     shadow_descriptors_changed: Bool[Array, ""]
     route: FeatureBankRouteDiagnostics
+    router_proposed_post_route_words: UInt[Array, " 2"]
+    router_committed_post_route_words: UInt[Array, " 2"]
+    router_proposed_post_generation_words: UInt[Array, " 2"]
+    router_committed_post_generation_words: UInt[Array, " 2"]
     consumer_route_source_slots_exact: Bool[Array, ""]
     consumer_route_identity_masks_exact: Bool[Array, ""]
     consumer_route_stable_prefix_exact: Bool[Array, ""]
@@ -966,18 +1080,50 @@ class IntegratedUpdateDiagnostics:
     world_reward_error: Float[Array, ""]
     world_outcome_error: Float[Array, " 1"]
     world_target_valid: Bool[Array, ""]
+    world_lifetime_counter_valid: Bool[Array, ""]
+    world_lifetime_capacity_available: Bool[Array, ""]
+    world_update_applied: Bool[Array, ""]
+    world_pre_step_words: UInt[Array, " 2"]
+    world_proposed_post_step_words: UInt[Array, " 2"]
+    world_post_step_words: UInt[Array, " 2"]
     td_error: Float[Array, ""]
     average_reward: Float[Array, ""]
+    control_lifetime_counter_valid: Bool[Array, ""]
+    control_lifetime_capacity_available: Bool[Array, ""]
+    control_update_applied: Bool[Array, ""]
+    control_pre_step_words: UInt[Array, " 2"]
+    control_proposed_post_step_words: UInt[Array, " 2"]
+    control_post_step_words: UInt[Array, " 2"]
     transition_input_valid: Bool[Array, ""]
     decision_cache_valid: Bool[Array, ""]
-    decision_cache_check_vector: Bool[Array, " 23"]
+    decision_cache_check_vector: Bool[Array, " 24"]
     behavior_gradient_valid: Bool[Array, ""]
+    behavior_lifetime_counter_valid: Bool[Array, ""]
+    behavior_lifetime_capacity_available: Bool[Array, ""]
+    behavior_update_applied: Bool[Array, ""]
+    behavior_pre_step_words: UInt[Array, " 2"]
+    behavior_proposed_post_step_words: UInt[Array, " 2"]
+    behavior_post_step_words: UInt[Array, " 2"]
     grounded_path_valid: Bool[Array, ""]
     candidate_models_valid: Bool[Array, ""]
     candidate_state_finite: Bool[Array, ""]
+    outer_pre_step_words: UInt[Array, " 2"]
+    outer_proposed_post_step_words: UInt[Array, " 2"]
+    outer_committed_post_step_words: UInt[Array, " 2"]
+    outer_lifetime_counter_valid: Bool[Array, ""]
+    outer_lifetime_capacity_available: Bool[Array, ""]
+    pre_child_clock_alignment_vector: Bool[Array, " 9"]
+    pre_child_clocks_aligned: Bool[Array, ""]
+    proposed_post_child_clock_alignment_vector: Bool[Array, " 9"]
+    proposed_post_child_clocks_aligned: Bool[Array, ""]
+    committed_post_child_clock_alignment_vector: Bool[Array, " 9"]
+    committed_post_child_clocks_aligned: Bool[Array, ""]
+    transaction_capacity_available: Bool[Array, ""]
     transition_observation_matches: Bool[Array, ""]
     transition_action_matches: Bool[Array, ""]
+    # Compatibility name: this is the full transaction verdict, not just input syntax.
     transition_semantics_valid: Bool[Array, ""]
+    transition_applied: Bool[Array, ""]
     transition_rejected: Bool[Array, ""]
     model_valid: Bool[Array, ""]
     state_builder_step_delta: Int[Array, ""]
@@ -1200,6 +1346,7 @@ class IntegratedHiddenPartnerAgent:
             + _tree_array_nbytes(state.current_q_value_delta)
             + _tree_array_nbytes(state.current_selection)
             + _tree_array_nbytes(state.step_count)
+            + _tree_array_nbytes(state.step_words)
         )
         consumer_active_mask_bytes = _tree_array_nbytes(state.consumer_active_mask)
         consumer_evidence_streak_bytes = _tree_array_nbytes(state.consumer_evidence_streak)
@@ -1271,7 +1418,12 @@ class IntegratedHiddenPartnerAgent:
                 else grounded_budget.learned_float32_scalars_touched_per_update
             ),
             grounded_world_update_counter_nbytes=(
-                0 if state.grounded_world is None else int(state.grounded_world.update_count.nbytes)
+                0
+                if state.grounded_world is None
+                else int(
+                    state.grounded_world.update_count.nbytes
+                    + state.grounded_world.update_words.nbytes
+                )
             ),
             control_nbytes=control_bytes,
             router_nbytes=router_budget.router_state_nbytes,
@@ -1279,6 +1431,9 @@ class IntegratedHiddenPartnerAgent:
             consumer_evidence_streak_nbytes=consumer_evidence_streak_bytes,
             consumer_read_idle_steps_nbytes=consumer_read_idle_steps_bytes,
             decision_cache_nbytes=cache_bytes,
+            integrated_transition_counter_nbytes=int(
+                state.step_count.nbytes + state.step_words.nbytes
+            ),
             total_state_nbytes=total,
             legacy_joint_world_cells_per_decision=(
                 self._joint_world.resource_budget.planner_cell_evaluations_per_decision
@@ -1643,11 +1798,68 @@ class IntegratedHiddenPartnerAgent:
             rng_key_after=key,
         )
 
+    def _child_clock_alignment_vector(
+        self,
+        state: IntegratedHiddenPartnerState,
+    ) -> Bool[Array, " 9"]:
+        """Authenticate every persistent child clock against the outer identity."""
+
+        expected_builder_step, _ = _checked_lifetime_words_increment(
+            state.step_words
+        )
+        zero_words = jnp.zeros((2,), dtype=jnp.uint32)
+        expected_builder_update = (
+            state.step_words
+            if self._config.state_learning_enabled
+            else zero_words
+        )
+        if self._grounded_world is None:
+            if state.grounded_world is not None:
+                raise ValueError("disabled grounded lane must not carry grounded state")
+            grounded_clock_aligned = jnp.asarray(True, dtype=jnp.bool_)
+        else:
+            if state.grounded_world is None:
+                raise ValueError("enabled grounded lane requires grounded state")
+            expected_grounded_update = (
+                state.step_words
+                if self._config.grounded_world_learning_enabled
+                else zero_words
+            )
+            grounded_clock_aligned = jnp.array_equal(
+                state.grounded_world.update_words,
+                expected_grounded_update,
+            )
+        checks = jnp.stack(
+            (
+                jnp.array_equal(state.behavior.step_words, state.step_words),
+                jnp.array_equal(state.joint_world.step_words, state.step_words),
+                jnp.array_equal(state.control.step_words, state.step_words),
+                jnp.array_equal(state.router.route_words, state.step_words),
+                jnp.array_equal(state.interaction.step_words, state.step_words),
+                jnp.array_equal(
+                    state.state_builder.step_words,
+                    expected_builder_step,
+                ),
+                jnp.array_equal(
+                    state.state_builder.update_words,
+                    expected_builder_update,
+                ),
+                grounded_clock_aligned,
+                _lifetime_words_le(
+                    state.router.generation_words,
+                    state.router.route_words,
+                ),
+            )
+        )
+        if len(INTEGRATED_CHILD_CLOCK_ALIGNMENT_ORDER) != 9:
+            raise RuntimeError("integrated child clock order must remain width 9")
+        return checks
+
     def _current_decision_cache_check_vector(
         self,
         state: IntegratedHiddenPartnerState,
         fresh: IntegratedPlannerEvaluation,
-    ) -> Bool[Array, " 23"]:
+    ) -> Bool[Array, " 24"]:
         """Return every reproducible or internally bound cache check in fixed order.
 
         ``current_evaluation.q_values`` records the values used to score the
@@ -1712,6 +1924,7 @@ class IntegratedHiddenPartnerAgent:
                 jnp.zeros((N_ACTIONS,), dtype=jnp.float32),
             ),
             exact(state.control.step_count, state.step_count),
+            exact(state.control.step_words, state.step_words),
         )
 
         if self._grounded_world is None:
@@ -1801,8 +2014,8 @@ class IntegratedHiddenPartnerAgent:
                 _numeric_tree_finite(selection),
             )
         )
-        if len(INTEGRATED_DECISION_CACHE_CHECK_ORDER) != 23:
-            raise RuntimeError("integrated decision-cache check order must remain width 23")
+        if len(INTEGRATED_DECISION_CACHE_CHECK_ORDER) != 24:
+            raise RuntimeError("integrated decision-cache check order must remain width 24")
         return checks
 
     def _current_decision_cache_coherent(
@@ -1876,10 +2089,17 @@ class IntegratedHiddenPartnerAgent:
             4,
         )
         builder_initial = self._state_builder.init(builder_key)
-        builder_state, phi = self._state_builder.start(
+        builder_start = self._state_builder.update_with_status(
             builder_initial,
             raw,
+            -1,
+            0.0,
+            1.0,
         )
+        if not bool(jax.device_get(builder_start.transition_applied)):
+            raise ValueError("initial state-builder transition was rejected")
+        builder_state = builder_start.state
+        phi = builder_start.representation
         interaction_initial = self._interaction.init(
             BASE_FEATURE_DIM,
             interaction_key,
@@ -1987,9 +2207,22 @@ class IntegratedHiddenPartnerAgent:
             current_q_value_delta=jnp.zeros((N_ACTIONS,), dtype=jnp.float32),
             current_selection=selection,
             step_count=jnp.asarray(0, dtype=jnp.int32),
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
         )
-        start_finite = self._start_finite(state)
-        if not bool(jax.device_get(start_finite)):
+        outer_lifetime_counter_valid = _lifetime_counter_valid(
+            state.step_words,
+            state.step_count,
+        )
+        child_clock_alignment_vector = self._child_clock_alignment_vector(state)
+        child_clocks_aligned = jnp.all(child_clock_alignment_vector)
+        start_valid = (
+            self._start_finite(state)
+            & outer_lifetime_counter_valid
+            & jnp.all(state.step_words == jnp.asarray(0, dtype=jnp.uint32))
+            & (state.step_count == jnp.asarray(0, dtype=jnp.int32))
+            & child_clocks_aligned
+        )
+        if not bool(jax.device_get(start_valid)):
             raise ValueError("initial integrated state is invalid")
         diagnostics = IntegratedStartDiagnostics(
             evaluation=evaluation,
@@ -1997,7 +2230,11 @@ class IntegratedHiddenPartnerAgent:
             descriptors=router_state.descriptors,
             descriptors_valid=descriptor_validation.valid,
             state_advances=(builder_state.step_count - builder_initial.step_count),
-            all_finite=start_finite,
+            integrated_step_words=state.step_words,
+            outer_lifetime_counter_valid=outer_lifetime_counter_valid,
+            child_clock_alignment_vector=child_clock_alignment_vector,
+            child_clocks_aligned=child_clocks_aligned,
+            all_finite=start_valid,
         )
         return IntegratedStartResult(
             state=state,
@@ -2128,6 +2365,17 @@ class IntegratedHiddenPartnerAgent:
             shape=(),
             dtype=jnp.bool_,
         )
+        outer_proposed_post_step_words, outer_lifetime_capacity_available = (
+            _checked_lifetime_words_increment(state.step_words)
+        )
+        outer_lifetime_counter_valid = _lifetime_counter_valid(
+            state.step_words,
+            state.step_count,
+        )
+        pre_child_clock_alignment_vector = self._child_clock_alignment_vector(
+            state
+        )
+        pre_child_clocks_aligned = jnp.all(pre_child_clock_alignment_vector)
 
         observations_finite = jnp.all(jnp.isfinite(raw_current)) & jnp.all(jnp.isfinite(raw_next))
         observation_matches = jnp.all(raw_current == state.raw_observation)
@@ -2155,6 +2403,12 @@ class IntegratedHiddenPartnerAgent:
             & forced_next_action_valid
         )
         transition_input_valid = transition_valid
+        transition_valid = (
+            transition_valid
+            & outer_lifetime_counter_valid
+            & outer_lifetime_capacity_available
+            & pre_child_clocks_aligned
+        )
 
         next_raw = jnp.where(jnp.isfinite(raw_next), raw_next, state.raw_observation)
         focal_action = jnp.where(
@@ -2210,6 +2464,11 @@ class IntegratedHiddenPartnerAgent:
             gradient_mix = None
             mixed_gradient_chi = behavior_gradient.gradient
             grounded_world_counter_saturated = jnp.asarray(False, dtype=jnp.bool_)
+            grounded_world_lifetime_counter_valid = jnp.asarray(True, dtype=jnp.bool_)
+            grounded_world_lifetime_capacity_available = jnp.asarray(True, dtype=jnp.bool_)
+            grounded_world_update_applied = jnp.asarray(False, dtype=jnp.bool_)
+            grounded_world_pre_update_words = jnp.zeros((2,), dtype=jnp.uint32)
+            grounded_world_post_update_words = jnp.zeros((2,), dtype=jnp.uint32)
             grounded_world_prediction_matches = jnp.asarray(True, dtype=jnp.bool_)
             grounded_path_valid = jnp.asarray(True, dtype=jnp.bool_)
         else:
@@ -2233,15 +2492,8 @@ class IntegratedHiddenPartnerAgent:
             grounded_world_counter_saturated = state.grounded_world.update_count == jnp.asarray(
                 _INT32_MAX, dtype=jnp.int32
             )
-            grounded_update_input = state.grounded_world.replace(
-                update_count=jnp.where(
-                    grounded_world_counter_saturated,
-                    jnp.asarray(_INT32_MAX - 1, dtype=jnp.int32),
-                    state.grounded_world.update_count,
-                )
-            )
             grounded_world_update = self._grounded_world.update(
-                grounded_update_input,
+                state.grounded_world,
                 state.chi,
                 focal_action,
                 partner_action,
@@ -2249,15 +2501,15 @@ class IntegratedHiddenPartnerAgent:
                 reward,
                 discount,
             )
-            grounded_world_update = grounded_world_update.replace(
-                state=grounded_world_update.state.replace(
-                    update_count=jnp.where(
-                        grounded_world_counter_saturated,
-                        state.grounded_world.update_count,
-                        grounded_world_update.state.update_count,
-                    )
-                )
+            grounded_world_lifetime_counter_valid = (
+                grounded_world_update.diagnostics.lifetime_counter_valid
             )
+            grounded_world_lifetime_capacity_available = (
+                grounded_world_update.diagnostics.capacity_available
+            )
+            grounded_world_update_applied = grounded_world_update.update_applied
+            grounded_world_pre_update_words = grounded_world_update.pre_update_words
+            grounded_world_post_update_words = grounded_world_update.post_update_words
             executed_joint_index = N_ACTIONS * focal_action + partner_action
             executed_prediction = grounded_world_update.prediction
             grounded_world_prediction_matches = (
@@ -2344,6 +2596,7 @@ class IntegratedHiddenPartnerAgent:
             external_read_mask=state.consumer_active_mask,
             curation_priority_override=curation_priority_override,
         )
+        interaction_proposal_applied = interaction_update.update_applied
         committed_interaction = (
             interaction_update.state
             if self._config.feature_lifecycle_enabled
@@ -2381,13 +2634,15 @@ class IntegratedHiddenPartnerAgent:
             )
         )
 
-        advanced_builder, next_phi = self._state_builder.update(
+        builder_transition = self._state_builder.update_with_status(
             deployed_builder,
             next_raw,
             focal_action,
             reward,
             discount,
         )
+        advanced_builder = builder_transition.state
+        next_phi = builder_transition.representation
         world_update = self._joint_world.update(
             state.joint_world,
             focal_action,
@@ -2538,17 +2793,40 @@ class IntegratedHiddenPartnerAgent:
                 ).predictions_valid
             )
         )
+        transaction_capacity_available = (
+            outer_lifetime_capacity_available
+            & behavior_update.lifetime_capacity_available
+            & world_update.lifetime_capacity_available
+            & grounded_world_lifetime_capacity_available
+            & control_update.lifetime_capacity_available
+            & state_learning.lifetime_capacity_available
+            & builder_transition.step_capacity_available
+            & interaction_update.lifetime_capacity_available
+            & route_diagnostics.lifetime_capacity_available
+        )
         candidate_models_valid = (
             current_evaluation.partner_probabilities_valid
             & next_evaluation.partner_probabilities_valid
+            & behavior_update.update_applied
+            & world_update.update_applied
             & world_update.target_valid
             & grounded_path_valid
             & grounded_evaluations_valid
+            & control_update.update_applied
+            & state_learning.valid
+            & state_learning.update_applied
+            & builder_transition.candidate_state_valid
+            & builder_transition.candidate_representation_valid
+            & builder_transition.transition_applied
+            & interaction_update.state_valid
+            & interaction_update.candidate_state_valid
+            & interaction_update.update_applied
+            & route_diagnostics.route_applied
         )
         transition_valid = (
             transition_valid
             & candidate_models_valid
-            & route_diagnostics.valid
+            & transaction_capacity_available
             & consumer_route_audit.values_exact
             & consumer_route_audit.lifecycle_destination_reset_exact
         )
@@ -2571,6 +2849,13 @@ class IntegratedHiddenPartnerAgent:
             current_q_value_delta=next_q_value_delta,
             current_selection=next_selection,
             step_count=_saturating_int32_increment(state.step_count),
+            step_words=outer_proposed_post_step_words,
+        )
+        proposed_post_child_clock_alignment_vector = (
+            self._child_clock_alignment_vector(proposed_state)
+        )
+        proposed_post_child_clocks_aligned = jnp.all(
+            proposed_post_child_clock_alignment_vector
         )
         candidate_state_finite = self._update_finite(
             proposed_state,
@@ -2583,21 +2868,33 @@ class IntegratedHiddenPartnerAgent:
             world_update.outcome_error,
             control_update.td_error,
         )
-        transition_valid = transition_valid & candidate_state_finite
+        transition_applied = (
+            transition_valid
+            & candidate_state_finite
+            & proposed_post_child_clocks_aligned
+        )
         next_state = jax.lax.cond(
-            transition_valid,
+            transition_applied,
             lambda _: proposed_state,
             lambda _: state,
             operand=None,
         )
+        committed_post_child_clock_alignment_vector = (
+            self._child_clock_alignment_vector(next_state)
+        )
+        committed_post_child_clocks_aligned = jnp.all(
+            committed_post_child_clock_alignment_vector
+        )
+        transition_valid = transition_applied
         model_valid = candidate_models_valid
         grounded_world_step_delta = (
             jnp.asarray(0, dtype=jnp.int32)
             if state.grounded_world is None
-            else (
-                cast(GroundedJointWorldModelState, next_state.grounded_world).update_count
-                - state.grounded_world.update_count
-            )
+            else cast(
+                GroundedJointWorldModelState,
+                next_state.grounded_world,
+            ).update_count
+            - state.grounded_world.update_count
         )
         false_active = jnp.zeros((ACTIVE_PAIR_SLOTS,), dtype=jnp.bool_)
         false_candidates = jnp.zeros((CANDIDATE_PAIR_SLOTS,), dtype=jnp.bool_)
@@ -2638,6 +2935,8 @@ class IntegratedHiddenPartnerAgent:
             new_live_count=old_live_count,
             route_count_after=state.router.route_count,
             generation_count_after=state.router.generation_count,
+            route_words_after=state.router.route_words,
+            generation_words_after=state.router.generation_words,
         )
         committed_route_diagnostics = jax.lax.cond(
             transition_valid,
@@ -2661,75 +2960,142 @@ class IntegratedHiddenPartnerAgent:
                 dtype=jnp.bool_,
             ),
             grounded_world_counter_saturated=grounded_world_counter_saturated,
+            grounded_world_lifetime_counter_valid=(
+                grounded_world_lifetime_counter_valid
+            ),
+            grounded_world_lifetime_capacity_available=(
+                grounded_world_lifetime_capacity_available
+            ),
+            grounded_world_update_applied=(
+                transition_valid & grounded_world_update_applied
+            ),
+            grounded_world_pre_update_words=grounded_world_pre_update_words,
+            grounded_world_proposed_post_update_words=(
+                grounded_world_post_update_words
+            ),
+            grounded_world_post_update_words=jnp.where(
+                transition_valid,
+                grounded_world_post_update_words,
+                grounded_world_pre_update_words,
+            ),
             grounded_world_prediction_matches_decision=(grounded_world_prediction_matches),
             gradient_mix=gradient_mix,
             mixed_gradient_chi=(None if grounded_world_update is None else mixed_gradient_chi),
             mixed_gradient_phi=(None if grounded_world_update is None else representation_gradient),
             state_learning=state_learning,
+            state_builder_transition_state_valid=builder_transition.state_valid,
+            state_builder_transition_input_valid=builder_transition.input_valid,
+            state_builder_step_counter_valid=builder_transition.step_counter_valid,
+            state_builder_step_capacity_available=(
+                builder_transition.step_capacity_available
+            ),
+            state_builder_candidate_state_valid=(
+                builder_transition.candidate_state_valid
+            ),
+            state_builder_candidate_representation_valid=(
+                builder_transition.candidate_representation_valid
+            ),
+            state_builder_transition_applied=(
+                transition_valid & builder_transition.transition_applied
+            ),
+            state_builder_pre_step_words=builder_transition.pre_step_words,
+            state_builder_proposed_post_step_words=(
+                builder_transition.post_step_words
+            ),
+            state_builder_post_step_words=jnp.where(
+                transition_valid,
+                builder_transition.post_step_words,
+                builder_transition.pre_step_words,
+            ),
             interaction_prediction_preupdate=(interaction_update.predictions),
             interaction_error_preupdate=interaction_update.errors,
             interaction_metrics=interaction_update.metrics,
-            interaction_replaced_slot=jnp.where(
+            interaction_lifetime_counter_valid=(
+                interaction_update.lifetime_counter_valid
+            ),
+            interaction_lifetime_capacity_available=(
+                interaction_update.lifetime_capacity_available
+            ),
+            interaction_state_valid=interaction_update.state_valid,
+            interaction_candidate_state_valid=(
+                interaction_update.candidate_state_valid
+            ),
+            interaction_proposal_applied=interaction_proposal_applied,
+            interaction_update_applied=(
+                transition_valid & interaction_update.update_applied
+            ),
+            interaction_pre_step_words=interaction_update.pre_step_words,
+            interaction_proposed_post_step_words=(
+                interaction_update.post_step_words
+            ),
+            interaction_post_step_words=jnp.where(
                 transition_valid,
+                interaction_update.post_step_words,
+                interaction_update.pre_step_words,
+            ),
+            interaction_replaced_slot=jnp.where(
+                interaction_proposal_applied,
                 interaction_update.replaced_slot,
                 rejected_index,
             ),
             interaction_promoted_candidate=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 interaction_update.promoted_candidate,
                 rejected_index,
             ),
             interaction_refreshed_candidate=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 interaction_update.refreshed_candidate,
                 rejected_index,
             ),
             interaction_retired_slot=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 interaction_update.retired_slot,
                 rejected_index,
             ),
             interaction_retired_left=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 interaction_update.retired_left,
                 rejected_index,
             ),
             interaction_retired_right=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 interaction_update.retired_right,
                 rejected_index,
             ),
             interaction_proposal_replaced_slot=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 interaction_update.replaced_slot,
                 rejected_index,
             ),
             interaction_proposal_promoted_candidate=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 interaction_update.promoted_candidate,
                 rejected_index,
             ),
             interaction_proposal_refreshed_candidate=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 interaction_update.refreshed_candidate,
                 rejected_index,
             ),
             interaction_proposal_retired_slot=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 interaction_update.retired_slot,
                 rejected_index,
             ),
             interaction_proposal_retired_left=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 interaction_update.retired_left,
                 rejected_index,
             ),
             interaction_proposal_retired_right=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 interaction_update.retired_right,
                 rejected_index,
             ),
-            interaction_lifecycle_proposed=(transition_valid & lifecycle_proposed),
+            interaction_lifecycle_proposed=(
+                interaction_proposal_applied & lifecycle_proposed
+            ),
             interaction_lifecycle_applied=(
                 lifecycle_apply_gate & lifecycle_proposed
             ),
@@ -2815,14 +3181,14 @@ class IntegratedHiddenPartnerAgent:
             ),
             interaction_candidate_promotion_evidence_streak_updated=(
                 jnp.where(
-                    transition_valid,
+                    interaction_proposal_applied,
                     interaction_update.candidate_promotion_evidence_streak_updated,
                     state.interaction.candidate_promotion_evidence_streak,
                 )
             ),
             interaction_candidate_promotion_evidence_streak_proposal_post=(
                 jnp.where(
-                    transition_valid,
+                    interaction_proposal_applied,
                     interaction_update.state.candidate_promotion_evidence_streak,
                     state.interaction.candidate_promotion_evidence_streak,
                 )
@@ -2842,7 +3208,7 @@ class IntegratedHiddenPartnerAgent:
             ),
             interaction_candidate_reacquisition_required_proposal_post=(
                 jnp.where(
-                    transition_valid,
+                    interaction_proposal_applied,
                     interaction_update.state.candidate_reacquisition_required,
                     state.interaction.candidate_reacquisition_required,
                 )
@@ -2906,13 +3272,13 @@ class IntegratedHiddenPartnerAgent:
             consumer_active_mask_post=next_state.consumer_active_mask,
             interaction_matching_candidate_reset_mask=(
                 jnp.where(
-                    transition_valid,
+                    interaction_proposal_applied,
                     interaction_update.matching_candidate_reset_mask,
                     false_candidates,
                 )
             ),
             interaction_matching_candidate_reset_count=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 jnp.sum(
                     interaction_update.matching_candidate_reset_mask,
                     dtype=jnp.int32,
@@ -2933,30 +3299,32 @@ class IntegratedHiddenPartnerAgent:
                 0,
             ),
             interaction_live_feature_count=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 interaction_update.live_feature_count,
                 old_live_count,
             ),
             interaction_vacancy_count=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 interaction_update.vacancy_count,
                 ACTIVE_PAIR_SLOTS - old_live_count,
             ),
             interaction_promoted_into_vacancy=(
-                transition_valid & interaction_update.promoted_into_vacancy
+                interaction_proposal_applied
+                & interaction_update.promoted_into_vacancy
             ),
             interaction_proposal_live_feature_count=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 interaction_update.live_feature_count,
                 old_live_count,
             ),
             interaction_proposal_vacancy_count=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 interaction_update.vacancy_count,
                 ACTIVE_PAIR_SLOTS - old_live_count,
             ),
             interaction_proposal_promoted_into_vacancy=(
-                transition_valid & interaction_update.promoted_into_vacancy
+                interaction_proposal_applied
+                & interaction_update.promoted_into_vacancy
             ),
             interaction_applied_live_feature_count=jnp.where(
                 transition_valid,
@@ -2973,49 +3341,50 @@ class IntegratedHiddenPartnerAgent:
             ),
             random_curation_enabled=curation_priority_override.enabled,
             random_curation_attempted=(
-                transition_valid & interaction_update.curation_attempted
+                interaction_proposal_applied
+                & interaction_update.curation_attempted
             ),
             random_curation_applied=(
                 transition_valid
                 & interaction_update.curation_priority_override_applied
             ),
             random_active_priorities=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 random_active_priorities,
                 jnp.zeros_like(random_active_priorities),
             ),
             random_candidate_priorities=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 random_candidate_priorities,
                 jnp.zeros_like(random_candidate_priorities),
             ),
             curation_selected_active_worst_slot=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 interaction_update.curation_selected_active_worst_slot,
                 rejected_index,
             ),
             curation_selected_promotion_candidate=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 interaction_update.curation_selected_promotion_candidate,
                 rejected_index,
             ),
             curation_selected_refresh_candidate=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 interaction_update.curation_selected_refresh_candidate,
                 rejected_index,
             ),
             shadow_descriptors=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 shadow_descriptors,
                 state.router.descriptors,
             ),
             proposed_descriptors=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 proposed_descriptors,
                 state.router.descriptors,
             ),
             interaction_proposal_descriptors=jnp.where(
-                transition_valid,
+                interaction_proposal_applied,
                 shadow_descriptors,
                 state.router.descriptors,
             ),
@@ -3025,9 +3394,20 @@ class IntegratedHiddenPartnerAgent:
                 state.router.descriptors,
             ),
             shadow_descriptors_changed=(
-                transition_valid & jnp.any(shadow_descriptors != state.router.descriptors)
+                interaction_proposal_applied
+                & jnp.any(shadow_descriptors != state.router.descriptors)
             ),
             route=committed_route_diagnostics,
+            router_proposed_post_route_words=(
+                route_diagnostics.route_words_after
+            ),
+            router_committed_post_route_words=next_state.router.route_words,
+            router_proposed_post_generation_words=(
+                route_diagnostics.generation_words_after
+            ),
+            router_committed_post_generation_words=(
+                next_state.router.generation_words
+            ),
             consumer_route_source_slots_exact=(
                 consumer_route_audit.source_slots_exact
             ),
@@ -3068,19 +3448,84 @@ class IntegratedHiddenPartnerAgent:
             world_reward_error=world_update.reward_error,
             world_outcome_error=world_update.outcome_error,
             world_target_valid=world_update.target_valid,
+            world_lifetime_counter_valid=world_update.lifetime_counter_valid,
+            world_lifetime_capacity_available=(
+                world_update.lifetime_capacity_available
+            ),
+            world_update_applied=(transition_valid & world_update.update_applied),
+            world_pre_step_words=world_update.pre_step_words,
+            world_proposed_post_step_words=world_update.post_step_words,
+            world_post_step_words=jnp.where(
+                transition_valid,
+                world_update.post_step_words,
+                world_update.pre_step_words,
+            ),
             td_error=control_update.td_error,
             average_reward=control_update.average_reward,
+            control_lifetime_counter_valid=(
+                control_update.lifetime_counter_valid
+            ),
+            control_lifetime_capacity_available=(
+                control_update.lifetime_capacity_available
+            ),
+            control_update_applied=(transition_valid & control_update.update_applied),
+            control_pre_step_words=control_update.pre_step_words,
+            control_proposed_post_step_words=control_update.post_step_words,
+            control_post_step_words=jnp.where(
+                transition_valid,
+                control_update.post_step_words,
+                control_update.pre_step_words,
+            ),
             transition_input_valid=transition_input_valid,
             decision_cache_valid=decision_cache_valid,
             decision_cache_check_vector=decision_cache_check_vector,
             behavior_gradient_valid=behavior_gradient_valid,
+            behavior_lifetime_counter_valid=(
+                behavior_update.lifetime_counter_valid
+            ),
+            behavior_lifetime_capacity_available=(
+                behavior_update.lifetime_capacity_available
+            ),
+            behavior_update_applied=(transition_valid & behavior_update.update_applied),
+            behavior_pre_step_words=behavior_update.pre_step_words,
+            behavior_proposed_post_step_words=behavior_update.post_step_words,
+            behavior_post_step_words=jnp.where(
+                transition_valid,
+                behavior_update.post_step_words,
+                behavior_update.pre_step_words,
+            ),
             grounded_path_valid=grounded_path_valid,
             candidate_models_valid=candidate_models_valid,
             candidate_state_finite=candidate_state_finite,
+            outer_pre_step_words=state.step_words,
+            outer_proposed_post_step_words=outer_proposed_post_step_words,
+            outer_committed_post_step_words=next_state.step_words,
+            outer_lifetime_counter_valid=outer_lifetime_counter_valid,
+            outer_lifetime_capacity_available=(
+                outer_lifetime_capacity_available
+            ),
+            pre_child_clock_alignment_vector=(
+                pre_child_clock_alignment_vector
+            ),
+            pre_child_clocks_aligned=pre_child_clocks_aligned,
+            proposed_post_child_clock_alignment_vector=(
+                proposed_post_child_clock_alignment_vector
+            ),
+            proposed_post_child_clocks_aligned=(
+                proposed_post_child_clocks_aligned
+            ),
+            committed_post_child_clock_alignment_vector=(
+                committed_post_child_clock_alignment_vector
+            ),
+            committed_post_child_clocks_aligned=(
+                committed_post_child_clocks_aligned
+            ),
+            transaction_capacity_available=transaction_capacity_available,
             transition_observation_matches=observation_matches,
             transition_action_matches=action_matches,
             transition_semantics_valid=transition_valid,
-            transition_rejected=~transition_valid,
+            transition_applied=transition_applied,
+            transition_rejected=~transition_applied,
             model_valid=transition_valid & model_valid,
             state_builder_step_delta=(
                 next_state.state_builder.step_count - state.state_builder.step_count

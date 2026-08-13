@@ -102,6 +102,8 @@ from alberta_framework.core.context_inference import (
 from alberta_framework.streams import SwitchingTwoStateConfig, SwitchingTwoStateMDP
 from alberta_framework.streams.closed_loop import PHASE_A
 
+pytestmark = [pytest.mark.development, pytest.mark.slow]
+
 # ---------------------------------------------------------------------------
 # Life protocol (mirrors tests/test_integrated_life.py, context hidden)
 # ---------------------------------------------------------------------------

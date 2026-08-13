@@ -16,7 +16,6 @@ import pytest
 
 import alberta_framework as alberta
 import alberta_framework.core as core
-import alberta_framework.core.world_model_ensemble as world_model_ensemble_module
 from alberta_framework.core.checkpoints import (
     load_checkpoint_metadata,
     save_checkpoint,
@@ -877,70 +876,71 @@ def test_checkpoint_rejects_resource_budget_metadata_tampering(tmp_path: Path) -
         load_world_model_ensemble_checkpoint(tampered)
 
 
-def test_checkpoint_strictly_migrates_pre_replay_v1_state(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "schema",
+    (
+        "alberta.world_model_ensemble.v1",
+        "alberta.world_model_ensemble.v2",
+    ),
+)
+def test_checkpoint_rejects_true_historical_nested_shapes(
+    tmp_path: Path,
+    schema: str,
+) -> None:
     ensemble = WorldModelEnsemble(_config())
     state = ensemble.init(jr.key(91))
-    for index in range(3):
-        state = ensemble.update(state, *_event(index)).state
-    legacy_state = world_model_ensemble_module._legacy_v1_template(state)
-    config = ensemble.to_config()
-    legacy = tmp_path / "legacy-v1"
+    historical_members = []
+    for member in state.member_states:
+        learner = {
+            field.name: getattr(member.learner_state, field.name)
+            for field in dataclasses.fields(type(member.learner_state))
+            if field.name != "step_words"
+        }
+        historical_member = {
+            field.name: getattr(member, field.name)
+            for field in dataclasses.fields(type(member))
+            if field.name not in {"learner_state", "step_words"}
+        }
+        historical_member["learner_state"] = learner
+        historical_members.append(historical_member)
+    historical_signal = {
+        field.name: getattr(state.signal_state, field.name)
+        for field in dataclasses.fields(type(state.signal_state))
+        if field.name not in {"step_words", "valid_words", "invalid_words"}
+    }
+    historical_state = {
+        "member_states": tuple(historical_members),
+        "residual_variances": state.residual_variances,
+        "signal_state": historical_signal,
+        "bootstrap_key": state.bootstrap_key,
+        "last_bootstrap_mask": state.last_bootstrap_mask,
+        "member_update_counts": state.member_update_counts,
+        "event_count": state.event_count,
+    }
+    if schema.endswith("v2"):
+        historical_state.update(
+            {
+                "replay_bootstrap_key": state.replay_bootstrap_key,
+                "last_replay_bootstrap_mask": state.last_replay_bootstrap_mask,
+                "replay_member_update_counts": state.replay_member_update_counts,
+                "replay_event_count": state.replay_event_count,
+            }
+        )
+    legacy = tmp_path / schema.rsplit(".", maxsplit=1)[-1]
     save_checkpoint(
-        legacy_state,
+        historical_state,
         legacy,
         metadata={
-            "schema": "alberta.world_model_ensemble.v1",
-            "ensemble_config": config,
-            "config_sha256": world_model_ensemble_module._ensemble_config_digest(
-                config
-            ),
-            "resource_budget": (
-                world_model_ensemble_module._legacy_v1_resource_budget(
-                    ensemble,
-                    state,
-                )
-            ),
+            "schema": schema,
+            "ensemble_config": {"historical_nested_schema": True},
         },
     )
 
-    restored_ensemble, restored = load_world_model_ensemble_checkpoint(legacy)
-    assert restored_ensemble.config == ensemble.config
-    _assert_tree_equal(restored.member_states, legacy_state.member_states)
-    _assert_tree_equal(restored.residual_variances, legacy_state.residual_variances)
-    _assert_tree_equal(restored.signal_state, legacy_state.signal_state)
-    np.testing.assert_array_equal(
-        jr.key_data(restored.bootstrap_key),
-        jr.key_data(legacy_state.bootstrap_key),
-    )
-    np.testing.assert_array_equal(
-        restored.last_bootstrap_mask,
-        legacy_state.last_bootstrap_mask,
-    )
-    np.testing.assert_array_equal(
-        restored.member_update_counts,
-        legacy_state.member_update_counts,
-    )
-    np.testing.assert_array_equal(restored.event_count, legacy_state.event_count)
-    np.testing.assert_array_equal(
-        jr.key_data(restored.replay_bootstrap_key),
-        jr.key_data(
-            jr.fold_in(
-                legacy_state.bootstrap_key,
-                world_model_ensemble_module._V1_REPLAY_KEY_FOLD_IN,
-            )
-        ),
-    )
-    assert not bool(jnp.any(restored.last_replay_bootstrap_mask))
-    assert not bool(jnp.any(restored.replay_member_update_counts))
-    assert int(restored.replay_event_count) == 0
-    assert bool(restored_ensemble.state_valid(restored))
-
-    _, restored_again = load_world_model_ensemble_checkpoint(legacy)
-    _assert_tree_equal(restored_again, restored)
-
-    v2 = tmp_path / "resaved-v2"
-    save_world_model_ensemble_checkpoint(restored_ensemble, restored, v2)
-    assert load_checkpoint_metadata(v2)["schema"] == WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA
+    with pytest.raises(
+        ValueError,
+        match="migration unavailable: historical nested",
+    ):
+        load_world_model_ensemble_checkpoint(legacy)
 
 
 def test_checkpoint_rejects_invalid_state(tmp_path: Path) -> None:

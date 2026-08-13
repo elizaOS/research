@@ -28,7 +28,7 @@ from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, Protocol, cast, runtime_checkable
+from typing import Any, Literal, NamedTuple, NoReturn, Protocol, cast, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -206,6 +206,10 @@ FORAGER_FOV_EMA_SUBSAMPLE = 100
 FORAGER_FOV_TAIL_FRACTION = 0.10
 FORAGER_ENVIRONMENT_RNG_SCHEDULE = "dedicated_environment_split_chain_v1"
 _MAX_JAX_INT32 = 2**31 - 1
+_MAX_JAX_UINT32 = 2**32 - 1
+_EXPLICIT_AGENT_SEED_TRANSPORT_SCHEMA = (
+    "alberta.forager_explicit_agent_seed_transport.v1"
+)
 
 
 def _validated_seed(value: Any, *, name: str = "seed") -> int:
@@ -216,6 +220,85 @@ def _validated_seed(value: Any, *, name: str = "seed") -> int:
     if not 0 <= seed <= _MAX_JAX_INT32:
         raise ValueError(f"{name} must lie in [0, {_MAX_JAX_INT32}]")
     return seed
+
+
+def _validated_explicit_agent_seeds(
+    agent_seeds: Sequence[int] | None,
+    *,
+    lane_count: int,
+) -> tuple[int, ...] | None:
+    """Validate an optional, lane-index-paired uint32 agent-seed sequence."""
+    if agent_seeds is None:
+        return None
+    if isinstance(agent_seeds, (str, bytes, bytearray)) or not isinstance(
+        agent_seeds,
+        Sequence,
+    ):
+        raise ValueError("agent_seeds must be an explicit sequence")
+    values = tuple(agent_seeds)
+    if len(values) != lane_count:
+        raise ValueError("agent_seeds must have the same length as seeds")
+    validated: list[int] = []
+    for index, value in enumerate(values):
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise ValueError(
+                f"agent_seeds[{index}] must be a uint32-compatible integer "
+                "without coercion"
+            )
+        seed = int(value)
+        if not 0 <= seed <= _MAX_JAX_UINT32:
+            raise ValueError(
+                f"agent_seeds[{index}] must be a uint32-compatible integer "
+                "without coercion"
+            )
+        validated.append(seed)
+    return tuple(validated)
+
+
+def _with_explicit_agent_seed_metadata(
+    metadata: Mapping[str, Any],
+    *,
+    environment_seed: int,
+    agent_seed: int,
+    lane_index: int,
+    agent_root_uses: Sequence[str],
+) -> dict[str, Any]:
+    """Return detached metadata that unambiguously binds both lane roots."""
+    result = dict(metadata)
+    result.pop("seed", None)
+    result["environment_seed"] = environment_seed
+    result["agent_seed"] = agent_seed
+    result["seed_transport"] = {
+        "schema_version": _EXPLICIT_AGENT_SEED_TRANSPORT_SCHEMA,
+        "transport": "explicit_lane_index_pairing",
+        "lane_index": lane_index,
+        "environment_seed": environment_seed,
+        "agent_seed": agent_seed,
+        "environment_root_uses": ["reset", "transition_split_chain"],
+        "agent_root_uses": list(agent_root_uses),
+        "agent_seed_collisions_allowed": True,
+        "environment_agent_seed_equality_required": False,
+    }
+    return result
+
+
+def _explicit_rtu_agent_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Rewrite the RTU RNG descriptor for an explicit agent-seed root."""
+    result = dict(metadata)
+    raw_agent_rng = result.get("agent_rng")
+    if not isinstance(raw_agent_rng, Mapping):
+        raise ValueError("RTU metadata must contain an agent_rng mapping")
+    agent_rng = dict(raw_agent_rng)
+    if agent_rng.get("root") != (
+        "jax.random.fold_in(jax.random.key(seed), namespace)"
+    ):
+        raise ValueError("RTU metadata has an unexpected legacy agent RNG root")
+    agent_rng["root"] = (
+        "jax.random.fold_in(jax.random.key(agent_seed), namespace)"
+    )
+    agent_rng["seed_field"] = "agent_seed"
+    result["agent_rng"] = agent_rng
+    return result
 
 
 def _require_builtin_int(
@@ -280,6 +363,46 @@ def _agent_key(seed: int | Array) -> Array:
 def _rtu_rtrl_key(seed: int | Array) -> Array:
     """Return an RTU policy root disjoint from every environment key."""
     return jr.fold_in(jr.key(seed), _RTU_RTRL_RNG_NAMESPACE)
+
+
+@dataclass(frozen=True)
+class _AlbertaLaneSeedRoots:
+    """Independent environment and Alberta-agent roots for one lane."""
+
+    environment: Array
+    recurrent: Array
+    core: Array
+
+
+@dataclass(frozen=True)
+class _RTURTRLLaneSeedRoots:
+    """Independent environment and RTU/RTRL-agent roots for one lane."""
+
+    environment: Array
+    core: Array
+
+
+def _alberta_lane_seed_roots(
+    environment_seed: int | Array,
+    agent_seed: int | Array,
+) -> _AlbertaLaneSeedRoots:
+    """Derive every Alberta lane root from its explicitly assigned seed."""
+    return _AlbertaLaneSeedRoots(
+        environment=jr.key(environment_seed),
+        recurrent=_recurrent_key(agent_seed),
+        core=_agent_key(agent_seed),
+    )
+
+
+def _rtu_rtrl_lane_seed_roots(
+    environment_seed: int | Array,
+    agent_seed: int | Array,
+) -> _RTURTRLLaneSeedRoots:
+    """Derive every RTU/RTRL lane root from its explicitly assigned seed."""
+    return _RTURTRLLaneSeedRoots(
+        environment=jr.key(environment_seed),
+        core=_rtu_rtrl_key(agent_seed),
+    )
 
 
 def forager_rng_contract() -> dict[str, Any]:
@@ -1039,6 +1162,14 @@ class AlbertaForagerConfig:
         data["critic_hidden_sizes"] = list(self.critic_hidden_sizes)
         data["features"] = self.features.to_dict()
         return data
+
+
+def _alberta_agent_root_uses(config: AlbertaForagerConfig) -> tuple[str, ...]:
+    """Return only the explicit agent roots consumed by this configuration."""
+    roots = ["horde_core"]
+    if config.recurrent_hidden_size > 0:
+        roots.append("recurrent_features")
+    return tuple(roots)
 
 
 class ForagerRecurrentState(NamedTuple):
@@ -2751,6 +2882,7 @@ def run_alberta_forager_seeds(
     benchmark_config: ForagerBenchmarkConfig,
     seeds: Sequence[int],
     *,
+    agent_seeds: Sequence[int] | None = None,
     mode: ForagerBatchMode = "vmap",
     reward_trace_sink_factory: ForagerRewardTraceSinkFactory | None = None,
 ) -> tuple[ForagerRunResult, ...]:
@@ -2760,7 +2892,9 @@ def run_alberta_forager_seeds(
     floating-point rounding relative to independent single-seed executables,
     although RNG identity and the tested trajectories are preserved. ``strict``
     uses ``jax.lax.map`` to retain independent per-seed lowering within one
-    executable and is the reproducibility-sensitive mode.
+    executable and is the reproducibility-sensitive mode.  When supplied,
+    ``agent_seeds`` pairs by lane index with the environment ``seeds`` while
+    leaving the legacy one-seed schedule unchanged by default.
     """
     if not isinstance(agent_config, AlbertaForagerConfig):
         raise TypeError("agent_config must be an AlbertaForagerConfig")
@@ -2774,6 +2908,13 @@ def run_alberta_forager_seeds(
         raise ValueError("seeds must be non-empty")
     if len(set(ordered_seeds)) != len(ordered_seeds):
         raise ValueError("seeds must be unique")
+    ordered_agent_seeds = _validated_explicit_agent_seeds(
+        agent_seeds,
+        lane_count=len(ordered_seeds),
+    )
+    effective_agent_seeds = (
+        ordered_seeds if ordered_agent_seeds is None else ordered_agent_seeds
+    )
     if mode not in ("vmap", "strict"):
         raise ValueError("mode must be 'vmap' or 'strict'")
 
@@ -2789,8 +2930,9 @@ def run_alberta_forager_seeds(
     core = AlbertaForagerAgent(agent_config)._build_core()
     seed_values = jnp.asarray(ordered_seeds, dtype=jnp.int32)
 
-    def init_one(
-        seed: Array,
+    def init_lane(
+        environment_seed: Array,
+        agent_seed: Array,
     ) -> tuple[
         Any,
         Array,
@@ -2801,7 +2943,8 @@ def run_alberta_forager_seeds(
         Array,
         Array,
     ]:
-        env_key = jr.key(seed)
+        roots = _alberta_lane_seed_roots(environment_seed, agent_seed)
+        env_key = roots.environment
         env_key, reset_key = jr.split(env_key)
         observation, env_state = env.reset(reset_key, params)
         reward_traces = jnp.zeros(
@@ -2818,14 +2961,14 @@ def run_alberta_forager_seeds(
         recurrent_state = _init_forager_recurrent_state(
             base_features.shape[0],
             agent_config,
-            _recurrent_key(seed),
+            roots.recurrent,
         )
         recurrent_state, features = _augment_with_recurrent_features(
             base_features,
             recurrent_state,
             agent_config,
         )
-        core_state = core.init(features.shape[0], _agent_key(seed))
+        core_state = core.init(features.shape[0], roots.core)
         core_state, action, _ = core.start(core_state, features)
         zero = jnp.asarray(0.0, dtype=jnp.float32)
         return (
@@ -2839,8 +2982,26 @@ def run_alberta_forager_seeds(
             zero,
         )
 
-    initialize = jax.jit(jax.vmap(init_one))
-    carry = initialize(seed_values)
+    if ordered_agent_seeds is None:
+
+        def init_one(environment_seed: Array) -> tuple[
+            Any,
+            Array,
+            Any,
+            Array,
+            Array,
+            ForagerRecurrentState,
+            Array,
+            Array,
+        ]:
+            return init_lane(environment_seed, environment_seed)
+
+        initialize = jax.jit(jax.vmap(init_one))
+        carry = initialize(seed_values)
+    else:
+        agent_seed_values = jnp.asarray(ordered_agent_seeds, dtype=jnp.uint32)
+        initialize = jax.jit(jax.vmap(init_lane))
+        carry = initialize(seed_values, agent_seed_values)
     jax.block_until_ready(carry)  # type: ignore[no-untyped-call]
 
     seed_chunk = _make_alberta_scan_chunk(
@@ -3023,7 +3184,19 @@ def run_alberta_forager_seeds(
     effective_seed_fps = cfg.steps / max(execution_duration, 1e-12)
     results: list[ForagerRunResult] = []
     for lane, seed in enumerate(ordered_seeds):
-        metadata = dict(AlbertaForagerAgent(agent_config, seed=seed).metadata())
+        agent_seed = effective_agent_seeds[lane]
+        if ordered_agent_seeds is None:
+            metadata = dict(
+                AlbertaForagerAgent(agent_config, seed=seed).metadata()
+            )
+        else:
+            metadata = _with_explicit_agent_seed_metadata(
+                AlbertaForagerAgent(agent_config, seed=0).metadata(),
+                environment_seed=seed,
+                agent_seed=agent_seed,
+                lane_index=lane,
+                agent_root_uses=_alberta_agent_root_uses(agent_config),
+            )
         metadata["environment_rng_schedule"] = (
             FORAGER_ENVIRONMENT_RNG_SCHEDULE
         )
@@ -3052,6 +3225,11 @@ def run_alberta_forager_seeds(
                 else "independent lax.map lanes"
             ),
         }
+        if ordered_agent_seeds is not None:
+            metadata["runner"]["batch_agent_seeds"] = list(
+                ordered_agent_seeds
+            )
+            metadata["runner"]["seed_pairing"] = "lane_index"
         if trace_metadata:
             metadata["raw_metric_trace"] = dict(trace_metadata[lane])
         results.append(
@@ -3278,9 +3456,19 @@ def _execute_rtu_rtrl_forager_seeds(
     *,
     mode: ForagerBatchMode,
     reward_trace_sink_factory: ForagerRewardTraceSinkFactory | None,
+    agent_seeds: tuple[int, ...] | None = None,
     single_policy: RTURTRLForagerAgent | None = None,
 ) -> tuple[ForagerRunResult, ...]:
     """Execute the canonical batched RTU scan, including the one-lane path."""
+    ordered_agent_seeds = _validated_explicit_agent_seeds(
+        agent_seeds,
+        lane_count=len(ordered_seeds),
+    )
+    if single_policy is not None and ordered_agent_seeds is not None:
+        raise ValueError("single RTU policy does not accept explicit agent seeds")
+    effective_agent_seeds = (
+        ordered_seeds if ordered_agent_seeds is None else ordered_agent_seeds
+    )
     cfg = benchmark_config
     trace_sinks = _create_reward_trace_sinks(
         reward_trace_sink_factory,
@@ -3294,10 +3482,12 @@ def _execute_rtu_rtrl_forager_seeds(
     feature_cfg = agent_config.features
     seed_values = jnp.asarray(ordered_seeds, dtype=jnp.int32)
 
-    def init_one(
-        seed: Array,
+    def init_lane(
+        environment_seed: Array,
+        agent_seed: Array,
     ) -> tuple[Any, Array, Any, Array, Array, Array, Array, Array]:
-        env_key = jr.key(seed)
+        roots = _rtu_rtrl_lane_seed_roots(environment_seed, agent_seed)
+        env_key = roots.environment
         env_key, reset_key = jr.split(env_key)
         observation, env_state = env.reset(reset_key, params)
         reward_traces = jnp.zeros(
@@ -3311,7 +3501,7 @@ def _execute_rtu_rtrl_forager_seeds(
             jnp.asarray(0.0, dtype=jnp.float32),
             reward_traces,
         )
-        core_state = core.init(features.shape[0], _rtu_rtrl_key(seed))
+        core_state = core.init(features.shape[0], roots.core)
         core_state, action, _ = core.start(core_state, features)
         zero_float = jnp.asarray(0.0, dtype=jnp.float32)
         zero_count = jnp.asarray(0, dtype=jnp.int32)
@@ -3326,8 +3516,26 @@ def _execute_rtu_rtrl_forager_seeds(
             zero_float,
         )
 
-    initialize = jax.jit(jax.vmap(init_one))
-    carry = initialize(seed_values)
+    if ordered_agent_seeds is None:
+
+        def init_one(environment_seed: Array) -> tuple[
+            Any,
+            Array,
+            Any,
+            Array,
+            Array,
+            Array,
+            Array,
+            Array,
+        ]:
+            return init_lane(environment_seed, environment_seed)
+
+        initialize = jax.jit(jax.vmap(init_one))
+        carry = initialize(seed_values)
+    else:
+        agent_seed_values = jnp.asarray(ordered_agent_seeds, dtype=jnp.uint32)
+        initialize = jax.jit(jax.vmap(init_lane))
+        carry = initialize(seed_values, agent_seed_values)
     jax.block_until_ready(carry)  # type: ignore[no-untyped-call]
 
     seed_chunk = _make_rtu_rtrl_scan_chunk(
@@ -3551,7 +3759,21 @@ def _execute_rtu_rtrl_forager_seeds(
     effective_seed_fps = cfg.steps / max(execution_duration, 1e-12)
     results: list[ForagerRunResult] = []
     for lane, seed in enumerate(ordered_seeds):
-        metadata = dict(RTURTRLForagerAgent(agent_config, seed=seed).metadata())
+        agent_seed = effective_agent_seeds[lane]
+        if ordered_agent_seeds is None:
+            metadata = dict(
+                RTURTRLForagerAgent(agent_config, seed=seed).metadata()
+            )
+        else:
+            metadata = _with_explicit_agent_seed_metadata(
+                _explicit_rtu_agent_metadata(
+                    RTURTRLForagerAgent(agent_config, seed=0).metadata()
+                ),
+                environment_seed=seed,
+                agent_seed=agent_seed,
+                lane_index=lane,
+                agent_root_uses=("rtu_rtrl_core",),
+            )
         metadata["environment_rng_schedule"] = FORAGER_ENVIRONMENT_RNG_SCHEDULE
         metadata["environment_rng_schedule_sha256"] = (
             environment_rng_schedule_sha256()
@@ -3579,6 +3801,11 @@ def _execute_rtu_rtrl_forager_seeds(
                     else "independent lax.map lanes"
                 ),
             }
+            if ordered_agent_seeds is not None:
+                metadata["runner"]["batch_agent_seeds"] = list(
+                    ordered_agent_seeds
+                )
+                metadata["runner"]["seed_pairing"] = "lane_index"
         else:
             metadata["runner"] = {
                 "kind": "jax_scan",
@@ -3650,6 +3877,7 @@ def run_rtu_rtrl_forager_seeds(
     benchmark_config: ForagerBenchmarkConfig,
     seeds: Sequence[int],
     *,
+    agent_seeds: Sequence[int] | None = None,
     mode: ForagerBatchMode = "vmap",
     reward_trace_sink_factory: ForagerRewardTraceSinkFactory | None = None,
 ) -> tuple[ForagerRunResult, ...]:
@@ -3658,7 +3886,8 @@ def run_rtu_rtrl_forager_seeds(
     ``vmap`` is the throughput path.  ``strict`` lowers independent
     ``lax.map`` lanes for reproducibility-sensitive development checks.  Both
     modes use the exact same per-seed environment key schedule as the other
-    in-tree Forager runners.
+    in-tree Forager runners.  Optional ``agent_seeds`` bind only the RTU/RTRL
+    roots and pair with environment ``seeds`` by lane index.
     """
     if not isinstance(agent_config, RTURTRLForagerConfig):
         raise TypeError("agent_config must be an RTURTRLForagerConfig")
@@ -3672,6 +3901,10 @@ def run_rtu_rtrl_forager_seeds(
         raise ValueError("seeds must be non-empty")
     if len(set(ordered_seeds)) != len(ordered_seeds):
         raise ValueError("seeds must be unique")
+    ordered_agent_seeds = _validated_explicit_agent_seeds(
+        agent_seeds,
+        lane_count=len(ordered_seeds),
+    )
     if mode not in ("vmap", "strict"):
         raise ValueError("mode must be 'vmap' or 'strict'")
     return _execute_rtu_rtrl_forager_seeds(
@@ -3680,6 +3913,7 @@ def run_rtu_rtrl_forager_seeds(
         ordered_seeds,
         mode=mode,
         reward_trace_sink_factory=reward_trace_sink_factory,
+        agent_seeds=ordered_agent_seeds,
     )
 
 
@@ -3736,6 +3970,146 @@ class ForagerBenchmarkSummary:
         data["seeds"] = list(self.seeds)
         data["runs"] = [run.to_dict() for run in self.runs]
         return data
+
+
+def _validate_result_seed_metadata(run: ForagerRunResult) -> None:
+    """Validate either the historical single seed or the explicit v3 pair."""
+    metadata = run.agent_metadata
+    explicit_fields = {"environment_seed", "agent_seed", "seed_transport"}
+    present_explicit_fields = explicit_fields.intersection(metadata)
+    if not present_explicit_fields:
+        metadata_seed = metadata.get("seed")
+        if metadata_seed is not None and (
+            isinstance(metadata_seed, bool)
+            or not isinstance(metadata_seed, (int, np.integer))
+            or int(metadata_seed) != run.seed
+        ):
+            raise ValueError(
+                "agent and environment seeds must match within each run"
+            )
+        return
+
+    def fail(message: str) -> NoReturn:
+        raise ValueError(f"explicit agent seed transport {message}")
+
+    if present_explicit_fields != explicit_fields:
+        fail("must provide environment_seed, agent_seed, and seed_transport")
+    if "seed" in metadata:
+        fail("must not retain the ambiguous legacy seed field")
+
+    environment_seed = metadata["environment_seed"]
+    if type(environment_seed) is not int:
+        fail("environment_seed must be an integer without coercion")
+    if int(environment_seed) != run.seed:
+        fail("environment_seed does not match the result seed")
+
+    agent_seed = metadata["agent_seed"]
+    if type(agent_seed) is not int:
+        fail("agent_seed must be a uint32-compatible integer without coercion")
+    canonical_agent_seed = int(agent_seed)
+    if not 0 <= canonical_agent_seed <= _MAX_JAX_UINT32:
+        fail("agent_seed must be a uint32-compatible integer without coercion")
+
+    transport = metadata["seed_transport"]
+    if type(transport) is not dict:
+        fail("seed_transport must be a plain object")
+    expected_transport_keys = {
+        "schema_version",
+        "transport",
+        "lane_index",
+        "environment_seed",
+        "agent_seed",
+        "environment_root_uses",
+        "agent_root_uses",
+        "agent_seed_collisions_allowed",
+        "environment_agent_seed_equality_required",
+    }
+    if set(transport) != expected_transport_keys:
+        fail("seed_transport fields do not match the frozen schema")
+    if (
+        type(transport["schema_version"]) is not str
+        or transport["schema_version"] != _EXPLICIT_AGENT_SEED_TRANSPORT_SCHEMA
+    ):
+        fail("schema_version does not match the frozen schema")
+    if (
+        type(transport["transport"]) is not str
+        or transport["transport"] != "explicit_lane_index_pairing"
+    ):
+        fail("transport kind must be explicit_lane_index_pairing")
+    nested_environment_seed = transport["environment_seed"]
+    if (
+        type(nested_environment_seed) is not int
+        or nested_environment_seed != environment_seed
+    ):
+        fail("nested environment_seed does not match the top-level value")
+    nested_agent_seed = transport["agent_seed"]
+    if type(nested_agent_seed) is not int or nested_agent_seed != canonical_agent_seed:
+        fail("nested agent_seed does not match the top-level value")
+
+    lane_index = transport["lane_index"]
+    if (
+        type(lane_index) is not int
+        or int(lane_index) < 0
+    ):
+        fail("lane_index must be a non-negative integer without coercion")
+    canonical_lane_index = int(lane_index)
+    if transport["environment_root_uses"] != [
+        "reset",
+        "transition_split_chain",
+    ]:
+        fail("environment_root_uses does not match the runner contract")
+    agent_root_uses = transport["agent_root_uses"]
+    if (
+        type(agent_root_uses) is not list
+        or not agent_root_uses
+        or any(type(root) is not str or not root for root in agent_root_uses)
+        or len(set(agent_root_uses)) != len(agent_root_uses)
+    ):
+        fail("agent_root_uses must be a non-empty list of unique names")
+    if transport["agent_seed_collisions_allowed"] is not True:
+        fail("agent_seed_collisions_allowed must be true")
+    if transport["environment_agent_seed_equality_required"] is not False:
+        fail("environment_agent_seed_equality_required must be false")
+
+    runner = metadata.get("runner")
+    if not isinstance(runner, Mapping):
+        fail("requires runner lane metadata")
+    batch_environment_seeds = runner.get("batch_seeds")
+    batch_agent_seeds = runner.get("batch_agent_seeds")
+    if (
+        type(batch_environment_seeds) is not list
+        or type(batch_agent_seeds) is not list
+    ):
+        fail("runner seed vectors must be lists")
+    if len(batch_environment_seeds) != len(batch_agent_seeds):
+        fail("runner seed vectors must have equal lengths")
+    if canonical_lane_index >= len(batch_environment_seeds):
+        fail("lane_index lies outside the runner seed vectors")
+    if (
+        type(runner.get("seed_pairing")) is not str
+        or runner.get("seed_pairing") != "lane_index"
+    ):
+        fail("runner seed_pairing must be lane_index")
+    for index, value in enumerate(batch_environment_seeds):
+        if (
+            type(value) is not int
+            or not 0 <= int(value) <= _MAX_JAX_UINT32
+        ):
+            fail(f"runner batch_seeds[{index}] is not a uint32 integer")
+    for index, value in enumerate(batch_agent_seeds):
+        if (
+            type(value) is not int
+            or not 0 <= int(value) <= _MAX_JAX_UINT32
+        ):
+            fail(f"runner batch_agent_seeds[{index}] is not a uint32 integer")
+    if len({int(value) for value in batch_environment_seeds}) != len(
+        batch_environment_seeds
+    ):
+        fail("runner batch_seeds must contain unique environment seeds")
+    if int(batch_environment_seeds[canonical_lane_index]) != run.seed:
+        fail("runner lane environment seed does not match the result")
+    if int(batch_agent_seeds[canonical_lane_index]) != canonical_agent_seed:
+        fail("runner lane agent seed does not match the result")
 
 
 def summarize_forager_runs(
@@ -3808,13 +4182,7 @@ def summarize_forager_runs(
     for run in runs:
         if not isinstance(run.agent_metadata, Mapping):
             raise ValueError("run agent_metadata must be a mapping")
-        metadata_seed = run.agent_metadata.get("seed")
-        if metadata_seed is not None and (
-            isinstance(metadata_seed, bool)
-            or not isinstance(metadata_seed, (int, np.integer))
-            or int(metadata_seed) != run.seed
-        ):
-            raise ValueError("agent and environment seeds must match within each run")
+        _validate_result_seed_metadata(run)
         if run.agent_metadata.get("name", run.agent) != run.agent:
             raise ValueError("run agent metadata name does not match result agent")
         if (

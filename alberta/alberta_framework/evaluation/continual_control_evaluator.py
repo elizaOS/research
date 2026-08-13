@@ -1416,12 +1416,11 @@ class PrototypeAgentControlAdapter:
             return False
         try:
             expected = self._jax_observation(observation)
-            # PrototypeAgent exposes no public checkpoint-validity predicate, so
-            # the adapter reuses the agent's own structural + numeric-leaf
-            # validator; "valid" here is exactly the invariant the agent
-            # enforces on its own checkpoints.
+            # Use PrototypeAgent's public structural + numeric-leaf boundary;
+            # "valid" here is exactly the invariant the agent enforces on its
+            # own checkpoints.
             return bool(
-                self._agent._checkpoint_state_valid(state)
+                self._agent.validate_state(state)
                 & jnp.array_equal(state.current_raw_observation, expected)
             )
         except (TypeError, ValueError):
@@ -1576,9 +1575,7 @@ class PrototypeAgentControlAdapter:
         )
         if _canonical_json(self.state_to_config(restored)) != _canonical_json(mapping):
             raise ValueError("PrototypeAgent control state numeric payload is not canonical")
-        # Same private validator as state_valid_for_observation; no public
-        # equivalent exists.
-        if not bool(self._agent._checkpoint_state_valid(restored)):
+        if not bool(self._agent.validate_state(restored)):
             raise ValueError("reconstructed PrototypeAgent state is inconsistent")
         return restored
 

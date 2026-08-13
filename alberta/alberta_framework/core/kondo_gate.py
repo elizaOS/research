@@ -5,10 +5,12 @@ In *Does This Gradient Spark Joy?*, delight is the forward-pass quantity
 
 ``advantage * surprisal`` where ``surprisal = -action_log_probability``.
 
-The Kondo gate uses that quantity to decide which samples receive an expensive
-backward pass.  This module keeps that meaning narrow.  It does not reuse the
-name for a generic update-quality score and it does not claim that masking a
-full-batch loss saves compute.
+The Kondo gate uses that quantity to propose which samples' actor-gradient
+contributions should enter an expensive backward pass.  This forward-only
+module does not establish that execution; an actor consumer must actually
+differentiate the admitted rows before they ``spark joy``.  It does not reuse
+the name for a generic update-quality score and it does not claim that masking
+a full-batch loss saves compute.
 
 The boundary is deliberately split in two:
 
@@ -31,7 +33,7 @@ Two development modes are available:
 ``bernoulli_price``
     The paper's finite-temperature gate
     ``Bernoulli(sigmoid((delight - price) / temperature))``.  If more samples
-    spark joy than the declared sparse capacity, the result requires an
+    are selected than the declared sparse capacity, the result requires an
     explicitly reported full-shape masked backward rather than silently
     dropping selected samples.
 
@@ -60,8 +62,13 @@ import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int, UInt
 
-KONDO_GATE_SCHEMA = "alberta.kondo-gate.v1"
+KONDO_GATE_SCHEMA = "alberta.kondo-gate.v2"
+KONDO_GATE_LEGACY_V1_SCHEMA = "alberta.kondo-gate.v1"
 KondoGateMode = Literal["top_k_rate", "bernoulli_price"]
+
+_BACKWARD_ADMISSION_INTENT_SEMANTICS = (
+    "detached-forward-selection-not-backward-execution"
+)
 
 _INT32_MAX = 2_147_483_647
 _FLOAT32_MAX = float(np.finfo(np.float32).max)
@@ -140,6 +147,11 @@ class KondoGateConfig:
     in Bernoulli mode it is unioned with the sampled gate. It defaults to zero
     so the paper equations are exact. A nonzero value is an explicit continual-
     learning extension, not part of the paper's Kondo definition.
+
+    Canonical v2 payloads call the forward mask ``backward_admission_intent``.
+    The frozen v1 ``sparks_joy_semantics`` field is accepted only by the
+    explicit legacy import path and is always normalized to v2 on emission.
+    Only an executing actor consumer can establish that a gradient sparked joy.
     """
 
     batch_size: int
@@ -209,19 +221,43 @@ class KondoGateConfig:
         )
         return max(1, min(self.batch_size, count))
 
-    def to_config(self) -> dict[str, object]:
+    def _to_config_for_schema(self, schema: str) -> dict[str, object]:
         payload = dataclasses.asdict(self)
-        payload["schema"] = KONDO_GATE_SCHEMA
+        payload["schema"] = schema
         payload["type"] = "KondoGateConfig"
         payload["backward_capacity"] = self.backward_capacity
         payload["delight_semantics"] = "advantage-times-action-surprisal"
-        payload["sparks_joy_semantics"] = "selected-for-backward-pass"
+        if schema == KONDO_GATE_SCHEMA:
+            payload["backward_admission_intent_semantics"] = (
+                _BACKWARD_ADMISSION_INTENT_SEMANTICS
+            )
+        elif schema == KONDO_GATE_LEGACY_V1_SCHEMA:
+            payload["sparks_joy_semantics"] = "selected-for-backward-pass"
+        else:  # pragma: no cover - private invariant
+            raise ValueError("unsupported Kondo gate config schema")
         payload["generic_gradient_quality_audit"] = False
         payload["wall_clock_savings_claimed"] = False
         return payload
 
+    def to_config(self) -> dict[str, object]:
+        """Emit only the canonical v2 backward-admission-intent surface."""
+        return self._to_config_for_schema(KONDO_GATE_SCHEMA)
+
     @classmethod
     def from_config(cls, payload: Mapping[str, object]) -> KondoGateConfig:
+        schema = payload.get("schema")
+        if type(schema) is not str:
+            raise ValueError("Kondo gate config schema is invalid")
+        if schema == KONDO_GATE_SCHEMA:
+            version = "v2"
+            semantic_field = "backward_admission_intent_semantics"
+            semantic_value = _BACKWARD_ADMISSION_INTENT_SEMANTICS
+        elif schema == KONDO_GATE_LEGACY_V1_SCHEMA:
+            version = "legacy v1"
+            semantic_field = "sparks_joy_semantics"
+            semantic_value = "selected-for-backward-pass"
+        else:
+            raise ValueError("Kondo gate config schema is invalid")
         expected = {
             "batch_size",
             "mode",
@@ -235,23 +271,23 @@ class KondoGateConfig:
             "type",
             "backward_capacity",
             "delight_semantics",
-            "sparks_joy_semantics",
+            semantic_field,
             "generic_gradient_quality_audit",
             "wall_clock_savings_claimed",
         }
         if set(payload) != expected:
-            raise ValueError("Kondo gate config fields do not match v1")
-        fixed = {
-            "schema": KONDO_GATE_SCHEMA,
+            raise ValueError(f"Kondo gate config fields do not match {version}")
+        fixed: dict[str, object] = {
+            "schema": schema,
             "type": "KondoGateConfig",
             "delight_semantics": "advantage-times-action-surprisal",
-            "sparks_joy_semantics": "selected-for-backward-pass",
+            semantic_field: semantic_value,
             "generic_gradient_quality_audit": False,
             "wall_clock_savings_claimed": False,
         }
         for name, value in fixed.items():
             if type(payload.get(name)) is not type(value) or payload.get(name) != value:
-                raise ValueError(f"Kondo gate {name} is invalid")
+                raise ValueError(f"Kondo gate {version} {name} is invalid")
         integer_fields = ("batch_size", "minimum_uniform_keep", "max_screenings")
         for name in integer_fields:
             if type(payload[name]) is not int:
@@ -279,14 +315,19 @@ class KondoGateConfig:
             payload["backward_capacity"] != result.backward_capacity
         ):
             raise ValueError("Kondo gate backward_capacity is noncanonical")
-        if result.to_config() != dict(payload):
+        if result._to_config_for_schema(schema) != dict(payload):
             raise ValueError("Kondo gate config is noncanonical")
         return result
 
 
 @chex.dataclass(frozen=True)
 class KondoGateState:
-    """RNG ownership and exact logical accounting for screening."""
+    """RNG ownership and exact logical accounting for forward screening.
+
+    ``sparse_batch_count`` and ``full_fallback_count`` are frozen checkpoint
+    fields counting the gate's planned screen outcomes. They do not certify
+    actor-backward execution; the consuming actor reports that boundary.
+    """
 
     rng_key: Array
     screen_count: Int[Array, ""]
@@ -326,9 +367,20 @@ class KondoGateResult:
     transaction_applied: Bool[Array, ""]
 
     @property
-    def sparks_joy(self) -> Bool[Array, " batch"]:
-        """Paper meaning: samples selected to receive a backward pass."""
+    def backward_admission_intent(self) -> Bool[Array, " batch"]:
+        """Forward plan for rows a caller may admit to an actor backward."""
         return self.selected_mask
+
+    @property
+    def sparks_joy(self) -> Bool[Array, " batch"]:
+        """Compatibility shorthand for :attr:`backward_admission_intent`.
+
+        This forward-only result does not establish that a gradient sparked
+        joy because it does not itself execute autodiff.  The
+        :mod:`kondo_sparse_actor` integration is the boundary that establishes
+        that the admitted rows entered an actual actor backward pass.
+        """
+        return self.backward_admission_intent
 
 
 @chex.dataclass(frozen=True)
@@ -632,8 +684,8 @@ class KondoGate:
         derived_finite = jnp.all(jnp.isfinite(candidate_delight))
         input_valid = base_input_valid & derived_finite
         transaction_allowed = state_valid & input_valid & capacity_available
-        action_surprisal = jnp.where(
-            transaction_allowed, candidate_surprisal, 0.0
+        action_surprisal = jax.lax.stop_gradient(
+            jnp.where(transaction_allowed, candidate_surprisal, 0.0)
         )
         delight = jax.lax.stop_gradient(
             jnp.where(transaction_allowed, candidate_delight, 0.0)
@@ -1179,8 +1231,11 @@ class KondoGate:
             source_indices=result.selected_indices,
         )
 
-    def checkpoint_payload(self, state: KondoGateState) -> dict[str, object]:
-        """Serialize a strict fixed-shape controller checkpoint."""
+    def _checkpoint_payload_for_schema(
+        self,
+        state: KondoGateState,
+        schema: str,
+    ) -> dict[str, object]:
         self._validate_state_static(state)
         if not bool(np.asarray(self._state_valid(state))):
             raise ValueError("Kondo gate state is invalid")
@@ -1189,9 +1244,9 @@ class KondoGate:
             return int(np.asarray(getattr(state, name)))
 
         return {
-            "schema": KONDO_GATE_SCHEMA,
+            "schema": schema,
             "type": "KondoGateCheckpoint",
-            "config": self.to_config(),
+            "config": self._config._to_config_for_schema(schema),
             "state": {
                 "rng_key_data": np.asarray(jr.key_data(state.rng_key), dtype=np.uint32).tolist(),
                 "screen_count": scalar("screen_count"),
@@ -1203,24 +1258,37 @@ class KondoGate:
             },
         }
 
+    def checkpoint_payload(self, state: KondoGateState) -> dict[str, object]:
+        """Serialize a strict canonical v2 fixed-shape controller checkpoint."""
+        return self._checkpoint_payload_for_schema(state, KONDO_GATE_SCHEMA)
+
     @classmethod
     def from_checkpoint_payload(
         cls,
         payload: Mapping[str, object],
     ) -> tuple[KondoGate, KondoGateState]:
-        """Restore only canonical v1 checkpoints."""
-        if set(payload) != {"schema", "type", "config", "state"}:
-            raise ValueError("Kondo checkpoint fields do not match v1")
-        if payload.get("schema") != KONDO_GATE_SCHEMA:
+        """Restore exact v2 or legacy-v1 checkpoints and normalize on emission."""
+        schema = payload.get("schema")
+        if type(schema) is not str:
             raise ValueError("Kondo checkpoint schema is invalid")
+        if schema == KONDO_GATE_SCHEMA:
+            version = "v2"
+        elif schema == KONDO_GATE_LEGACY_V1_SCHEMA:
+            version = "legacy v1"
+        else:
+            raise ValueError("Kondo checkpoint schema is invalid")
+        if set(payload) != {"schema", "type", "config", "state"}:
+            raise ValueError(f"Kondo checkpoint fields do not match {version}")
         if payload.get("type") != "KondoGateCheckpoint":
             raise ValueError("Kondo checkpoint type is invalid")
         config_payload = payload.get("config")
         state_payload = payload.get("state")
         if not isinstance(config_payload, Mapping) or not isinstance(state_payload, Mapping):
             raise ValueError("Kondo checkpoint config/state must be objects")
+        if config_payload.get("schema") != schema:
+            raise ValueError("Kondo checkpoint config schema does not match checkpoint")
         if set(state_payload) != _STATE_FIELDS:
-            raise ValueError("Kondo checkpoint state fields do not match v1")
+            raise ValueError(f"Kondo checkpoint state fields do not match {version}")
         key_data = state_payload.get("rng_key_data")
         if (
             not isinstance(key_data, list)
@@ -1252,12 +1320,13 @@ class KondoGate:
             sparse_batch_count=jnp.asarray(integer("sparse_batch_count"), dtype=jnp.int32),
             full_fallback_count=jnp.asarray(integer("full_fallback_count"), dtype=jnp.int32),
         )
-        if gate.checkpoint_payload(state) != dict(payload):
+        if gate._checkpoint_payload_for_schema(state, schema) != dict(payload):
             raise ValueError("Kondo checkpoint is noncanonical")
         return gate, state
 
 
 __all__ = [
+    "KONDO_GATE_LEGACY_V1_SCHEMA",
     "KONDO_GATE_SCHEMA",
     "KondoGate",
     "KondoGateConfig",

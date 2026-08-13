@@ -57,7 +57,8 @@ Key documents:
   `RESEARCH_REPORT_AGE_OF_EXPERIENCE.md` ·
   `outputs/ipmnist_screening/{RUNBOOK,FINAL_REPORT,AUDIT,CEILING_ANALYSIS,SOTA_LANDSCAPE_2026}.md`
 - Roadmap: `CONTINUAL_AGENT_IMPLEMENTATION_PLAN.md` (WP0–WP9, live — cited
-  from source docstrings)
+  from source docstrings) · `CONTINUAL_DYAD_BENCHMARK.md` (staged,
+  nonexecuting HCCL causal-core/HCCL-v1 design)
 - Frozen records: `CONTINUAL_AGENT_RESEARCH.md` (2026-07-30 audit snapshot) ·
   `FORAGER_COMPARATOR_AUDIT.md` · `FORAGER_ALBERTA_CANDIDATE_AUDIT.md` ·
   `RTU_TAYLOR_CORRECTION.md` · `NEGATIVE_RESULTS_LEDGER.md` ·
@@ -84,7 +85,7 @@ Always use the project venv:
 ```
 
 `addopts` defaults to `-v`; override with `-o addopts=""` for quiet runs.
-There are 16 console scripts — see `[project.scripts]` in `pyproject.toml`;
+There are 18 console scripts — see `[project.scripts]` in `pyproject.toml`;
 the ones you'll reach for are `alberta-evidence-status`,
 `alberta-forager-benchmark`, `alberta-foragax-open-screen`, and the
 `alberta-forager-matched-*` family. Benchmark executions happen through

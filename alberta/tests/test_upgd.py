@@ -1050,6 +1050,8 @@ class TestUpdateMetrics:
         cold = learner.update(state, obs, targets).state
         warm_state = state.replace(  # type: ignore[attr-defined]
             step_count=jnp.array(5, dtype=jnp.int32),
+            step_words=jnp.array([0, 5], dtype=jnp.uint32),
+            perturbation_phase=jnp.array(0, dtype=jnp.int32),
         )
         warm = learner.update(warm_state, obs, targets).state
 
@@ -1695,7 +1697,11 @@ class TestPerturbation:
         )
 
         # Force step_count >= 1 so perturbation actually fires.
-        state = state.replace(step_count=jnp.array(5, dtype=jnp.int32))  # type: ignore[attr-defined]
+        state = state.replace(  # type: ignore[attr-defined]
+            step_count=jnp.array(5, dtype=jnp.int32),
+            step_words=jnp.array([0, 5], dtype=jnp.uint32),
+            perturbation_phase=jnp.array(0, dtype=jnp.int32),
+        )
 
         # Save weights pre-perturb
         old_w = state.trunk_params.weights[0]
@@ -1731,7 +1737,11 @@ class TestPerturbation:
             utility_decay=0.999,
         )
         state = learner.init(feature_dim=4, key=jr.key(7))
-        state = state.replace(step_count=jnp.array(5, dtype=jnp.int32))  # type: ignore[attr-defined]
+        state = state.replace(  # type: ignore[attr-defined]
+            step_count=jnp.array(5, dtype=jnp.int32),
+            step_words=jnp.array([0, 5], dtype=jnp.uint32),
+            perturbation_phase=jnp.array(0, dtype=jnp.int32),
+        )
         old_w = state.trunk_params.weights[0]
 
         result = learner.update(state, jnp.zeros(4), jnp.array([0.0]))
@@ -1758,7 +1768,11 @@ class TestPerturbation:
             perturbation_ramp_steps=10,
         )
         state = full.init(feature_dim=4, key=jr.key(7))
-        state = state.replace(step_count=jnp.array(1, dtype=jnp.int32))  # type: ignore[attr-defined]
+        state = state.replace(  # type: ignore[attr-defined]
+            step_count=jnp.array(1, dtype=jnp.int32),
+            step_words=jnp.array([0, 1], dtype=jnp.uint32),
+            perturbation_phase=jnp.array(0, dtype=jnp.int32),
+        )
 
         full_result = full.update(state, jnp.zeros(4), jnp.array([0.0]))
         ramped_result = ramped.update(state, jnp.zeros(4), jnp.array([0.0]))

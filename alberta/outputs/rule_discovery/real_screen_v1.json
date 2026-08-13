@@ -1,0 +1,147 @@
+{
+ "bar": 0.864,
+ "confirm_200_task": {
+  "disc_r1_pscale_norms": {
+   "mean": 0.8652486449333333,
+   "per_seed": [
+    0.8653619790499999,
+    0.8653969784000001,
+    0.8649869773500001
+   ]
+  },
+  "sigma0_shiftnorm_d099": {
+   "mean": 0.86458564355,
+   "per_seed": [
+    0.86421297815,
+    0.8644149770000001,
+    0.8651289755
+   ]
+  }
+ },
+ "evidence_policy": {
+  "development_only": true,
+  "evidence_class": "development_screening_diagnostic",
+  "scientific_promotion_allowed": false
+ },
+ "paired_vs_champion_60_task": {
+  "disc_r1": {
+   "mean": -0.08024555127777777,
+   "per_seed": [
+    -0.07920999550000007,
+    -0.08199666233333336,
+    -0.07952999599999999
+   ]
+  },
+  "disc_r1_pscale": {
+   "mean": -0.04903555261111103,
+   "per_seed": [
+    -0.04984666383333336,
+    -0.04887666266666657,
+    -0.04838333133333328
+   ]
+  },
+  "disc_r1_pscale_norms": {
+   "mean": 0.0017333347777778174,
+   "per_seed": [
+    0.0023199991666665865,
+    0.0021566749999999413,
+    0.0007233301666667025
+   ]
+  },
+  "disc_r2": {
+   "mean": -0.1408277741666667,
+   "per_seed": [
+    -0.13963333266666678,
+    -0.14123999200000015,
+    -0.1416099978333334
+   ]
+  },
+  "disc_r3": {
+   "mean": -0.09056888411111108,
+   "per_seed": [
+    -0.08986000116666648,
+    -0.08993665483333335,
+    -0.09190999633333341
+   ]
+  }
+ },
+ "schema": "alberta.rule_discovery.real_screen.v1",
+ "screen_60_task": {
+  "disc_r1": {
+   "mean": 0.7837166482222222,
+   "per_seed": [
+    0.7843433168333332,
+    0.7821699781666667,
+    0.7846366496666667
+   ]
+  },
+  "disc_r1_pscale": {
+   "mean": 0.8149266468888889,
+   "per_seed": [
+    0.8137066485,
+    0.8152899778333335,
+    0.8157833143333334
+   ]
+  },
+  "disc_r1_pscale_norms": {
+   "mean": 0.8656955342777778,
+   "per_seed": [
+    0.8658733114999999,
+    0.8663233155,
+    0.8648899758333334
+   ]
+  },
+  "disc_r2": {
+   "mean": 0.7231344253333333,
+   "per_seed": [
+    0.7239199796666665,
+    0.7229266484999999,
+    0.7225566478333333
+   ]
+  },
+  "disc_r3": {
+   "mean": 0.7733933153888889,
+   "per_seed": [
+    0.7736933111666668,
+    0.7742299856666667,
+    0.7722566493333333
+   ]
+  },
+  "sgd_ema_norm_d099": {
+   "mean": 0.8616033112222222,
+   "per_seed": [
+    0.8620266458333333,
+    0.8619733123333332,
+    0.8608099755000002
+   ]
+  },
+  "sigma0_shiftnorm_d099": {
+   "mean": 0.8639621995,
+   "per_seed": [
+    0.8635533123333333,
+    0.8641666405,
+    0.8641666456666667
+   ]
+  },
+  "upgd_w_control": {
+   "mean": 0.7777588672222223,
+   "per_seed": [
+    0.7774766431666668,
+    0.7785599808333334,
+    0.7772399776666666
+   ]
+  }
+ },
+ "seeds": [
+  0,
+  1,
+  2
+ ],
+ "verdicts": {
+  "disc_r1_pscale": "hidden RMS at protocol scale costs ~-0.051 (transfer-killer isolated)",
+  "disc_r1_pscale_norms": "discovered structure (surprise budget replaces utility gate) at champion constants beats the champion on the 60-task screen (+0.00173, 3/3 seeds) and ties-to-slightly-beats at 200 tasks (+0.00066 paired, 2/3 seeds; screening claims nothing by itself)",
+  "disc_r1_verbatim": "below bar (0.78372); beats published UPGD-W control +0.006, no gate",
+  "disc_r2_verbatim": "below bar (0.72313)",
+  "disc_r3_verbatim": "below bar (0.77339)"
+ }
+}

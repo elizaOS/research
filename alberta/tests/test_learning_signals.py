@@ -15,8 +15,16 @@ import alberta_framework as alberta
 import alberta_framework.core as core
 from alberta_framework.core.checkpoints import load_checkpoint, save_checkpoint
 from alberta_framework.core.learning_signals import (
+    LEARNING_SIGNAL_LIFETIME_COUNTER_DELTA_NBYTES,
+    LEARNING_SIGNAL_LIFETIME_COUNTER_NBYTES,
+    LEARNING_SIGNAL_STATE_SCHEMA,
+    LearningSignalCounterStatus,
     LearningSignalEstimator,
     LearningSignalEstimatorConfig,
+    LearningSignalStateCounterStatus,
+    learning_signal_lifetime_counter_nbytes,
+    measure_learning_signal_state_nbytes,
+    migrate_legacy_learning_signal_state,
 )
 
 
@@ -27,6 +35,16 @@ def test_learning_signal_producer_is_publicly_exported() -> None:
         is core.LearningSignalEstimatorConfig
     )
     assert alberta.TypedLearningSignals is core.TypedLearningSignals
+    assert alberta.LearningSignalCounterStatus is LearningSignalCounterStatus
+    assert (
+        alberta.LearningSignalStateCounterStatus
+        is LearningSignalStateCounterStatus
+    )
+    assert alberta.LEARNING_SIGNAL_STATE_SCHEMA == LEARNING_SIGNAL_STATE_SCHEMA
+    assert (
+        alberta.learning_signal_lifetime_counter_nbytes
+        is learning_signal_lifetime_counter_nbytes
+    )
 
 
 def _estimator(**overrides: object) -> LearningSignalEstimator:
@@ -78,16 +96,23 @@ def test_config_roundtrip_validation_and_exact_resource_budget() -> None:
     assert budget.input_float_scalars_per_step == 2 * 3 * 2 + 2 + 1
     assert budget.persistent_float32_scalars == 5
     assert budget.persistent_int32_scalars == 4
-    assert budget.persistent_state_scalars == 9
-    assert budget.persistent_state_bytes == 36
+    assert budget.persistent_uint32_scalars == 6
+    assert budget.persistent_state_scalars == 15
+    assert budget.persistent_state_bytes == 60
     assert budget.output_float32_scalars == 8
-    assert budget.output_bool_scalars == 6
-    assert budget.output_logical_bytes == 38
+    assert budget.output_bool_scalars == 12
+    assert budget.output_logical_bytes == 92
     assert budget.trainable_scalars == 0
     json.dumps(budget.to_config())
+    estimator = LearningSignalEstimator(config)
+    assert measure_learning_signal_state_nbytes(estimator.init()) == 60
+    assert learning_signal_lifetime_counter_nbytes() == 36
+    assert LEARNING_SIGNAL_LIFETIME_COUNTER_NBYTES == 36
+    assert LEARNING_SIGNAL_LIFETIME_COUNTER_DELTA_NBYTES == 24
+    assert config.to_config()["state_schema"] == LEARNING_SIGNAL_STATE_SCHEMA
 
     with pytest.raises(ValueError, match="ensemble_size"):
-        LearningSignalEstimatorConfig(ensemble_size=1, target_dim=1)
+        LearningSignalEstimatorConfig(ensemble_size=0, target_dim=1)
     with pytest.raises(ValueError, match="target_dim"):
         LearningSignalEstimatorConfig(ensemble_size=2, target_dim=0)
     with pytest.raises(ValueError, match="smaller"):
@@ -121,6 +146,65 @@ def test_config_roundtrip_validation_and_exact_resource_budget() -> None:
         invalid_claim = config.to_config()
         invalid_claim["accepted_scientific_evidence"] = True
         LearningSignalEstimatorConfig.from_config(invalid_claim)
+    with pytest.raises(ValueError, match="state schema"):
+        missing_schema = config.to_config()
+        del missing_schema["state_schema"]
+        LearningSignalEstimatorConfig.from_config(missing_schema)
+
+
+def test_singleton_has_valid_non_epistemic_channels_and_exact_positive_zeros() -> None:
+    estimator = LearningSignalEstimator(
+        LearningSignalEstimatorConfig(
+            ensemble_size=1,
+            target_dim=2,
+            fast_loss_decay=0.0,
+            slow_loss_decay=0.5,
+            progress_warmup_steps=2,
+            change_calibration_steps=2,
+        )
+    )
+    state = estimator.init()
+    means = jnp.asarray([[2.0, -3.0]], dtype=jnp.float32)
+    variances = jnp.asarray([[4.0, 9.0]], dtype=jnp.float32)
+    target = jnp.asarray([1.0, -1.0], dtype=jnp.float32)
+
+    state, first = estimator.observe(
+        state,
+        means,
+        variances,
+        target,
+        jnp.asarray(5.0, dtype=jnp.float32),
+    )
+    for value in (first.epistemic_disagreement, first.epistemic_surprise):
+        assert value.dtype == jnp.float32
+        np.testing.assert_array_equal(
+            jax.lax.bitcast_convert_type(value, jnp.uint32),
+            jnp.asarray(0, dtype=jnp.uint32),
+        )
+    assert bool(first.availability.input_valid)
+    assert not bool(first.availability.epistemic)
+    assert bool(first.availability.aleatoric)
+    assert bool(first.availability.normalized_residual)
+    assert not bool(first.availability.learning_progress)
+    chex.assert_trees_all_close(first.aleatoric_uncertainty, 6.5)
+    chex.assert_trees_all_close(first.normalized_residual, (0.25 + 4.0 / 9.0) / 2.0)
+    np.testing.assert_array_equal(first.counter_status.pre_step_words, [0, 0])
+    np.testing.assert_array_equal(first.counter_status.post_step_words, [0, 1])
+    np.testing.assert_array_equal(first.counter_status.post_valid_words, [0, 1])
+    assert bool(first.counter_status.valid_event_recorded)
+
+    state, second = estimator.observe(
+        state,
+        means,
+        variances,
+        target,
+        jnp.asarray(1.0, dtype=jnp.float32),
+    )
+    assert not bool(second.availability.epistemic)
+    assert bool(second.availability.learning_progress)
+    chex.assert_trees_all_close(second.learning_progress, 2.0)
+    np.testing.assert_array_equal(state.step_words, [0, 2])
+    np.testing.assert_array_equal(state.valid_words, [0, 2])
 
 
 def test_hand_calculation_preserves_units_and_causal_progress() -> None:
@@ -151,6 +235,12 @@ def test_hand_calculation_preserves_units_and_causal_progress() -> None:
     assert bool(first.availability.normalized_residual)
     assert not bool(first.availability.learning_progress)
     chex.assert_trees_all_close(first.learning_progress, 0.0)
+    np.testing.assert_array_equal(first.counter_status.pre_step_words, [0, 0])
+    np.testing.assert_array_equal(first.counter_status.post_step_words, [0, 1])
+    np.testing.assert_array_equal(first.counter_status.post_valid_words, [0, 1])
+    np.testing.assert_array_equal(first.counter_status.post_invalid_words, [0, 0])
+    assert bool(first.counter_status.valid_event_recorded)
+    assert not bool(first.counter_status.invalid_event_recorded)
 
     state, second = estimator.observe(state, means, variances, target, 0.0)
     # Fast loss is 0, slow loss is 5: progress is +5 observed-loss units.
@@ -275,6 +365,11 @@ def test_warmup_flags_and_invalid_inputs_fail_closed_without_poisoning_state() -
     assert int(state.step_count) == int(before.step_count) + 1
     assert int(state.invalid_count) == int(before.invalid_count) + 1
     assert int(state.valid_count) == int(before.valid_count)
+    np.testing.assert_array_equal(state.step_words, [0, 2])
+    np.testing.assert_array_equal(state.valid_words, [0, 1])
+    np.testing.assert_array_equal(state.invalid_words, [0, 1])
+    assert bool(invalid.counter_status.invalid_event_recorded)
+    assert not bool(invalid.counter_status.valid_event_recorded)
     chex.assert_trees_all_close(state.calibration_mean, before.calibration_mean)
     chex.assert_trees_all_close(state.fast_loss_ema, before.fast_loss_ema)
 
@@ -298,13 +393,15 @@ def test_warmup_flags_and_invalid_inputs_fail_closed_without_poisoning_state() -
     chex.assert_trees_all_equal(returned_corrupt_state, corrupt_state)
 
 
-def test_lifetime_counters_saturate_without_wraparound() -> None:
+def test_exact_lifetime_identity_continues_after_telemetry_saturates() -> None:
     estimator = _estimator(change_calibration_steps=4)
     maximum = 2_147_483_647
     near_limit = replace(
         estimator.init(),
         step_count=jnp.asarray(maximum - 1, dtype=jnp.int32),
         valid_count=jnp.asarray(maximum - 1, dtype=jnp.int32),
+        step_words=jnp.asarray((0, maximum - 1), dtype=jnp.uint32),
+        valid_words=jnp.asarray((0, maximum - 1), dtype=jnp.uint32),
         calibration_count=jnp.asarray(4, dtype=jnp.int32),
     )
 
@@ -312,8 +409,10 @@ def test_lifetime_counters_saturate_without_wraparound() -> None:
     assert bool(signal.availability.input_valid)
     assert int(saturated.step_count) == maximum
     assert int(saturated.valid_count) == maximum
+    np.testing.assert_array_equal(saturated.step_words, [0, maximum])
+    np.testing.assert_array_equal(saturated.valid_words, [0, maximum])
 
-    still_saturated, _ = estimator.observe(
+    still_saturated, invalid_signal = estimator.observe(
         saturated,
         jnp.asarray([[jnp.nan], [0.0]], dtype=jnp.float32),
         jnp.ones((2, 1), dtype=jnp.float32),
@@ -323,6 +422,95 @@ def test_lifetime_counters_saturate_without_wraparound() -> None:
     assert int(still_saturated.step_count) == maximum
     assert int(still_saturated.valid_count) == maximum
     assert int(still_saturated.invalid_count) == 1
+    np.testing.assert_array_equal(still_saturated.step_words, [0, maximum + 1])
+    np.testing.assert_array_equal(still_saturated.valid_words, [0, maximum])
+    np.testing.assert_array_equal(still_saturated.invalid_words, [0, 1])
+    assert bool(invalid_signal.counter_status.invalid_event_recorded)
+
+
+def test_exact_lifetime_words_roll_over_under_jitted_scan() -> None:
+    estimator = _estimator(change_calibration_steps=4)
+    maximum_u32 = 2**32 - 1
+    maximum_i32 = 2_147_483_647
+    near_rollover = replace(
+        estimator.init(),
+        step_count=jnp.asarray(maximum_i32, dtype=jnp.int32),
+        valid_count=jnp.asarray(maximum_i32, dtype=jnp.int32),
+        step_words=jnp.asarray((0, maximum_u32), dtype=jnp.uint32),
+        valid_words=jnp.asarray((0, maximum_u32), dtype=jnp.uint32),
+        calibration_count=jnp.asarray(4, dtype=jnp.int32),
+    )
+    means = jnp.zeros((2, 2, 1), dtype=jnp.float32)
+    variances = jnp.ones_like(means)
+    targets = jnp.ones((2, 1), dtype=jnp.float32)
+    losses = jnp.ones((2,), dtype=jnp.float32)
+
+    final_state, signals = jax.jit(estimator.scan)(
+        near_rollover,
+        means,
+        variances,
+        targets,
+        losses,
+    )
+
+    np.testing.assert_array_equal(final_state.step_words, [1, 1])
+    np.testing.assert_array_equal(final_state.valid_words, [1, 1])
+    np.testing.assert_array_equal(final_state.invalid_words, [0, 0])
+    np.testing.assert_array_equal(signals.counter_status.post_step_words[0], [1, 0])
+    assert bool(jnp.all(signals.counter_status.valid_event_recorded))
+
+
+def test_corrupt_or_exhausted_exact_lifetime_clock_fails_atomically() -> None:
+    estimator = _estimator(change_calibration_steps=4)
+    state, _ = _observe_scalar(estimator, estimator.init())
+    corrupt = replace(
+        state,
+        invalid_words=jnp.asarray((0, 1), dtype=jnp.uint32),
+    )
+    returned, corrupt_signal = _observe_scalar(estimator, corrupt)
+    chex.assert_trees_all_equal(returned, corrupt)
+    assert not bool(corrupt_signal.counter_status.state_valid)
+    assert not bool(corrupt_signal.counter_status.event_recorded)
+    assert not bool(corrupt_signal.availability.input_valid)
+
+    maximum_i32 = 2_147_483_647
+    maximum_u32 = 2**32 - 1
+    exhausted = replace(
+        estimator.init(),
+        step_count=jnp.asarray(maximum_i32, dtype=jnp.int32),
+        valid_count=jnp.asarray(maximum_i32, dtype=jnp.int32),
+        step_words=jnp.asarray((maximum_u32, maximum_u32), dtype=jnp.uint32),
+        valid_words=jnp.asarray((maximum_u32, maximum_u32), dtype=jnp.uint32),
+        calibration_count=jnp.asarray(4, dtype=jnp.int32),
+    )
+    returned, exhausted_signal = _observe_scalar(estimator, exhausted)
+    chex.assert_trees_all_equal(returned, exhausted)
+    assert bool(exhausted_signal.counter_status.state_valid)
+    assert not bool(exhausted_signal.counter_status.lifetime_capacity_available)
+    assert not bool(exhausted_signal.counter_status.event_recorded)
+    assert not bool(exhausted_signal.availability.input_valid)
+
+
+def test_legacy_lifetime_migration_is_exact_and_fail_closed() -> None:
+    estimator = _estimator()
+    current, _ = _observe_scalar(estimator, estimator.init())
+    legacy = {
+        name: getattr(current, name)
+        for name in current.__dataclass_fields__
+        if name not in {"step_words", "valid_words", "invalid_words"}
+    }
+    migrated = migrate_legacy_learning_signal_state(legacy)
+    chex.assert_trees_all_equal(migrated, current)
+
+    saturated = dict(legacy)
+    saturated["step_count"] = jnp.asarray(2_147_483_647, dtype=jnp.int32)
+    with pytest.raises(ValueError, match="ambiguous"):
+        migrate_legacy_learning_signal_state(saturated)
+
+    misaligned = dict(legacy)
+    misaligned["invalid_count"] = jnp.asarray(1, dtype=jnp.int32)
+    with pytest.raises(ValueError, match="not aligned"):
+        migrate_legacy_learning_signal_state(misaligned)
 
 
 def test_shape_and_dtype_validation_is_strict() -> None:
@@ -385,9 +573,10 @@ def test_jit_scan_parity_and_fixed_output_shapes() -> None:
     chex.assert_trees_all_close(eager_state, jit_state)
     chex.assert_trees_all_close(eager_signals, jit_signals)
 
-    for value in jax.tree_util.tree_leaves(eager_signals):
-        assert value.shape == (num_steps,)
-    assert len(jax.tree_util.tree_leaves(eager_signals)) == 14
+    leaves = jax.tree_util.tree_leaves(eager_signals)
+    assert sum(value.shape == (num_steps, 2) for value in leaves) == 6
+    assert all(value.shape in {(num_steps,), (num_steps, 2)} for value in leaves)
+    assert len(leaves) == 26
 
 
 def test_checkpoint_resume_matches_uninterrupted_scan(tmp_path) -> None:

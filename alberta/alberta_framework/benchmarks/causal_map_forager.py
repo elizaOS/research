@@ -50,6 +50,8 @@ from alberta_framework.benchmarks.forager import (
     _finalize_reward_trace_sinks,
     _fov_last_tenth_ema_auc,
     _unadjusted_ema_chunk,
+    _validated_explicit_agent_seeds,
+    _with_explicit_agent_seed_metadata,
     environment_rng_schedule_sha256,
     forager_metric_contract,
 )
@@ -113,6 +115,36 @@ def _causal_map_environment_key(seed: int | Array) -> Array:
     if _prng_impl_name(key) != _CAUSAL_MAP_ENVIRONMENT_PRNG_IMPL:
         raise RuntimeError("causal-map environment PRNG implementation mismatch")
     return key
+
+
+def _causal_map_agent_key(seed: int | Array) -> Array:
+    """Return the causal-map policy root in its isolated namespace."""
+    return jr.fold_in(
+        jr.key(seed, impl=_CAUSAL_MAP_PRNG_IMPL),
+        _CAUSAL_MAP_RNG_NAMESPACE,
+    )
+
+
+@dataclass(frozen=True)
+class _CausalMapLaneSeedRoots:
+    """Independent environment and causal-map roots for one lane."""
+
+    environment: Array
+    agent_seed: Array
+    agent: Array
+
+
+def _causal_map_lane_seed_roots(
+    environment_seed: int | Array,
+    agent_seed: int | Array,
+) -> _CausalMapLaneSeedRoots:
+    """Derive each causal-map lane root from its explicitly assigned seed."""
+    validated_agent_seed = _validated_seed(agent_seed)
+    return _CausalMapLaneSeedRoots(
+        environment=_causal_map_environment_key(environment_seed),
+        agent_seed=validated_agent_seed,
+        agent=_causal_map_agent_key(validated_agent_seed),
+    )
 
 
 @dataclass(frozen=True)
@@ -746,10 +778,7 @@ def _empty_state(
         last_target_channel=jnp.asarray(-1, dtype=jnp.int32),
         last_target_position=jnp.zeros((2,), dtype=jnp.int32),
         last_target_expected_active=jnp.asarray(False),
-        rng_key=jr.fold_in(
-            jr.key(seed, impl=_CAUSAL_MAP_PRNG_IMPL),
-            _CAUSAL_MAP_RNG_NAMESPACE,
-        ),
+        rng_key=_causal_map_agent_key(seed),
         jax_threefry_partitionable=jnp.asarray(
             _threefry_partitionable_mode(),
             dtype=jnp.bool_,
@@ -3220,6 +3249,7 @@ def _build_causal_map_result(
     agent_config: CausalMapForagerConfig,
     cfg: ForagerBenchmarkConfig,
     seeds: tuple[int, ...],
+    agent_seeds: tuple[int, ...] | None,
     mode: ForagerBatchMode,
     seed: int,
     lane_metrics: _LaneMetrics,
@@ -3385,6 +3415,9 @@ def _build_causal_map_result(
             "pure per-lane map transition; vmap and lax.map trajectories are exact"
         ),
     }
+    if agent_seeds is not None:
+        metadata["runner"]["batch_agent_seeds"] = list(agent_seeds)
+        metadata["runner"]["seed_pairing"] = "lane_index"
     if trace_metadata is not None:
         metadata["raw_metric_trace"] = dict(trace_metadata)
     return ForagerRunResult(
@@ -3427,8 +3460,16 @@ def _run_causal_map_lanes(
     *,
     mode: ForagerBatchMode,
     reward_trace_sink_factory: ForagerRewardTraceSinkFactory | None = None,
+    agent_seeds: tuple[int, ...] | None = None,
 ) -> tuple[tuple[ForagerRunResult, ...], CausalMapForagerState | None]:
     _validate_benchmark_contract(agent_config, benchmark_config)
+    ordered_agent_seeds = _validated_explicit_agent_seeds(
+        agent_seeds,
+        lane_count=len(seeds),
+    )
+    effective_agent_seeds = (
+        seeds if ordered_agent_seeds is None else ordered_agent_seeds
+    )
     cfg = benchmark_config
     trace_sinks = _create_reward_trace_sinks(
         reward_trace_sink_factory,
@@ -3440,17 +3481,37 @@ def _run_causal_map_lanes(
         env, params = cfg.environment.make()
         seed_values = jnp.asarray(seeds, dtype=jnp.uint32)
 
-        def init_one(
-            seed: Array,
+        def init_lane(
+            environment_seed: Array,
+            agent_seed: Array,
         ) -> tuple[Any, Array, CausalMapForagerState, Array]:
-            env_key = _causal_map_environment_key(seed)
+            roots = _causal_map_lane_seed_roots(environment_seed, agent_seed)
+            env_key = roots.environment
             env_key, reset_key = jr.split(env_key)
             observation, env_state = env.reset(reset_key, params)
-            agent_state, action = causal_map_start(observation, agent_config, seed)
+            agent_state, action = causal_map_start(
+                observation,
+                agent_config,
+                roots.agent_seed,
+            )
             return env_state, env_key, agent_state, action
 
-        initialize = jax.jit(jax.vmap(init_one))
-        carry = initialize(seed_values)
+        if ordered_agent_seeds is None:
+
+            def init_one(
+                environment_seed: Array,
+            ) -> tuple[Any, Array, CausalMapForagerState, Array]:
+                return init_lane(environment_seed, environment_seed)
+
+            initialize = jax.jit(jax.vmap(init_one))
+            carry = initialize(seed_values)
+        else:
+            agent_seed_values = jnp.asarray(
+                ordered_agent_seeds,
+                dtype=jnp.uint32,
+            )
+            initialize = jax.jit(jax.vmap(init_lane))
+            carry = initialize(seed_values, agent_seed_values)
         jax.block_until_ready(carry)  # type: ignore[no-untyped-call]
         seed_chunk = _make_scan_chunk(env, params, agent_config, cfg)
         if mode == "vmap":
@@ -3542,9 +3603,10 @@ def _run_causal_map_lanes(
                 raise ValueError(
                     "causal-map final state step_count does not match requested horizon"
                 )
-            if int(lane_state.initial_seed) != seeds[lane]:
+            if int(lane_state.initial_seed) != effective_agent_seeds[lane]:
                 raise ValueError(
-                    "causal-map final state initial_seed does not match requested lane"
+                    "causal-map final state initial_seed does not match requested "
+                    "lane agent seed"
                 )
             validated_lane_states.append(lane_state)
         bound_partitionable_modes = {
@@ -3561,10 +3623,25 @@ def _run_causal_map_lanes(
         raise
     try:
         base_metadata_by_lane: list[Mapping[str, Any]] = []
-        for seed in seeds:
-            base_metadata = dict(
-                CausalMapForagerAgent(agent_config, seed=seed).metadata()
-            )
+        for lane, seed in enumerate(seeds):
+            agent_seed = effective_agent_seeds[lane]
+            raw_metadata = CausalMapForagerAgent(
+                agent_config,
+                seed=agent_seed,
+            ).metadata()
+            if ordered_agent_seeds is None:
+                base_metadata = dict(raw_metadata)
+            else:
+                base_metadata = _with_explicit_agent_seed_metadata(
+                    raw_metadata,
+                    environment_seed=seed,
+                    agent_seed=agent_seed,
+                    lane_index=lane,
+                    agent_root_uses=(
+                        "causal_map_start",
+                        "causal_map_state_rng",
+                    ),
+                )
             base_metadata["jax_threefry_partitionable"] = (
                 bound_partitionable_mode
             )
@@ -3580,6 +3657,7 @@ def _run_causal_map_lanes(
                 agent_config=agent_config,
                 cfg=cfg,
                 seeds=seeds,
+                agent_seeds=ordered_agent_seeds,
                 mode=mode,
                 seed=seed,
                 lane_metrics=lane_metrics,
@@ -3633,10 +3711,11 @@ def run_causal_map_forager_seeds(
     benchmark_config: ForagerBenchmarkConfig,
     seeds: Sequence[int],
     *,
+    agent_seeds: Sequence[int] | None = None,
     mode: ForagerBatchMode = "vmap",
     reward_trace_sink_factory: ForagerRewardTraceSinkFactory | None = None,
 ) -> tuple[ForagerRunResult, ...]:
-    """Run unique seeds with one compiled executable and bounded host memory."""
+    """Run unique environment seeds with optional lane-paired agent seeds."""
     if not isinstance(agent_config, CausalMapForagerConfig):
         raise TypeError("agent_config must be a CausalMapForagerConfig")
     if not isinstance(benchmark_config, ForagerBenchmarkConfig):
@@ -3654,6 +3733,10 @@ def run_causal_map_forager_seeds(
         raise ValueError("seeds must be unique")
     if any(seed < 0 or seed > np.iinfo(np.uint32).max for seed in ordered):
         raise ValueError("seeds must be uint32-compatible non-negative integers")
+    ordered_agent_seeds = _validated_explicit_agent_seeds(
+        agent_seeds,
+        lane_count=len(ordered),
+    )
     if mode not in ("vmap", "strict"):
         raise ValueError("mode must be 'vmap' or 'strict'")
     results, _ = _run_causal_map_lanes(
@@ -3662,6 +3745,7 @@ def run_causal_map_forager_seeds(
         ordered,
         mode=mode,
         reward_trace_sink_factory=reward_trace_sink_factory,
+        agent_seeds=ordered_agent_seeds,
     )
     return results
 

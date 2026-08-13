@@ -611,3 +611,1300 @@ class CanonicalUPGD:
                 "nonfinite_or_missing_count": nonfinite_count,
             },
         )
+
+
+# This Alberta-derived transform was introduced separately from the official RL
+# AdaptiveUPGD profile implemented below and remains intentionally distinct.  It
+# extends the numerically guarded first-order UPGD equations above with an
+# Adam/RMSProp-style gradient second moment and applies that same denominator to
+# both the ordinary direction and the perturbation.  The released implementation
+# instead tracks a first moment, leaves noise outside the denominator, uses a raw
+# utility-EMA maximum, and applies a two-alpha direction.  Keeping separate types
+# prevents either set of semantics from changing CanonicalUPGD or each other.
+AlbertaAdaUPGDProfile = Literal["alberta_derived_first_order_adaptive_v1"]
+ALBERTA_ADAUPGD_PROFILE: AlbertaAdaUPGDProfile = (
+    "alberta_derived_first_order_adaptive_v1"
+)
+
+_INT32_MAX = 2**31 - 1
+
+
+@dataclass(frozen=True)
+class AlbertaAdaUPGDConfig:
+    """Configuration for the opt-in Alberta-derived adaptive UPGD transform.
+
+    This is not claimed to reproduce the pinned official AdaUPGD variant from
+    Elsayed and Mahmood.  It deliberately keeps the guarded first-order signed
+    utility, normalization, sigmoid gate, protecting and non-protecting
+    directions, and decoupled UPGD-W decay from :class:`CanonicalUPGD`, then
+    divides gradient and perturbation directions by a bias-corrected
+    per-parameter gradient second moment:
+
+    ``v_t = beta_2 v_(t-1) + (1-beta_2) g_t^2``
+
+    ``d_t = sqrt(v_t / (1-beta_2^t)) + epsilon``.
+
+    In protecting mode the direction is ``(g + xi) / d * (1-gate)``.  In
+    non-protecting mode it is ``g/d + xi/d * (1-gate)``.  Decoupled weight
+    decay remains ``(1-alpha*weight_decay)*w`` and is never divided by ``d``.
+
+    A parameter mask selects where UPGD utility protection and perturbation
+    apply.  A false mask does *not* freeze a parameter: it receives ordinary
+    adaptive gradient descent and decoupled decay.  Its utility trace and age
+    pause, while its second moment continues to update.  Missing or non-finite
+    gradients reject the complete transaction even under a false mask because
+    the adaptive base update still owns those gradients.
+    """
+
+    profile: AlbertaAdaUPGDProfile = ALBERTA_ADAUPGD_PROFILE
+    step_size: float = 1e-3
+    utility_decay: float = 0.999
+    second_moment_decay: float = 0.999
+    noise_std: float = 1e-3
+    weight_decay: float = 0.0
+    mode: UPGDMode = "protecting"
+    normalization: UPGDNormalization = "global"
+    epsilon: float = 1e-8
+
+    def __post_init__(self) -> None:
+        if self.profile != ALBERTA_ADAUPGD_PROFILE:
+            raise ValueError(
+                "profile must be the explicit Alberta-derived AdaUPGD profile"
+            )
+        for name in (
+            "step_size",
+            "utility_decay",
+            "second_moment_decay",
+            "noise_std",
+            "weight_decay",
+            "epsilon",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"{name} must be a real number, not boolean")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
+        if self.step_size <= 0.0:
+            raise ValueError("step_size must be positive")
+        if not 0.0 <= self.utility_decay < 1.0:
+            raise ValueError("utility_decay must be in [0, 1)")
+        if not 0.0 <= self.second_moment_decay < 1.0:
+            raise ValueError("second_moment_decay must be in [0, 1)")
+        if self.noise_std < 0.0:
+            raise ValueError("noise_std must be non-negative")
+        if self.weight_decay < 0.0:
+            raise ValueError("weight_decay must be non-negative")
+        if self.mode not in {"protecting", "non_protecting"}:
+            raise ValueError("mode must be 'protecting' or 'non_protecting'")
+        if self.normalization not in {"global", "local"}:
+            raise ValueError("normalization must be 'global' or 'local'")
+        if self.epsilon <= 0.0:
+            raise ValueError("epsilon must be positive")
+        # Config constants participate in float32 arithmetic.  Reject silent
+        # overflow while preserving ordinary Python numeric spellings.
+        for name in (
+            "step_size",
+            "utility_decay",
+            "second_moment_decay",
+            "noise_std",
+            "weight_decay",
+            "epsilon",
+        ):
+            narrowed = jnp.asarray(getattr(self, name), dtype=jnp.float32)
+            if not bool(jnp.isfinite(narrowed)):
+                raise ValueError(f"{name} must be finite in float32")
+            if float(getattr(self, name)) != 0.0 and float(narrowed) == 0.0:
+                raise ValueError(f"{name} must not underflow in float32")
+
+    @property
+    def official_reference_parity(self) -> bool:
+        """Whether this profile claims parity with the released AdaUPGD code."""
+
+        return False
+
+    @property
+    def source_attribution(self) -> str:
+        """Return the non-reference provenance attached to this equation."""
+
+        return (
+            "Alberta-derived adaptive extension of canonical first-order UPGD; "
+            "not the pinned official AdaUPGD parity profile"
+        )
+
+    def to_config(self) -> dict[str, object]:
+        """Return the complete, strict JSON-compatible configuration."""
+
+        return {
+            "type": "AlbertaAdaUPGD",
+            "profile": self.profile,
+            "step_size": self.step_size,
+            "utility_decay": self.utility_decay,
+            "second_moment_decay": self.second_moment_decay,
+            "noise_std": self.noise_std,
+            "weight_decay": self.weight_decay,
+            "mode": self.mode,
+            "normalization": self.normalization,
+            "epsilon": self.epsilon,
+        }
+
+    @classmethod
+    def from_config(cls, config: dict[str, object]) -> AlbertaAdaUPGDConfig:
+        """Strictly reconstruct the adaptive extension configuration."""
+
+        if type(config) is not dict:
+            raise TypeError("AlbertaAdaUPGD config must be an exact dict")
+        payload = dict(config)
+        expected = {
+            "type",
+            "profile",
+            "step_size",
+            "utility_decay",
+            "second_moment_decay",
+            "noise_std",
+            "weight_decay",
+            "mode",
+            "normalization",
+            "epsilon",
+        }
+        if set(payload) != expected:
+            raise ValueError("config fields do not match the AlbertaAdaUPGD schema")
+        type_name = payload.pop("type")
+        if type_name != "AlbertaAdaUPGD":
+            raise ValueError(f"expected AlbertaAdaUPGD config, got {type_name!r}")
+        return cls(**payload)  # type: ignore[arg-type]
+
+
+@chex.dataclass(frozen=True)
+class AlbertaAdaUPGDState:
+    """Persistent state owned by :class:`AlbertaAdaUPGD`."""
+
+    utility_ema: Any
+    utility_age: Any
+    gradient_second_moment: Any
+    step: Int[Array, ""]
+
+
+@chex.dataclass(frozen=True)
+class AlbertaAdaUPGDUpdate:
+    """Atomic result of one adaptive UPGD proposal and commit attempt."""
+
+    params: Any
+    state: AlbertaAdaUPGDState
+    next_key: Array
+    accepted: Array
+    scaled_utility: Any
+    corrected_utility: Any
+    adaptive_denominator: Any
+    perturbation: Any
+    metrics: dict[str, Array]
+
+
+@dataclass(frozen=True)
+class AlbertaAdaUPGDResources:
+    """Exact persistent-array accounting for one adaptive optimizer state."""
+
+    profile: str
+    official_reference_parity: bool
+    parameter_count: int
+    persistent_array_count: int
+    persistent_state_nbytes: int
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-compatible resource record."""
+
+        return {
+            "profile": self.profile,
+            "official_reference_parity": self.official_reference_parity,
+            "parameter_count": self.parameter_count,
+            "persistent_array_count": self.persistent_array_count,
+            "persistent_state_nbytes": self.persistent_state_nbytes,
+        }
+
+
+def _adaupgd_typed_threefry_key(value: object, *, name: str) -> Array:
+    """Require one typed scalar Threefry key without accepting legacy words."""
+
+    try:
+        key = jnp.asarray(value)
+        implementation = str(jr.key_impl(value))  # type: ignore[arg-type]
+        words = jr.key_data(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{name} must be a typed scalar threefry2x32 key") from exc
+    if (
+        key.shape != ()
+        or implementation != "threefry2x32"
+        or words.shape != (2,)
+        or words.dtype != jnp.uint32
+    ):
+        raise TypeError(f"{name} must be a typed scalar threefry2x32 key")
+    return key
+
+
+def _adaupgd_tree_array_nbytes(tree: Any) -> int:
+    return sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree.leaves(tree)
+        if hasattr(leaf, "size") and hasattr(leaf, "dtype")
+    )
+
+
+def measure_alberta_adaupgd_state_nbytes(state: AlbertaAdaUPGDState) -> int:
+    """Measure every persistent JAX-array byte in an adaptive UPGD state."""
+
+    return _adaupgd_tree_array_nbytes(state)
+
+
+def _adaupgd_select_tree(condition: Array, candidate: Any, fallback: Any) -> Any:
+    """Select a complete same-structure array PyTree with one scalar condition."""
+
+    return jax.tree.map(
+        lambda new, old: jnp.where(condition, new, old),
+        candidate,
+        fallback,
+    )
+
+
+class AlbertaAdaUPGD:
+    """Opt-in, functional Alberta-derived adaptive first-order UPGD.
+
+    The update is JIT/scan compatible.  Structural contract violations raise
+    before arithmetic.  Dynamic numeric failures (invalid state, missing or
+    non-finite gradients, non-finite noise, counter exhaustion, or a non-finite
+    candidate) reject atomically: parameters, state, and key all retain their
+    input values and diagnostic output trees are zeroed.
+    """
+
+    def __init__(self, config: AlbertaAdaUPGDConfig | None = None):
+        self._config = AlbertaAdaUPGDConfig() if config is None else config
+
+    @property
+    def config(self) -> AlbertaAdaUPGDConfig:
+        """Return the immutable optimizer configuration."""
+
+        return self._config
+
+    def to_config(self) -> dict[str, object]:
+        """Serialize the exact optimizer configuration."""
+
+        return self._config.to_config()
+
+    @classmethod
+    def from_config(cls, config: dict[str, object]) -> AlbertaAdaUPGD:
+        """Reconstruct the optimizer from its strict configuration."""
+
+        return cls(AlbertaAdaUPGDConfig.from_config(config))
+
+    @staticmethod
+    def _parameter_contract(params: Any) -> tuple[list[Array], jax.tree_util.PyTreeDef]:
+        leaves, structure = _flatten_with_none(params)
+        if not leaves or any(value is None for value in leaves):
+            raise ValueError("params must contain at least one array leaf")
+        arrays: list[Array] = []
+        for value in leaves:
+            array = jnp.asarray(value)
+            if not jnp.issubdtype(array.dtype, jnp.floating):
+                raise ValueError("AlbertaAdaUPGD parameters must have floating-point dtype")
+            arrays.append(array)
+        return arrays, structure
+
+    @staticmethod
+    def _state_contract(
+        state: AlbertaAdaUPGDState,
+        params: Any,
+    ) -> tuple[
+        list[Array],
+        list[Array],
+        list[Array],
+        list[Array],
+        jax.tree_util.PyTreeDef,
+    ]:
+        if not isinstance(state, AlbertaAdaUPGDState):
+            raise TypeError("state must be an AlbertaAdaUPGDState")
+        param_leaves, structure = AlbertaAdaUPGD._parameter_contract(params)
+        utility_leaves, utility_structure = _flatten_with_none(state.utility_ema)
+        age_leaves, age_structure = _flatten_with_none(state.utility_age)
+        moment_leaves, moment_structure = _flatten_with_none(
+            state.gradient_second_moment
+        )
+        if not (
+            structure == utility_structure == age_structure == moment_structure
+        ):
+            raise ValueError("params and AlbertaAdaUPGD state must share a PyTree structure")
+        utilities: list[Array] = []
+        ages: list[Array] = []
+        moments: list[Array] = []
+        for param, utility, age, moment in zip(
+            param_leaves,
+            utility_leaves,
+            age_leaves,
+            moment_leaves,
+            strict=True,
+        ):
+            utility_array = jnp.asarray(utility)
+            age_array = jnp.asarray(age)
+            moment_array = jnp.asarray(moment)
+            if utility_array.shape != param.shape or moment_array.shape != param.shape:
+                raise ValueError("every adaptive state leaf must match its parameter shape")
+            if age_array.shape != param.shape:
+                raise ValueError("every utility-age leaf must match its parameter shape")
+            if utility_array.dtype != param.dtype or moment_array.dtype != param.dtype:
+                raise TypeError("utility and second-moment dtypes must match parameters")
+            if age_array.dtype != jnp.int32:
+                raise TypeError("utility-age leaves must have int32 dtype")
+            utilities.append(utility_array)
+            ages.append(age_array)
+            moments.append(moment_array)
+        step = jnp.asarray(state.step)
+        if step.shape != () or step.dtype != jnp.int32:
+            raise TypeError("state.step must be one scalar int32 array")
+        return param_leaves, utilities, ages, moments, structure
+
+    def init(self, params: Any) -> AlbertaAdaUPGDState:
+        """Initialize utility and adaptive second-moment traces."""
+
+        self._parameter_contract(params)
+        return AlbertaAdaUPGDState(  # type: ignore[call-arg]
+            utility_ema=jax.tree.map(jnp.zeros_like, params),
+            utility_age=jax.tree.map(
+                lambda value: jnp.zeros(jnp.asarray(value).shape, dtype=jnp.int32),
+                params,
+            ),
+            gradient_second_moment=jax.tree.map(jnp.zeros_like, params),
+            step=jnp.asarray(0, dtype=jnp.int32),
+        )
+
+    def state_valid(self, state: AlbertaAdaUPGDState, params: Any) -> Array:
+        """Return whether state and parameter values satisfy the numeric contract."""
+
+        param_leaves, utility_leaves, age_leaves, moment_leaves, _ = self._state_contract(
+            state, params
+        )
+        step = jnp.asarray(state.step)
+        valid = (step >= 0) & (step <= _INT32_MAX)
+        for param, utility, age, moment in zip(
+            param_leaves,
+            utility_leaves,
+            age_leaves,
+            moment_leaves,
+            strict=True,
+        ):
+            valid = (
+                valid
+                & jnp.all(jnp.isfinite(param))
+                & jnp.all(jnp.isfinite(utility))
+                & jnp.all(jnp.isfinite(moment))
+                & jnp.all(moment >= 0.0)
+                & jnp.all(age >= 0)
+                & jnp.all(age <= step)
+            )
+        return valid
+
+    def resource_budget(self, state: AlbertaAdaUPGDState) -> AlbertaAdaUPGDResources:
+        """Return exact persistent-array resources for ``state``."""
+
+        parameter_count = sum(
+            int(jnp.asarray(leaf).size)
+            for leaf in jax.tree.leaves(state.utility_ema)
+        )
+        array_leaves = [
+            leaf for leaf in jax.tree.leaves(state) if isinstance(leaf, Array)
+        ]
+        return AlbertaAdaUPGDResources(
+            profile=self._config.profile,
+            official_reference_parity=False,
+            parameter_count=parameter_count,
+            persistent_array_count=len(array_leaves),
+            persistent_state_nbytes=measure_alberta_adaupgd_state_nbytes(state),
+        )
+
+    def update(
+        self,
+        state: AlbertaAdaUPGDState,
+        params: Any,
+        gradients: Any,
+        key: Array,
+        *,
+        mask: Any | None = None,
+        noise: Any | None = None,
+    ) -> AlbertaAdaUPGDUpdate:
+        """Attempt one atomic adaptive first-order UPGD-W update.
+
+        ``noise=None`` samples Gaussian perturbations and advances the supplied
+        typed Threefry key only if the transaction commits.  A supplied noise
+        PyTree is interpreted as the already-scaled perturbation ``xi``; it is
+        intended for fixed-noise equation tests and follows the same key
+        splitting/commit contract as sampled noise.
+        """
+
+        checked_key = _adaupgd_typed_threefry_key(key, name="key")
+        (
+            param_leaves,
+            utility_leaves,
+            age_leaves,
+            moment_leaves,
+            structure,
+        ) = self._state_contract(state, params)
+        grad_leaves, grad_structure = _flatten_with_none(gradients)
+        if grad_structure != structure:
+            raise ValueError("params, gradients, and state must share a PyTree structure")
+
+        if mask is None:
+            mask_leaves = [jnp.ones(param.shape, dtype=jnp.bool_) for param in param_leaves]
+        else:
+            mask_leaves, mask_structure = _flatten_with_none(mask)
+            if mask_structure != structure:
+                raise ValueError("mask must share the parameter PyTree structure")
+        eligible_leaves: list[Array] = []
+        for param, mask_leaf in zip(param_leaves, mask_leaves, strict=True):
+            mask_array = jnp.asarray(mask_leaf)
+            if mask_array.dtype != jnp.bool_:
+                raise TypeError("every mask leaf must have boolean dtype")
+            try:
+                eligible = jnp.broadcast_to(mask_array, param.shape)
+            except ValueError as exc:
+                raise ValueError("every mask leaf must broadcast to its parameter shape") from exc
+            eligible_leaves.append(eligible)
+
+        if noise is None:
+            supplied_noise_leaves: list[Any] = [None] * len(param_leaves)
+        else:
+            supplied_noise_leaves, noise_structure = _flatten_with_none(noise)
+            if noise_structure != structure:
+                raise ValueError("noise must share the parameter PyTree structure")
+            if any(value is None for value in supplied_noise_leaves):
+                raise ValueError("supplied noise must contain every parameter leaf")
+
+        split_keys = jr.split(checked_key, len(param_leaves) + 1)
+        proposed_next_key = split_keys[0]
+        noise_keys = split_keys[1:]
+        state_is_valid = self.state_valid(state, params)
+        capacity_available = state.step < jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+        proposed_step = jnp.where(capacity_available, state.step + 1, state.step)
+        input_is_valid = jnp.asarray(True, dtype=jnp.bool_)
+        missing_gradient_leaf_count = jnp.asarray(0, dtype=jnp.int32)
+        nonfinite_gradient_count = jnp.asarray(0, dtype=jnp.int32)
+        nonfinite_noise_count = jnp.asarray(0, dtype=jnp.int32)
+
+        clean_params: list[Array] = []
+        clean_gradients: list[Array] = []
+        clean_utilities: list[Array] = []
+        clean_ages: list[Array] = []
+        clean_moments: list[Array] = []
+        sampled_noise_leaves: list[Array] = []
+        for param, gradient, utility, age, moment, noise_key, supplied_noise in zip(
+            param_leaves,
+            grad_leaves,
+            utility_leaves,
+            age_leaves,
+            moment_leaves,
+            noise_keys,
+            supplied_noise_leaves,
+            strict=True,
+        ):
+            clean_params.append(jnp.where(jnp.isfinite(param), param, 0.0))
+            clean_utilities.append(jnp.where(jnp.isfinite(utility), utility, 0.0))
+            clean_ages.append(jnp.clip(age, 0, _INT32_MAX - 1))
+            clean_moments.append(
+                jnp.where(jnp.isfinite(moment) & (moment >= 0.0), moment, 0.0)
+            )
+            if gradient is None:
+                clean_gradient = jnp.zeros_like(param)
+                gradient_finite = jnp.zeros(param.shape, dtype=jnp.bool_)
+                missing_gradient_leaf_count = missing_gradient_leaf_count + 1
+            else:
+                gradient_array = jnp.asarray(gradient, dtype=param.dtype)
+                if gradient_array.shape != param.shape:
+                    raise ValueError("every gradient leaf must match its parameter shape")
+                gradient_finite = jnp.isfinite(gradient_array)
+                clean_gradient = jnp.where(gradient_finite, gradient_array, 0.0)
+            nonfinite_gradient_count = nonfinite_gradient_count + jnp.sum(
+                (~gradient_finite).astype(jnp.int32)
+            )
+            input_is_valid = input_is_valid & jnp.all(gradient_finite)
+            clean_gradients.append(clean_gradient)
+
+            if supplied_noise is None:
+                sampled_noise = (
+                    jr.normal(noise_key, param.shape, dtype=param.dtype)
+                    * self._config.noise_std
+                )
+            else:
+                sampled_noise = jnp.asarray(supplied_noise, dtype=param.dtype)
+                if sampled_noise.shape != param.shape:
+                    raise ValueError("every noise leaf must match its parameter shape")
+            noise_finite = jnp.isfinite(sampled_noise)
+            nonfinite_noise_count = nonfinite_noise_count + jnp.sum(
+                (~noise_finite).astype(jnp.int32)
+            )
+            input_is_valid = input_is_valid & jnp.all(noise_finite)
+            sampled_noise_leaves.append(jnp.where(noise_finite, sampled_noise, 0.0))
+
+        beta_utility = self._config.utility_decay
+        beta_second = self._config.second_moment_decay
+        proposed_utility_leaves: list[Array] = []
+        proposed_age_leaves: list[Array] = []
+        proposed_moment_leaves: list[Array] = []
+        corrected_leaves: list[Array] = []
+        denominator_leaves: list[Array] = []
+
+        for param, gradient, utility, age, moment, eligible in zip(
+            clean_params,
+            clean_gradients,
+            clean_utilities,
+            clean_ages,
+            clean_moments,
+            eligible_leaves,
+            strict=True,
+        ):
+            instantaneous_utility = -gradient * param
+            proposed_utility = jnp.where(
+                eligible,
+                beta_utility * utility
+                + (1.0 - beta_utility) * instantaneous_utility,
+                utility,
+            )
+            proposed_age = jnp.where(eligible, age + 1, age)
+            utility_clock = jnp.maximum(proposed_age, 1).astype(param.dtype)
+            utility_correction = 1.0 - jnp.power(beta_utility, utility_clock)
+            corrected = jnp.where(
+                eligible & (proposed_age > 0),
+                proposed_utility
+                / jnp.maximum(
+                    utility_correction,
+                    jnp.asarray(self._config.epsilon, dtype=param.dtype),
+                ),
+                0.0,
+            )
+
+            proposed_moment = (
+                beta_second * moment + (1.0 - beta_second) * jnp.square(gradient)
+            )
+            moment_clock = jnp.maximum(proposed_step, 1).astype(param.dtype)
+            moment_correction = 1.0 - jnp.power(beta_second, moment_clock)
+            corrected_moment = proposed_moment / jnp.maximum(
+                moment_correction,
+                jnp.asarray(self._config.epsilon, dtype=param.dtype),
+            )
+            denominator = jnp.sqrt(corrected_moment) + jnp.asarray(
+                self._config.epsilon, dtype=param.dtype
+            )
+
+            proposed_utility_leaves.append(proposed_utility)
+            proposed_age_leaves.append(proposed_age)
+            proposed_moment_leaves.append(proposed_moment)
+            corrected_leaves.append(corrected)
+            denominator_leaves.append(denominator)
+
+        if self._config.normalization == "global":
+            maximum = jnp.asarray(-jnp.inf, dtype=jnp.float32)
+            has_eligible = jnp.asarray(False, dtype=jnp.bool_)
+            for corrected, eligible in zip(
+                corrected_leaves, eligible_leaves, strict=True
+            ):
+                maximum = jnp.maximum(
+                    maximum,
+                    jnp.max(
+                        jnp.where(eligible, corrected, -jnp.inf),
+                        initial=-jnp.inf,
+                    ).astype(jnp.float32),
+                )
+                has_eligible = has_eligible | jnp.any(eligible)
+            global_maximum = jnp.where(has_eligible, maximum, 0.0)
+            global_denominator = _safe_signed_denominator(
+                global_maximum, self._config.epsilon
+            )
+            normalized_leaves = [
+                jnp.where(
+                    eligible,
+                    corrected / global_denominator.astype(corrected.dtype),
+                    0.0,
+                )
+                for corrected, eligible in zip(
+                    corrected_leaves, eligible_leaves, strict=True
+                )
+            ]
+        else:
+            global_maximum = jnp.asarray(jnp.nan, dtype=jnp.float32)
+            normalized_leaves = [
+                _local_normalize(
+                    corrected,
+                    corrected,
+                    eligible,
+                    self._config.epsilon,
+                )
+                for corrected, eligible in zip(
+                    corrected_leaves, eligible_leaves, strict=True
+                )
+            ]
+
+        proposed_param_leaves: list[Array] = []
+        gate_leaves: list[Array] = []
+        perturbation_leaves: list[Array] = []
+        for param, gradient, denominator, normalized, eligible, sampled_noise in zip(
+            clean_params,
+            clean_gradients,
+            denominator_leaves,
+            normalized_leaves,
+            eligible_leaves,
+            sampled_noise_leaves,
+            strict=True,
+        ):
+            safe_normalized = jnp.where(jnp.isfinite(normalized), normalized, 0.0)
+            gate = jnp.where(eligible, jax.nn.sigmoid(safe_normalized), 0.0)
+            perturbation = jnp.where(eligible, sampled_noise, 0.0)
+            adaptive_gradient = gradient / denominator
+            adaptive_noise = perturbation / denominator
+            if self._config.mode == "protecting":
+                direction = (adaptive_gradient + adaptive_noise) * (1.0 - gate)
+            else:
+                direction = adaptive_gradient + adaptive_noise * (1.0 - gate)
+            decayed = param * (
+                1.0 - self._config.step_size * self._config.weight_decay
+            )
+            proposed_param_leaves.append(decayed - self._config.step_size * direction)
+            gate_leaves.append(gate)
+            perturbation_leaves.append(perturbation)
+
+        proposed_params = jax.tree_util.tree_unflatten(structure, proposed_param_leaves)
+        proposed_state = AlbertaAdaUPGDState(  # type: ignore[call-arg]
+            utility_ema=jax.tree_util.tree_unflatten(
+                structure, proposed_utility_leaves
+            ),
+            utility_age=jax.tree_util.tree_unflatten(structure, proposed_age_leaves),
+            gradient_second_moment=jax.tree_util.tree_unflatten(
+                structure, proposed_moment_leaves
+            ),
+            step=proposed_step,
+        )
+        candidate_is_valid = self.state_valid(proposed_state, proposed_params)
+        accepted = (
+            state_is_valid
+            & capacity_available
+            & input_is_valid
+            & candidate_is_valid
+        )
+        committed_params = _adaupgd_select_tree(accepted, proposed_params, params)
+        committed_state = _adaupgd_select_tree(accepted, proposed_state, state)
+        committed_key = jax.lax.cond(
+            accepted,
+            lambda _: proposed_next_key,
+            lambda _: checked_key,
+            operand=None,
+        )
+        zero_tree = jax.tree.map(jnp.zeros_like, params)
+        scaled_utility = _adaupgd_select_tree(
+            accepted,
+            jax.tree_util.tree_unflatten(structure, gate_leaves),
+            zero_tree,
+        )
+        corrected_utility = _adaupgd_select_tree(
+            accepted,
+            jax.tree_util.tree_unflatten(structure, corrected_leaves),
+            zero_tree,
+        )
+        adaptive_denominator = _adaupgd_select_tree(
+            accepted,
+            jax.tree_util.tree_unflatten(structure, denominator_leaves),
+            zero_tree,
+        )
+        perturbation = _adaupgd_select_tree(
+            accepted,
+            jax.tree_util.tree_unflatten(structure, perturbation_leaves),
+            zero_tree,
+        )
+        eligible_count = sum(
+            (jnp.sum(eligible.astype(jnp.int32)) for eligible in eligible_leaves),
+            start=jnp.asarray(0, dtype=jnp.int32),
+        )
+        parameter_count = sum(param.size for param in param_leaves)
+        gate_sum = sum(
+            (jnp.sum(gate.astype(jnp.float32)) for gate in gate_leaves),
+            start=jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        utility_sum = sum(
+            (
+                jnp.sum(jnp.where(eligible, jnp.abs(corrected), 0.0)).astype(
+                    jnp.float32
+                )
+                for corrected, eligible in zip(
+                    corrected_leaves, eligible_leaves, strict=True
+                )
+            ),
+            start=jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        count_floor = jnp.maximum(eligible_count.astype(jnp.float32), 1.0)
+        reported_global_maximum = jnp.where(
+            accepted & (self._config.normalization == "global"),
+            global_maximum,
+            0.0,
+        )
+        return AlbertaAdaUPGDUpdate(  # type: ignore[call-arg]
+            params=committed_params,
+            state=committed_state,
+            next_key=committed_key,
+            accepted=accepted,
+            scaled_utility=scaled_utility,
+            corrected_utility=corrected_utility,
+            adaptive_denominator=adaptive_denominator,
+            perturbation=perturbation,
+            metrics={
+                "accepted": accepted,
+                "mean_scaled_utility": jnp.where(
+                    accepted, gate_sum / count_floor, 0.0
+                ),
+                "mean_absolute_utility": jnp.where(
+                    accepted, utility_sum / count_floor, 0.0
+                ),
+                "global_maximum_utility": reported_global_maximum,
+                "eligible_parameter_count": eligible_count,
+                "parameter_count": jnp.asarray(parameter_count, dtype=jnp.int32),
+                "missing_gradient_leaf_count": missing_gradient_leaf_count,
+                "nonfinite_gradient_count": nonfinite_gradient_count,
+                "nonfinite_noise_count": nonfinite_noise_count,
+                "persistent_state_nbytes": jnp.asarray(
+                    measure_alberta_adaupgd_state_nbytes(state), dtype=jnp.int32
+                ),
+            },
+        )
+
+
+# Exact finite/all-active equation profile for the released RL implementation.
+# This is intentionally separate from both CanonicalUPGD and AlbertaAdaUPGD:
+# the released AdaptiveUPGD has materially different moments, normalization,
+# noise scaling, and a two-alpha learning direction.  The constants below bind
+# the implementation to the audited immutable source location.
+OfficialAdaUPGDProfile = Literal["official_rl_adaptive_upgd_b75e90a"]
+OFFICIAL_ADAUPGD_PROFILE: OfficialAdaUPGDProfile = (
+    "official_rl_adaptive_upgd_b75e90a"
+)
+OFFICIAL_ADAUPGD_COMMIT = "b75e90ad4b09c28971ac9dbb902a8fd86709b28c"
+OFFICIAL_ADAUPGD_PATH = "core/run/rl/adaupgd.py"
+
+
+@dataclass(frozen=True)
+class OfficialAdaUPGDConfig:
+    """Configuration for the pinned official RL ``AdaptiveUPGD`` equation.
+
+    Provenance is the released MIT implementation at commit
+    ``b75e90ad4b09c28971ac9dbb902a8fd86709b28c``, file
+    ``core/run/rl/adaupgd.py``.  Defaults match that constructor exactly.
+
+    This profile deliberately preserves its source quirks:
+
+    * corrected utility is divided by the *uncorrected* raw utility-EMA maximum;
+    * corrected first/second Adam moments drive the task direction;
+    * perturbation noise is outside the adaptive denominator;
+    * the task/noise direction is multiplied by ``2 * step_size`` while
+      decoupled weight decay uses ``1 * step_size``; and
+    * the raw maximum has no zero or non-finite guard.
+
+    Consequently all-zero utility produces zero-over-zero and non-finite values
+    propagate just as they do in the source.  Parity is equation-level for one
+    float32 parameter group with finite, all-active gradients and supplied fixed
+    perturbations; JAX and PyTorch random samplers are not claimed bitwise
+    identical.
+    """
+
+    profile: OfficialAdaUPGDProfile = OFFICIAL_ADAUPGD_PROFILE
+    source_commit: str = OFFICIAL_ADAUPGD_COMMIT
+    source_path: str = OFFICIAL_ADAUPGD_PATH
+    step_size: float = 1e-5
+    weight_decay: float = 0.001
+    utility_decay: float = 0.999
+    noise_std: float = 0.001
+    beta1: float = 0.9
+    beta2: float = 0.999
+    epsilon: float = 1e-5
+
+    def __post_init__(self) -> None:
+        if self.profile != OFFICIAL_ADAUPGD_PROFILE:
+            raise ValueError("profile must name the pinned official RL AdaptiveUPGD")
+        if self.source_commit != OFFICIAL_ADAUPGD_COMMIT:
+            raise ValueError("source_commit must match the pinned AdaptiveUPGD commit")
+        if self.source_path != OFFICIAL_ADAUPGD_PATH:
+            raise ValueError("source_path must match the pinned AdaptiveUPGD path")
+        for name in (
+            "step_size",
+            "weight_decay",
+            "utility_decay",
+            "noise_std",
+            "beta1",
+            "beta2",
+            "epsilon",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"{name} must be a real number, not boolean")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
+            narrowed = jnp.asarray(value, dtype=jnp.float32)
+            if not bool(jnp.isfinite(narrowed)):
+                raise ValueError(f"{name} must be finite in float32")
+            if float(value) != 0.0 and float(narrowed) == 0.0:
+                raise ValueError(f"{name} must not underflow in float32")
+        if self.step_size <= 0.0:
+            raise ValueError("step_size must be positive")
+        if self.weight_decay < 0.0:
+            raise ValueError("weight_decay must be non-negative")
+        if not 0.0 <= self.utility_decay < 1.0:
+            raise ValueError("utility_decay must be in [0, 1)")
+        if self.noise_std < 0.0:
+            raise ValueError("noise_std must be non-negative")
+        if not 0.0 <= self.beta1 < 1.0:
+            raise ValueError("beta1 must be in [0, 1)")
+        if not 0.0 <= self.beta2 < 1.0:
+            raise ValueError("beta2 must be in [0, 1)")
+        if self.epsilon <= 0.0:
+            raise ValueError("epsilon must be positive")
+
+    @property
+    def official_reference_parity(self) -> bool:
+        """Whether this is an explicitly source-bound equation profile."""
+
+        return True
+
+    @property
+    def parity_scope(self) -> str:
+        """Return the bounded scope of the official-source parity claim."""
+
+        return "finite_float32_all_active_single_group_fixed_noise_equation_parity"
+
+    def to_config(self) -> dict[str, object]:
+        """Return the complete source-bound configuration."""
+
+        return {
+            "type": "OfficialAdaUPGD",
+            "profile": self.profile,
+            "source_commit": self.source_commit,
+            "source_path": self.source_path,
+            "step_size": self.step_size,
+            "weight_decay": self.weight_decay,
+            "utility_decay": self.utility_decay,
+            "noise_std": self.noise_std,
+            "beta1": self.beta1,
+            "beta2": self.beta2,
+            "epsilon": self.epsilon,
+        }
+
+    @classmethod
+    def from_config(cls, config: dict[str, object]) -> OfficialAdaUPGDConfig:
+        """Strictly reconstruct the pinned official profile."""
+
+        if type(config) is not dict:
+            raise TypeError("OfficialAdaUPGD config must be an exact dict")
+        payload = dict(config)
+        expected = {
+            "type",
+            "profile",
+            "source_commit",
+            "source_path",
+            "step_size",
+            "weight_decay",
+            "utility_decay",
+            "noise_std",
+            "beta1",
+            "beta2",
+            "epsilon",
+        }
+        if set(payload) != expected:
+            raise ValueError("config fields do not match the OfficialAdaUPGD schema")
+        type_name = payload.pop("type")
+        if type_name != "OfficialAdaUPGD":
+            raise ValueError(f"expected OfficialAdaUPGD config, got {type_name!r}")
+        return cls(**payload)  # type: ignore[arg-type]
+
+
+@chex.dataclass(frozen=True)
+class OfficialAdaUPGDState:
+    """Utility, first-moment, and second-moment state of official AdaUPGD."""
+
+    utility_ema: Any
+    first_moment: Any
+    second_moment: Any
+    step: Int[Array, ""]
+
+
+@chex.dataclass(frozen=True)
+class OfficialAdaUPGDUpdate:
+    """Result of one functional official-source AdaUPGD update."""
+
+    params: Any
+    state: OfficialAdaUPGDState
+    next_key: Array
+    scaled_utility: Any
+    corrected_utility: Any
+    corrected_first_moment: Any
+    corrected_second_moment: Any
+    perturbation: Any
+    metrics: dict[str, Array]
+
+
+@dataclass(frozen=True)
+class OfficialAdaUPGDResources:
+    """Exact state resources plus immutable official-source provenance."""
+
+    profile: str
+    source_commit: str
+    source_path: str
+    official_reference_parity: bool
+    parameter_count: int
+    persistent_array_count: int
+    persistent_state_nbytes: int
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-compatible resource record."""
+
+        return {
+            "profile": self.profile,
+            "source_commit": self.source_commit,
+            "source_path": self.source_path,
+            "official_reference_parity": self.official_reference_parity,
+            "parameter_count": self.parameter_count,
+            "persistent_array_count": self.persistent_array_count,
+            "persistent_state_nbytes": self.persistent_state_nbytes,
+        }
+
+
+def measure_official_adaupgd_state_nbytes(state: OfficialAdaUPGDState) -> int:
+    """Measure every persistent JAX-array byte in official AdaUPGD state."""
+
+    return _adaupgd_tree_array_nbytes(state)
+
+
+class OfficialAdaUPGD:
+    """Functional JAX port of the pinned official RL ``AdaptiveUPGD``.
+
+    Masks and missing gradients are rejected because the source defines neither
+    behavior.  Structural contracts fail before arithmetic.  Numeric values are
+    otherwise left unguarded on purpose, including raw-maximum zero division
+    and non-finite propagation.  Use :class:`AlbertaAdaUPGD` when an atomic,
+    guarded adaptive extension is required instead of source parity.
+    """
+
+    def __init__(self, config: OfficialAdaUPGDConfig | None = None):
+        self._config = OfficialAdaUPGDConfig() if config is None else config
+
+    @property
+    def config(self) -> OfficialAdaUPGDConfig:
+        """Return the immutable official-source configuration."""
+
+        return self._config
+
+    def to_config(self) -> dict[str, object]:
+        """Serialize the exact optimizer configuration and provenance."""
+
+        return self._config.to_config()
+
+    @classmethod
+    def from_config(cls, config: dict[str, object]) -> OfficialAdaUPGD:
+        """Reconstruct the transform from a strict source-bound config."""
+
+        return cls(OfficialAdaUPGDConfig.from_config(config))
+
+    @staticmethod
+    def _parameter_contract(params: Any) -> tuple[list[Array], jax.tree_util.PyTreeDef]:
+        leaves, structure = _flatten_with_none(params)
+        if not leaves or any(value is None for value in leaves):
+            raise ValueError("params must contain at least one array leaf")
+        arrays: list[Array] = []
+        for value in leaves:
+            array = jnp.asarray(value)
+            if not jnp.issubdtype(array.dtype, jnp.floating):
+                raise ValueError("OfficialAdaUPGD parameters must have floating-point dtype")
+            arrays.append(array)
+        return arrays, structure
+
+    @staticmethod
+    def _state_contract(
+        state: OfficialAdaUPGDState,
+        params: Any,
+    ) -> tuple[
+        list[Array],
+        list[Array],
+        list[Array],
+        list[Array],
+        jax.tree_util.PyTreeDef,
+    ]:
+        if not isinstance(state, OfficialAdaUPGDState):
+            raise TypeError("state must be an OfficialAdaUPGDState")
+        param_leaves, structure = OfficialAdaUPGD._parameter_contract(params)
+        utility_leaves, utility_structure = _flatten_with_none(state.utility_ema)
+        first_leaves, first_structure = _flatten_with_none(state.first_moment)
+        second_leaves, second_structure = _flatten_with_none(state.second_moment)
+        if not (
+            structure == utility_structure == first_structure == second_structure
+        ):
+            raise ValueError("params and OfficialAdaUPGD state must share a PyTree structure")
+        utilities: list[Array] = []
+        first_moments: list[Array] = []
+        second_moments: list[Array] = []
+        for param, utility, first, second in zip(
+            param_leaves,
+            utility_leaves,
+            first_leaves,
+            second_leaves,
+            strict=True,
+        ):
+            utility_array = jnp.asarray(utility)
+            first_array = jnp.asarray(first)
+            second_array = jnp.asarray(second)
+            if (
+                utility_array.shape != param.shape
+                or first_array.shape != param.shape
+                or second_array.shape != param.shape
+            ):
+                raise ValueError("every official AdaUPGD state leaf must match its parameter shape")
+            if (
+                utility_array.dtype != param.dtype
+                or first_array.dtype != param.dtype
+                or second_array.dtype != param.dtype
+            ):
+                raise TypeError("official AdaUPGD state dtypes must match parameters")
+            utilities.append(utility_array)
+            first_moments.append(first_array)
+            second_moments.append(second_array)
+        step = jnp.asarray(state.step)
+        if step.shape != () or step.dtype != jnp.int32:
+            raise TypeError("state.step must be one scalar int32 array")
+        return param_leaves, utilities, first_moments, second_moments, structure
+
+    def init(self, params: Any) -> OfficialAdaUPGDState:
+        """Initialize the three source-defined moment PyTrees."""
+
+        self._parameter_contract(params)
+        return OfficialAdaUPGDState(  # type: ignore[call-arg]
+            utility_ema=jax.tree.map(jnp.zeros_like, params),
+            first_moment=jax.tree.map(jnp.zeros_like, params),
+            second_moment=jax.tree.map(jnp.zeros_like, params),
+            step=jnp.asarray(0, dtype=jnp.int32),
+        )
+
+    def state_valid(self, state: OfficialAdaUPGDState, params: Any) -> Array:
+        """Return whether a state is finite and its second moments are valid."""
+
+        param_leaves, utility_leaves, first_leaves, second_leaves, _ = (
+            self._state_contract(state, params)
+        )
+        valid = (state.step >= 0) & (state.step <= _INT32_MAX)
+        for param, utility, first, second in zip(
+            param_leaves,
+            utility_leaves,
+            first_leaves,
+            second_leaves,
+            strict=True,
+        ):
+            valid = (
+                valid
+                & jnp.all(jnp.isfinite(param))
+                & jnp.all(jnp.isfinite(utility))
+                & jnp.all(jnp.isfinite(first))
+                & jnp.all(jnp.isfinite(second))
+                & jnp.all(second >= 0.0)
+            )
+        return valid
+
+    def resource_budget(self, state: OfficialAdaUPGDState) -> OfficialAdaUPGDResources:
+        """Return exact state resources with source provenance."""
+
+        parameter_count = sum(
+            int(jnp.asarray(leaf).size)
+            for leaf in jax.tree.leaves(state.utility_ema)
+        )
+        array_leaves = [
+            leaf for leaf in jax.tree.leaves(state) if isinstance(leaf, Array)
+        ]
+        return OfficialAdaUPGDResources(
+            profile=self._config.profile,
+            source_commit=self._config.source_commit,
+            source_path=self._config.source_path,
+            official_reference_parity=True,
+            parameter_count=parameter_count,
+            persistent_array_count=len(array_leaves),
+            persistent_state_nbytes=measure_official_adaupgd_state_nbytes(state),
+        )
+
+    def update(
+        self,
+        state: OfficialAdaUPGDState,
+        params: Any,
+        gradients: Any,
+        key: Array,
+        *,
+        mask: Any | None = None,
+        noise: Any | None = None,
+    ) -> OfficialAdaUPGDUpdate:
+        """Apply one pinned official AdaptiveUPGD equation step.
+
+        A supplied noise PyTree is the already-scaled perturbation used for
+        fixed-noise parity.  Sampling uses a typed Threefry key as the explicit
+        JAX port of the source's implicit PyTorch generator.
+        """
+
+        checked_key = _adaupgd_typed_threefry_key(key, name="key")
+        if mask is not None:
+            raise ValueError("the official AdaptiveUPGD profile does not accept masks")
+        (
+            param_leaves,
+            utility_leaves,
+            first_leaves,
+            second_leaves,
+            structure,
+        ) = self._state_contract(state, params)
+        grad_leaves, grad_structure = _flatten_with_none(gradients)
+        if grad_structure != structure:
+            raise ValueError("params, gradients, and state must share a PyTree structure")
+        if any(gradient is None for gradient in grad_leaves):
+            raise ValueError("the official AdaptiveUPGD profile requires every gradient")
+        if noise is None:
+            supplied_noise_leaves: list[Any] = [None] * len(param_leaves)
+        else:
+            supplied_noise_leaves, noise_structure = _flatten_with_none(noise)
+            if noise_structure != structure:
+                raise ValueError("noise must share the parameter PyTree structure")
+            if any(value is None for value in supplied_noise_leaves):
+                raise ValueError("supplied noise must contain every parameter leaf")
+
+        gradient_arrays: list[Array] = []
+        for param, gradient in zip(param_leaves, grad_leaves, strict=True):
+            gradient_array = jnp.asarray(gradient, dtype=param.dtype)
+            if gradient_array.shape != param.shape:
+                raise ValueError("every gradient leaf must match its parameter shape")
+            gradient_arrays.append(gradient_array)
+
+        split_keys = jr.split(checked_key, len(param_leaves) + 1)
+        next_key = split_keys[0]
+        noise_keys = split_keys[1:]
+        next_step = state.step + jnp.asarray(1, dtype=jnp.int32)
+        proposed_utility_leaves: list[Array] = []
+        proposed_first_leaves: list[Array] = []
+        proposed_second_leaves: list[Array] = []
+        for param, gradient, utility, first, second in zip(
+            param_leaves,
+            gradient_arrays,
+            utility_leaves,
+            first_leaves,
+            second_leaves,
+            strict=True,
+        ):
+            proposed_utility_leaves.append(
+                self._config.utility_decay * utility
+                + (1.0 - self._config.utility_decay) * (-gradient * param)
+            )
+            proposed_first_leaves.append(
+                self._config.beta1 * first
+                + (1.0 - self._config.beta1) * gradient
+            )
+            proposed_second_leaves.append(
+                self._config.beta2 * second
+                + (1.0 - self._config.beta2) * jnp.square(gradient)
+            )
+
+        # Match the source's scalar-tensor ``if current > maximum`` fold rather
+        # than jnp.maximum: a NaN leaf comparison is false and leaves the prior
+        # maximum untouched.
+        raw_global_maximum = jnp.asarray(-jnp.inf, dtype=jnp.float32)
+        for utility in proposed_utility_leaves:
+            leaf_maximum = jnp.max(utility).astype(jnp.float32)
+            raw_global_maximum = jnp.where(
+                leaf_maximum > raw_global_maximum,
+                leaf_maximum,
+                raw_global_maximum,
+            )
+
+        corrected_utility_leaves: list[Array] = []
+        corrected_first_leaves: list[Array] = []
+        corrected_second_leaves: list[Array] = []
+        gate_leaves: list[Array] = []
+        perturbation_leaves: list[Array] = []
+        proposed_param_leaves: list[Array] = []
+        for (
+            param,
+            proposed_utility,
+            proposed_first,
+            proposed_second,
+            noise_key,
+            supplied_noise,
+        ) in zip(
+            param_leaves,
+            proposed_utility_leaves,
+            proposed_first_leaves,
+            proposed_second_leaves,
+            noise_keys,
+            supplied_noise_leaves,
+            strict=True,
+        ):
+            clock = next_step.astype(param.dtype)
+            utility_correction = 1.0 - jnp.power(self._config.utility_decay, clock)
+            first_correction = 1.0 - jnp.power(self._config.beta1, clock)
+            second_correction = 1.0 - jnp.power(self._config.beta2, clock)
+            corrected_utility = proposed_utility / utility_correction
+            corrected_first = proposed_first / first_correction
+            corrected_second = proposed_second / second_correction
+            if supplied_noise is None:
+                perturbation = (
+                    jr.normal(noise_key, param.shape, dtype=param.dtype)
+                    * self._config.noise_std
+                )
+            else:
+                perturbation = jnp.asarray(supplied_noise, dtype=param.dtype)
+                if perturbation.shape != param.shape:
+                    raise ValueError("every noise leaf must match its parameter shape")
+            gate = jax.nn.sigmoid(
+                corrected_utility / raw_global_maximum.astype(param.dtype)
+            )
+            one_minus_gate = 1.0 - gate
+            direction = (
+                corrected_first * one_minus_gate
+                / (jnp.sqrt(corrected_second) + self._config.epsilon)
+                + perturbation * one_minus_gate
+            )
+            decayed = param * (
+                1.0 - self._config.step_size * self._config.weight_decay
+            )
+            proposed_param_leaves.append(
+                decayed - 2.0 * self._config.step_size * direction
+            )
+            corrected_utility_leaves.append(corrected_utility)
+            corrected_first_leaves.append(corrected_first)
+            corrected_second_leaves.append(corrected_second)
+            gate_leaves.append(gate)
+            perturbation_leaves.append(perturbation)
+
+        next_state = OfficialAdaUPGDState(  # type: ignore[call-arg]
+            utility_ema=jax.tree_util.tree_unflatten(
+                structure, proposed_utility_leaves
+            ),
+            first_moment=jax.tree_util.tree_unflatten(
+                structure, proposed_first_leaves
+            ),
+            second_moment=jax.tree_util.tree_unflatten(
+                structure, proposed_second_leaves
+            ),
+            step=next_step,
+        )
+        parameter_count = sum(param.size for param in param_leaves)
+        return OfficialAdaUPGDUpdate(  # type: ignore[call-arg]
+            params=jax.tree_util.tree_unflatten(structure, proposed_param_leaves),
+            state=next_state,
+            next_key=next_key,
+            scaled_utility=jax.tree_util.tree_unflatten(structure, gate_leaves),
+            corrected_utility=jax.tree_util.tree_unflatten(
+                structure, corrected_utility_leaves
+            ),
+            corrected_first_moment=jax.tree_util.tree_unflatten(
+                structure, corrected_first_leaves
+            ),
+            corrected_second_moment=jax.tree_util.tree_unflatten(
+                structure, corrected_second_leaves
+            ),
+            perturbation=jax.tree_util.tree_unflatten(
+                structure, perturbation_leaves
+            ),
+            metrics={
+                "raw_global_maximum_utility": raw_global_maximum,
+                "parameter_count": jnp.asarray(parameter_count, dtype=jnp.int32),
+                "persistent_state_nbytes": jnp.asarray(
+                    measure_official_adaupgd_state_nbytes(state), dtype=jnp.int32
+                ),
+            },
+        )

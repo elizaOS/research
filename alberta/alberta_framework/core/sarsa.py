@@ -32,6 +32,7 @@ from jaxtyping import Float, Int
 
 from alberta_framework.core.horde import HordeLearner
 from alberta_framework.core.multi_head_learner import (
+    MULTI_HEAD_MLP_STATE_SCHEMA,
     AnyOptimizer,
     MultiHeadMLPState,
 )
@@ -47,6 +48,29 @@ from alberta_framework.core.types import (
     TraceMode,
     create_horde_spec,
 )
+
+_INT32_MAX = 2**31 - 1
+
+
+def _saturating_int32_increment(value: Array) -> Array:
+    """Increment compatibility telemetry without signed wraparound."""
+
+    return jnp.where(
+        value < jnp.asarray(_INT32_MAX, dtype=jnp.int32),
+        value + jnp.asarray(1, dtype=jnp.int32),
+        value,
+    )
+
+
+def _tree_arrays_finite(tree: Any) -> Array:
+    """Return whether every persistent floating/complex array is finite."""
+
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for leaf in jax.tree.leaves(tree):
+        dtype = getattr(leaf, "dtype", None)
+        if dtype is not None and jnp.issubdtype(dtype, jnp.inexact):
+            valid = valid & jnp.all(jnp.isfinite(leaf))
+    return valid
 
 # =============================================================================
 # Types
@@ -126,6 +150,13 @@ class SARSAUpdateResult:
     q_values: Float[Array, " n_actions"]
     td_error: Float[Array, ""]
     reward: Float[Array, ""]
+    pre_step_words: Array
+    post_step_words: Array
+    source_valid: Array
+    state_valid: Array
+    candidate_state_valid: Array
+    horde_update_applied: Array
+    update_applied: Array
 
 
 @dataclasses.dataclass(frozen=True)
@@ -368,6 +399,9 @@ class SARSAAgent:
 
         config = dict(config)
         config.pop("type", None)
+        state_schema = config.pop("state_schema", MULTI_HEAD_MLP_STATE_SCHEMA)
+        if state_schema != MULTI_HEAD_MLP_STATE_SCHEMA:
+            raise ValueError(f"unsupported SARSA Horde state schema: {state_schema!r}")
 
         sarsa_config = SARSAConfig.from_config(config.pop("sarsa_config"))
         optimizer = optimizer_from_config(config.pop("optimizer"))
@@ -548,7 +582,7 @@ class SARSAAgent:
 
         # Epsilon decay
         cfg = self._sarsa_config
-        new_step_count = state.step_count + 1
+        new_step_count = _saturating_int32_increment(state.step_count)
         new_epsilon = jax.lax.cond(
             cfg.epsilon_decay_steps > 0,
             lambda: jnp.maximum(
@@ -559,7 +593,7 @@ class SARSAAgent:
             lambda: state.epsilon,
         )
 
-        new_state = SARSAState(  # type: ignore[call-arg]
+        candidate_state = SARSAState(  # type: ignore[call-arg]
             learner_state=new_learner_state,
             last_action=next_action,
             last_observation=observation,
@@ -568,12 +602,54 @@ class SARSAAgent:
             step_count=new_step_count,
         )
 
+        source_valid = (
+            jnp.isfinite(reward)
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(jnp.asarray(terminated, dtype=jnp.float32))
+            & (
+                (jnp.asarray(terminated, dtype=jnp.float32) == 0.0)
+                | (jnp.asarray(terminated, dtype=jnp.float32) == 1.0)
+            )
+            & (next_action >= 0)
+            & (next_action < n_actions)
+        )
+        state_valid = (
+            _tree_arrays_finite(state)
+            & (state.step_count >= 0)
+            & (state.last_action >= 0)
+            & (state.last_action < n_actions)
+        )
+        candidate_state_valid = _tree_arrays_finite(candidate_state)
+        horde_update_applied = jnp.asarray(
+            horde_result.update_applied,
+            dtype=jnp.bool_,
+        )
+        update_applied = (
+            source_valid
+            & state_valid
+            & candidate_state_valid
+            & horde_update_applied
+        )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda _: candidate_state,
+            lambda _: state,
+            operand=None,
+        )
+
         return SARSAUpdateResult(  # type: ignore[call-arg]
             state=new_state,
             action=next_action,
             q_values=q_next,
             td_error=td_error,
             reward=reward,
+            pre_step_words=horde_result.pre_step_words,
+            post_step_words=new_state.learner_state.step_words,
+            source_valid=source_valid,
+            state_valid=state_valid,
+            candidate_state_valid=candidate_state_valid,
+            horde_update_applied=horde_update_applied,
+            update_applied=update_applied,
         )
 
 

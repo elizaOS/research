@@ -34,9 +34,12 @@ Reference: Elsayed & Mahmood (2024). "Addressing Loss of Plasticity and
 Catastrophic Forgetting in Continual Learning." ICLR 2024.
 """
 
+import dataclasses
 import functools
 import time
-from typing import Any
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, cast
 
 import chex
 import jax
@@ -45,9 +48,146 @@ import jax.random as jr
 from jax import Array
 from jaxtyping import Float
 
+from alberta_framework.core.checkpoints import (
+    load_checkpoint,
+    load_checkpoint_metadata,
+    save_checkpoint,
+)
 from alberta_framework.core.initializers import sparse_init
 from alberta_framework.core.optimizers import Bounder, ObGDBounding
 from alberta_framework.core.types import MLPParams
+
+_INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
+_UINT64_MAX = 2**64 - 1
+
+UPGD_STATE_SCHEMA = "alberta.upgd-state.v2"
+UPGD_CHECKPOINT_SCHEMA = "alberta.upgd-checkpoint.v2"
+UPGD_LIFETIME_COUNTER_NBYTES = 12
+UPGD_LIFETIME_COUNTER_DELTA_NBYTES = 8
+UPGD_TRANSACTION_CLOCK_NBYTES = 16
+UPGD_TRANSACTION_CLOCK_DELTA_NBYTES = 12
+_LEGACY_UPGD_CHECKPOINT_SCHEMA = "alberta.upgd-checkpoint.v1"
+
+
+def _require_array_contract(
+    value: Any,
+    *,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: jnp.dtype,
+) -> Array:
+    """Return an array after trace-time shape and effective-dtype validation."""
+
+    array = jnp.asarray(value)
+    if array.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {array.shape}")
+    if array.dtype != dtype:
+        raise TypeError(f"{name} must have dtype {dtype}, got {array.dtype}")
+    return array
+
+
+def _saturating_nonnegative_int32_increment(value: Array) -> Array:
+    """Advance non-negative int32 compatibility telemetry without wrapping."""
+
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    counter = jnp.asarray(value, dtype=jnp.int32)
+    return jnp.minimum(jnp.maximum(counter, 0), maximum - 1) + 1
+
+
+def _checked_step_words_increment(step_words: Array) -> tuple[Array, Array]:
+    """Propose one exact 64-bit update identity without wrapping all ones."""
+
+    if getattr(step_words, "shape", None) != (2,):
+        raise ValueError("UPGD step_words must have shape (2,)")
+    if getattr(step_words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("UPGD step_words must have dtype uint32")
+    maximum = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+    capacity_available = ~jnp.all(step_words == maximum)
+    one = jnp.asarray(1, dtype=jnp.uint32)
+    low = step_words[1] + one
+    carry = (low == jnp.asarray(0, dtype=jnp.uint32)).astype(jnp.uint32)
+    candidate = jnp.stack((step_words[0] + carry, low))
+    return (
+        jnp.where(capacity_available, candidate, step_words).astype(jnp.uint32),
+        capacity_available,
+    )
+
+
+def _lifetime_counter_valid(step_words: Array, step_count: Array) -> Array:
+    """Authenticate exact identity against saturating int32 telemetry."""
+
+    _checked_step_words_increment(step_words)
+    _require_array_contract(
+        step_count,
+        name="UPGD step_count",
+        shape=(),
+        dtype=jnp.dtype(jnp.int32),
+    )
+    maximum_i32 = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    below_saturation = (step_words[0] == jnp.asarray(0, dtype=jnp.uint32)) & (
+        step_words[1] < jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+    )
+    return (step_count >= 0) & jnp.where(
+        below_saturation,
+        step_count == step_words[1].astype(jnp.int32),
+        step_count == maximum_i32,
+    )
+
+
+def _exact_step_at_least(step_words: Array, threshold: int) -> Array:
+    """Compare an exact two-word identity with one validated Python integer."""
+
+    high, low = divmod(threshold, 2**32)
+    high_word = jnp.asarray(high, dtype=jnp.uint32)
+    low_word = jnp.asarray(low, dtype=jnp.uint32)
+    return (step_words[0] > high_word) | (
+        (step_words[0] == high_word) & (step_words[1] >= low_word)
+    )
+
+
+def _bounded_ramp_strength(
+    step_words: Array,
+    *,
+    start: int,
+    length: int,
+) -> Array:
+    """Return an exact-clock-gated finite ramp while preserving early values."""
+
+    if length == 0:
+        return _exact_step_at_least(step_words, start).astype(jnp.float32)
+    started = _exact_step_at_least(step_words, start)
+    full = _exact_step_at_least(step_words, start + length - 1)
+    start_high, start_low = divmod(start, 2**32)
+    start_low_word = jnp.asarray(start_low, dtype=jnp.uint32)
+    borrow = (step_words[1] < start_low_word).astype(jnp.uint32)
+    delta_low = step_words[1] - start_low_word
+    delta_high = (
+        step_words[0]
+        - jnp.asarray(start_high, dtype=jnp.uint32)
+        - borrow
+    )
+    within_bounded_window = started & ~full & (
+        delta_high == jnp.asarray(0, dtype=jnp.uint32)
+    )
+    partial = (delta_low.astype(jnp.float32) + 1.0) / jnp.asarray(
+        length,
+        dtype=jnp.float32,
+    )
+    return jnp.where(
+        full,
+        jnp.asarray(1.0, dtype=jnp.float32),
+        jnp.where(within_bounded_window, partial, 0.0),
+    )
+
+
+def _require_bounded_schedule(name: str, value: Any, maximum: int) -> int:
+    """Reject ambiguous booleans and counters outside one explicit bound."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+        bound_name = "int32-safe" if maximum == _INT32_MAX else "uint64-safe"
+        raise ValueError(f"{name} must be a {bound_name} non-negative integer")
+    return value
 
 # =============================================================================
 # Types
@@ -80,9 +220,13 @@ class UPGDState:
         unit_ages: Per-hidden-layer hidden-unit ages since initialization or
             last recycling.
         unit_replacement_counts: Per-hidden-layer count of hidden-unit
-            replacements performed by optional recycling.
+            replacements performed by optional recycling. Saturating int32
+            telemetry; it is not a scheduling authority.
         unit_replacement_accumulators: Per-layer fractional replacement
-            budget accumulator for optional hidden-unit recycling.
+            budget accumulator for optional hidden-unit recycling. This is a
+            bounded pending-credit value in ``[0, 1]``; excess backlog is not
+            accumulated because an update can recycle at most one unit per
+            layer.
         loss_fast_ema: Fast EMA of the online per-step MSE, used only by
             optional loss-spike-gated recycling.
         loss_slow_ema: Slow EMA of the online per-step MSE, used only by
@@ -113,7 +257,11 @@ class UPGDState:
         previous_head_bias_grads: Previous output-head bias gradients for
             online gradient-alignment meta-plasticity.
         key: JAX random key for sampling perturbations
-        step_count: Scalar step counter
+        step_count: Saturating int32 compatibility step telemetry.
+        step_words: Authenticated exact update identity as ``[high, low]``
+            uint32 words.
+        perturbation_phase: Bounded cadence phase authenticated against
+            ``step_words``.
         birth_timestamp: Wall-clock time at init
         uptime_s: Cumulative time spent in learning loops
     """
@@ -143,10 +291,12 @@ class UPGDState:
     previous_head_weight_grads: tuple[Array, ...]
     previous_head_bias_grads: tuple[Array, ...]
     key: Array
-    step_count: Array = None  # type: ignore[assignment]
-    birth_timestamp: float = 0.0
-    uptime_s: float = 0.0
-    unit_replacement_counts: Array | None = None
+    step_count: Array
+    step_words: Array
+    perturbation_phase: Array
+    birth_timestamp: Array
+    uptime_s: Array
+    unit_replacement_counts: Array
 
 
 @chex.dataclass(frozen=True)
@@ -160,12 +310,25 @@ class UPGDUpdateResult:
         metrics: 1D array ``[mean_loss, mean_utility, min_utility,
             max_perturbation_magnitude]``. ``mean_utility`` and
             ``min_utility`` are 0 when there are no hidden layers.
+        update_applied: Whether the whole proposed transaction committed.
+        update_rejected: Whether source/input/candidate validation or exact
+            lifetime exhaustion made the update an atomic no-op.
     """
 
     state: UPGDState
     predictions: Float[Array, " n_heads"]
     errors: Float[Array, " n_heads"]
     metrics: Float[Array, " 4"]
+    pre_step_words: Array
+    post_step_words: Array
+    lifetime_counter_valid: Array
+    lifetime_capacity_available: Array
+    state_valid: Array
+    candidate_state_valid: Array
+    perturbation_due: Array
+    perturbation_applied: Array
+    update_applied: Array
+    update_rejected: Array
 
 
 @chex.dataclass(frozen=True)
@@ -1001,6 +1164,60 @@ class UPGDLearner:
             )
             raise ValueError(msg)
 
+        _require_bounded_schedule(
+            "perturbation_interval",
+            perturbation_interval,
+            _INT32_MAX,
+        )
+        _require_bounded_schedule(
+            "perturbation_warmup_steps",
+            perturbation_warmup_steps,
+            _UINT64_MAX,
+        )
+        _require_bounded_schedule(
+            "perturbation_ramp_steps",
+            perturbation_ramp_steps,
+            _INT32_MAX,
+        )
+        if (
+            perturbation_ramp_steps > 0
+            and perturbation_warmup_steps + perturbation_ramp_steps - 1
+            > _UINT64_MAX
+        ):
+            raise ValueError(
+                "perturbation warmup plus ramp must fit the uint64-safe lifetime"
+            )
+        _require_bounded_schedule(
+            "head_loss_pressure_warmup_steps",
+            head_loss_pressure_warmup_steps,
+            _UINT64_MAX,
+        )
+        _require_bounded_schedule(
+            "head_repetition_warmup_steps",
+            head_repetition_warmup_steps,
+            _UINT64_MAX,
+        )
+        _require_bounded_schedule(
+            "unit_maturity_threshold",
+            unit_maturity_threshold,
+            _INT32_MAX,
+        )
+        _require_bounded_schedule(
+            "adaptive_kappa_warmup_steps",
+            adaptive_kappa_warmup_steps,
+            _UINT64_MAX,
+        )
+        _require_bounded_schedule(
+            "adaptive_kappa_meta_warmup_steps",
+            adaptive_kappa_meta_warmup_steps,
+            _UINT64_MAX,
+        )
+        _require_bounded_schedule(
+            "meta_plasticity_warmup_steps",
+            meta_plasticity_warmup_steps,
+            _UINT64_MAX,
+        )
+
         self._n_heads = n_heads
         self._hidden_sizes = hidden_sizes
         self._step_size = float(step_size)
@@ -1152,6 +1369,309 @@ class UPGDLearner:
                 and self._adaptive_kappa_meta_step_size > 0.0
             )
         )
+
+    def _require_state_contract(self, state: UPGDState, *, feature_dim: int) -> None:
+        """Validate every static state shape and dtype before traced arithmetic."""
+
+        if feature_dim < 1:
+            raise ValueError("UPGD observation feature dimension must be positive")
+        trunk_sizes = (feature_dim, *self._hidden_sizes)
+        n_trunk = len(self._hidden_sizes)
+        if len(state.trunk_params.weights) != n_trunk:
+            raise ValueError("state.trunk_params.weights layer count is invalid")
+        if len(state.trunk_params.biases) != n_trunk:
+            raise ValueError("state.trunk_params.biases layer count is invalid")
+        if len(state.utilities) != n_trunk:
+            raise ValueError("state.utilities layer count is invalid")
+        for index in range(n_trunk):
+            weight_shape = (trunk_sizes[index + 1], trunk_sizes[index])
+            bias_shape = (trunk_sizes[index + 1],)
+            _require_array_contract(
+                state.trunk_params.weights[index],
+                name=f"state.trunk_params.weights[{index}]",
+                shape=weight_shape,
+                dtype=jnp.dtype(jnp.float32),
+            )
+            _require_array_contract(
+                state.trunk_params.biases[index],
+                name=f"state.trunk_params.biases[{index}]",
+                shape=bias_shape,
+                dtype=jnp.dtype(jnp.float32),
+            )
+            _require_array_contract(
+                state.utilities[index],
+                name=f"state.utilities[{index}]",
+                shape=weight_shape,
+                dtype=jnp.dtype(jnp.float32),
+            )
+
+        head_input_dim = self._hidden_sizes[-1] if self._hidden_sizes else feature_dim
+        if self._readout_input_mode == "hidden_plus_input" and self._hidden_sizes:
+            head_input_dim += feature_dim
+        for group_name, params in (
+            ("head_params", state.head_params),
+            ("readout_fast_head_params", state.readout_fast_head_params),
+        ):
+            if len(params.weights) != self._n_heads or len(params.biases) != self._n_heads:
+                raise ValueError(f"state.{group_name} head count is invalid")
+            for index in range(self._n_heads):
+                _require_array_contract(
+                    params.weights[index],
+                    name=f"state.{group_name}.weights[{index}]",
+                    shape=(1, head_input_dim),
+                    dtype=jnp.dtype(jnp.float32),
+                )
+                _require_array_contract(
+                    params.biases[index],
+                    name=f"state.{group_name}.biases[{index}]",
+                    shape=(1,),
+                    dtype=jnp.dtype(jnp.float32),
+                )
+        _require_array_contract(
+            state.readout_label_adapter,
+            name="state.readout_label_adapter",
+            shape=(self._n_heads, self._n_heads),
+            dtype=jnp.dtype(jnp.float32),
+        )
+
+        stored_unit_layers = n_trunk if self._stores_unit_state() else 0
+        unit_groups = (
+            ("unit_utilities", state.unit_utilities, jnp.dtype(jnp.float32)),
+            ("unit_long_utilities", state.unit_long_utilities, jnp.dtype(jnp.float32)),
+            ("unit_gradient_emas", state.unit_gradient_emas, jnp.dtype(jnp.float32)),
+            ("unit_ages", state.unit_ages, jnp.dtype(jnp.int32)),
+        )
+        for name, values, dtype in unit_groups:
+            if len(values) != stored_unit_layers:
+                raise ValueError(f"state.{name} layer count is invalid")
+            for index, value in enumerate(values):
+                _require_array_contract(
+                    value,
+                    name=f"state.{name}[{index}]",
+                    shape=(self._hidden_sizes[index],),
+                    dtype=dtype,
+                )
+        if state.unit_replacement_counts is None:
+            raise TypeError("state.unit_replacement_counts must be an int32 array")
+        _require_array_contract(
+            state.unit_replacement_counts,
+            name="state.unit_replacement_counts",
+            shape=(stored_unit_layers,),
+            dtype=jnp.dtype(jnp.int32),
+        )
+        _require_array_contract(
+            state.unit_replacement_accumulators,
+            name="state.unit_replacement_accumulators",
+            shape=(stored_unit_layers,),
+            dtype=jnp.dtype(jnp.float32),
+        )
+
+        gradient_layer_count = n_trunk if self._stores_gradient_history() else 0
+        gradient_contracts = (
+            (
+                "previous_trunk_weight_grads",
+                state.previous_trunk_weight_grads,
+                tuple((trunk_sizes[i + 1], trunk_sizes[i]) for i in range(n_trunk)),
+            ),
+            (
+                "previous_trunk_bias_grads",
+                state.previous_trunk_bias_grads,
+                tuple((trunk_sizes[i + 1],) for i in range(n_trunk)),
+            ),
+            (
+                "previous_head_weight_grads",
+                state.previous_head_weight_grads,
+                tuple((1, head_input_dim) for _ in range(self._n_heads)),
+            ),
+            (
+                "previous_head_bias_grads",
+                state.previous_head_bias_grads,
+                tuple((1,) for _ in range(self._n_heads)),
+            ),
+        )
+        for name, values, populated_shapes in gradient_contracts:
+            is_trunk = "trunk" in name
+            expected_count = gradient_layer_count if is_trunk else (
+                self._n_heads if self._stores_gradient_history() else 0
+            )
+            if len(values) != expected_count:
+                raise ValueError(f"state.{name} layer count is invalid")
+            expected_shapes = populated_shapes if expected_count > 0 else ()
+            for index, (value, shape) in enumerate(zip(values, expected_shapes)):
+                _require_array_contract(
+                    value,
+                    name=f"state.{name}[{index}]",
+                    shape=shape,
+                    dtype=jnp.dtype(jnp.float32),
+                )
+
+        float_contracts = (
+            ("loss_fast_ema", state.loss_fast_ema, ()),
+            ("loss_slow_ema", state.loss_slow_ema, ()),
+            ("previous_targets", state.previous_targets, (self._n_heads,)),
+            ("target_repeat_ema", state.target_repeat_ema, ()),
+            ("target_simplex_ema", state.target_simplex_ema, ()),
+            ("meta_trunk_log_scale", state.meta_trunk_log_scale, ()),
+            ("meta_head_weight_log_scale", state.meta_head_weight_log_scale, ()),
+            ("meta_head_bias_log_scale", state.meta_head_bias_log_scale, ()),
+            ("meta_repetition_log_scale", state.meta_repetition_log_scale, ()),
+            ("adaptive_kappa_log_scale", state.adaptive_kappa_log_scale, ()),
+            ("birth_timestamp", state.birth_timestamp, ()),
+            ("uptime_s", state.uptime_s, ()),
+        )
+        for name, value, shape in float_contracts:
+            _require_array_contract(
+                value,
+                name=f"state.{name}",
+                shape=shape,
+                dtype=jnp.dtype(jnp.float32),
+            )
+        _require_array_contract(
+            state.step_count,
+            name="state.step_count",
+            shape=(),
+            dtype=jnp.dtype(jnp.int32),
+        )
+        _checked_step_words_increment(state.step_words)
+        _require_array_contract(
+            state.perturbation_phase,
+            name="state.perturbation_phase",
+            shape=(),
+            dtype=jnp.dtype(jnp.int32),
+        )
+        key_data = jr.key_data(state.key)
+        _require_array_contract(
+            key_data,
+            name="state.key data",
+            shape=(2,),
+            dtype=jnp.dtype(jnp.uint32),
+        )
+
+    def _perturbation_phase_valid(self, step_words: Array, phase: Array) -> Array:
+        """Bind a bounded perturbation cadence phase to exact update identity."""
+
+        divisor = jnp.asarray(self._perturbation_interval, dtype=jnp.uint32)
+
+        def fold_word(remainder: Array, word: Array) -> Array:
+            def fold_bit(bit_index: Array, current: Array) -> Array:
+                shift = jnp.asarray(31, dtype=jnp.int32) - bit_index
+                bit = (word >> shift.astype(jnp.uint32)) & jnp.asarray(
+                    1,
+                    dtype=jnp.uint32,
+                )
+                doubled = current + current + bit
+                return jnp.where(doubled >= divisor, doubled - divisor, doubled)
+
+            return cast(Array, jax.lax.fori_loop(0, 32, fold_bit, remainder))
+
+        exact_phase = fold_word(
+            fold_word(jnp.asarray(0, dtype=jnp.uint32), step_words[0]),
+            step_words[1],
+        )
+        phase_in_range = (phase >= 0) & (
+            phase < jnp.asarray(self._perturbation_interval, dtype=jnp.int32)
+        )
+        return phase_in_range & (phase.astype(jnp.uint32) == exact_phase)
+
+    def _next_perturbation_phase(self, phase: Array) -> Array:
+        """Advance perturbation cadence independently of saturated telemetry."""
+
+        final_phase = jnp.asarray(self._perturbation_interval - 1, dtype=jnp.int32)
+        return jnp.where(
+            phase == final_phase,
+            jnp.asarray(0, dtype=jnp.int32),
+            phase + jnp.asarray(1, dtype=jnp.int32),
+        )
+
+    def _state_values_valid(self, state: UPGDState) -> Array:
+        """Validate every persisted dynamic value outside the exact clock."""
+
+        floating_values: list[Any] = [
+            *state.trunk_params.weights,
+            *state.trunk_params.biases,
+            *state.head_params.weights,
+            *state.head_params.biases,
+            *state.readout_fast_head_params.weights,
+            *state.readout_fast_head_params.biases,
+            state.readout_label_adapter,
+            *state.utilities,
+            *state.unit_utilities,
+            *state.unit_long_utilities,
+            *state.unit_gradient_emas,
+            state.unit_replacement_counts,
+            state.unit_replacement_accumulators,
+            state.loss_fast_ema,
+            state.loss_slow_ema,
+            state.previous_targets,
+            state.target_repeat_ema,
+            state.target_simplex_ema,
+            state.meta_trunk_log_scale,
+            state.meta_head_weight_log_scale,
+            state.meta_head_bias_log_scale,
+            state.meta_repetition_log_scale,
+            state.adaptive_kappa_log_scale,
+            *state.previous_trunk_weight_grads,
+            *state.previous_trunk_bias_grads,
+            *state.previous_head_weight_grads,
+            *state.previous_head_bias_grads,
+            state.birth_timestamp,
+            state.uptime_s,
+        ]
+        finite = jnp.asarray(True, dtype=jnp.bool_)
+        for value in floating_values:
+            finite = finite & jnp.all(jnp.isfinite(value))
+        nonnegative_unit_state = jnp.asarray(True, dtype=jnp.bool_)
+        for value in (
+            *state.utilities,
+            *state.unit_utilities,
+            *state.unit_long_utilities,
+            *state.unit_gradient_emas,
+        ):
+            nonnegative_unit_state = nonnegative_unit_state & jnp.all(value >= 0.0)
+        nonnegative_ages = jnp.asarray(True, dtype=jnp.bool_)
+        for ages in state.unit_ages:
+            nonnegative_ages = nonnegative_ages & jnp.all(ages >= 0)
+        adapter_rows = jnp.sum(state.readout_label_adapter, axis=1)
+        return (
+            finite
+            & nonnegative_unit_state
+            & nonnegative_ages
+            & jnp.all(state.unit_replacement_counts >= 0.0)
+            & jnp.all(state.unit_replacement_accumulators >= 0.0)
+            & jnp.all(state.unit_replacement_accumulators <= 1.0)
+            & (state.loss_fast_ema >= 0.0)
+            & (state.loss_slow_ema >= 0.0)
+            & (state.target_repeat_ema >= 0.0)
+            & (state.target_repeat_ema <= 1.0)
+            & (state.target_simplex_ema >= 0.0)
+            & (state.target_simplex_ema <= 1.0)
+            & jnp.all(state.readout_label_adapter >= 0.0)
+            & jnp.all(jnp.abs(adapter_rows - 1.0) <= 1e-4)
+            & (jnp.asarray(state.birth_timestamp, dtype=jnp.float32) >= 0.0)
+            & (jnp.asarray(state.uptime_s, dtype=jnp.float32) >= 0.0)
+        )
+
+    def _transaction_state_valid(self, state: UPGDState) -> Array:
+        """Validate the whole dynamic state including authenticated schedules."""
+
+        return (
+            _lifetime_counter_valid(state.step_words, state.step_count)
+            & self._perturbation_phase_valid(
+                state.step_words,
+                state.perturbation_phase,
+            )
+            & self._state_values_valid(state)
+        )
+
+    def memory_accounting(self, state: UPGDState) -> dict[str, int]:
+        """Return exact persistent-array and lifetime-clock resource accounting."""
+
+        return {
+            "lifetime_counter_bytes": UPGD_LIFETIME_COUNTER_NBYTES,
+            "perturbation_phase_bytes": int(state.perturbation_phase.nbytes),
+            "transaction_clock_bytes": UPGD_TRANSACTION_CLOCK_NBYTES,
+            "persistent_array_bytes": measure_upgd_state_nbytes(state),
+        }
 
     @classmethod
     def step2_default(
@@ -1345,6 +1865,7 @@ class UPGDLearner:
         """Serialize learner configuration to dict."""
         return {
             "type": "UPGDLearner",
+            "state_schema": UPGD_STATE_SCHEMA,
             "n_heads": self._n_heads,
             "hidden_sizes": list(self._hidden_sizes),
             "step_size": self._step_size,
@@ -1492,7 +2013,18 @@ class UPGDLearner:
         from alberta_framework.core.optimizers import bounder_from_config
 
         config = dict(config)
-        config.pop("type", None)
+        expected_fields = set(cls(n_heads=1).to_config())
+        if set(config) != expected_fields:
+            missing = sorted(expected_fields - set(config))
+            extra = sorted(set(config) - expected_fields)
+            raise ValueError(
+                "UPGD config field manifest is not exact; "
+                f"missing={missing}, extra={extra}"
+            )
+        if config.pop("type") != "UPGDLearner":
+            raise ValueError("UPGD config type is unsupported")
+        if config.pop("state_schema") != UPGD_STATE_SCHEMA:
+            raise ValueError("UPGD state schema is unsupported")
         bounder_cfg = config.pop("bounder", None)
         bounder = bounder_from_config(bounder_cfg) if bounder_cfg is not None else None
         return cls(
@@ -1593,7 +2125,7 @@ class UPGDLearner:
             unit_ages=tuple(unit_ages),
             unit_replacement_counts=jnp.zeros(
                 len(unit_utilities),
-                dtype=jnp.float32,
+                dtype=jnp.int32,
             ),
             unit_replacement_accumulators=jnp.zeros(
                 len(unit_utilities),
@@ -1631,8 +2163,10 @@ class UPGDLearner:
             ),
             key=key,
             step_count=jnp.array(0, dtype=jnp.int32),
-            birth_timestamp=time.time(),
-            uptime_s=0.0,
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
+            perturbation_phase=jnp.array(0, dtype=jnp.int32),
+            birth_timestamp=jnp.asarray(time.time(), dtype=jnp.float32),
+            uptime_s=jnp.asarray(0.0, dtype=jnp.float32),
         )
 
     # -------------------------------------------------------------------------
@@ -1871,7 +2405,7 @@ class UPGDLearner:
         observation: Array,
         targets: Array,
     ) -> UPGDUpdateResult:
-        """Run one UPGD update step.
+        """Run one validated, atomic UPGD update step.
 
         The loss is ``0.5 * sum_active((pred_i - target_i)^2)`` by default;
         inactive (NaN target) heads contribute zero. Gradients are computed
@@ -1887,6 +2421,52 @@ class UPGDLearner:
             :class:`UPGDUpdateResult` with the updated state, predictions,
             errors, and 1D metrics array.
         """
+        raw_observation = jnp.asarray(observation)
+        if raw_observation.ndim != 1:
+            raise ValueError(
+                "observation must be rank one, "
+                f"got shape {raw_observation.shape}"
+            )
+        if raw_observation.dtype != jnp.dtype(jnp.float32):
+            raise TypeError(
+                "observation must have dtype float32, "
+                f"got {raw_observation.dtype}"
+            )
+        raw_targets = _require_array_contract(
+            targets,
+            name="targets",
+            shape=(self._n_heads,),
+            dtype=jnp.dtype(jnp.float32),
+        )
+        self._require_state_contract(state, feature_dim=raw_observation.shape[0])
+        proposed_step_words, lifetime_capacity_available = (
+            _checked_step_words_increment(state.step_words)
+        )
+        proposed_perturbation_phase = self._next_perturbation_phase(
+            state.perturbation_phase
+        )
+        lifetime_counter_valid = _lifetime_counter_valid(
+            state.step_words,
+            state.step_count,
+        )
+        state_valid = self._transaction_state_valid(state)
+        input_valid = (
+            state_valid
+            & lifetime_capacity_available
+            & jnp.all(jnp.isfinite(raw_observation))
+            & jnp.all(jnp.isfinite(raw_targets) | jnp.isnan(raw_targets))
+        )
+        observation = jnp.where(
+            jnp.isfinite(raw_observation),
+            raw_observation,
+            0.0,
+        )
+        targets = jnp.where(
+            jnp.isfinite(raw_targets) | jnp.isnan(raw_targets),
+            raw_targets,
+            jnp.nan,
+        )
+
         slope = self._leaky_relu_slope
         ln = self._use_layer_norm
         sigma = jnp.array(self._perturbation_sigma, dtype=jnp.float32)
@@ -1896,8 +2476,6 @@ class UPGDLearner:
         unit_long_decay = jnp.array(self._unit_long_utility_decay, dtype=jnp.float32)
         unit_gradient_decay = jnp.array(self._unit_gradient_decay, dtype=jnp.float32)
         step_size = jnp.array(self._step_size, dtype=jnp.float32)
-        warmup_steps = jnp.array(self._perturbation_warmup_steps, dtype=jnp.float32)
-        ramp_steps = jnp.array(self._perturbation_ramp_steps, dtype=jnp.float32)
         use_mean_loss = self._loss_normalization == "mean"
         use_target_density_loss = self._loss_normalization == "target_density"
         use_target_structure_loss = self._loss_normalization == "target_structure"
@@ -2266,9 +2844,9 @@ class UPGDLearner:
             )
             head_ratio = new_loss_fast_ema / (new_loss_slow_ema + 1e-12)
             head_pressure_width = jnp.maximum(head_threshold - 1.0, 1e-3)
-            warm = state.step_count >= jnp.asarray(
+            warm = _exact_step_at_least(
+                state.step_words,
                 self._head_loss_pressure_warmup_steps,
-                dtype=jnp.int32,
             )
             head_loss_pressure = jnp.where(
                 warm,
@@ -2302,9 +2880,9 @@ class UPGDLearner:
             )
             * simplex_like_target.astype(jnp.float32)
         )
-        repetition_warm = state.step_count >= jnp.asarray(
+        repetition_warm = _exact_step_at_least(
+            state.step_words,
             self._head_repetition_warmup_steps,
-            dtype=jnp.int32,
         )
         repetition_threshold = jnp.asarray(
             self._head_repetition_pressure_threshold,
@@ -2471,10 +3049,9 @@ class UPGDLearner:
                     jnp.asarray(self._adaptive_kappa_max, dtype=jnp.float32),
                 )
                 effective_kappa = jnp.where(
-                    state.step_count
-                    >= jnp.asarray(
+                    _exact_step_at_least(
+                        state.step_words,
                         self._adaptive_kappa_warmup_steps,
-                        dtype=jnp.int32,
                     ),
                     effective_kappa,
                     jnp.asarray(self._adaptive_kappa_base, dtype=jnp.float32),
@@ -2539,10 +3116,9 @@ class UPGDLearner:
                         jnp.asarray(self._adaptive_kappa_max, dtype=jnp.float32),
                     )
                     effective_kappa = jnp.where(
-                        state.step_count
-                        >= jnp.asarray(
+                        _exact_step_at_least(
+                            state.step_words,
                             self._adaptive_kappa_warmup_steps,
-                            dtype=jnp.int32,
                         ),
                         effective_kappa,
                         jnp.asarray(self._adaptive_kappa_base, dtype=jnp.float32),
@@ -2782,7 +3358,9 @@ class UPGDLearner:
                     unit_gradient_decay * state.unit_gradient_emas[i]
                     + (1.0 - unit_gradient_decay) * unit_gradient_signal
                 )
-                new_unit_ages.append(state.unit_ages[i] + 1)
+                new_unit_ages.append(
+                    _saturating_nonnegative_int32_increment(state.unit_ages[i])
+                )
             elif len(state.unit_utilities) > 0:
                 new_unit_utilities.append(state.unit_utilities[i])
                 new_unit_long_utilities.append(state.unit_long_utilities[i])
@@ -2793,22 +3371,20 @@ class UPGDLearner:
         # Apply every `perturbation_interval` steps. Skip on step 0 because
         # utilities are still all zero (would maximally perturb every weight).
         do_perturb = jnp.logical_and(
-            state.step_count > 0,
-            (state.step_count % self._perturbation_interval) == 0,
+            jnp.any(state.step_words != jnp.asarray(0, dtype=jnp.uint32)),
+            state.perturbation_phase == jnp.asarray(0, dtype=jnp.int32),
         )
-        after_warmup = state.step_count >= self._perturbation_warmup_steps
-        ramp_progress = jnp.where(
-            ramp_steps > 0.0,
-            (state.step_count.astype(jnp.float32) - warmup_steps + 1.0)
-            / jnp.maximum(ramp_steps, 1.0),
-            1.0,
-        )
-        schedule_scale = jnp.where(
-            after_warmup,
-            jnp.clip(ramp_progress, 0.0, 1.0),
-            0.0,
+        schedule_scale = _bounded_ramp_strength(
+            state.step_words,
+            start=self._perturbation_warmup_steps,
+            length=self._perturbation_ramp_steps,
         )
         effective_sigma = sigma * schedule_scale
+        perturbation_applied = (
+            do_perturb
+            & (effective_sigma > 0.0)
+            & jnp.asarray(self._perturbation_sigma > 0.0 and n_trunk > 0)
+        )
 
         new_key = state.key
         eps = jnp.array(1e-12, dtype=jnp.float32)
@@ -2864,7 +3440,7 @@ class UPGDLearner:
         if unit_replacement_counts is None:
             unit_replacement_counts = jnp.zeros(
                 len(state.unit_utilities),
-                dtype=jnp.float32,
+                dtype=jnp.int32,
             )
         new_replacement_counts: list[Array] = list(unit_replacement_counts)
 
@@ -2968,11 +3544,11 @@ class UPGDLearner:
                     )
                 else:
                     rate_scale = jnp.array(1.0, dtype=jnp.float32)
-                accum = (
+                proposed_accum = (
                     state.unit_replacement_accumulators[i]
                     + rate * layer_size_f * rate_scale
                 )
-                do_replace = accum >= 1.0
+                do_replace = proposed_accum >= 1.0
                 gated = jnp.logical_and(
                     jnp.logical_and(
                         jnp.logical_and(do_replace, has_candidate),
@@ -3070,9 +3646,26 @@ class UPGDLearner:
                 new_unit_ages[i] = unit_age.at[unit_idx].set(
                     jnp.where(gated, jnp.int32(0), unit_age[unit_idx])
                 )
-                new_accumulators.append(jnp.where(gated, accum - 1.0, accum))
+                remaining_credit = jnp.where(
+                    gated,
+                    proposed_accum - 1.0,
+                    proposed_accum,
+                )
+                new_accumulators.append(
+                    jnp.clip(
+                        remaining_credit,
+                        jnp.asarray(0.0, dtype=jnp.float32),
+                        jnp.asarray(1.0, dtype=jnp.float32),
+                    )
+                )
                 new_replacement_counts.append(
-                    unit_replacement_counts[i] + gated.astype(jnp.float32)
+                    jnp.where(
+                        gated,
+                        _saturating_nonnegative_int32_increment(
+                            unit_replacement_counts[i]
+                        ),
+                        unit_replacement_counts[i],
+                    )
                 )
         # When there are no hidden layers, utilities is empty.
         if n_trunk == 0:
@@ -3124,9 +3717,9 @@ class UPGDLearner:
                     dtype=jnp.float32,
                 )
             )
-            kappa_meta_warm = state.step_count >= jnp.asarray(
+            kappa_meta_warm = _exact_step_at_least(
+                state.step_words,
                 self._adaptive_kappa_meta_warmup_steps,
-                dtype=jnp.int32,
             )
             global_alignment = self._gradient_alignment(
                 state.previous_trunk_weight_grads
@@ -3160,9 +3753,9 @@ class UPGDLearner:
                     dtype=jnp.float32,
                 )
             )
-            meta_warm = state.step_count >= jnp.asarray(
+            meta_warm = _exact_step_at_least(
+                state.step_words,
                 self._meta_plasticity_warmup_steps,
-                dtype=jnp.int32,
             )
 
             def update_log_scale(log_scale: Array, signal: Array) -> Array:
@@ -3227,7 +3820,7 @@ class UPGDLearner:
             unit_ages=tuple(new_unit_ages),
             unit_replacement_counts=jnp.asarray(
                 new_replacement_counts,
-                dtype=jnp.float32,
+                dtype=jnp.int32,
             ),
             unit_replacement_accumulators=jnp.asarray(
                 new_accumulators,
@@ -3248,7 +3841,9 @@ class UPGDLearner:
             previous_head_weight_grads=next_previous_head_weight_grads,
             previous_head_bias_grads=next_previous_head_bias_grads,
             key=new_key,
-            step_count=state.step_count + 1,
+            step_count=_saturating_nonnegative_int32_increment(state.step_count),
+            step_words=proposed_step_words,
+            perturbation_phase=proposed_perturbation_phase,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
@@ -3257,12 +3852,250 @@ class UPGDLearner:
             [loss_value, mean_utility, min_utility, max_perturbation_magnitude]
         )
 
-        return UPGDUpdateResult(  # type: ignore[call-arg]
-            state=new_state,
-            predictions=predictions,
-            errors=errors,
-            metrics=metrics,
+        candidate_state_valid = self._transaction_state_valid(new_state)
+        update_available = input_valid & candidate_state_valid
+        committed_state = jax.lax.cond(
+            update_available,
+            lambda _: new_state,
+            lambda _: state,
+            operand=None,
         )
+
+        return UPGDUpdateResult(  # type: ignore[call-arg]
+            state=committed_state,
+            predictions=jnp.where(
+                update_available,
+                predictions,
+                jnp.full_like(predictions, jnp.nan),
+            ),
+            errors=jnp.where(
+                update_available,
+                errors,
+                jnp.full_like(errors, jnp.nan),
+            ),
+            metrics=jnp.where(update_available, metrics, jnp.zeros_like(metrics)),
+            pre_step_words=state.step_words,
+            post_step_words=committed_state.step_words,
+            lifetime_counter_valid=lifetime_counter_valid,
+            lifetime_capacity_available=lifetime_capacity_available,
+            state_valid=state_valid,
+            candidate_state_valid=candidate_state_valid,
+            perturbation_due=update_available & do_perturb,
+            perturbation_applied=update_available & perturbation_applied,
+            update_applied=update_available,
+            update_rejected=~update_available,
+        )
+
+
+def upgd_lifetime_counter_nbytes() -> int:
+    """Return bytes occupied by compatibility telemetry and exact identity."""
+
+    return UPGD_LIFETIME_COUNTER_NBYTES
+
+
+def upgd_transaction_clock_nbytes() -> int:
+    """Return bytes occupied by telemetry, exact identity, and cadence phase."""
+
+    return UPGD_TRANSACTION_CLOCK_NBYTES
+
+
+def measure_upgd_state_nbytes(state: UPGDState) -> int:
+    """Measure every persistent JAX-array byte in one UPGD state."""
+
+    return sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree.leaves(state)
+        if isinstance(leaf, Array)
+    )
+
+
+def migrate_legacy_upgd_state(
+    legacy_state: Any,
+    *,
+    perturbation_interval: int,
+) -> UPGDState:
+    """Migrate one exact pre-v2 state without inventing saturated history.
+
+    The historical field manifest must match exactly. Negative, wrapped, or
+    saturated int32 telemetry and unit ages are rejected because their exact
+    prior lifetime cannot be reconstructed.
+    """
+
+    _require_bounded_schedule(
+        "perturbation_interval",
+        perturbation_interval,
+        _INT32_MAX,
+    )
+    if perturbation_interval < 1:
+        raise ValueError("perturbation_interval must be at least one")
+    if isinstance(legacy_state, Mapping):
+        fields = dict(legacy_state)
+    elif dataclasses.is_dataclass(legacy_state) and not isinstance(legacy_state, type):
+        fields = {
+            field.name: getattr(legacy_state, field.name)
+            for field in dataclasses.fields(legacy_state)
+        }
+    else:
+        raise TypeError("legacy UPGD state must be a mapping or dataclass")
+
+    current_names = {
+        field.name
+        for field in dataclasses.fields(UPGDState)  # type: ignore[arg-type]
+    }
+    legacy_names = current_names - {"step_words", "perturbation_phase"}
+    supplied_names = set(fields)
+    if supplied_names != legacy_names:
+        missing = sorted(legacy_names - supplied_names)
+        extra = sorted(supplied_names - legacy_names)
+        raise ValueError(
+            "legacy UPGD field manifest is not exact; "
+            f"missing={missing}, extra={extra}"
+        )
+
+    step_count = jnp.asarray(fields["step_count"])
+    if step_count.shape != () or step_count.dtype != jnp.dtype(jnp.int32):
+        raise TypeError("legacy UPGD step_count must be scalar int32")
+    step = int(step_count)
+    if step < 0:
+        raise ValueError("negative legacy UPGD step_count indicates wrap")
+    if step >= _INT32_MAX:
+        raise ValueError("saturated legacy UPGD step_count is ambiguous")
+    unit_ages = fields["unit_ages"]
+    if not isinstance(unit_ages, tuple):
+        raise TypeError("legacy UPGD unit_ages must be a tuple")
+    for index, value in enumerate(unit_ages):
+        age = jnp.asarray(value)
+        if age.ndim != 1 or age.dtype != jnp.dtype(jnp.int32):
+            raise TypeError(f"legacy UPGD unit_ages[{index}] must be rank-one int32")
+        if bool(jnp.any(age < 0)):
+            raise ValueError(f"negative legacy UPGD unit_ages[{index}] indicates wrap")
+        if bool(jnp.any(age >= _INT32_MAX)):
+            raise ValueError(f"saturated legacy UPGD unit_ages[{index}] is ambiguous")
+    legacy_accumulators = jnp.asarray(fields["unit_replacement_accumulators"])
+    if (
+        legacy_accumulators.shape != (len(unit_ages),)
+        or legacy_accumulators.dtype != jnp.dtype(jnp.float32)
+    ):
+        raise TypeError(
+            "legacy UPGD unit_replacement_accumulators must be rank-one float32"
+        )
+    if (
+        not bool(jnp.all(jnp.isfinite(legacy_accumulators)))
+        or bool(jnp.any(legacy_accumulators < 0.0))
+        or bool(jnp.any(legacy_accumulators > 1.0))
+    ):
+        raise ValueError(
+            "legacy UPGD unit_replacement_accumulators outside bounded pending "
+            "credit [0, 1] are ambiguous"
+        )
+    if fields["unit_replacement_counts"] is None:
+        fields["unit_replacement_counts"] = jnp.zeros(
+            len(unit_ages),
+            dtype=jnp.int32,
+        )
+    else:
+        legacy_counts = jnp.asarray(fields["unit_replacement_counts"])
+        if (
+            legacy_counts.shape != (len(unit_ages),)
+            or legacy_counts.dtype != jnp.dtype(jnp.float32)
+        ):
+            raise TypeError(
+                "legacy UPGD unit_replacement_counts must be rank-one float32"
+            )
+        if (
+            not bool(jnp.all(jnp.isfinite(legacy_counts)))
+            or bool(jnp.any(legacy_counts < 0.0))
+            or bool(jnp.any(legacy_counts != jnp.floor(legacy_counts)))
+        ):
+            raise ValueError(
+                "legacy UPGD unit_replacement_counts must be finite "
+                "non-negative integers"
+            )
+        if bool(jnp.any(legacy_counts >= 2**24)):
+            raise ValueError(
+                "legacy UPGD unit_replacement_counts at float32's consecutive-"
+                "integer boundary are ambiguous"
+            )
+        fields["unit_replacement_counts"] = legacy_counts.astype(jnp.int32)
+    for name in ("birth_timestamp", "uptime_s"):
+        value = float(fields[name])
+        if not jnp.isfinite(value) or value < 0.0:
+            raise ValueError(f"legacy UPGD {name} must be finite nonnegative")
+        fields[name] = jnp.asarray(value, dtype=jnp.float32)
+
+    fields["step_words"] = jnp.asarray((0, step), dtype=jnp.uint32)
+    fields["perturbation_phase"] = jnp.asarray(
+        step % perturbation_interval,
+        dtype=jnp.int32,
+    )
+    return UPGDState(**fields)
+
+
+def save_upgd_checkpoint(
+    learner: UPGDLearner,
+    state: UPGDState,
+    path: str | Path,
+    *,
+    feature_dim: int,
+) -> None:
+    """Persist one structurally and dynamically valid exact-clock UPGD state."""
+
+    if isinstance(feature_dim, bool) or not isinstance(feature_dim, int) or feature_dim < 1:
+        raise ValueError("feature_dim must be a positive integer")
+    learner._require_state_contract(state, feature_dim=feature_dim)
+    if not bool(jax.device_get(learner._transaction_state_valid(state))):
+        raise ValueError("UPGD checkpoint state is invalid")
+    save_checkpoint(
+        state,
+        path,
+        metadata={
+            "schema": UPGD_CHECKPOINT_SCHEMA,
+            "learner_config": learner.to_config(),
+            "feature_dim": feature_dim,
+            "memory_accounting": learner.memory_accounting(state),
+        },
+    )
+
+
+def load_upgd_checkpoint(path: str | Path) -> tuple[UPGDLearner, UPGDState]:
+    """Restore only a structurally valid v2 exact-clock UPGD checkpoint."""
+
+    metadata = load_checkpoint_metadata(path)
+    expected_fields = {
+        "schema",
+        "learner_config",
+        "feature_dim",
+        "memory_accounting",
+    }
+    if set(metadata) != expected_fields:
+        raise ValueError("UPGD checkpoint metadata fields are invalid")
+    checkpoint_schema = metadata.get("schema")
+    if checkpoint_schema == _LEGACY_UPGD_CHECKPOINT_SCHEMA:
+        raise ValueError(
+            "legacy UPGD checkpoint v1 lacks exact step_words and "
+            "perturbation_phase; migrate its state with "
+            "migrate_legacy_upgd_state and resave it"
+        )
+    if checkpoint_schema != UPGD_CHECKPOINT_SCHEMA:
+        raise ValueError("UPGD checkpoint schema is unsupported")
+    config = metadata.get("learner_config")
+    if not isinstance(config, dict):
+        raise ValueError("UPGD checkpoint learner_config is invalid")
+    learner = UPGDLearner.from_config(config)
+    feature_dim = metadata.get("feature_dim")
+    if isinstance(feature_dim, bool) or not isinstance(feature_dim, int) or feature_dim < 1:
+        raise ValueError("UPGD checkpoint feature_dim is invalid")
+    template = learner.init(feature_dim=feature_dim, key=jr.key(0))
+    restored, restored_metadata = load_checkpoint(template, path)
+    if restored_metadata != metadata:
+        raise ValueError("UPGD checkpoint metadata changed between reads")
+    restored = cast(UPGDState, restored)
+    learner._require_state_contract(restored, feature_dim=feature_dim)
+    if not bool(jax.device_get(learner._transaction_state_valid(restored))):
+        raise ValueError("UPGD checkpoint state is invalid")
+    if learner.memory_accounting(restored) != metadata.get("memory_accounting"):
+        raise ValueError("UPGD checkpoint resource contract does not match")
+    return learner, restored
 
 
 # =============================================================================

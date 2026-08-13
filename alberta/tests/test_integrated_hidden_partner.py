@@ -234,6 +234,8 @@ def _force_next_interaction_promotion(
 ) -> Any:
     """Make one unique native archive identity replace active slot zero at step 64."""
     interaction = state.interaction
+    clock_63 = jnp.asarray((0, 63), dtype=jnp.uint32)
+    clock_64 = jnp.asarray((0, 64), dtype=jnp.uint32)
     matching = (interaction.candidate_left == pair[0]) & (
         interaction.candidate_right == pair[1]
     )
@@ -250,6 +252,8 @@ def _force_next_interaction_promotion(
     return state.replace(
         interaction=interaction.replace(
             step_count=jnp.asarray(63, dtype=jnp.int32),
+            step_words=clock_63,
+            replacement_phase=jnp.asarray(63, dtype=jnp.int32),
             ages=jnp.full(
                 (ACTIVE_PAIR_SLOTS,),
                 256,
@@ -265,7 +269,32 @@ def _force_next_interaction_promotion(
                 dtype=jnp.int32,
             ),
             candidate_utilities=candidate_utilities,
-        )
+        ),
+        state_builder=state.state_builder.replace(
+            step_count=jnp.asarray(64, dtype=jnp.int32),
+            step_words=clock_64,
+            update_count=jnp.asarray(63, dtype=jnp.int32),
+            update_words=clock_63,
+        ),
+        behavior=state.behavior.replace(
+            step_count=jnp.asarray(63, dtype=jnp.int32),
+            step_words=clock_63,
+        ),
+        joint_world=state.joint_world.replace(
+            step_count=jnp.asarray(63, dtype=jnp.int32),
+            step_words=clock_63,
+        ),
+        control=state.control.replace(
+            step_count=jnp.asarray(63, dtype=jnp.int32),
+            step_words=clock_63,
+        ),
+        router=dataclasses.replace(
+            state.router,
+            route_count=jnp.asarray(63, dtype=jnp.int32),
+            route_words=clock_63,
+        ),
+        step_count=jnp.asarray(63, dtype=jnp.int32),
+        step_words=clock_63,
     )
 
 
@@ -326,7 +355,7 @@ def test_config_round_trip_and_exact_default_composition() -> None:
     assert agent.router.config.total_feature_dim == DEPLOYED_FEATURE_DIM == 24
 
     payload = config.to_config()
-    assert payload["schema_version"] == "alberta.integrated-hidden-partner.l0.v15"
+    assert payload["schema_version"] == "alberta.integrated-hidden-partner.l0.v16"
     assert payload["schema_version"] == INTEGRATED_HIDDEN_PARTNER_SCHEMA_VERSION
     assert payload["development_level"] == "L0"
     assert payload["accepted_scientific_evidence"] is False
@@ -335,14 +364,14 @@ def test_config_round_trip_and_exact_default_composition() -> None:
     ]
     extra = copy.deepcopy(payload)
     extra["promoted_evidence"] = True
-    with pytest.raises(ValueError, match="v15 schema"):
+    with pytest.raises(ValueError, match="v16 schema"):
         IntegratedHiddenPartnerConfig.from_config(extra)
     invalid_claim = copy.deepcopy(payload)
     invalid_claim["accepted_scientific_evidence"] = True
     with pytest.raises(ValueError, match="not accepted"):
         IntegratedHiddenPartnerConfig.from_config(invalid_claim)
     old_schema = copy.deepcopy(payload)
-    old_schema["schema_version"] = "alberta.integrated-hidden-partner.l0.v14"
+    old_schema["schema_version"] = "alberta.integrated-hidden-partner.l0.v15"
     with pytest.raises(ValueError, match="unsupported"):
         IntegratedHiddenPartnerConfig.from_config(old_schema)
     assert payload["action_selection_mode"] == "agent"
@@ -355,7 +384,7 @@ def test_config_round_trip_and_exact_default_composition() -> None:
     )
     missing_mode = copy.deepcopy(payload)
     missing_mode.pop("action_selection_mode")
-    with pytest.raises(ValueError, match="v15 schema"):
+    with pytest.raises(ValueError, match="v16 schema"):
         IntegratedHiddenPartnerConfig.from_config(missing_mode)
     for invalid_mode in (None, 1, "forced"):
         with pytest.raises(ValueError, match="action_selection_mode"):
@@ -2263,7 +2292,7 @@ def test_custom_initial_bank_starts_router_and_interaction_in_exact_order() -> N
 
     custom_budget = custom_agent.resource_budget(custom.state)
     legacy_budget = legacy_agent.resource_budget(legacy.state)
-    assert custom_budget.total_state_nbytes == legacy_budget.total_state_nbytes == 6757
+    assert custom_budget.total_state_nbytes == legacy_budget.total_state_nbytes == 6833
     assert jax.tree_util.tree_structure(custom.state) == jax.tree_util.tree_structure(legacy.state)
     chex.assert_trees_all_equal(
         custom.diagnostics.selection.rng_key_before,
@@ -3763,6 +3792,109 @@ def test_invalid_transition_is_an_explicit_atomic_noop(invalid_case: str) -> Non
         assert int(delta) == 0
 
 
+def test_exhausted_behavior_clock_rejects_the_complete_integrated_transaction() -> None:
+    agent = IntegratedHiddenPartnerAgent(
+        IntegratedHiddenPartnerConfig(replacement_interval=0)
+    )
+    start, transition, _ = _start_and_transition(agent, seed=8_405)
+    exhausted = start.state.replace(
+        behavior=start.state.behavior.replace(
+            step_count=jnp.asarray(2**31 - 1, dtype=jnp.int32),
+            step_words=jnp.full((2,), 2**32 - 1, dtype=jnp.uint32),
+        )
+    )
+
+    result = agent.update(exhausted, transition)
+
+    chex.assert_trees_all_equal(result.state, exhausted)
+    chex.assert_trees_all_equal(result.action, exhausted.control.last_action)
+    assert bool(result.diagnostics.behavior_lifetime_counter_valid)
+    assert not bool(result.diagnostics.behavior_lifetime_capacity_available)
+    assert not bool(result.diagnostics.behavior_update_applied)
+    assert not bool(result.diagnostics.candidate_models_valid)
+    assert bool(result.diagnostics.transition_rejected)
+    for delta in (
+        result.diagnostics.state_builder_step_delta,
+        result.diagnostics.state_builder_learning_delta,
+        result.diagnostics.behavior_step_delta,
+        result.diagnostics.interaction_step_delta,
+        result.diagnostics.world_step_delta,
+        result.diagnostics.grounded_world_step_delta,
+        result.diagnostics.control_step_delta,
+        result.diagnostics.router_route_delta,
+        result.diagnostics.router_generation_delta,
+        result.diagnostics.integrated_step_delta,
+    ):
+        assert int(delta) == 0
+
+
+def test_exhausted_joint_world_clock_rejects_the_complete_integrated_transaction() -> None:
+    agent = IntegratedHiddenPartnerAgent(
+        IntegratedHiddenPartnerConfig(replacement_interval=0)
+    )
+    start, transition, _ = _start_and_transition(agent, seed=8_406)
+    exhausted = start.state.replace(
+        joint_world=start.state.joint_world.replace(
+            step_count=jnp.asarray(2**31 - 1, dtype=jnp.int32),
+            step_words=jnp.full((2,), 2**32 - 1, dtype=jnp.uint32),
+        )
+    )
+
+    result = agent.update(exhausted, transition)
+
+    chex.assert_trees_all_equal(result.state, exhausted)
+    chex.assert_trees_all_equal(result.action, exhausted.control.last_action)
+    assert bool(result.diagnostics.world_lifetime_counter_valid)
+    assert not bool(result.diagnostics.world_lifetime_capacity_available)
+    assert not bool(result.diagnostics.world_update_applied)
+    assert not bool(result.diagnostics.candidate_models_valid)
+    assert bool(result.diagnostics.transition_rejected)
+    for delta in (
+        result.diagnostics.state_builder_step_delta,
+        result.diagnostics.state_builder_learning_delta,
+        result.diagnostics.behavior_step_delta,
+        result.diagnostics.interaction_step_delta,
+        result.diagnostics.world_step_delta,
+        result.diagnostics.grounded_world_step_delta,
+        result.diagnostics.control_step_delta,
+        result.diagnostics.router_route_delta,
+        result.diagnostics.router_generation_delta,
+        result.diagnostics.integrated_step_delta,
+    ):
+        assert int(delta) == 0
+
+
+def test_exhausted_grounded_world_clock_rejects_the_complete_integrated_transaction() -> None:
+    agent = IntegratedHiddenPartnerAgent(_grounded_integrated_config())
+    start, transition, _ = _start_and_transition(agent, seed=8_407)
+    assert start.state.grounded_world is not None
+    exhausted = start.state.replace(
+        grounded_world=start.state.grounded_world.replace(
+            update_count=jnp.asarray(2**31 - 1, dtype=jnp.int32),
+            update_words=jnp.full((2,), 2**32 - 1, dtype=jnp.uint32),
+        )
+    )
+
+    result = agent.update(exhausted, transition)
+
+    chex.assert_trees_all_equal(result.state, exhausted)
+    chex.assert_trees_all_equal(result.action, exhausted.control.last_action)
+    assert bool(result.diagnostics.grounded_world_lifetime_counter_valid)
+    assert not bool(result.diagnostics.grounded_world_lifetime_capacity_available)
+    assert not bool(result.diagnostics.grounded_world_update_applied)
+    chex.assert_trees_all_equal(
+        result.diagnostics.grounded_world_pre_update_words,
+        exhausted.grounded_world.update_words,
+    )
+    chex.assert_trees_all_equal(
+        result.diagnostics.grounded_world_post_update_words,
+        exhausted.grounded_world.update_words,
+    )
+    assert not bool(result.diagnostics.grounded_path_valid)
+    assert not bool(result.diagnostics.candidate_models_valid)
+    assert bool(result.diagnostics.transition_rejected)
+
+
 def test_public_array_contracts_reject_static_shape_and_dtype_errors() -> None:
     agent = IntegratedHiddenPartnerAgent()
     environment = _environment()
@@ -3833,10 +3965,12 @@ def test_stateless_public_kernels_return_neutral_output_for_dynamic_invalidity()
     )
 
 
-def test_all_integrated_long_lived_counters_saturate_without_replacement() -> None:
+def test_saturating_telemetry_stays_compatible_while_exact_clocks_advance() -> None:
     agent = IntegratedHiddenPartnerAgent(IntegratedHiddenPartnerConfig(replacement_interval=0))
     start, transition, _ = _start_and_transition(agent, seed=83)
     maximum = jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32)
+    outer_words = jnp.asarray((0, 2**31 - 1), dtype=jnp.uint32)
+    builder_words = jnp.asarray((0, 2**31), dtype=jnp.uint32)
     interaction = start.state.interaction.replace(
         ages=jnp.full_like(start.state.interaction.ages, maximum),
         candidate_ages=jnp.full_like(start.state.interaction.candidate_ages, maximum),
@@ -3853,26 +3987,37 @@ def test_all_integrated_long_lived_counters_saturate_without_replacement() -> No
             maximum,
         ),
         step_count=maximum,
+        step_words=outer_words,
+        replacement_phase=jnp.asarray(0, dtype=jnp.int32),
     )
     state = start.state.replace(
         state_builder=start.state.state_builder.replace(
             step_count=maximum,
+            step_words=builder_words,
             update_count=maximum,
+            update_words=outer_words,
         ),
         interaction=interaction,
-        behavior=start.state.behavior.replace(step_count=maximum),
+        behavior=start.state.behavior.replace(
+            step_count=maximum,
+            step_words=outer_words,
+        ),
         joint_world=start.state.joint_world.replace(
             visit_counts=jnp.full_like(
                 start.state.joint_world.visit_counts,
                 maximum,
             ),
             step_count=maximum,
+            step_words=outer_words,
         ),
-        control=start.state.control.replace(step_count=maximum),
+        control=start.state.control.replace(
+            step_count=maximum,
+            step_words=outer_words,
+        ),
         router=dataclasses.replace(
             start.state.router,
             route_count=maximum,
-            generation_count=maximum,
+            route_words=outer_words,
         ),
         consumer_evidence_streak=jnp.full_like(
             start.state.consumer_evidence_streak,
@@ -3883,6 +4028,7 @@ def test_all_integrated_long_lived_counters_saturate_without_replacement() -> No
             maximum,
         ),
         step_count=maximum,
+        step_words=outer_words,
     )
 
     result = agent.update(state, transition)
@@ -3899,7 +4045,15 @@ def test_all_integrated_long_lived_counters_saturate_without_replacement() -> No
     assert bool(jnp.all(result.state.joint_world.visit_counts == maximum))
     assert int(result.state.control.step_count) == int(maximum)
     assert int(result.state.router.route_count) == int(maximum)
-    assert int(result.state.router.generation_count) == int(maximum)
+    chex.assert_trees_all_equal(
+        result.state.step_words,
+        jnp.asarray((0, 2**31), dtype=jnp.uint32),
+    )
+    chex.assert_trees_all_equal(
+        result.state.state_builder.step_words,
+        jnp.asarray((0, 2**31 + 1), dtype=jnp.uint32),
+    )
+    assert bool(result.diagnostics.committed_post_child_clocks_aligned)
 
 
 def test_default_grounded_lane_is_absent_and_preserves_legacy_state_bytes() -> None:
@@ -3920,8 +4074,8 @@ def test_default_grounded_lane_is_absent_and_preserves_legacy_state_bytes() -> N
     assert budget.grounded_world_update_counter_nbytes == 0
     assert budget.grounded_world_joint_cells_per_decision == 0
     assert budget.planner_cell_evaluations_per_decision == 4
-    assert budget.decision_cache_nbytes == 303
-    assert budget.total_state_nbytes == _tree_array_nbytes(start.state) == 6757
+    assert budget.decision_cache_nbytes == 311
+    assert budget.total_state_nbytes == _tree_array_nbytes(start.state) == 6833
 
 
 def test_grounded_nested_configs_roundtrip_and_reject_incomplete_or_wrong_shapes() -> None:
@@ -4350,7 +4504,7 @@ def test_enabled_gradient_modes_have_exact_resource_and_shape_parity_under_jit()
         assert budget.grounded_world_parameters_touched_per_update == (
             agent.grounded_world_model.resource_budget.learned_float32_scalars_touched_per_update
         )
-        assert budget.grounded_world_update_counter_nbytes == 4
+        assert budget.grounded_world_update_counter_nbytes == 12
         assert budget.grounded_world_joint_cells_per_decision == 4
         assert budget.planner_cell_evaluations_per_decision == 8
         assert budget.decision_cache_nbytes == 501
@@ -4515,7 +4669,7 @@ def test_replaced_checkpoint_must_match_the_cached_behavior_and_grounded_decisio
     )
 
 
-def test_grounded_counter_saturates_without_stopping_continual_updates() -> None:
+def test_grounded_counter_telemetry_corruption_rejects_integrated_update() -> None:
     agent = IntegratedHiddenPartnerAgent(_grounded_integrated_config())
     start, transition, _ = _start_and_transition(agent, seed=8305)
     assert start.state.grounded_world is not None
@@ -4529,17 +4683,13 @@ def test_grounded_counter_saturates_without_stopping_continual_updates() -> None
     assert result.state.grounded_world is not None
     assert result.diagnostics.grounded_world_update is not None
     assert bool(result.diagnostics.grounded_world_counter_saturated)
-    assert bool(result.diagnostics.grounded_world_update.diagnostics.applied)
-    assert bool(result.diagnostics.transition_semantics_valid)
-    assert int(result.state.grounded_world.update_count) == int(maximum)
+    assert not bool(result.diagnostics.grounded_world_lifetime_counter_valid)
+    assert not bool(result.diagnostics.grounded_world_update.diagnostics.applied)
+    assert not bool(result.diagnostics.transition_applied)
+    assert bool(result.diagnostics.transition_rejected)
+    chex.assert_trees_all_equal(result.state, saturated)
     assert int(result.diagnostics.grounded_world_step_delta) == 0
-    assert not bool(
-        jnp.array_equal(
-            result.state.grounded_world.weights,
-            saturated.grounded_world.weights,
-        )
-    )
-    assert int(result.diagnostics.integrated_step_delta) == 1
+    assert int(result.diagnostics.integrated_step_delta) == 0
 
 
 def test_global_planning_ablation_reports_grounded_planner_not_applied() -> None:

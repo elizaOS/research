@@ -20,7 +20,12 @@ from alberta_framework.core.feature_bank_router import (
     FeatureBankRouter,
     FeatureBankRouteResult,
 )
-from alberta_framework.core.oak import OaKAgent, OaKConfig, OaKState
+from alberta_framework.core.oak import (
+    OaKAgent,
+    OaKConfig,
+    OaKState,
+    learned_feature_subtask_specs,
+)
 from alberta_framework.core.options import STOMPConfig, SubtaskSpec
 from alberta_framework.core.prototype_feature_lifecycle import (
     PROTOTYPE_FEATURE_LIFECYCLE_MECHANISM_STATUS,
@@ -58,6 +63,56 @@ def _config(*, replacement_interval: int = 1) -> PrototypeFeatureLifecycleConfig
     )
 
 
+def _primitive_only_config() -> PrototypeFeatureLifecycleConfig:
+    return PrototypeFeatureLifecycleConfig(
+        base_feature_dim=3,
+        active_pair_slots=1,
+        candidate_pair_slots=3,
+        n_tasks=1,
+        n_options=0,
+        n_primitive_actions=2,
+        option_subtask_feature_indices=(),
+        step_size_output=0.05,
+        utility_decay=0.9,
+        replacement_interval=0,
+        min_feature_age=0,
+        candidate_min_age=0,
+        promotion_margin=1.0,
+        scale_normalizer_decay=0.9,
+        scale_normalizer_epsilon=1.0e-6,
+        carry_survivors=True,
+        max_observations=100,
+    )
+
+
+def _prefix_pair_config(
+    *,
+    replacement_interval: int = 0,
+) -> PrototypeFeatureLifecycleConfig:
+    """Return the HCCL-sized base/pair-source separation contract."""
+
+    return PrototypeFeatureLifecycleConfig(
+        base_feature_dim=23,
+        pair_source_feature_dim=16,
+        active_pair_slots=12,
+        candidate_pair_slots=120,
+        n_tasks=2,
+        n_options=2,
+        n_primitive_actions=2,
+        option_subtask_feature_indices=(0, 22),
+        step_size_output=0.05,
+        utility_decay=0.9,
+        replacement_interval=replacement_interval,
+        min_feature_age=0,
+        candidate_min_age=0,
+        promotion_margin=1.0,
+        scale_normalizer_decay=0.9,
+        scale_normalizer_epsilon=1.0e-6,
+        carry_survivors=True,
+        max_observations=100,
+    )
+
+
 def _oak_agent(config: PrototypeFeatureLifecycleConfig, *, hidden: bool = False) -> OaKAgent:
     specs = tuple(
         SubtaskSpec(feature_index=index)
@@ -74,6 +129,105 @@ def _oak_agent(config: PrototypeFeatureLifecycleConfig, *, hidden: bool = False)
                 epsilon_option=0.0,
             )
         )
+    )
+
+
+def test_nonnegative_int32_sum_within_accepts_empty_vector_without_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = jnp.empty((0,), dtype=jnp.int32)
+    limit = jnp.asarray(7, dtype=jnp.int32)
+
+    def forbidden_scan(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise AssertionError("empty int32 sums must not enter lax.scan")
+
+    with monkeypatch.context() as local:
+        local.setattr(lifecycle_module.jax.lax, "scan", forbidden_scan)
+        with jax.disable_jit():
+            eager_result = lifecycle_module._nonnegative_int32_sum_within(values, limit)
+        jitted_result = jax.jit(
+            lifecycle_module._nonnegative_int32_sum_within
+        )(values, limit)
+
+    for result in (eager_result, jitted_result):
+        assert result.shape == ()
+        assert result.dtype == jnp.bool_
+        assert bool(result)
+
+
+def test_nonnegative_int32_sum_within_preserves_nonempty_and_jit_contract() -> None:
+    values = jnp.asarray((1, 2, 3), dtype=jnp.int32)
+    helper = jax.jit(lifecycle_module._nonnegative_int32_sum_within)
+
+    accepted = helper(values, jnp.asarray(6, dtype=jnp.int32))
+    rejected_over_limit = helper(values, jnp.asarray(5, dtype=jnp.int32))
+    rejected_negative = helper(
+        values.at[1].set(jnp.asarray(-1, dtype=jnp.int32)),
+        jnp.asarray(6, dtype=jnp.int32),
+    )
+
+    for result in (accepted, rejected_over_limit, rejected_negative):
+        assert result.shape == ()
+        assert result.dtype == jnp.bool_
+    assert bool(accepted)
+    assert not bool(rejected_over_limit)
+    assert not bool(rejected_negative)
+
+
+def test_primitive_only_lifecycle_and_oak_have_no_dummy_option_or_curation() -> None:
+    config = _primitive_only_config()
+    assert PrototypeFeatureLifecycleConfig.from_config(config.to_config()) == config
+    lifecycle = PrototypeFeatureLifecycle(config)
+    oak_agent = _oak_agent(config)
+    lifecycle.require_compatible_oak_config(oak_agent.config)
+
+    lifecycle_state = lifecycle.init(jr.key(81))
+    oak_state = oak_agent.init(jr.key(82))
+    observation = jnp.asarray((0.2, -0.3, 0.5, 0.1), dtype=jnp.float32)
+    oak_state = oak_agent.start(oak_state, observation)
+    assert bool(lifecycle.state_valid(lifecycle_state))
+    assert int(oak_state.stomp_state.executing_option) == -1
+    assert oak_state.execution_counts.shape == (0,)
+    assert oak_state.utility_ema.shape == (0,)
+
+    updated = oak_agent.update(
+        oak_state,
+        jnp.asarray(0.25, dtype=jnp.float32),
+        observation.at[0].add(0.1),
+        jnp.asarray(1.0, dtype=jnp.float32),
+    )
+    assert bool(updated.update_applied)
+    assert int(updated.planning_backups) == 0
+    assert updated.utility_ema.shape == (0,)
+    generated = learned_feature_subtask_specs(updated.state, n_subtasks=2)
+    assert len(generated) == 2
+
+    curated_agent, curated_state = oak_agent.curate(updated.state, jr.key(83))
+    assert curated_agent is oak_agent
+    assert curated_state is updated.state
+
+    budget = lifecycle.resource_budget(lifecycle_state)
+    assert budget.output_route_feature_groups == 0
+    assert budget.managed_oak_feature_width == config.total_feature_dim
+
+    next_base = jnp.asarray((-0.4, 0.6, 0.2), dtype=jnp.float32)
+    routed = lifecycle.observe_and_route(
+        lifecycle_state,
+        _seed_oak(lifecycle, lifecycle_state, next_base),
+        _consumer_binding(lifecycle_state),
+        PrototypeFeatureLifecycleEvent(
+            observation=jnp.asarray((0.5, -0.25, 1.0), dtype=jnp.float32),
+            targets=jnp.asarray((0.3,), dtype=jnp.float32),
+            next_observation=next_base,
+            allow_curation=jnp.asarray(False, dtype=jnp.bool_),
+        ),
+    )
+    assert bool(routed.diagnostics.transaction_applied)
+    assert routed.oak_state.stomp_state.option_policies.q_weights.shape == (
+        0,
+        config.n_primitive_actions,
+        config.total_feature_dim,
     )
 
 
@@ -139,10 +293,12 @@ def _force_promotion(lifecycle: PrototypeFeatureLifecycle, state):
         candidate_utilities=candidate_utilities,
         candidate_ages=jnp.full_like(learner_state.candidate_ages, 10),
         step_count=jnp.asarray(10, dtype=jnp.int32),
+        step_words=jnp.asarray((0, 10), dtype=jnp.uint32),
     )
     forced = state.replace(
         learner_state=learner_state,
         observe_count=jnp.asarray(10, dtype=jnp.int32),
+        observe_words=jnp.asarray((0, 10), dtype=jnp.uint32),
     )
     assert bool(lifecycle.state_valid(forced))
     return forced, candidates[candidate_index]
@@ -151,6 +307,7 @@ def _force_promotion(lifecycle: PrototypeFeatureLifecycle, state):
 def _consumer_binding(state) -> PrototypeFeatureConsumerBinding:
     return PrototypeFeatureConsumerBinding(
         semantic_generation=state.router_state.generation_count,
+        semantic_generation_words=state.router_state.generation_words,
         descriptors=state.router_state.descriptors,
     )
 
@@ -164,6 +321,12 @@ def _seed_oak(
     oak = _oak_agent(config).init(jr.key(71))
     stomp = oak.stomp_state
     width = config.total_feature_dim
+    next_step = int(lifecycle_state.observe_count) + 1
+    next_step_count = jnp.asarray(
+        min(next_step, np.iinfo(np.int32).max),
+        dtype=jnp.int32,
+    )
+    next_step_words = jnp.asarray((0, next_step), dtype=jnp.uint32)
 
     head_weights = tuple(
         jnp.arange(width, dtype=jnp.float32)[None, :] + 100.0 * (index + 1)
@@ -179,6 +342,8 @@ def _seed_oak(
     base_learner = stomp.base_learner_state.replace(
         head_params=stomp.base_learner_state.head_params.replace(weights=head_weights),
         head_traces=head_traces,
+        step_count=next_step_count,
+        step_words=next_step_words,
     )
     policy_values = jnp.arange(
         config.n_options * config.n_primitive_actions * width,
@@ -201,8 +366,44 @@ def _seed_oak(
         option_models=models,
         executing_option=jnp.asarray(-1, dtype=jnp.int32),
         option_start_obs=jnp.arange(width, dtype=jnp.float32) + 5_000.0,
+        step_count=next_step_count,
+        step_words=next_step_words,
     )
-    return cast(OaKState, oak.replace(stomp_state=stomp))
+    return cast(
+        OaKState,
+        oak.replace(
+            stomp_state=stomp,
+            step_count=next_step_count,
+            step_words=next_step_words,
+        ),
+    )
+
+
+def _advance_oak_clock(oak: OaKState) -> OaKState:
+    """Stage the next caller-owned post-transition OaK identity."""
+
+    maximum = jnp.asarray(np.iinfo(np.int32).max, dtype=jnp.int32)
+    next_count = jnp.where(oak.step_count < maximum, oak.step_count + 1, maximum)
+    next_low = oak.step_words[1] + jnp.asarray(1, dtype=jnp.uint32)
+    carry = (next_low < oak.step_words[1]).astype(jnp.uint32)
+    next_words = jnp.stack((oak.step_words[0] + carry, next_low))
+    base = oak.stomp_state.base_learner_state.replace(
+        step_count=next_count,
+        step_words=next_words,
+    )
+    stomp = oak.stomp_state.replace(
+        base_learner_state=base,
+        step_count=next_count,
+        step_words=next_words,
+    )
+    return cast(
+        OaKState,
+        oak.replace(
+            stomp_state=stomp,
+            step_count=next_count,
+            step_words=next_words,
+        ),
+    )
 
 
 def _event(*, allow_curation: bool = True) -> PrototypeFeatureLifecycleEvent:
@@ -234,6 +435,32 @@ class _DuplicateDescriptorRouter(FeatureBankRouter):
             feature_axes=feature_axes,
             carry_survivors=carry_survivors,
         )
+
+
+class _NoUpdateProxy:
+    """Delegate every learner operation except forbidden adoption recompute."""
+
+    def __init__(self, delegate: Any) -> None:
+        self._delegate = delegate
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    def update(self, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("adoption must not evaluate the learner")
+
+
+class _NoRouteProxy:
+    """Delegate router validation/init while forbidding a new route call."""
+
+    def __init__(self, delegate: Any) -> None:
+        self._delegate = delegate
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    def route(self, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("adoption must not evaluate the router")
 
 
 class _InvalidPostconditionRouter(FeatureBankRouter):
@@ -407,6 +634,64 @@ def test_config_is_strict_versioned_mechanism_only_and_round_trips() -> None:
         single_action_lifecycle.require_compatible_oak_config(boolean_actions)
 
 
+def test_pair_source_prefix_config_is_opt_in_strict_and_legacy_byte_stable() -> None:
+    legacy = _config()
+    legacy_payload = legacy.to_config()
+    assert legacy.pair_source_feature_dim is None
+    assert legacy.effective_pair_source_feature_dim == legacy.base_feature_dim
+    assert "pair_source_feature_dim" not in legacy_payload
+    assert PrototypeFeatureLifecycleConfig.from_config(legacy_payload).to_config() == (
+        legacy_payload
+    )
+
+    scoped = _prefix_pair_config()
+    scoped_payload = scoped.to_config()
+    assert scoped.effective_pair_source_feature_dim == 16
+    assert scoped.total_feature_dim == 35
+    assert scoped_payload["schema"] == (
+        "alberta.prototype-feature-lifecycle.config.v5"
+    )
+    assert scoped_payload["pair_source_feature_dim"] == 16
+    assert PrototypeFeatureLifecycleConfig.from_config(scoped_payload) == scoped
+
+    scoped_horde = dataclasses.replace(
+        scoped,
+        n_tasks=2,
+        managed_horde_demons=1,
+    )
+    scoped_horde_payload = scoped_horde.to_config()
+    assert scoped_horde_payload["schema"] == (
+        "alberta.prototype-feature-lifecycle.config.v6"
+    )
+    assert PrototypeFeatureLifecycleConfig.from_config(scoped_horde_payload) == (
+        scoped_horde
+    )
+
+    for invalid_source in (True, 1.0, 1, 23, 24):
+        with pytest.raises(ValueError, match="pair_source_feature_dim"):
+            dataclasses.replace(
+                scoped,
+                pair_source_feature_dim=cast(int | None, invalid_source),
+            )
+    with pytest.raises(ValueError, match="pair space"):
+        dataclasses.replace(scoped, active_pair_slots=121)
+    with pytest.raises(ValueError, match="pair space"):
+        dataclasses.replace(scoped, candidate_pair_slots=121)
+
+    missing_source = dict(scoped_payload)
+    missing_source.pop("pair_source_feature_dim")
+    with pytest.raises(ValueError, match="config fields"):
+        PrototypeFeatureLifecycleConfig.from_config(missing_source)
+    null_source = dict(scoped_payload)
+    null_source["pair_source_feature_dim"] = None
+    with pytest.raises(ValueError, match="pair_source_feature_dim"):
+        PrototypeFeatureLifecycleConfig.from_config(null_source)
+    wrong_schema = dict(legacy_payload)
+    wrong_schema["pair_source_feature_dim"] = 16
+    with pytest.raises(ValueError, match="config fields"):
+        PrototypeFeatureLifecycleConfig.from_config(wrong_schema)
+
+
 def test_allocation_and_python_collection_ceilings_fail_before_construction() -> None:
     config = _config()
     with pytest.raises(ValueError, match="active descriptor comparison"):
@@ -495,6 +780,142 @@ def test_init_augmentation_state_and_exact_resource_contracts() -> None:
     assert budget.managed_oak_feature_width == lifecycle.config.total_feature_dim
     assert budget.rebuilt_base_cache_nbytes == 4 * lifecycle.config.total_feature_dim
     assert budget.scientific_promotion_allowed is False
+
+
+def test_pair_source_prefix_has_complete_raw_pair_universe_and_full_base_output() -> None:
+    lifecycle = PrototypeFeatureLifecycle(_prefix_pair_config())
+    state = lifecycle.init(jr.key(0))
+    source_dim = lifecycle.config.effective_pair_source_feature_dim
+
+    active = np.stack(
+        (
+            np.asarray(state.learner_state.feature_left),
+            np.asarray(state.learner_state.feature_right),
+        ),
+        axis=1,
+    )
+    candidates = np.stack(
+        (
+            np.asarray(state.learner_state.candidate_left),
+            np.asarray(state.learner_state.candidate_right),
+        ),
+        axis=1,
+    )
+    expected_candidates = {
+        (left, right)
+        for left in range(source_dim)
+        for right in range(left + 1, source_dim)
+    }
+    assert active.shape == (12, 2)
+    assert candidates.shape == (120, 2)
+    assert int(np.max(active)) < source_dim
+    assert {tuple(pair) for pair in candidates.tolist()} == expected_candidates
+    assert bool(lifecycle.state_valid(state))
+
+    observation = jnp.arange(1, 24, dtype=jnp.float32)
+    augmented = lifecycle.augment(state, observation)
+    np.testing.assert_array_equal(augmented[:23], observation)
+    np.testing.assert_array_equal(
+        augmented[23:],
+        observation[active[:, 0]] * observation[active[:, 1]],
+    )
+
+    non_source_changed = observation.at[16:].add(1_000.0)
+    changed_augmented = lifecycle.augment(state, non_source_changed)
+    np.testing.assert_array_equal(changed_augmented[:23], non_source_changed)
+    np.testing.assert_array_equal(changed_augmented[23:], augmented[23:])
+
+    budget = lifecycle.resource_budget(state)
+    assert budget.base_feature_slots == 23
+    assert budget.pair_source_feature_slots == 16
+    assert budget.canonical_pair_universe_slots == 120
+    assert budget.managed_oak_feature_width == 35
+    assert budget.max_active_pair_products_per_observe == 60
+    assert budget.max_candidate_pair_products_per_observe == 120
+
+    invalid_active_descriptors = state.router_state.descriptors.at[0].set(
+        jnp.asarray((0, 16), dtype=jnp.int32)
+    )
+    invalid_active = state.replace(
+        learner_state=state.learner_state.replace(
+            feature_left=state.learner_state.feature_left.at[0].set(0),
+            feature_right=state.learner_state.feature_right.at[0].set(16),
+        ),
+        router_state=dataclasses.replace(
+            state.router_state,
+            descriptors=invalid_active_descriptors,
+        ),
+    )
+    assert not bool(lifecycle.state_valid(invalid_active))
+
+    invalid_candidate = state.replace(
+        learner_state=state.learner_state.replace(
+            candidate_left=state.learner_state.candidate_left.at[0].set(0),
+            candidate_right=state.learner_state.candidate_right.at[0].set(16),
+        )
+    )
+    assert not bool(lifecycle.state_valid(invalid_candidate))
+
+
+def test_pair_source_prefix_pullback_and_learning_ignore_non_source_coordinates() -> None:
+    lifecycle = PrototypeFeatureLifecycle(_prefix_pair_config())
+    state = lifecycle.init(jr.key(5))
+    observation = jnp.linspace(-2.0, 3.0, 23, dtype=jnp.float32)
+    augmented_gradient = jnp.linspace(
+        -0.7,
+        0.9,
+        lifecycle.config.total_feature_dim,
+        dtype=jnp.float32,
+    )
+
+    pullback = lifecycle.pullback_pair_gradient(
+        state,
+        observation,
+        augmented_gradient,
+        state.router_state.generation_count,
+        state.router_state.descriptors,
+    )
+    expected = jax.grad(
+        lambda value: jnp.vdot(
+            lifecycle.augment(state, value),
+            augmented_gradient,
+        )
+    )(observation)
+    assert bool(pullback.valid)
+    np.testing.assert_array_equal(pullback.gradient, expected)
+    np.testing.assert_array_equal(
+        pullback.gradient[16:],
+        augmented_gradient[16:23],
+    )
+
+    next_observation = jnp.linspace(0.1, 2.3, 23, dtype=jnp.float32)
+    oak = _seed_oak(lifecycle, state, next_observation)
+    binding = _consumer_binding(state)
+    base_event = PrototypeFeatureLifecycleEvent(
+        observation=observation,
+        targets=jnp.asarray((0.25, -0.5), dtype=jnp.float32),
+        next_observation=next_observation,
+        allow_curation=jnp.asarray(False, dtype=jnp.bool_),
+    )
+    changed_event = cast(
+        PrototypeFeatureLifecycleEvent,
+        base_event.replace(
+            observation=observation.at[16:].add(10_000.0),
+        ),
+    )
+    base_result = lifecycle.observe_and_route(state, oak, binding, base_event)
+    changed_result = lifecycle.observe_and_route(
+        state,
+        oak,
+        binding,
+        changed_event,
+    )
+    assert bool(base_result.diagnostics.transaction_applied)
+    assert bool(changed_result.diagnostics.transaction_applied)
+    _assert_tree_exact(
+        base_result.state.learner_state,
+        changed_result.state.learner_state,
+    )
 
 
 def test_unavailable_diagnostics_are_finite_neutral_and_jax_shape_compatible() -> None:
@@ -602,15 +1023,20 @@ def test_descriptor_semantics_cannot_advance_ahead_of_generation() -> None:
 
     one_generation = mutated.replace(
         learner_state=mutated.learner_state.replace(
-            step_count=jnp.asarray(1, dtype=jnp.int32)
+            step_count=jnp.asarray(1, dtype=jnp.int32),
+            step_words=jnp.asarray((0, 1), dtype=jnp.uint32),
         ),
         router_state=dataclasses.replace(
             mutated.router_state,
             route_count=jnp.asarray(1, dtype=jnp.int32),
+            route_words=jnp.asarray((0, 1), dtype=jnp.uint32),
             generation_count=jnp.asarray(1, dtype=jnp.int32),
+            generation_words=jnp.asarray((0, 1), dtype=jnp.uint32),
         ),
         observe_count=jnp.asarray(1, dtype=jnp.int32),
+        observe_words=jnp.asarray((0, 1), dtype=jnp.uint32),
         committed_curation_count=jnp.asarray(1, dtype=jnp.int32),
+        committed_curation_words=jnp.asarray((0, 1), dtype=jnp.uint32),
     )
     assert not bool(lifecycle.state_valid(one_generation))
 
@@ -625,15 +1051,20 @@ def test_same_generation_descriptor_forks_cannot_cross_bind_or_pull_back() -> No
                 feature_left=descriptors[:, 0],
                 feature_right=descriptors[:, 1],
                 step_count=jnp.asarray(1, dtype=jnp.int32),
+                step_words=jnp.asarray((0, 1), dtype=jnp.uint32),
             ),
             router_state=dataclasses.replace(
                 canonical.router_state,
                 descriptors=descriptors,
                 route_count=jnp.asarray(1, dtype=jnp.int32),
+                route_words=jnp.asarray((0, 1), dtype=jnp.uint32),
                 generation_count=jnp.asarray(1, dtype=jnp.int32),
+                generation_words=jnp.asarray((0, 1), dtype=jnp.uint32),
             ),
             observe_count=jnp.asarray(1, dtype=jnp.int32),
+            observe_words=jnp.asarray((0, 1), dtype=jnp.uint32),
             committed_curation_count=jnp.asarray(1, dtype=jnp.int32),
+            committed_curation_words=jnp.asarray((0, 1), dtype=jnp.uint32),
         )
 
     branch_a = branch(jnp.asarray([[0, 1], [0, 3]], dtype=jnp.int32))
@@ -844,7 +1275,7 @@ def test_zero_cache_collision_rejects_stale_oak_and_binding_exactly() -> None:
 
     fresh = lifecycle.observe_and_route(
         committed.state,
-        committed.oak_state,
+        _advance_oak_clock(committed.oak_state),
         committed.consumer_binding,
         event,
     )
@@ -1044,9 +1475,11 @@ def test_fixed_disabled_learner_substate_must_remain_reachable() -> None:
     state = lifecycle.init(jr.key(48))
     state = state.replace(
         learner_state=state.learner_state.replace(
-            step_count=jnp.asarray(1, dtype=jnp.int32)
+            step_count=jnp.asarray(1, dtype=jnp.int32),
+            step_words=jnp.asarray((0, 1), dtype=jnp.uint32),
         ),
         observe_count=jnp.asarray(1, dtype=jnp.int32),
+        observe_words=jnp.asarray((0, 1), dtype=jnp.uint32),
     )
     assert bool(lifecycle.state_valid(state))
     learner = state.learner_state
@@ -1120,8 +1553,8 @@ def test_full_oak_audit_rejects_ownership_model_counter_and_outer_corruption() -
                 base_last_action=jnp.asarray(1, dtype=jnp.int32)
             )
         ),
-        oak.replace(
-            stomp_state=stomp.replace(option_steps=jnp.asarray(1, dtype=jnp.int32))
+            oak.replace(
+                stomp_state=stomp.replace(option_steps=jnp.asarray(2, dtype=jnp.int32))
         ),
         oak.replace(
             stomp_state=stomp.replace(
@@ -1130,8 +1563,8 @@ def test_full_oak_audit_rejects_ownership_model_counter_and_outer_corruption() -
                 )
             )
         ),
-        oak.replace(
-            execution_counts=jnp.asarray([2, 0], dtype=jnp.int32)
+            oak.replace(
+                execution_counts=jnp.asarray([3, 0], dtype=jnp.int32)
         ),
         oak.replace(
             stomp_state=stomp.replace(
@@ -1178,9 +1611,11 @@ def test_max_observation_capacity_is_an_exact_atomic_noop() -> None:
     state = lifecycle.init(jr.key(53))
     state = state.replace(
         learner_state=state.learner_state.replace(
-            step_count=jnp.asarray(1, dtype=jnp.int32)
+            step_count=jnp.asarray(1, dtype=jnp.int32),
+            step_words=jnp.asarray((0, 1), dtype=jnp.uint32),
         ),
         observe_count=jnp.asarray(1, dtype=jnp.int32),
+        observe_words=jnp.asarray((0, 1), dtype=jnp.uint32),
     )
     assert bool(lifecycle.state_valid(state))
     event = _event()
@@ -1192,6 +1627,58 @@ def test_max_observation_capacity_is_an_exact_atomic_noop() -> None:
     assert not bool(result.diagnostics.transaction_applied)
     _assert_tree_exact(result.state, state)
     _assert_tree_exact(result.oak_state, oak)
+
+    binding = _consumer_binding(state)
+    prepared = lifecycle.prepare_observe_and_route(state, oak, binding, event)
+    receipt = lifecycle.external_readiness_receipt(
+        prepared,
+        jnp.asarray(True, dtype=jnp.bool_),
+    )
+    adopted = lifecycle.adopt_prepared_route(
+        state,
+        oak,
+        binding,
+        prepared,
+        receipt,
+    )
+    expected_next = lifecycle.augment(state, event.next_observation)
+    _assert_tree_exact(adopted.result.state, state)
+    _assert_tree_exact(adopted.result.oak_state, oak)
+    _assert_tree_exact(adopted.result.consumer_binding, binding)
+    np.testing.assert_array_equal(
+        np.asarray(adopted.result.next_augmented_observation),
+        np.asarray(expected_next),
+    )
+    assert np.all(np.isnan(np.asarray(adopted.result.predictions)))
+    assert np.all(np.isnan(np.asarray(adopted.result.errors)))
+    assert not bool(adopted.result.diagnostics.transaction_applied)
+    assert not bool(adopted.result.diagnostics.routing_attempted)
+    assert not bool(adopted.diagnostics.transaction_applied)
+    assert not bool(adopted.diagnostics.destination_adopted)
+    assert not bool(adopted.diagnostics.ordinary_update_retained)
+    assert bool(adopted.diagnostics.rejected)
+    assert int(adopted.diagnostics.adoption_learner_update_evaluations) == 0
+
+    untrusted = prepared.replace(
+        destination_result=prepared.destination_result.replace(
+            next_augmented_observation=jnp.full_like(expected_next, 99.0),
+        )
+    )
+    untrusted_receipt = lifecycle.external_readiness_receipt(
+        untrusted,
+        jnp.asarray(True, dtype=jnp.bool_),
+    )
+    sanitized = lifecycle.adopt_prepared_route(
+        state,
+        oak,
+        binding,
+        untrusted,
+        untrusted_receipt,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(sanitized.result.next_augmented_observation),
+        np.asarray(expected_next),
+    )
 
 
 def test_static_contract_rejects_wrong_event_dtype_and_nonlinear_oak() -> None:
@@ -1229,6 +1716,7 @@ def test_static_contract_rejects_wrong_event_dtype_and_nonlinear_oak() -> None:
     binding = _consumer_binding(state)
     binding_subclass = BindingSubclass(
         semantic_generation=binding.semantic_generation,
+        semantic_generation_words=binding.semantic_generation_words,
         descriptors=binding.descriptors,
     )
     with pytest.raises(TypeError, match="PrototypeFeatureConsumerBinding"):
@@ -1299,7 +1787,7 @@ def test_eager_and_jit_transactions_are_exact_and_scan_is_recurrent() -> None:
         )
         return (
             result.state,
-            result.oak_state,
+            _advance_oak_clock(result.oak_state),
             result.consumer_binding,
         ), result.diagnostics.transaction_applied
 
@@ -1316,7 +1804,7 @@ def test_eager_and_jit_transactions_are_exact_and_scan_is_recurrent() -> None:
         )
         loop_state, loop_oak, loop_binding = (
             result.state,
-            result.oak_state,
+            _advance_oak_clock(result.oak_state),
             result.consumer_binding,
         )
     # XLA may reassociate the scan's float32 EMA arithmetic by one ULP; all
@@ -1327,6 +1815,189 @@ def test_eager_and_jit_transactions_are_exact_and_scan_is_recurrent() -> None:
     np.testing.assert_array_equal(applied, np.ones(3, dtype=np.bool_))
     assert int(scanned_state.observe_count) == 3
     assert int(scanned_state.router_state.generation_count) == 0
+
+
+def test_external_readiness_adopts_route_or_retains_exact_ordinary_successor() -> None:
+    lifecycle = PrototypeFeatureLifecycle(_config())
+    state, _ = _force_promotion(lifecycle, lifecycle.init(jr.key(611)))
+    event = _event()
+    oak = _seed_oak(lifecycle, state, event.next_observation)
+    binding = _consumer_binding(state)
+
+    prepared = lifecycle.prepare_observe_and_route(state, oak, binding, event)
+    assert bool(prepared.internally_valid)
+    assert bool(prepared.destination_result.diagnostics.curation_committed)
+    assert int(prepared.preparation_learner_update_evaluations) == 1
+    lifecycle._learner = cast(Any, _NoUpdateProxy(lifecycle._learner))
+    lifecycle._router = cast(Any, _NoRouteProxy(lifecycle._router))
+
+    ready_receipt = lifecycle.external_readiness_receipt(
+        prepared,
+        jnp.asarray(True, dtype=jnp.bool_),
+    )
+    ready = lifecycle.adopt_prepared_route(
+        state,
+        oak,
+        binding,
+        prepared,
+        ready_receipt,
+    )
+    _assert_tree_exact(ready.result, prepared.destination_result)
+    assert bool(ready.diagnostics.destination_adopted)
+    assert not bool(ready.diagnostics.external_curation_rolled_back)
+
+    veto_receipt = lifecycle.external_readiness_receipt(
+        prepared,
+        jnp.asarray(False, dtype=jnp.bool_),
+    )
+    veto = lifecycle.adopt_prepared_route(
+        state,
+        oak,
+        binding,
+        prepared,
+        veto_receipt,
+    )
+    _assert_tree_exact(veto.result, prepared.ordinary_result)
+    _assert_tree_exact(veto.result.oak_state, oak)
+    _assert_tree_exact(veto.result.consumer_binding, binding)
+    _assert_tree_exact(veto.result.state.router_state, state.router_state)
+    assert int(veto.result.state.observe_count) == int(state.observe_count) + 1
+    assert int(veto.result.state.committed_curation_count) == int(
+        state.committed_curation_count
+    )
+    assert int(veto.result.state.rolled_back_curation_count) == int(
+        state.rolled_back_curation_count
+    ) + 1
+    assert not bool(veto.result.diagnostics.curation_deferred)
+    assert bool(veto.result.diagnostics.curation_rolled_back)
+    assert bool(veto.diagnostics.ordinary_update_retained)
+    assert bool(veto.diagnostics.external_curation_rolled_back)
+    assert int(veto.diagnostics.adoption_learner_update_evaluations) == 0
+    assert int(veto.diagnostics.total_learner_update_evaluations) == 1
+    transient = lifecycle.external_transaction_resource_budget(
+        prepared,
+        veto_receipt,
+    )
+    prepared_nbytes = sum(
+        int(getattr(leaf, "nbytes", 0)) for leaf in jax.tree.leaves(prepared)
+    )
+    receipt_nbytes = sum(
+        int(getattr(leaf, "nbytes", 0)) for leaf in jax.tree.leaves(veto_receipt)
+    )
+    assert transient.prepared_route_logical_nbytes == prepared_nbytes
+    assert transient.readiness_receipt_logical_nbytes == receipt_nbytes
+    assert transient.simultaneous_logical_transient_nbytes == (
+        prepared_nbytes + receipt_nbytes
+    )
+    assert (
+        transient.lifecycle_persistent_state_nbytes_before
+        == lifecycle.resource_budget(state).lifecycle_state_nbytes
+    )
+    assert (
+        transient.lifecycle_persistent_state_nbytes_after
+        == transient.lifecycle_persistent_state_nbytes_before
+    )
+    assert transient.learner_update_evaluations_per_prepare == 1
+    assert transient.learner_update_evaluations_per_adopt == 0
+    assert transient.router_evaluations_per_prepare == 2
+    assert transient.router_evaluations_per_adopt == 0
+    assert transient.persistent_capacity_growth == 0
+
+
+def test_external_readiness_rejects_internal_invalidity_staleness_and_tampering() -> None:
+    lifecycle = PrototypeFeatureLifecycle(_config())
+    state, _ = _force_promotion(lifecycle, lifecycle.init(jr.key(612)))
+    event = _event()
+    oak = _seed_oak(lifecycle, state, event.next_observation)
+    binding = _consumer_binding(state)
+    prepared = lifecycle.prepare_observe_and_route(state, oak, binding, event)
+    receipt = lifecycle.external_readiness_receipt(
+        prepared,
+        jnp.asarray(True, dtype=jnp.bool_),
+    )
+
+    tampered = prepared.replace(
+        destination_result=prepared.destination_result.replace(
+            predictions=prepared.destination_result.predictions.at[0].add(1.0),
+        )
+    )
+    refused = lifecycle.adopt_prepared_route(
+        state,
+        oak,
+        binding,
+        tampered,
+        receipt,
+    )
+    assert not bool(refused.diagnostics.receipt_matches_preparation)
+    assert bool(refused.diagnostics.rejected)
+    _assert_tree_exact(refused.result.state, state)
+    _assert_tree_exact(refused.result.oak_state, oak)
+    np.testing.assert_array_equal(
+        np.asarray(refused.result.next_augmented_observation),
+        np.zeros_like(np.asarray(refused.result.next_augmented_observation)),
+    )
+
+    stale_state = prepared.destination_result.state
+    stale = lifecycle.adopt_prepared_route(
+        stale_state,
+        oak,
+        binding,
+        prepared,
+        receipt,
+    )
+    assert not bool(stale.diagnostics.source_state_matches)
+    _assert_tree_exact(stale.result.state, stale_state)
+
+    invalid_event = event.replace(observation=event.observation.at[0].set(jnp.inf))
+    invalid_prepared = lifecycle.prepare_observe_and_route(
+        state,
+        oak,
+        binding,
+        invalid_event,
+    )
+    for ready in (False, True):
+        invalid_receipt = lifecycle.external_readiness_receipt(
+            invalid_prepared,
+            jnp.asarray(ready, dtype=jnp.bool_),
+        )
+        invalid = lifecycle.adopt_prepared_route(
+            state,
+            oak,
+            binding,
+            invalid_prepared,
+            invalid_receipt,
+        )
+        assert not bool(invalid.diagnostics.preparation_internally_valid)
+        assert bool(invalid.diagnostics.rejected)
+        _assert_tree_exact(invalid.result.state, state)
+        _assert_tree_exact(invalid.result.oak_state, oak)
+        np.testing.assert_array_equal(
+            np.asarray(invalid.result.next_augmented_observation),
+            np.zeros_like(np.asarray(invalid.result.next_augmented_observation)),
+        )
+
+
+def test_external_readiness_adoption_is_eager_jit_exact() -> None:
+    lifecycle = PrototypeFeatureLifecycle(_config())
+    state, _ = _force_promotion(lifecycle, lifecycle.init(jr.key(613)))
+    event = _event()
+    oak = _seed_oak(lifecycle, state, event.next_observation)
+    binding = _consumer_binding(state)
+    prepared = lifecycle.prepare_observe_and_route(state, oak, binding, event)
+    receipt = lifecycle.external_readiness_receipt(
+        prepared,
+        jnp.asarray(False, dtype=jnp.bool_),
+    )
+
+    eager = lifecycle.adopt_prepared_route(state, oak, binding, prepared, receipt)
+    compiled = jax.jit(lifecycle.adopt_prepared_route)(
+        state,
+        oak,
+        binding,
+        prepared,
+        receipt,
+    )
+    _assert_tree_exact(eager, compiled)
 
 
 def test_checkpoint_round_trip_is_strict_and_resource_bound(

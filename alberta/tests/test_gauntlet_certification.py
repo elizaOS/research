@@ -54,6 +54,8 @@ from alberta_framework.streams.gauntlet import (
     segment_mse,
 )
 
+pytestmark = [pytest.mark.development, pytest.mark.slow]
+
 N_SEEDS = 8
 
 

@@ -57,6 +57,21 @@ def _tree_nbytes(tree: object) -> int:
     return sum(int(leaf.nbytes) for leaf in jax.tree_util.tree_leaves(tree))
 
 
+def _at_exact_step(
+    state: HiddenPartnerMappingState,
+    step: int,
+) -> HiddenPartnerMappingState:
+    """Move a test fixture to one coherent exact non-negative lifetime."""
+
+    return state.replace(
+        step_count=jnp.asarray(min(step, 2**31 - 1), dtype=jnp.int32),
+        step_words=jnp.asarray((step >> 32, step & (2**32 - 1)), dtype=jnp.uint32),
+        previous_outcome=jnp.asarray(0.0 if step == 0 else 1.0, dtype=jnp.float32),
+        previous_partner_action=jnp.asarray(0 if step == 0 else 1, dtype=jnp.int32),
+        has_partner_history=jnp.asarray(step > 0, dtype=jnp.bool_),
+    )
+
+
 def test_default_contract_and_canonical_config_round_trip() -> None:
     config = HiddenPartnerMappingConfig()
     world = HiddenPartnerMappingWorld(config)
@@ -117,6 +132,7 @@ def test_default_contract_and_canonical_config_round_trip() -> None:
     [
         {"contract_version": "hidden-partner-mapping-v1"},
         {"regime_schedule": DEFAULT_REGIME_SCHEDULE[:-1]},
+        {"regime_schedule": (False,) + DEFAULT_REGIME_SCHEDULE[1:]},
         {"regime_schedule": list(DEFAULT_REGIME_SCHEDULE)},
         {"base_segment_lengths": DEFAULT_BASE_SEGMENT_LENGTHS[:-1]},
         {"base_segment_lengths": list(DEFAULT_BASE_SEGMENT_LENGTHS)},
@@ -284,8 +300,8 @@ def test_hidden_task_and_imminent_boundary_do_not_leak_into_observation() -> Non
 
     # Identical ordinary state at hidden A and hidden B gives bitwise-identical
     # pre-action input, even though the partner mapping is opposite.
-    hidden_a = base.replace(step_count=jnp.asarray(0, dtype=jnp.int32))
-    hidden_b = base.replace(step_count=jnp.asarray(3, dtype=jnp.int32))
+    hidden_a = _at_exact_step(base, 6)
+    hidden_b = _at_exact_step(base, 3)
     chex.assert_trees_all_equal(world.observe(hidden_a), world.observe(hidden_b))
     a_transition, _ = world.step(
         hidden_a,
@@ -305,8 +321,7 @@ def test_hidden_task_and_imminent_boundary_do_not_leak_into_observation() -> Non
     # but different evaluator-only schedules make only one transition cross
     # into B.  Current action, reward, and next ordinary observation remain
     # identical; only the oracle reports the imminent boundary.
-    long_first = base.replace(
-        step_count=jnp.asarray(1, dtype=jnp.int32),
+    long_first = _at_exact_step(base, 1).replace(
         segment_lengths=jnp.asarray((3,) * 9, dtype=jnp.int32),
         segment_ends=jnp.cumsum(jnp.asarray((3,) * 9, dtype=jnp.int32)),
     )
@@ -410,7 +425,10 @@ def test_regime_formulas_and_reward_timing(
     expected_intended_sign: float,
 ) -> None:
     world = HiddenPartnerMappingWorld(_small_config(lengths=(2,) * 9, flip_probability=0.0))
-    state = world.init(jr.key(10)).replace(
+    state = _at_exact_step(
+        world.init(jr.key(10)),
+        18 + 2 * segment_index,
+    ).replace(
         current_signals=jnp.asarray(
             (1.0, 1.0, -1.0, 1.0, -1.0),
             dtype=jnp.float32,
@@ -418,7 +436,6 @@ def test_regime_formulas_and_reward_timing(
         previous_outcome=jnp.asarray(-1.0, dtype=jnp.float32),
         previous_partner_action=jnp.asarray(-1, dtype=jnp.int32),
         has_partner_history=jnp.asarray(True, dtype=jnp.bool_),
-        step_count=jnp.asarray(2 * segment_index, dtype=jnp.int32),
     )
     transition, next_state = world.step(
         state,
@@ -442,12 +459,11 @@ def test_regime_formulas_and_reward_timing(
 
 def test_boundary_reward_uses_current_regime_not_next_regime() -> None:
     world = HiddenPartnerMappingWorld(_small_config(lengths=(2,) * 9, flip_probability=0.0))
-    state = world.init(jr.key(11)).replace(
+    state = _at_exact_step(world.init(jr.key(11)), 1).replace(
         current_signals=jnp.asarray(
             (1.0, 1.0, 1.0, -1.0, -1.0),
             dtype=jnp.float32,
         ),
-        step_count=jnp.asarray(1, dtype=jnp.int32),
     )
     transition, _ = world.step(
         state,
@@ -521,13 +537,18 @@ def test_fixed_state_resource_accounting_matches_array_leaves() -> None:
     budget = world.resource_budget
 
     assert budget.to_dict() == {
+        "state_schema": "alberta.hidden-partner-mapping.state.v2",
         "observation_float32_scalars": 8,
         "persistent_float32_scalars": 6,
         "persistent_int32_scalars": 20,
         "persistent_bool_scalars": 1,
+        "exact_identity_uint32_scalars": 2,
+        "exact_identity_nbytes": 8,
+        "lifetime_identity_bits": 64,
+        "telemetry_saturation": 2_147_483_647,
         "rng_uint32_scalars": 4,
-        "persistent_state_scalars": 31,
-        "state_nbytes": 121,
+        "persistent_state_scalars": 33,
+        "state_nbytes": 129,
         "trainable_scalars": 0,
         "replay_capacity": 0,
     }

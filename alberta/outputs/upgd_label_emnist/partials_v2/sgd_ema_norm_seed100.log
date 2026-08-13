@@ -1,0 +1,23 @@
+WARNING:jax._src.xla_bridge:An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-08-02 09:21:04,461 INFO shard learner=sgd_ema_norm seed=100 tasks=400 task_length=2500
+2026-08-02 09:22:03,702 INFO sgd_ema_norm task 20/400 online_acc=0.3336 elapsed=55.1s
+2026-08-02 09:22:07,294 INFO sgd_ema_norm task 40/400 online_acc=0.4120 elapsed=58.7s
+2026-08-02 09:22:11,210 INFO sgd_ema_norm task 60/400 online_acc=0.4276 elapsed=62.6s
+2026-08-02 09:22:15,165 INFO sgd_ema_norm task 80/400 online_acc=0.4196 elapsed=66.6s
+2026-08-02 09:22:19,392 INFO sgd_ema_norm task 100/400 online_acc=0.4800 elapsed=70.8s
+2026-08-02 09:22:23,592 INFO sgd_ema_norm task 120/400 online_acc=0.4736 elapsed=75.0s
+2026-08-02 09:22:27,884 INFO sgd_ema_norm task 140/400 online_acc=0.5120 elapsed=79.3s
+2026-08-02 09:22:32,169 INFO sgd_ema_norm task 160/400 online_acc=0.4864 elapsed=83.6s
+2026-08-02 09:22:36,522 INFO sgd_ema_norm task 180/400 online_acc=0.5476 elapsed=87.9s
+2026-08-02 09:22:40,795 INFO sgd_ema_norm task 200/400 online_acc=0.5608 elapsed=92.2s
+2026-08-02 09:22:45,262 INFO sgd_ema_norm task 220/400 online_acc=0.5184 elapsed=96.7s
+2026-08-02 09:22:49,802 INFO sgd_ema_norm task 240/400 online_acc=0.5688 elapsed=101.2s
+2026-08-02 09:22:54,558 INFO sgd_ema_norm task 260/400 online_acc=0.5788 elapsed=106.0s
+2026-08-02 09:22:59,101 INFO sgd_ema_norm task 280/400 online_acc=0.5452 elapsed=110.5s
+2026-08-02 09:23:03,388 INFO sgd_ema_norm task 300/400 online_acc=0.5664 elapsed=114.8s
+2026-08-02 09:23:07,728 INFO sgd_ema_norm task 320/400 online_acc=0.5784 elapsed=119.1s
+2026-08-02 09:23:12,017 INFO sgd_ema_norm task 340/400 online_acc=0.5652 elapsed=123.4s
+2026-08-02 09:23:16,704 INFO sgd_ema_norm task 360/400 online_acc=0.5840 elapsed=128.1s
+2026-08-02 09:23:21,395 INFO sgd_ema_norm task 380/400 online_acc=0.5812 elapsed=132.8s
+2026-08-02 09:23:26,148 INFO sgd_ema_norm task 400/400 online_acc=0.6192 elapsed=137.6s
+2026-08-02 09:23:26,260 INFO wrote shard outputs/upgd_label_emnist/partials_v2/sgd_ema_norm_seed100.json (avg online acc 0.5065, wall 137.6s)

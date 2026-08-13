@@ -109,6 +109,12 @@ Validate a completed bundle independently with:
   outputs/opmnist_published_scale_development/run-2026-08-01-v1
 ```
 
+The upstream runner strings `include_delight_candidates` and
+`DelightGatedLearner` are frozen historical spellings. This fork does not
+interpret them as DG/Kondo delight, does not assess whether a gradient
+contribution entered an executed actor backward, and requires the ingested
+lane to keep `include_delight_candidates=false`.
+
 ## Fail-closed checks
 
 The v1 receipt and every input JSON reject duplicate keys, `NaN`, infinities,

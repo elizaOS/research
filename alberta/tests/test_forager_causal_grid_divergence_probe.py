@@ -169,6 +169,22 @@ def _private_probe_mount(tmp_path: Path) -> Path:
     return path
 
 
+@pytest.fixture
+def private_qualification(tmp_path: Path) -> tuple[Path, Path]:
+    qualification_root = tmp_path / "qualification"
+    qualification_root.mkdir(mode=0o700)
+    probe._materialize_readable_qualification_mount(  # noqa: SLF001
+        probe.DEFAULT_QUALIFICATION_ROOT,
+        qualification_root,
+    )
+    source_root = qualification_root / "sources" / "alberta" / "source"
+    probe._extract_pinned_source_archive(  # noqa: SLF001
+        qualification_root,
+        source_root,
+    )
+    return qualification_root, source_root
+
+
 def _all_mapping_keys(value: Any) -> set[str]:
     keys: set[str] = set()
     if isinstance(value, dict):
@@ -226,10 +242,13 @@ def test_harness_is_outside_registered_alberta_source_tree() -> None:
     assert not (repository_root / "alberta_framework" / "benchmarks" / harness_path.name).exists()
 
 
-def test_frozen_source_configuration_runtime_and_task_bindings_are_exact() -> None:
+def test_frozen_source_configuration_runtime_and_task_bindings_are_exact(
+    private_qualification: tuple[Path, Path],
+) -> None:
+    qualification_root, source_root = private_qualification
     configurations, manifest = probe._load_bound_inputs(
-        probe.DEFAULT_QUALIFICATION_ROOT,
-        probe.DEFAULT_QUALIFICATION_ROOT / "sources" / "alberta" / "source",
+        qualification_root,
+        source_root,
     )
 
     assert manifest["open_protocol_sha256"] == probe.OPEN_PROTOCOL_SHA256
@@ -282,10 +301,11 @@ def test_qualification_manifest_contract_rejects_schema_path_and_field_drift(
 
 def test_manifest_bound_source_root_rejects_siblings_symlinks_and_relative_paths(
     tmp_path: Path,
+    private_qualification: tuple[Path, Path],
 ) -> None:
-    expected = probe.DEFAULT_QUALIFICATION_ROOT / "sources" / "alberta" / "source"
+    qualification_root, expected = private_qualification
     probe._require_manifest_source_root(  # noqa: SLF001
-        probe.DEFAULT_QUALIFICATION_ROOT,
+        qualification_root,
         expected,
     )
     sibling = tmp_path / "sibling"
@@ -299,11 +319,11 @@ def test_manifest_bound_source_root_rejects_siblings_symlinks_and_relative_paths
             match="source root|absolute canonical",
         ):
             probe._require_manifest_source_root(  # noqa: SLF001
-                probe.DEFAULT_QUALIFICATION_ROOT,
+                qualification_root,
                 changed,
             )
 
-    qualification_root = tmp_path / "qualification"
+    qualification_root = tmp_path / "escaped-qualification"
     escaped_root = tmp_path / "escaped"
     escaped_source = escaped_root / "alberta" / "source"
     qualification_root.mkdir()
@@ -358,7 +378,9 @@ def test_every_qualification_input_rejects_symlinked_path_components(
 
 def test_bound_input_loader_rejects_a_bad_manifest_sidecar(
     monkeypatch: pytest.MonkeyPatch,
+    private_qualification: tuple[Path, Path],
 ) -> None:
+    qualification_root, source_root = private_qualification
     real_read = probe._read_stable_regular_file  # noqa: SLF001
 
     def read(path: Path, *, label: str, maximum: int) -> bytes:
@@ -372,8 +394,8 @@ def test_bound_input_loader_rejects_a_bad_manifest_sidecar(
         match="manifest sidecar",
     ):
         probe._load_bound_inputs(  # noqa: SLF001
-            probe.DEFAULT_QUALIFICATION_ROOT,
-            probe.DEFAULT_QUALIFICATION_ROOT / "sources" / "alberta" / "source",
+            qualification_root,
+            source_root,
         )
 
 
@@ -478,6 +500,96 @@ def test_pinned_source_archive_reconstructs_exact_private_inventory(
         )
 
 
+def test_private_extracted_source_loader_binds_the_verified_snapshot(
+    tmp_path: Path,
+) -> None:
+    qualification_root = tmp_path / "qualification-mount"
+    qualification_root.mkdir(mode=0o700)
+    probe._materialize_readable_qualification_mount(  # noqa: SLF001
+        probe.DEFAULT_QUALIFICATION_ROOT,
+        qualification_root,
+    )
+    private_source = tmp_path / "private-source"
+    probe._extract_pinned_source_archive(  # noqa: SLF001
+        qualification_root,
+        private_source,
+    )
+
+    with pytest.raises(
+        probe.CausalGridDivergenceProbeError,
+        match="manifest-bound Alberta",
+    ):
+        probe._load_bound_inputs(qualification_root, private_source)  # noqa: SLF001
+
+    configurations, manifest = probe._load_bound_inputs(  # noqa: SLF001
+        qualification_root,
+        private_source,
+        private_extracted_source=True,
+    )
+
+    assert len(configurations) == 3
+    assert manifest["schema_version"] == probe.QUALIFICATION_MANIFEST_SCHEMA_VERSION
+
+
+def test_child_binds_its_private_extracted_source_to_loading_and_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    observed: dict[str, Any] = {}
+    source_root = Path("/run/alberta/source")
+    qualification_root = Path("/inputs/qualification")
+    configurations = ({"candidate_id": "private-snapshot"},)
+
+    def extract(received_qualification: Path, received_source: Path) -> None:
+        observed["extracted"] = (received_qualification, received_source)
+
+    def load(
+        received_qualification: Path,
+        received_source: Path,
+        *,
+        private_extracted_source: bool,
+    ) -> tuple[tuple[dict[str, Any], ...], dict[str, Any]]:
+        observed["loaded"] = (
+            received_qualification,
+            received_source,
+            private_extracted_source,
+        )
+        return configurations, {}
+
+    def execute(
+        received_source: Path,
+        received_configurations: tuple[dict[str, Any], ...],
+    ) -> dict[str, Any]:
+        observed["executed"] = (received_source, received_configurations)
+        return {"bound_private_source": True}
+
+    monkeypatch.setattr(probe, "_read_probe_source", lambda **_kwargs: b"probe")
+    monkeypatch.setattr(probe, "_extract_pinned_source_archive", extract)
+    monkeypatch.setattr(probe, "_load_bound_inputs", load)
+    monkeypatch.setattr(probe, "_child_runtime_payload", execute)
+
+    assert (
+        probe._child_main(  # noqa: SLF001
+            (
+                "--source-root",
+                source_root.as_posix(),
+                "--qualification-root",
+                qualification_root.as_posix(),
+                "--probe-source-sha256",
+                "a" * 64,
+            )
+        )
+        == 0
+    )
+
+    assert observed == {
+        "executed": (source_root, configurations),
+        "extracted": (qualification_root, source_root),
+        "loaded": (qualification_root, source_root, True),
+    }
+    assert json.loads(capsys.readouterr().out) == {"bound_private_source": True}
+
+
 def test_qualification_mount_mirror_is_minimal_exact_and_world_readable(
     tmp_path: Path,
 ) -> None:
@@ -514,7 +626,9 @@ def test_qualification_mount_mirror_is_minimal_exact_and_world_readable(
 def test_run_child_uses_distinct_minimal_mirror_and_removes_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    private_qualification: tuple[Path, Path],
 ) -> None:
+    qualification_root, source_root = private_qualification
     observed: dict[str, Any] = {}
     expected_payload = _child_payload()
     expected_envelope = _execution_envelope()
@@ -545,13 +659,12 @@ def test_run_child_uses_distinct_minimal_mirror_and_removes_it(
         "_run_child_with_qualification_mount",
         fake_run_child_with_mount,
     )
-    source_root = probe.DEFAULT_QUALIFICATION_ROOT / "sources" / "alberta" / "source"
     runtime = tmp_path / "docker"
     source_digest = hashlib.sha256(Path(probe.__file__).read_bytes()).hexdigest()
 
     returned = probe._run_child(
         source_root,
-        probe.DEFAULT_QUALIFICATION_ROOT,
+        qualification_root,
         oci_runtime=runtime,
         expected_probe_source_sha256=source_digest,
     )
@@ -559,7 +672,7 @@ def test_run_child_uses_distinct_minimal_mirror_and_removes_it(
     mirror = observed["qualification_root"]
     probe_mirror = observed["probe_path"]
     assert returned == (expected_payload, expected_envelope)
-    assert mirror != probe.DEFAULT_QUALIFICATION_ROOT
+    assert mirror != qualification_root
     assert observed["oci_runtime"] == runtime
     assert observed["expected_probe_source_sha256"] == source_digest
     assert observed["files"] == sorted(probe._qualification_mount_relative_paths())

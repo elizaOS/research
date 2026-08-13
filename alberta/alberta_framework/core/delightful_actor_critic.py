@@ -426,7 +426,7 @@ class DelightfulActorCriticUpdateResult:
 class DelightfulActorCriticBatchDiagnostics:
     """Finite aggregate diagnostics over accepted scan transitions.
 
-    Legacy ``delight``-named fields summarize paper-specific DG actor samples.
+    ``delight``-named fields summarize exact paper-defined DG actor samples.
     """
 
     attempted_count: Int[Array, ""]
@@ -448,7 +448,7 @@ class DelightfulActorCriticBatchDiagnostics:
 class DelightfulActorCriticArrayResult:
     """Final state, bounded per-step outputs, and aggregate scan diagnostics.
 
-    ``delights`` contains historical paper-specific DG actor-sample values, not
+    ``delights`` contains exact paper-defined DG actor-sample values, not
     literal candidate-gradient verdicts.
     """
 

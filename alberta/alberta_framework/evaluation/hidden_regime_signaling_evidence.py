@@ -28,6 +28,7 @@ than pretending that floating-point traces are cross-backend portable.
 from __future__ import annotations
 
 import argparse
+import ast
 import copy
 import dataclasses
 import hashlib
@@ -206,10 +207,10 @@ COMPACT_RECORD_TRUST_BOUNDARY = (
     "same-backend deterministic rerun independently verifies run provenance"
 )
 SOURCE_CLOSURE_POLICY = (
-    "the sorted, deduplicated local __file__ paths of every alberta_framework module loaded "
-    "after importing this protocol and its dependencies are hashed, including package "
-    "__init__ side effects and this file; pyproject.toml and uv.lock bind the external "
-    "dependency graph; never-imported unrelated modules are excluded"
+    "the sorted, deduplicated static transitive local Python import closure rooted at this "
+    "protocol module is resolved from import specifications and parsed source, including "
+    "parent package __init__ modules; pyproject.toml and uv.lock bind the external dependency "
+    "graph; unrelated modules loaded earlier in the process are excluded"
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -218,30 +219,99 @@ MAX_JSON_DEPTH = 64
 MAX_JSON_NODES = 2_000_000
 
 
+_SOURCE_ROOT_MODULE = "alberta_framework.evaluation.hidden_regime_signaling_evidence"
+
+
+def _parent_packages(module: str) -> set[str]:
+    parts = module.split(".")
+    return {".".join(parts[:index]) for index in range(1, len(parts))}
+
+
+def _local_module_path(module: str, root: Path) -> Path | None:
+    """Resolve one Alberta module from its import specification without importing it."""
+
+    if module != "alberta_framework" and not module.startswith("alberta_framework."):
+        return None
+    try:
+        spec = importlib.util.find_spec(module)
+    except (AttributeError, ImportError, ModuleNotFoundError, ValueError):
+        return None
+    if spec is None or spec.origin in {None, "built-in", "frozen"}:
+        return None
+    path = Path(spec.origin)
+    if path.suffix in {".pyc", ".pyo"}:
+        try:
+            path = Path(importlib.util.source_from_cache(str(path)))
+        except ValueError:
+            return None
+    try:
+        relative = path.resolve().relative_to(REPO_ROOT.resolve())
+    except ValueError:
+        return None
+    candidate = root.resolve() / relative
+    if relative.suffix != ".py" or not candidate.is_file():
+        return None
+    return candidate
+
+
+def _resolve_local_imports(module: str, path: Path, root: Path) -> set[str]:
+    """Return statically referenced local modules and their parent packages."""
+
+    try:
+        tree = ast.parse(path.read_bytes(), filename=str(path))
+    except (OSError, SyntaxError, UnicodeError) as exc:
+        raise ValueError(f"cannot parse source closure member {path}: {exc}") from exc
+    package = module if path.name == "__init__.py" else module.rpartition(".")[0]
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        candidates: list[str] = []
+        if isinstance(node, ast.Import):
+            candidates.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                package_parts = package.split(".") if package else []
+                keep = len(package_parts) - node.level + 1
+                if keep < 0:
+                    continue
+                base_parts = package_parts[:keep]
+                if node.module:
+                    base_parts.extend(node.module.split("."))
+                base = ".".join(base_parts)
+            else:
+                base = node.module or ""
+            if base:
+                candidates.append(base)
+                candidates.extend(f"{base}.{alias.name}" for alias in node.names)
+        for candidate in candidates:
+            parts = candidate.split(".")
+            while parts:
+                possible = ".".join(parts)
+                if _local_module_path(possible, root) is not None:
+                    found.add(possible)
+                    found.update(_parent_packages(possible))
+                    break
+                parts.pop()
+    return found
+
+
 def _algorithm_source_paths(root: Path = REPO_ROOT) -> tuple[Path, ...]:
-    """Capture the deterministic local runtime import closure at module load."""
+    """Build a deterministic static local import closure for the protocol."""
 
     resolved_root = root.resolve()
+    pending = {_SOURCE_ROOT_MODULE, *_parent_packages(_SOURCE_ROOT_MODULE)}
+    visited: set[str] = set()
     selected = {Path("pyproject.toml"), Path("uv.lock")}
-    module_paths = [Path(__file__)]
-    module_paths.extend(
-        Path(file_name)
-        for name, module in tuple(sys.modules.items())
-        if name == "alberta_framework" or name.startswith("alberta_framework.")
-        if (file_name := getattr(module, "__file__", None)) is not None
-    )
-    for module_path in module_paths:
-        if module_path.suffix in {".pyc", ".pyo"}:
-            try:
-                module_path = Path(importlib.util.source_from_cache(str(module_path)))
-            except ValueError:
-                continue
-        try:
-            relative = module_path.resolve().relative_to(resolved_root)
-        except ValueError:
+    while pending:
+        module = min(pending)
+        pending.remove(module)
+        if module in visited:
             continue
-        if relative.suffix == ".py":
-            selected.add(relative)
+        path = _local_module_path(module, resolved_root)
+        if path is None:
+            raise ValueError(f"source closure module is missing: {module}")
+        visited.add(module)
+        selected.add(path.relative_to(resolved_root))
+        pending.update(_resolve_local_imports(module, path, resolved_root) - visited)
     return tuple(sorted(selected))
 
 

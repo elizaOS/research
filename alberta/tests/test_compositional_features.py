@@ -930,7 +930,7 @@ class TestCompositionalFeatureLearner:
             n_features=6,
             n_tasks=1,
             candidate_count=1,
-            replacement_interval=1,
+            replacement_interval=2,
             min_feature_age=100,
             candidate_min_age=0,
             promotion_margin=1000.0,
@@ -946,6 +946,7 @@ class TestCompositionalFeatureLearner:
             ),
             candidate_utilities=jnp.array([0.0], dtype=jnp.float32),
             candidate_ages=jnp.array([10], dtype=jnp.int32),
+            replacement_accumulator=jnp.asarray(0.5, dtype=jnp.float32),
         )
 
         result = learner.update(

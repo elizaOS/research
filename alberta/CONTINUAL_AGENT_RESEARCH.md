@@ -4,7 +4,7 @@
 - **Repository snapshot:** elizaOS research commit `c28144b`; Alberta Framework
   forked from `lalalune/alberta` commit
   `2ac35333efae45cf969ce02ec1f2703476fed6c2`
-- **Working-tree status refresh:** 2026-08-01 — the dated status passages
+- **Working-tree status refresh:** 2026-08-03 — the dated status passages
   below reflect the current tree, not the committed snapshot
 - **Scope:** continual learning, continual reinforcement learning, world
   models, state construction, plasticity, forgetting, surprise, curiosity,
@@ -52,8 +52,24 @@ The most important findings are:
 2. **The nominal full agent is only partially integrated.** World-model,
    dreaming, Horde, IA, and recurrent-perception paths are optional and disabled
    by default. One mutually restricted opt-in pair-feature lifecycle now reaches
-   the linear OaK loop, but it excludes those consumers and does not discover
-   cumulants, subtasks, or options. The legacy IA recommendation remains
+   linear OaK and an exact linear Horde. Its lifecycle learner uses balanced
+   shadow-prediction utility; a separate opt-in auditor measures only one-step
+   frozen-consumer deletion loss and a matched shadow-candidate insertion
+   cohort. An additional stateless adapter may use those post-observation
+   utilities only to rank active deletion within the active cohort and
+   candidate insertion within the candidate cohort. It has no promotion or
+   go/no-go authority and does not discover cumulants, subtasks, or options.
+   An opt-in v18 Prototype coordinator now gives one pair lifecycle/router
+   authority to linear OaK, an ordered linear Horde, a generated-input/fixed-
+   physical-output world model, and exact feature-bound memory. Descriptor
+   adoption is conjunctive across every consumer, while a veto retains each
+   valid ordinary old-bank update; planning remains disabled by default. The
+   older strict development-only A/B/A harness still uses its separate stable-
+   base model lane and scripted partner.
+   A separate standalone WP7.2 v1 mechanism now selects fixed-budget
+   cumulant/subtask proposals from four source families under strict gates,
+   but it has no consumer, option-lifecycle, curation, or promotion authority.
+   The legacy IA recommendation remains
    diagnostic, while separate partner fusion can affect action selection.
    Bounded option-model planning now exists, but lacks a promoted
    matched-resource benefit result.
@@ -75,9 +91,12 @@ The most important findings are:
    Alberta's current fixed-weight GRU does not learn what history to retain.
 6. **Prediction error, epistemic surprise, learning progress, and delight are
    not interchangeable.** Raw error is vulnerable to stochastic “noisy TV.”
-   Paper-defined delight is advantage multiplied by action surprisal. In
-   *Does This Gradient Spark Joy?*, that signal drives the Kondo decision about
-   which samples receive a backward pass. It is not a generic replacement for
+   Paper-defined delight is exact float32 advantage multiplied by action
+   surprisal. In *Does This Gradient Spark Joy?*, the Kondo gate uses that
+   signal to form detached forward admission intent; a sample sparks joy iff
+   the actor consumer actually includes its exact contribution in a backward
+   pass that executes.
+   It is not a generic replacement for
    novelty, model uncertainty, parameter utility, or the separate
    multi-objective candidate-update safety audit.
 7. **World models should support both retention and planning, but recent
@@ -106,12 +125,298 @@ correctness and evidence-contract gaps without changing the overall verdict:
   fixed-memory raw-feature baselines on a deterministic one-dimensional task;
 - a frozen 30-seed recurring two-agent artifact demonstrates visibly cued
   fixed-memory coadaptation, explicitly separated from IA;
+- a separate consumed-root hidden-rule dyad now binds context identity to exact
+  semantic births under three-slot/four-rule capacity pressure. A matched
+  controller-row scrub removes stale Q/trace transfer across recycled births,
+  while an executable prefix twin proves that no past-only deterministic
+  policy can guarantee whether B or D should be forgotten when their observed
+  histories are identical and only the future recurrence differs. Selective
+  forgetting therefore requires an explicit prior, learned recurrence model,
+  randomized/minimax objective, or bounded archive; it cannot be defined as
+  hindsight-perfect eviction. A first defaults-off current-birth recurrence
+  score changes two later evictions at `epsilon=.05`, avoids eight completed
+  recurrence intervals, and yields `+.0024999976` reward; the other three
+  epsilon arms are exact nulls and the prefix-limited first choice is unchanged,
+  so the remaining cross-birth future-value gap stays explicit. A matched
+  one-record victim cache then required a strict observed prediction win over
+  both a fresh prior and every live source model before transferring lineage.
+  It produced zero matches or behavioral effects at every epsilon; at `.05`,
+  all four cache-valid tests failed the fresh comparison and contained an exact
+  tie. One outcome is therefore insufficient on this dyad, and the next
+  mechanism must accumulate bounded causal evidence rather than relax the gate.
+  A standalone fixed-`H=2` successor now does so mechanically: it freezes the
+  archive and all live pre-update comparators at a full-bank birth, waits for a
+  second completed transition, and transfers exact lineage only when the same
+  birth survives pairwise never-worse evidence with strict support against
+  every comparator. Its 563-byte-per-agent state has separate configuration
+  and complete-content SHA-256 tokens and no parameter-transplant path. This
+  closes the bounded sidecar mechanism. A matched dyad wrapper now snapshots
+  rescue before the outcome, routes exact zero or that past-only value through
+  the prioritized context update, stages both sidecars/scrubs/controllers, and
+  commits the whole 2,088-byte state atomically with matched calls and RNG.
+  Ten focused wrapper tests pass. This still does not close the dyad result:
+  host-transition provenance remains caller-owned and the full 4,000-step
+  comparison has not run;
+- the current generated-AST lane now closes task-blind finite product
+  reachability but falsifies two simple retention repairs on one consumed
+  8,998-step life. Topological headroom admits recurring A/B/C and improves
+  greedy reward to `0.12247` while losing every target and retaining obsolete
+  `p12`; left-packing removes `p12` but never co-retains two targets, ends with
+  none, and falls to `0.03979`. Slot capacity and placement are therefore not a
+  learned future-recurrence value. A frozen three-arm contribution-future-
+  utility comparison then passed every structural contract but rejected both
+  enabled endpoints: the disabled internal comparator retained A and scored
+  `0.274283`, while mix-one/decay-zero and mix-one/decay-0.95 retained no A/B/C
+  and scored `-0.003112` and `-0.020449`. No endpoint was selected or retuned.
+  A five-arm v2 on a new development root froze current, future, half-mix,
+  normalized, and longer-horizon mechanisms with exact
+  active/candidate f32 ranks and honest intervention-specific work. Its public
+  validator/serializer cannot consume the one-shot panel, private report/arm
+  helpers require the latch's live capability, and a pure-stdlib external
+  declaration bound the source/protocol/key/stream and summary-first one-shot
+  chronology. Its sole attempt completed the first arm's scan, then failed
+  before returning any arm endpoint because an all-step margin diagnostic was
+  incorrectly asserted to be cadence-only. No report or result exists, the
+  root cannot be retried, and the current evaluator refuses reentry. Eighteen
+  evaluator, six decommissioned-declaration, and three outcome contracts pass.
+  A failing-test-first synthetic trace repairs the diagnostic/endpoint split
+  for a future root only; it does not revive or reinterpret v2;
+  a frozen-theta standalone adapter supplies
+  exact base/tail and full slot/birth identity plus recomputing deferred commit.
+  An isolated transaction routes changed births through exact linear OaK and
+  optional ordered Horde axes, with caller-derived safe-boundary curation
+  suppression. A two-transition development lane now performs real old-bank
+  OaK/Horde updates, consumes an unsafe due opportunity, then routes one birth
+  at a safe primitive boundary with exact survivor/scrub/cache checks. It is not
+  a matched outcome, and this standalone adapter is not itself a Prototype,
+  model, or memory composition;
+- an isolated model edge now lets the live generated tail condition a linear
+  world model without turning mutable feature identities into output targets.
+  Physical base-delta/reward/discount heads stay fixed; source learning precedes
+  exact input-column routing, and a fully source-bound planning transaction
+  re-augments predicted physical successors before one OaK base backup. Tests
+  show a surviving generated column causally changes both the prediction and
+  backup while newborn columns start at zero. This remains L0 reachability with
+  defaults-off planning, no partner model, and no calibration, retention, or
+  benefit result. A separate opt-in v18 Prototype coordinator now composes the
+  same generated-input/fixed-output model with one pair lifecycle/router,
+  linear OaK, ordered linear Horde, exact feature-bound memory, and exact
+  checkpoints. It evaluates feature and world learning once, admits a
+  destination only when every consumer is ready, and otherwise preserves all
+  valid ordinary old-bank successors. That is L0 composition, not an outcome;
+- the existing additive fast/slow learner now has exact two-word lifetime,
+  fail-stop, atomic rollback, strict records, and resource contracts. Its
+  consumed A/B/A diagnostic is negative for retention: the slow A-probe MSE
+  rises from `0.0188931` after A1 to `4.01919` after B (`212.73x`), so its low
+  A2 tail after further updates is reacquisition rather than permanent memory;
+- an explicitly non-source-faithful Alberta-derived Permanent/Transient sibling
+  uses independent tanh representations, fixed 788-byte state, no replay or
+  task boundary, and a same-work no-consolidation ablation. Its permanent A
+  probe rises from `0.0434621` after A1 to `3.92572` immediately after B, while
+  the combined probe rises from `0.0345716` to `4.63162`; A2 improvement follows
+  more A updates. Separating always-active representations therefore does not
+  supply selective dormancy or protect contradictory recurring knowledge;
+- a generic fixed-bank regression integration of the existing
+  `ContextInference` active-only-freeze law now binds ownership before each
+  outcome and computes every expert candidate with matched state/work. On the
+  same consumed A/B/A source it reactivates the learned A expert after one A2
+  outcome, but per-sample selection fragments identity: A switches 10 times in
+  A1 and three times in B, including one B update that changes the learned-A
+  subtree. The primitive preserves nonselected experts per transaction, but
+  does not establish phase-long dormancy or pre-outcome context inference;
+- a fixed two-event pairwise-dominance quarantine now repairs that specific
+  overwrite failure without tuning a margin or dwell threshold. Its opening
+  event nominates a unique no-worse dormant challenger but commits no expert
+  update; a source-bound second event must add strict support for the same
+  candidate. On the consumed 512/512/512 A/B/A source, learned A stays bit-
+  exact through B with zero B updates and returns after two observed A2
+  outcomes. Enabled A1/B/A2 prequential MSE is
+  `0.0156662/0.0145220/0.0174704`, compared with
+  `0.0156662/0.0994502/0.0754818` and 498 B-to-A updates when routing is
+  disabled at the same logical work. This is a clean bounded dormant-expert
+  retention result for one consumed synthetic life, but it still learns a
+  switch only after outcomes, has exactly two supplied experts, and supplies
+  no multi-seed, control, generated-feature, artifact, or promoted result;
+- the smallest hidden-context full-agent composition now runs two fully
+  instantiated `PrototypeAgent` objects through one uninterrupted 512/512/512
+  A/B/A life. Oracle
+  rule coordinates are destroyed, both actions precede outcome-based context
+  updates, and one outer transaction couples the shared environment to both
+  pair-feature/OaK/Horde/world-model/memory agents. Routing the existing two-
+  slot inferred state gives A1/B/A2 mean-agent reward
+  `0.991401/0.977935/0.964493`, versus
+  `0.984638/0.0149503/0.994810` with identical inference work left unrouted;
+  routed A2 recovers from `0.781546` early to `0.997949` in the tail. This is
+  one consumed U0 causal-development life with 41,718-byte fixed state, not a
+  held-out result. It immediately predates the final validation-only contract
+  gates. A first exact replay lost its constructed comparison to a caller-side
+  formatter error; the sole declared recovery reproduced every declared report
+  field but failed closed because `prototype_agent.py` changed between clean
+  preflight and comparison. The recovery budget is consumed, no report was
+  retained, current-source compatibility is not established, and full-report
+  identity is not claimed. Capacity equals the two-rule support, the initial
+  slot-zero prior is part of the intervention, and no checkpoint, threshold,
+  artifact, feature-generality, selective-forgetting, or promotion claim
+  follows. A factorized U1 successor is also
+  implemented but unexecuted: learned or uniform simultaneous partner beliefs
+  marginalize a grounded four-cell joint-action model and may replace the
+  post-memory primitive before one outer U0/planner commit. Its planner-only
+  rows are `PP`, `M0P1`, `P0M1`, and `MM`, where `M` is post-memory fallback;
+  memory query/write/eviction diagnostics remain available, but same-event
+  memory reward effects are not attributed. It adds 3,758 persistent bytes,
+  zero post-init planner RNG or replay, and retains four environment proposals
+  per event. On one stable dependency snapshot, 17
+  focused core/wrapper cases passed; the remaining case exposed an over-strong
+  bit-exact float assertion. A 589-leaf comparison found only 17 float leaves
+  with 1--2 ULP drift and exact discrete/key leaves, so the wrapper now uses
+  U0's declared `rtol=1e-6, atol=1e-7; discrete exact` contract. The corrected
+  parity case passed separately, but `prototype_agent.py` changed during that
+  run. No current-source 18/18 claim exists, and a stable-source verification
+  must pass before the full runner is considered;
+- the first HCCL causal-core transaction rung is now implemented but remains
+  L0 and nonpromoting. A fixed development world owns the physics, hidden-sign
+  and observation state, named Threefry streams, immutable source-bound event
+  receipts, typed task/net/safety/message signals, pure proposals, and atomic
+  rollback. A separate adapter owns exactly one such world state and one
+  adjacent-cube attribution-kernel state. It consumes an already-prepared event
+  plus exact `B/M/P` action receipts, stages
+  `MM/B0M1/M0B1/BB/PP/M0P1/P0M1/MM`, requires bit-exact duplicate `MM`, and can
+  adopt only the `PP` world successor once. Source clocks, event identity, and
+  all action-receipt identities fail closed on stale, tampered, cross-world, or
+  cross-event use; rejection preserves the complete source for same-receipt
+  retry. Composite orchestration and its prebound scan are explicitly
+  host/eager-only after a full compiled scan approached the operational memory
+  cliff; the smaller world-proposal and attribution donors retain their JIT
+  boundaries. That first adapter has no learning stacks or fast/slow context
+  and feature-lineage integration. A separate newer primitive-only factory and
+  runner can construct a fixed 420- or 8,998-event integrated-dyad life, but
+  neither schedule is an executed research result and partial resume/checkpoint
+  is absent. Issued runbook, protocol seeds, result, threshold, artifact/writer,
+  evidence, and promotion authority remain absent. Communication is still a
+  later HCCL-v1 extension;
+- a separate v1 `HCCLExternalCoordinatorBaseBridge` now supplies one bounded
+  base-only agent-substrate rung. It owns one HCCL world/attribution state and
+  two independently initialized external learned-state/router/audit
+  coordinator states, starts them from their own exact raw 16-channel world
+  observations, and binds each exact cached primitive as `B=M=P`. Six
+  deterministic action-receipt identities include the corresponding full
+  decision and lifecycle identities; one common hard-mask matrix governs all
+  three layers, and excluding a cached action rejects before any fallback can
+  be invented. The PP proposal supplies each coordinator exactly its own
+  executed action, net reward, and next observation. HCCL plus both
+  coordinators adopt all-or-none, with bit-exact rollback and same-event retry.
+  Exact zero memory/planner contrasts describe only this ablation; they are not
+  “no joy” conclusions and no actor backward pass occurs. Host-only staging,
+  in-memory checkpointing, and fixed resources are L0 contracts, not a life,
+  run, seed, artifact, threshold, evidence, benefit, or promotion claim;
+- a separate v1 `HCCLTwoLiveMemoryBridge` now replaces that base-only ablation
+  with exactly two live learned-memory adapters while retaining one HCCL
+  owner. Pending receipts bind each agent's `B` and `M`; absent receipts use
+  `B=M`, and `P=M` remains an explicit no-planner rung. Agent 0 settles only
+  `M0B1-BB` and agent 1 only `B0M1-BB`; memory interaction is audit-only.
+  Each child receives its own executed `M` action and `PP` outcome, next masks
+  install only on the all-owner commit, and every rejection is atomic. This is
+  host/eager L0 memory-utility integration, not delight, actor backward,
+  evidence, benefit, or promotion;
+- the additive v1 `HCCLTwoLiveMemoryPrepareAdoptBridge` keeps that exact
+  persistent owner tree but exposes one transient downstream transaction.
+  Preparation evaluates each donor once and binds both agents' candidate live
+  states, raw/final STOMP owners, complete finalization traces, and independent
+  extended masks. Adoption performs integrity checks and child adoption only,
+  with no donor reevaluation; veto, replay, tamper, or a foreign binding returns
+  the complete source and outer-gates child-applied facts. Partner fusion is
+  admitted only over an immutable feature bank. This is still unauthenticated
+  host/eager `P=M` L0 plumbing with no Kondo actor backward, so it establishes
+  neither delight nor that any gradient sparks joy;
+- an additive `HCCLTwoLiveMemoryFactorizedPlannerBridge` now supplies a
+  snapshot-free `P` rung. Its complete persistent owner tree is one HCCL
+  state, the same two live post-memory `M` states, and one paired factorized
+  planner state/cache. It completes the paired behavior/joint-world models
+  once and reconstructs transient `P` states through the public Prototype
+  cached-action replacement. The planner is grounded on the external GRU
+  builder's 17-wide constructed state while the 16-channel raw observation
+  remains separately bound to the HCCL plant and `PP` commit. Hard-mask
+  fallback is `M`, the effective `P` pair alone is consumed, and adoption fully
+  validates both current and candidate planner states/caches with no donor
+  reevaluation. Seven focused current-source cases pass individually. This is
+  still host/eager unauthenticated L0 plumbing without external or physical
+  dispatch, safety, Kondo actor backward, delight, matched benefit, evidence,
+  or promotion;
+- the additive no-planner
+  `HCCLTwoLiveMemoryRepeatedOptionPrepareAdoptBridge` retains those two sole
+  live STOMP owners and adds only detached repeated-option metadata. It
+  consumes each raw STOMP result once, projects a cached memory-action change
+  through the full coordinator owner, and adopts every owner together or not
+  at all. At a real started-but-quiescent boundary, one selected agent may
+  consume the exact fresh-cold atomic swap while the HCCL world, other agent,
+  learned memory, pending feedback, and primitive masks remain exact and no
+  cold slot persists. This remains `P=M`, host/eager, unkeyed L0 integrity
+  plumbing with no planner, physical dispatch, authentication, safety, Kondo
+  backward, delight, benefit, evidence, or promotion;
+- `HCCLContinualDyadTransaction` is the first atomic integrated-owner rung.
+  It owns one HCCL world/attribution state, two live post-memory action stacks,
+  two slow-context states, and one paired factorized planner. A strict split
+  stops after both memory phases and completes with either the planner or the
+  constructible disabled-planner form without donor reevaluation; all owners
+  adopt together or return the complete source. Its ordinary `step` now owns
+  event, B/M/P binding, canonical memory provenance, preparation, receipt, and
+  adoption from only a source state and hard masks. The production fixed-life
+  executor delegates to that method, while the separate factory/runner requires
+  a fresh complete 420- or 8,998-event primitive-only schedule and returns only
+  an in-memory trace. Neither schedule is an executed research result; partial
+  resume/checkpoint, physical dispatch, matched result, evidence, promotion,
+  and causal-core completion remain absent;
+- `HCCLKondoContinualDyadRoute` v3 uses that disabled-planner form for recurring
+  actor-owned `P`. Genesis installs the first proposal/compact certificate
+  without actor backward; every successor consumes the prior compact lineage
+  through one Kondo actor transaction before sampling and atomically installing
+  the next pair. The planner remains a learning-only shadow, both action stacks
+  remain the sole Prototype owners, and the route derives both learned-memory
+  inputs from its own causal-core event and canonical agent rows rather than
+  accepting caller provenance. Each successor also derives the exact pending-
+  `P`/current-`PP` protected batch and updates separate two-row linear reward-
+  value and cost-value heads with detached pre-update bootstraps before Kondo;
+  cost is `safety_cost + message_charge`, currently exact zero. Outer rollback
+  cannot erase an actor backward that already executed, but only the nested
+  actor result can say its gradient contribution sparked joy. Scheduling,
+  actor keys, and all-true masks remain caller-driven host/eager L0 machinery.
+  The protected-only checkpoint is not route recovery, and there is no
+  autonomous life, route checkpoint/resource closure, authentication,
+  dispatch, physical safety or critic-efficacy result, evaluator, benefit,
+  evidence, or promotion;
 - STOMP now keeps environment return separate from pseudo-reward, uses a
   coherent discounted differential semi-MDP target, and consumes option models
   in bounded planning backups;
 - OaK transition ownership, option-start accounting, active-option curation,
   Prototype primitive-action credit, and dream isolation have focused
   regressions;
+- an isolated nonlinear discrete actor/critic now binds the actually executed
+  action, target and caller-declared behavior likelihoods/revisions, and exact
+  identity before clipped per-decision action-importance correction. Separate
+  actor/critic head and trunk traces, component plastic/frozen policies, typed
+  RNG, exact clocks, checkpoint construction, rollback, and persistent-byte
+  accounting are L0-tested; it remains discounted scalar-V machinery without
+  state-visitation correction, average reward, learned component utility, or
+  matched outcome evidence;
+- a separate nonlinear discrete differential actor/critic now owns independent
+  `tanh` actor and critic networks, eligibility traces, momentum, fixed
+  head/trunk plasticity policies, bounded utility telemetry, and a learned
+  reward-rate baseline. Exact cached target and caller-owned behavior
+  distributions, revisions, action identity, owner digest, pure proposal, and
+  recomputing atomic commit contracts cover both ordinary epsilon-mixture
+  behavior scores and clipped per-decision action importance. This closes an
+  average-reward mechanism gap at L0 only: action ratios do not correct state
+  visitation, utility does not control plasticity, and no matched control,
+  convergence, retention, or safety result exists;
+- one restricted Prototype feature bank now updates linear OaK and an ordered
+  linear Horde under old-bank semantics before atomically routing both
+  post-update consumers, with scale/group-balanced proxy utility and a
+  schema-bound v4 checkpoint;
+- a separate fixed-universe WP7.2 v1 lane now emits only complete,
+  fixed-quota cumulant/subtask proposal cohorts from controllable events,
+  feature changes, reward-transition atoms, and typed prediction bottlenecks,
+  alongside frozen random and exact hand-authored comparators under the same
+  budget;
 - a pinned Foragax runner and protocol importer are present, and a
   stage-conformant five-seed field-of-view tuning stage selected `step3e3`;
   the 30-seed evaluation lane remains incomplete: the Alberta worker has no
@@ -141,10 +446,10 @@ opt-in scale-robust v2 package passed its immutable frozen narrow comparison,
 but registered source drift now makes that artifact invalid for the current
 learner. It also retains visible context, an exhaustive finite pair archive,
 and one fixed learner initialization; it does not close general feature
-discovery or control. State construction in the full prototype is still fixed
-rather than learned, the representation/model/planning lifecycle is not
-closed, and no single bounded agent life exercises and ablates all required
-links.
+discovery or control. State construction in the most integrated v18
+composition is still fixed rather than learned, the
+representation/model/planning lifecycle is not closed, and no single bounded
+agent life exercises and ablates all required links.
 
 As of 2026-08-01 the fail-closed evidence registry
 (`alberta-evidence-status`) reports overall `invalid` (exit 2) with all five
@@ -293,6 +598,56 @@ The framework already has unusually useful foundations:
 - **Embodiment-compatible boundary.** The robot stack can consume the continual
   RL subset without moving heavy research internals into the elizaOS runtime.
 
+The current working tree also adds a public, non-learning
+`EmbodiedSafetyEnvelope` L0 kernel. It validates current and proposed joint,
+workspace, collision, timing, bridge, identity, and version constraints and can
+return only the proposal, a statically configured fallback, or no action.
+Emergency stop latches in an independent checksummed transition even when the
+ordinary command transaction is rejected; reset requires a strictly newer
+stationary-safe sample, a monotonic nonce, and an authority-bound token after
+external caller authentication. Rollback preserves diagnostics while suspending
+deployment, and checkpoint restore requires an exact revision plus SHA-256
+anchor retained outside the payload. A pure fixed-ring shadow readout combines
+zero hard violations with Wilson, calibration, and latency gates but has zero
+dispatch, deployment, or promotion authority. These are mechanism contracts,
+not a geometry proof, physical-safety result, robot-simulation result, or
+deployment authorization.
+
+A strict nonpromoting synthetic robot fault audit now exercises that envelope
+over one frozen 30-event continuing schedule covering telemetry/wear drift,
+timing and delayed-reward metadata faults, sensor corruption/failure, bridge
+loss/recovery, unsafe candidates, emergency stop, reset, rollback, and exact
+checkpoint recovery. Only envelope-available commands are marked executed in
+simulation accounting, and physical dispatch remains zero. The complete trace,
+shadow facts (with success explicitly proxied by action availability), hard
+interventions, fallback identity, action-availability
+recovery delays, eager/JIT/scan parity, externally anchored checkpoint resume,
+and exact causal replay are retained.
+
+The schedule is synthetic, not a dynamics simulator or geometry proof. Its
+learner/controller is only an unchanged opaque witness, so no learner reset or
+adaptation latency is tested. The pure kernel does not authenticate callers;
+external authentication is still required before using its non-secret
+authority tokens. The held-out family is declared but unexecuted, and there is
+no matched no-candidate comparator, evidence seed, threshold, artifact,
+physical-safety result, or deployment authority. The audit is therefore L0
+fault-path inspection and remains `not_assessed`, not a robot-simulation or
+WP9 exit result.
+
+A separate minimal dynamics/adaptation evaluator now closes only that
+mechanism-wiring omission. It runs adaptive and zero-learning `PrototypeAgent`
+arms through owned bounded two-joint plants over A/B/A and one separately
+declared consumed change family. Typed common randomness covers only exogenous
+dynamics, sensor, fault, and latency inputs; policy randomness and trajectories
+remain independent. Every primitive becomes a robot-like command and crosses
+the hard envelope. Certified fallback changes are rebound to Prototype's real
+cached credit owner, and blocked actions advance neither plant nor learner.
+The full command/version/transition/revision trace, fixed resources, pure-
+dynamics parity, composite checkpoint resume, and exact replay are retained.
+This is still `not_assessed`: it has no untouched held-out family, threshold,
+artifact, physical dispatch, safety certificate, adaptation-efficacy result,
+or WP9 exit authority.
+
 These strengths should be preserved. The roadmap should connect and validate
 them, not replace them wholesale.
 
@@ -303,15 +658,15 @@ them, not replace them wholesale.
 | 1 | Strong linear/adaptive optimizer coverage | Used by later learners | Unit and smoke coverage; full replication artifacts omitted | **Implemented; re-establish benchmark evidence** |
 | 2 | Extensive nonlinear and feature-lifecycle machinery | Several alternative paths, no single accepted lifecycle | Critical benchmark and theory gates omitted; upstream evidence mixed | **Active research, not complete** |
 | 3 | Horde, mixed and independent demons, linear off-policy TD | Optional Horde in full agent | Nonlinear/off-policy/trace combinations remain open | **Substantial partial implementation** |
-| 4 | SARSA, discrete actor-critic, exact-density bounded continuous average-reward actor-critic | Step 1–4 pipeline exists; continuous core and evaluator remain isolated | Actor/critic is provisional versus SARSA; continuous lane has L0 contracts and `not-assessed` A/B/A instrumentation only | **Implemented surfaces; weak closure evidence** |
+| 4 | SARSA, discrete actor-critic, exact-density bounded continuous average-reward actor-critic, isolated nonlinear shared-trunk action-importance correction, and a separate nonlinear discrete differential actor/critic | Step 1–4 pipeline exists; continuous and nonlinear cores remain isolated | Actor/critic is provisional versus SARSA; one off-policy lane is discounted scalar-V/action-ratio-only, the differential lane still has action-only correction, and all isolated lanes have L0 contracts without matched outcome evidence | **Implemented surfaces; weak closure evidence** |
 | 5 | Average-reward prediction machinery | Available to later components | Small gates | **Kernel implemented** |
 | 6 | Differential continuing control | Used by STOMP/OaK | Small/surrogate environments | **Kernel implemented; benchmark breadth missing** |
-| 7 | One-step planning/Dyna helpers | Optional guarded dreams and fixed-budget option-model backups can update control | Small gates; no matched-budget planning gain | **Mechanism integrated; planning evidence open** |
-| 8 | Trainable state builders plus bounded feed-forward/recurrent world-model lanes | Opt-in Prototype paths return committed real model gradients to learned state; a separate restricted lane discovers/routes pair features into linear OaK | Narrow historical FTL result plus nonpromoting L0 diagnostics | **Separate causal edges integrated; balanced full lifecycle open** |
-| 9 | Dream guards, typed priorities, replay rehearsal, and candidate scoring | Prototype dreams still use random anchors/actions and do not consume a learned search controller | No promoted matched search-control result | **Guarded planning/replay, not learned search control** |
-| 10 | Subtasks, options, outcome models, extended actions | STOMP executes options and consumes learned option models in bounded backups | No promoted matched-budget planning benefit | **Mechanism implemented; defining control evidence missing** |
-| 11 | Utility EMA, bounded curation, keyboard proposal and owner-correct dispatch | Explicit consumers can dispatch; automatic chord discovery remains absent | Small gates; no matched option-lifecycle benefit | **Mechanism implemented; lifecycle evidence open** |
-| 12 | Exo-cerebellum/exo-cortex APIs plus bounded partner-policy fusion | Opt-in Prototype path can change the real primitive under hard safety and exact feedback ownership | Historical IA valid rejection; no calibrated closed-loop partner benefit | **Action mechanism integrated; efficacy gate open** |
+| 7 | Legacy one-step planning, real-anchor ensemble Dyna, and guarded short rollouts | Optional guarded legacy dreams and fixed-budget option-model backups can update control; a strict local planner→gauge→actor/critic composition closes rollout-tensor substitution, but ensemble lanes remain outside Prototype/dispatch and external grounding facts remain caller attestations | Small gates; no calibrated or matched-budget ensemble planning gain | **Mechanisms and a bounded local consumer exist; grounding and planning evidence remain open** |
+| 8 | Trainable state builders, separate balanced comprehensive auxiliary objectives, and bounded feed-forward/recurrent world-model lanes | Opt-in Prototype paths return committed real model gradients to learned state; online-gated, dense full-GRU, and compressed-RTU builders expose RTRL proposal/commit contracts. Transactional adapters route the smaller GVF/inverse and caller-targeted comprehensive objective sets; a separate learner-owned target producer/Prototype owner derives the same comprehensive families from the accepted transition. Strict-linear consumers for both comprehensive target authorities perform causal RTU whole-unit replacement before next-action selection. The v18 atomic lane gives one pair lifecycle/router to linear OaK, ordered linear Horde, a generated-input/fixed-physical-output model, and exact feature-bound memory, with conjunctive destination adoption and ordinary-update retention on veto | Narrow historical FTL result plus nonpromoting L0 diagnostics | **GRU/RTU comprehensive mechanics and one atomic generated-feature/model/memory composition exist; calibration, selective-retention/control outcomes, and Forager gates remain open** |
+| 9 | Dream guards, typed priorities, replay rehearsal, candidate scoring, prospective fixed-budget exploration, and calibrated four-mode search control | A raw-representation Prototype/STOMP sidecar snapshots live learned primitive/option models under one shared budget; a separate default-off v2 can consume candidate-specific evidence to replace the cached primitive and arm its actual owner under a caller mask; a consumed synthetic lane derives all six exploration arms' scores from independent executed histories | L0 contracts and development integration only; no safety/physical-dispatch authority or matched held-out exploration/search-control outcome | **Causal stochastic-trap mechanics and an owner-correct live policy edge exist; policy benefit and evidence remain open** |
+| 10 | Cumulant/subtask discovery, semantic-bound option lifecycle audit, options, outcome models, and extended actions | A bounded scheduler observes discovery continuously, requests fresh four-family proposals at an exact cadence/retry, and receipt-gates their installation into preallocated live STOMP slots at quiescent boundaries; cumulants are rematerialized and cold slots masked throughout behavior/learning/planning. One controller can execute an exact caller-authorized two-rebind retirement; a separate one-canonical-state controller can later install and reactivate one externally authorized replacement in the resulting cold slot. An opt-in one-owner bridge composes detached authority metadata with the sole live Prototype→OaK→STOMP owner, reuses the exact raw trace, propagates cold masks through search/Dyna/audit, and metadata-finalizes the sole post-control owner | L0 proposal/scheduler/installation/audit/authorized-retirement/replacement/bridge contracts; go/no-go remains caller-owned and there is no promoted matched-budget planning or repeated-lifecycle benefit | **A bounded live-owner composition exists; autonomous authority, repeated lifecycle policy, and outcome evidence remain open** |
+| 11 | Utility EMA, bounded curation, keyboard proposal/owner-correct dispatch, lifecycle diagnostics, and calibrated option-model search | Explicit consumers can change cached policy; discovery can reach live STOMP, exact authorized retirement can leave cold vacancies, and a default-off calibrated consumer can form a proposal-only chord without starting an option, but automatic chord discovery/replacement remains absent | L0 mechanism gates; no physical dispatch or matched automated lifecycle benefit | **Live narrow edges exist; autonomous curation evidence is open** |
+| 12 | Exo-cerebellum/exo-cortex APIs plus bounded partner-policy fusion | Opt-in Prototype can change the real primitive under hard safety and exact feedback ownership; a matched-initialization three-arm v2 evaluator now isolates the wrapper intervention | Historical IA valid rejection; the consumed 12-event matched lane gives learned versus fixed-zero internal separation but no behavioral separation | **Action mechanism and matched instrumentation exist; efficacy gate open** |
 
 The continuous Step 4 instrumentation is a strict fixed 12-event,
 one-dimensional A/B/A evaluator starting from an immutable source-bound
@@ -344,13 +699,74 @@ only. Neither object is the complete feedback system described by the Plan.
 
 The legacy `GRUPerceptionConfig` remains an honestly named fixed-weight
 echo-state baseline. `PrototypeAgent` now also accepts the common
-`StateBuilder` contract with identity, fixed-trace, and online-gated recurrent
-implementations. `start()` advances recurrence once and caches the exact raw
+`StateBuilder` contract with identity, fixed-trace, online-gated recurrent,
+conventional dense full-GRU, and diagonal complex compressed-RTU
+implementations. The full GRU has learned
+input and recurrent update/reset/candidate maps plus exact fixed-parameter
+RTRL sensitivities under the same proposal/commit, resource, reset, and
+checkpoint contracts. Its sensitivity storage is `O(H * P)`, and sensitivity
+carry after parameter changes is explicitly approximate. `start()` advances
+recurrence once and caches the exact raw
 observation, representation, primitive action, and lifecycle/generation token;
 `act()` only returns that cached decision and cannot advance recurrence.
 Explicit transitions advance a builder once per bootstrap observation, reset
 episode-local recurrence at a boundary, and consume the post-reset decision
 observation once. Eager, JIT, scan, and checkpoint tests cover those counts.
+
+The RTU builder persists the recurrence's unit-diagonal sensitivity structure
+instead of a dense hidden-by-parameter Jacobian. It is exact for fixed
+parameters and shares the source-bound advanced-destination commit contract.
+Default carry after parameter updates is approximate; the optional diagonal
+Taylor path owns its exact source vector, accumulated actual delta, and source
+update words but still omits mixed-parameter Hessian terms.
+
+A standalone `RTUGenerateAndTest` L0 lifecycle now closes the mechanism-only
+recycling gap for that builder. Before the downstream gradient changes the
+RTU, it observes per-unit real/imaginary activation-gradient products and
+updates fixed-capacity diagnostic utility, age, and support. In the strict live
+composition, the owning adapter also jointly deletes each unit's real and
+imaginary current-representation channels against frozen pre-update
+comprehensive heads and records a separate positive bounded causal-utility EMA
+and evidence count. Exact periodic replacement requires this causal rank—there
+is no contribution-rank fallback—alongside the existing maturity, protection,
+cadence, quota, and active-option gates. Missing or immature causal evidence
+defers recycling without dropping ordinary learning; an attempted invalid or
+non-finite internal counterfactual rejects the whole outer transaction. The stable
+lowest-causal-utility mature units outside a protected set are replaced
+under a fixed quota. Each replacement redraws the unit's polar recurrence and
+two input rows and scrubs its activation, compressed RTRL sensitivity, and
+optional Taylor trace/source/delta slices. If ordinary RTU learning is also
+proposed, the lifecycle recomputes that exact source-bound commit and accepts
+only its bit-identical live destination before recycling; stale or invented
+destinations fail atomically. The public finalization receipt reconstructs the
+advance receipt, independently reruns RTU commit, and exact-matches its
+destination and selected mask. That proves derivation from supplied values but
+does not authenticate caller-owned lifecycle, objective-gradient, or ordinary-
+proposal authority. A strict comprehensive-objective composition now
+prepares recurrence without learning or action RNG, applies the current
+transition's combined objective update to the old representation, performs at
+most one atomic whole-unit replacement, scrubs every recycled comprehensive-
+head, linear STOMP/OaK base, intra-option, trace, and option-model axis, and
+then selects the
+ordinary next action from the recycled representation. An executing option
+defers replacement while still committing recurrence, objective learning, and
+the real transition. Content-bound prepare/finalize receipts and separate
+replacement-unit/replacement-event clocks bind the builder revision to accepted
+transitions plus nonempty replacement events. The composition owns the
+lifecycle source and internally constructs the gradient and source-bound
+proposal, closing the three lower-level authority boundaries. Its declared
+source work is four builder-commit and two RTU-commit evaluations plus one
+frozen-head counterfactual per unit for preflight and independent derivation;
+persistent state receives one logical ordinary
+update and at most one replacement event. The RTU-enabled composition declares
+the stricter per-unit uint32 lifetime bound of `2**32 - 1` accepted transitions.
+The envelope deliberately rejects
+nonlinear STOMP, planning, world/model/replay/dreaming, Horde, IA,
+partner/memory, GRU, historical candidate-update audit, and feature-lifecycle
+sidecars. This prequential frozen-head causal-deletion mechanism is not an
+independently held-out efficacy result, and neither it nor the contribution
+diagnostic is the paper-defined delight signal. It has no matched recurrent
+comparison, control outcome, or evidence claim.
 
 The online-gated builder now exposes a source-bound proposal and destination
 commit boundary. An opt-in Prototype lane combines the bounded ensemble's real
@@ -369,37 +785,180 @@ application succeeds. Missing, stale, incomplete, or
 non-finite sidecars veto only builder learning, not the real control/model
 transition.
 
+The stateless `ExternalBuilderCandidateEvidenceProducer` now makes the
+external full-GRU variant of that probe boundary executable without accepting
+caller-shaped parameter gradients. It binds three caller-owned
+representation-space probes to exact coordinator event/builder/Prototype/
+feature-generation/decision identity and pulls their hidden components through
+the cached source RTRL sensitivity. Identity drift or non-finite values yield
+unavailable exact-zero evidence, while independence remains an explicit
+caller attestation that arrays cannot prove. The real coordinator accepts a
+valid produced bundle under a permissive mechanism configuration and changes
+only its external builder. These three analytic pullbacks add no model forward
+and no actor backward; they are candidate-audit plumbing, not a “sparks joy”
+fact, calibrated evidence, or an outcome result.
+
 This is causal mechanism integration, not a learned-state result. It is only a
 two-source grounded-model/current-control path, not an empirically balanced
-objective set: multiple-timescale GVF, inverse, feature-utility, causal
-deletion, and matched mixer ablations remain absent. Until those tests and the
-matched Forager gate exist, the builder must not be called a learned-state
-success.
+objective set. A separate `BalancedStateObjectives` L0 kernel now supplies
+linear GVF heads at multiple strictly ordered discounts plus a
+consecutive-pair inverse-action head. The head families update separately, the
+GVF family is averaged before fixed positive group masses are applied, and
+clipped current/successor representation gradients remain bound to the exact
+executed-action receipt and caller-owned revisions. Strict checkpoints,
+resources, fail-stop clocks, retry-safe rejection, JIT/scan, and a real
+`OnlineGatedStateBuilder` proposal/destination commit are tested. A separate
+opt-in `PrototypeBalancedStateObjectives` transaction now authenticates the
+exact dispatched decision/action and bitwise representation, scores the
+final/bootstrap observation before any autoreset decision, pulls back current
+and bootstrap gradients through their respective recurrent sensitivities, and
+commits one clipped builder update. Its cached next representation retains the
+pre-auxiliary decision-time builder owner while the live builder is exactly one
+accepted auxiliary update newer; failures roll back every component, RNG,
+clock, and cache. The ordinary Prototype path remains unchanged. Weights are
+still declared rather than empirically calibrated. A separate
+`ComprehensiveStateObjectives` L0 kernel now supplies action-conditional
+next-observation/latent, reward, Bernoulli termination, multi-timescale GVF,
+state-value, selected-action-advantage, and inverse-action heads. Prediction
+and control subheads are averaged inside fixed family masses; all heads retain
+independent parameters, step sizes, and exact revision rows. Stable BCE,
+finite-difference representation gradients, bit-exact action ownership,
+non-earlier successor revisions, numerical rollback, strict resources and
+checkpoints, and eager/JIT/scan parity are tested. A separate opt-in
+`PrototypeComprehensiveStateObjectives` transaction binds caller target bits,
+source revision, and provenance to the exact Prototype decision/action,
+observation event, final/bootstrap observation, and builder owner. It supports
+the online-gated, full-GRU, and compressed-RTU builders, sums current and successor RTRL
+pullbacks, commits one clipped logical update, and atomically restores every
+component on rejection. The strict-linear RTU composition above consumes that
+update through the independently rederived recurrent destination and scrubs
+recycled consumers
+before selection. A separate `CausalStateObjectiveTargetProducer` derives the
+ordinary target families from one accepted transition, and its versioned
+`PrototypeCausalStateObjectiveTargets` owner now supports the exact RTU builder
+only with the matching strict lifecycle. Its deletion scorer holds both the
+pre-update objective parameters and the one factual learner-owned target bundle
+fixed. Whole-unit replacement atomically scrubs the objective/pending cache,
+RTU sensitivity/Taylor ownership, and supported linear STOMP consumers to
+canonical `+0.0`; invalid scoring, consumer corruption, or a late successor
+cache refusal restores the complete source including lifecycle RNG. Typed
+metadata/sentinel checkpoints resume exactly, and the RTU lane fail-stops after
+`2**32 - 1` accepted transitions. Calibrated target semantics/masses, general
+lifecycle compatibility,
+independently held-out feature-utility efficacy, broader lifecycle curation,
+matched ablations, and the Forager gate are absent. The builder therefore must
+not be called a learned-state
+success. The consumed, resource-unmatched write/hold probe gave four-seed mean
+frozen-suffix accuracy `0.5158` observation-only, `0.5292` fixed trace,
+`0.5258` online-gated, `0.5067` full GRU, and `0.5617` RTU. The RTU used
+`1,324` total persistent bytes versus `12,204` for the full GRU. This is a
+descriptive supervised-development signal, not a matched control result or
+causal efficacy inference.
 
-#### 3. Prototype has one narrow pair lifecycle, not the required shared loop
+#### 3. Prototype has a narrow WP7.1b auditor and WP7.1c rank adapter, not the required loop
 
-An opt-in Prototype lane now augments a fixed-width builder base with a bounded
-pair-product bank and trains it from one owner-bound behavior TD target: base-Q
-while idle or the executing option's intra-option target. The augmented
-gradient is pulled back to builder coordinates against the exact pre-route
-generation and full descriptor bank. The same identity is persisted beside
-the enabled OaK subtree, rejecting stale or same-generation forked consumers.
-A descriptor change routes atomically through every
-linear OaK feature axis at a safe idle/cached-base boundary; otherwise the
-proposal is rolled back and curation is deferred rather than queued. Static
-allocation ceilings, exact resource declarations, and versioned checkpoints
-bound the mechanism.
+An opt-in Prototype lane augments a fixed-width builder base with a bounded
+pair-product bank. Its original mode trains from one owner-bound behavior TD
+target: base-Q while idle or the executing option's intra-option target. Its
+shared mode places that control target in channel zero and follows it with
+`HordeUpdateResult.td_targets` in the declared demon order. Linear OaK and the
+linear Horde update under the old descriptor bank first. The feature learner
+then observes the ordered target vector and, at a safe idle/cached-base
+boundary, routes every post-update consumer feature axis atomically in exactly
+two router calls. Unsafe curation is rolled back and deferred rather than
+queued.
 
-This configuration deliberately excludes world models, Horde, replay,
-dreaming, IA, partner fusion, experiential memory, and GRU perception. Thus it
-corrects the older claim that Prototype feature discovery is wholly absent,
-but it still does not close Step 8's required cycle:
+Scale normalization applies within the proxy, while explicit task weights give
+control `0.5` and each of `D` Horde demons `0.5/D`. This prevents target scale
+or demon count alone from owning the bank, but it remains shadow prediction
+utility rather than a causal downstream deletion test. The augmented gradient
+is pulled back against the exact pre-route generation and full descriptor bank.
+One enabled-only bundle binds linear OaK, Horde, the consumer binding, and an
+ordered-schema digest; the shared composition therefore requires a v4
+Prototype checkpoint. An exhausted lifecycle is an audited no-op that leaves
+the already-advanced, step-aligned OaK/Horde consumers untouched. Exact static
+checks reject nonlinear OaK or Horde, a non-LMS Horde optimizer, and any Horde
+normalizer.
+
+An additional opt-in auditor forms scores from the old descriptor bank's
+frozen, predict-before-update consumer targets, predictions, and linear tail
+weights. Active utility is the exact normalized one-step half-squared-loss
+increase under deletion. Candidate insertion is evaluated in a separate
+matched shadow-candidate cohort with private normalized-LMS contributions; it is scored
+before shadow weights, utility EMAs, or scale moments update and is not compared
+against active utility to route features. Task mass remains fixed at `0.5` for
+control and `0.5/D` for each ordered demon, without redistributing unavailable
+mass.
+
+If the lifecycle commits its two-call consumer route, the auditor explicitly
+rebinds private state by descriptor identity without another router call. New
+or colliding candidate identities are zeroed. Enabling this instrumentation
+nests audit state and its digest around the existing consumer bundle in a
+single atomic state bundle and requires the v5 checkpoint schema; disabling it
+leaves the v4 checkpoint and behavior unchanged.
+
+WP7.1c adds a stateless ranking adapter to this exact lane. It reads the
+post-observation audit EMAs as feature deletion/insertion sensitivity, not
+paper-defined actor-sample delight: it neither scores actor samples nor
+selects backward passes. Lower deletion utility ranks only among active slots, while higher
+insertion utility ranks only among candidates; an active score is never
+compared with a candidate score. Every configured task must independently
+meet the evidence floor for a slot before that slot is rank-eligible. The
+fixed control/Horde task mass is neither redistributed nor renormalized.
+
+This adapter influences rank, not the curation decision. Existing active and
+candidate ages, maintenance cadence, candidate-confirmation rules, internal
+proxy promotion floor and margin, and the safe routing boundary retain all
+promotion and go/no-go authority. The adapter owns no persistent state and
+adds no RNG draw, backward pass, consumer update, or router call. Its exact v6
+Prototype checkpoint shell binds the ranking configuration and digest around
+the v5 bundle; disabling the adapter leaves v5 behavior unchanged.
+
+This utility-auditor/curation configuration still excludes world models,
+replay, dreaming, IA, partner fusion, experiential memory, and GRU perception.
+Separate exact-Identity Prototype lanes admit feature-bound experiential memory
+and a stable-base action-conditioned model, and a development-only A/B/A
+harness executes those lanes together with OaK and managed Horde. The isolated
+routed linear model instead consumes the generated tail and re-augments its
+fixed physical successor for one OaK base backup.
+
+An opt-in v18 coordinator now composes one exact-Identity pair lifecycle/router
+with linear OaK, ordered linear Horde, that generated-input/fixed-physical-
+output model and anchor buffer, and exact feature-bound experiential memory.
+Feature and world learning are prepared once; lifecycle, world, memory, and
+all consumer readiness are conjunctive for destination adoption, while veto
+retains all valid ordinary old-bank updates. At the lifetime observation cap,
+the lifecycle remains an exact rejected no-op and only the authenticated
+current augmented encoding is locally derived for cache consistency. Mirrored
+bindings are caches, one state owns the resources, checkpoints bind the v18
+configuration, and planning defaults off. The v18 lane does not include the
+utility auditor or feed model/planning outcomes into feature ranking. Thus it
+closes the missing atomic ownership edge but still does not close Step 8's
+required learning cycle:
 
 `features → world-model quality → planning/control utility → feature ranking → features`.
 
-There is no multi-consumer utility balance, causal deletion result, automatic
-cumulant/subtask or option discovery, control benefit, scientific promotion,
-WP7 completion, or L3 claim.
+The pair lifecycle (including its ordered-Horde form) and that routed world
+model now share an external-readiness transaction shape. Preparation binds the
+authoritative source and produces both an ordinary old-bank successor and a
+routed destination with exactly one learner evaluation. Adoption performs no
+learner or router work: a ready receipt selects the routed candidate, while a
+veto preserves the already-computed ordinary update and records rollback rather
+than deferral. The world primitive deliberately separates ordinary validity
+from destination validity, so a bad route cannot erase a valid physical-model
+update when the coordinator vetoes it. Exact-content receipts reject stale or
+tampered trees but are unkeyed integrity declarations, not authentication.
+Their byte records describe serialized logical leaf occurrences, not allocator
+peaks. These primitives remain independently usable; the v18 coordinator is
+the narrow higher-level consumer and supplies no caller authentication.
+
+The auditor and adapter close only an instantaneous frozen-consumer loss
+diagnostic and within-cohort ranking surface. There is no adapted-consumer
+causal deletion result, realized return, planning, control, safety, or
+empirical benefit, automatic cumulant/subtask or option discovery, curation,
+promotion, or go/no-go authority, scientific promotion, WP7 completion,
+Alberta Plan completion, or L3 claim. They renew no registered evidence
+artifact; any artifact whose registered source hashes differ remains invalid.
 
 #### 4. The world-model ensemble is integrated but not externally calibrated
 
@@ -441,11 +1000,65 @@ record, fixed-quota dual-memory sample, and model-member rehearsal as one
 transaction. Replay has separate mask RNG, masks, update counters, and event
 counters; it cannot update causal signal calibration, residual variance, the
 real RNG/counters, actor, critic, or state builder. In Prototype, only the
-commit-gated real representation gradient can reach the builder or candidate-update audit
+commit-gated real representation gradient can reach the builder or candidate-update
 audit. Stored transitions retain the final/bootstrap observation—not the
 post-reset decision observation—and representation versions make stale/future
 samples explicit. This is bounded L0 composition; there is no replay-retention
 or control comparison and no actor rehearsal.
+
+A separate `RealStateOneStepDyna` kernel now covers WP4.6's first ordered item
+without changing that Prototype restriction. It records exact real
+representation/action anchors before the real update, then permits planning
+only from exact current ensemble and Q states whose revisions advanced
+monotonically. Each accepted backup forms
+`reward_hat + continuation_hat * max Q(next)` before updating one primitive
+head. Support, residual readiness, epistemic/residual magnitude, finite-value,
+and termination-agreement checks can veto a backup; model state is read-only,
+synthetic traces start at zero, hidden utility/lifecycle state is restored, and
+planning RNG/clocks/checkpoints/resources are disjoint. This is still L0:
+thresholds are supplied rather than calibrated, there is no Prototype adapter,
+actor update, matched planning benefit, or evidence artifact.
+
+`EnsembleShortRolloutPlanner` now covers WP4.6's policy/uncertainty-directed
+short-rollout and terminal-correct multi-step-return items. One exact real
+anchor plus immutable linear policy/value and full ensemble-content receipts
+produce fixed-shape proposal batches only. Every imagined transition must pass
+action support, residual readiness/magnitude, epistemic, finite-value, and
+member termination-agreement guards. Learned termination stops padding and
+forbids value bootstrap; only a valid horizon truncation may bootstrap. Exact
+revision/content aliases, RNG, clocks, checkpoints, and resource ceilings fail
+closed while the model, policy, and value owners remain read-only. The lane is
+not a Prototype, STOMP, or model update consumer, and its global support proxy
+and thresholds are uncalibrated.
+
+The separate `ImaginedRolloutSelectionGauge` supplies the grounded
+authorization boundary before an actor consumes those proposals. One frozen
+source/model generation feeds a bounded causal audit partitioned by primitive
+action and caller-declared region. Independent evidence, realized-validity,
+reward-error, next-observation-error, termination, success lower-bound,
+top-quantile-purity, and caller-owned safety/protected checks cannot compensate
+for one another. Audit records cannot authorize their own proposal, and each
+receipt binds every candidate transition plus the exact calibration
+revision/content. Every later transition is rejected when any valid path
+predecessor fails a gate. `AuthorizedImaginedRolloutActorCritic` forms
+autodiff-free authorization metadata, revalidates the source and receipt at
+commit, then performs exactly one fixed-shape actor/critic backward pass for a
+current receipt—or zero for stale, replayed, or tampered preflight. It uses exact
+terminal rewards instead of bootstrapping terminal targets, and weights dream
+imitation by bounded positive advantage. A competent-real episode-cloning mode
+has the same transition/update ceilings and prefix-closed admission. Its
+caller-declared competence is not authenticated, and the deterministic tags
+provide post-mint integrity rather than proof that the planner issued the
+original tensors. A strict `GroundedImaginationComposition` now derives the
+planner policy/value authority directly from the live actor/critic, obtains the
+rollout batch internally, passes that exact value into the gauge, and adopts
+planner, authorization, learner, dream, and composition clocks atomically
+around the only possible backward pass. This removes caller rollout-tensor
+substitution at the composed boundary. Model support, the real anchor, region
+assignments, safety/protection masks, and environmental truth remain caller
+attestations. This is an L0 mechanism comparison surface: thresholds are
+supplied, and no matched real-return, retention, Prototype, dispatch, safety,
+or promotion result exists.
 
 The explicit transition boundary now distinguishes the final/bootstrap
 observation from the next post-reset decision observation. World-model, Horde,
@@ -462,13 +1075,48 @@ is now an opt-in fourth Prototype lane whose exact dispatched cache, real NLL
 gradient, and causal signal state commit transactionally. A companion
 recurrent-reset A/B/A-style diagnostic reconstructs phase and recurrence-entry
 errors from exact reused cases. None of these mechanisms establishes
-calibration, retention, or control benefit, and there is still no validated
-multi-step dream consumer.
+calibration, retention, or control benefit. The new authorization-gated
+multi-step actor/critic consumer is L0 only and has no matched real-return or
+retention validation.
 
 This is a useful smoke model, not yet a reliable continual world model or a
 learned search-control process.
 
-#### 5. STOMP option-model planning is bounded but not validated
+#### 5. WP7 proposal, audit, and planning pieces are not yet one lifecycle
+
+`CumulantSubtaskDiscovery` v1 is a standalone, fixed-universe proposal
+mechanism over controllable events, feature changes, reward-relevant transition
+atoms, and typed prediction bottlenecks. Its two-phase boundary arms after the
+behavior action and freezes predict-before-update probes and insertion
+predictions. Observation is forward-shifted: successor semantics become the
+next arm's candidate values, and a reward-transition atom born on the current
+outcome cannot collect learnability or contribution evidence from that same
+outcome.
+
+Every candidate must independently pass learnability, randomized-propensity
+controllability, novelty, and frozen reward/model insertion-contribution
+gates. Missing evidence in one gate cannot be offset by a high score in
+another. Prediction-bottleneck candidates also require typed epistemic and
+progress evidence and pass a persistent running-mean aleatoric veto. Novelty
+is checked against incumbents and earlier selected proposals. Contribution
+retains the frozen task weights and requires every task channel rather than
+renormalizing around missing mass.
+
+Each of the four families has a fixed positive quota, quotas are never
+reassigned, and an incomplete family suppresses the entire discovered bundle.
+The discovered cohort is matched to a cohort backed by a random projection
+bank sampled once at initialization and an identity-bound, exactly `B`-entry
+hand-authored cohort. All three have budget `B` and materialize into the same
+compact appended tail slots; candidate IDs are not option feature indices.
+Exact v1 configuration/checkpoint schemas, source/semantic/transition/revision
+bindings, tamper checks, static ceilings, and resource counts bound this path.
+
+This mechanism is deliberately separate from WP7.1c: it invokes neither Kondo
+nor delight and performs no backward pass. It also cannot mutate OaK, STOMP,
+Prototype, or Horde and has no curation, promotion, go/no-go, or scientific
+authority. The consumer integration test constructs fresh, identically
+configured STOMP agents and performs one finite update per proposal cohort;
+the discovery object itself never installs or trains those consumers.
 
 [`STOMPAgent`](alberta_framework/core/options.py) updates external return,
 duration, discounted baseline mass, discount, and next-state outcome models
@@ -487,6 +1135,163 @@ selection boundary. Completion count is support, not calibration; primitive
 dreams still have a separate random budget, so this is neither combined search
 nor a matched-benefit result.
 
+The standalone `OptionLifecycleAudit` adds the missing semantic-bound audit
+surface around this boundary. Its exact arm/observe transaction freezes the
+full option semantic/generation set, source and representation revisions,
+state revision/checksum, initiation context, caller-randomized primitive
+assignment, and pre-update option-model signature. Per-context initiation,
+completion reasons, censoring, discounted external return, pseudo-return,
+model error, planning usage, redundancy, and resource costs remain separate.
+Primitive comparisons require both treatment and primitive evidence in every
+configured context and use fixed equal context mass. Semantic replacement
+resets all slot-local history and advances generation unless the descriptor is
+bit-identical; maintenance is bounded and proposal-only. The standalone audit
+object by itself has no OaK/Prototype wiring or replacement authority. An opt-in persistent
+`STOMPOptionLifecycle` wrapper now supplies the live STOMP edge: actual option
+ownership, starts, natural/censored endings, frozen pre-update model signatures,
+return inputs, outcome deltas, planning use, and costs drive the audit. The
+observer has zero control authority. Exhaustion or rejected external
+attribution freezes the audit with a terminal reason while valid STOMP updates
+continue; persistent composed-state corruption alone fails closed for
+checkpoint recovery. Disabled auditing preserves raw STOMP state and RNG, and
+explicit shape-compatible semantic rebind resets changed option-local learner,
+model, trace, optimizer, and base-head state. Its signed-int32
+`max_observations` cap remains a finite attribution horizon, not a control veto.
+
+`CalibratedExtendedSearchControl` supplies a separate strict four-mode tabular
+core for model-free extended-Q replay, primitive-model search, option-model
+search, and their combined candidate union. Every mode shares one real-anchor
+bank and the same exact backup budget; combined search never receives a second
+family budget. Correct primitive and differential semi-MDP option targets are
+ranked by a noncompensating product of value-change, future-anchor
+reachability, model reliability, and support. Natural completion versus
+censoring, pending mid-option checkpoint resume, semantic-generation resets,
+stable ties, and exact resources are explicit. A strict development
+evaluator runs all four modes from one immutable source/runtime-bound model
+and calibration snapshot over the same evaluator-owned Threefry trace and exact
+budget `B`. It preserves raw diagnostics, checkpoint/resume, exact causal
+replay verification, and tamper rejection, but remains `not-assessed`: its model is frozen,
+experience is action independent, and its contrasts have no thresholds or
+verdicts. Calibration/support/revision state also ends at a configured
+signed-int32 observation cap, which must disable secondary search without
+stopping real control. Separately, a raw-representation
+`PrototypeSTOMPCalibratedSearchAgent` snapshots the actual learned Prototype
+primitive and STOMP option models, settles their live outcomes under one shared
+budget, and preserves exact ownership. Its sidecar values have no policy,
+dispatch, or keyboard authority and cannot block valid real learning. A
+separate default-off `PrototypeSTOMPCalibratedDispatchAgent` v2 can consume
+candidate-specific evidence at one exact anchor, form a primitive or proposal-
+only option-keyboard command, intersect a caller-owned hard mask, replace the
+real cached primitive once, and arm the base or already-active option owner that
+will receive credit. A planned option never starts or switches an option.
+Proposal unavailability may retain only an independently safe current-owner
+command; withholding exposes `-1` and accepts no transition until a zero-
+learning retry succeeds. This closes a mechanical policy edge, not safety,
+physical dispatch, calibration benefit, or search-control evidence.
+
+`CumulantOptionInstallation` now joins the proposal and consumer sides through
+one strict L0 edge. A complete fresh proposal binds external descriptor
+semantics to a fixed bank of STOMP slots; every live observation rematerializes
+the four selected cumulant families, and an extended-action eligibility mask
+keeps cold slots out of behavior, real bootstraps, skip diagnostics, planning
+selection, and planning bootstraps. Bit-identical slots are preserved and
+changed slots are wholly reset at the lifecycle's public quiescent rebind
+boundary. An active option or comparator produces a no-op, not a hidden queue;
+the caller must supply a later fresh proposal. Installer exhaustion freezes
+replacement only, while installed control continues.
+
+The installation's empty STOMP template may additionally reserve a fixed
+suffix beyond the raw discovery prefix. Option-cumulant indices remain
+immediately after the raw prefix, standalone tokens fill the reserved cells
+with exact zero, and nonzero suffix tamper is rejected. This leaves the
+historical zero-suffix layout unchanged while allowing a separately bound
+external owner to supply its own exact hidden/generated-feature tail.
+
+`CumulantOptionScheduler` closes the mechanical timing edge. Every accepted
+scheduler transition arms and observes discovery; exact periodic cadence or a
+bounded zero-payload retry requests a newly observed bundle. Installation
+requires a source/canonical/lifetime-bound caller receipt with a strictly newer
+authority revision and a quiescent live lifecycle. Applied installs always
+advance the scheduler-owned Threefry key, while exhausted attempt capacity and
+terminal scheduling clocks fail explicitly without vetoing installed control.
+Maintenance emits only a bounded semantic-generation-bound retirement handoff;
+it cannot retire anything.
+
+`AuthorizedOptionRetirementController` supplies the separate execution edge.
+It accepts only a live handoff plus a distinct caller receipt binding the exact
+slots, source/representation, descriptors, generations, lifecycle/audit/
+controller revisions, validity window, and two independent reset keys. The
+controller recomputes a fixed noncompensating retirement policy, then uses two
+public quiescent lifecycle rebinds to scrub approved slots and restore their
+installer semantic identity before retaining an authoritative cold mask.
+Selection, bootstrap, planning, and attribution all consume that mask. No
+retirement or replacement payload is queued, and either rebind failure rolls
+back the complete composition.
+
+`AuthorizedOptionReplacementController` owns the next single-cold-slot
+transaction without duplicating the installation subtree. It projects
+retirement control from one canonical scheduler state, stages one ordinary
+scheduler observation with install authority denied, and keeps the newly
+discovered replacement transient. Host commit rederives and exact-compares the
+preparation before a separate caller receipt may install and reactivate exactly
+that slot. Decline persists only ordinary discovery/incumbent materialization
+and a bounded retry; candidate materialization, its RNG successor, and its
+semantic identity do not enter state. Active-option, stale/replay, freshness,
+capacity, forged-preparation, and partial-commit cases fail closed. This v1
+wrapper permits exactly one retirement and one replacement. Its unkeyed
+checksums and receipts detect accidental drift and declare authority facts;
+they do not authenticate a caller or prove cryptographic lineage.
+
+A separate stateless v2 `FreshColdSlotCumulantCohortFilter` can prepare, but
+not itself install, one same-family fresh candidate for an exact cold slot. It
+revalidates family quotas and uniqueness independently of the v1 bundle
+checksum, preserves all live descriptors and semantics, and rejects stale,
+tampered, or cross-family material. The original candidate universe still has
+no alternate; a versioned fixture with one additional eligible feature
+descriptor yields the expected one-slot cohort. A separate opt-in v2
+`AuthorizedFreshColdSlotAtomicSwapController` now consumes only that exact
+prepared cohort. It rederives the transient authorized retirement, ordinary v1
+preparation, filter source/output, and public lower scheduler/replacement
+adoption preparations, then selects only an all-installed successor with one
+exact reset target and all live slots preserved. No-fresh, decline, outer veto,
+stale/replay, foreign identity/config, key substitution, or checksum-valid
+bundle/target tamper returns the exact all-installed outer source. Preparation
+uses three scheduler observations and one installation-candidate evaluation;
+full commit rederivation uses six and three respectively, while adopting at
+most one installation. The wrapper derives no RNG root or split beyond the
+four caller keys. Receipts/checksums are unkeyed integrity declarations, not
+authentication; this does not rerun or repair the consumed repeated-lifecycle
+negative.
+
+The separate opt-in `PrototypeOptionAuthorityBridge` closes the bounded live
+owner edge without duplicating STOMP. One persistent `PrototypeAgentState`
+contains the sole nested Prototype→OaK→STOMP owner; authority and lifecycle
+state remain detached metadata with one borrowed binding. Unequal pristine
+owners require an explicit directional receipt bound to both exact source
+states and typed owner digests; unchanged-source reevaluation is idempotent.
+The receipt, checksums, and checkpoint hashes are unkeyed integrity, not caller
+authentication. Every optional Prototype sidecar crosses without
+reinterpretation, and one installed-slot mask reaches real behavior/bootstrap,
+internal planning, option search, guarded Dyna, and lifecycle attribution. The
+lifecycle consumes the exact raw `STOMPUpdateResult` without reevaluation; a
+transient five-stage trace classifies option-search, feature-route, Dyna,
+memory-dispatch, and partner-dispatch mutations before metadata-only
+finalization binds the sole final owner. Invalid sources cannot commit and use
+a primitives-only transient mask. Dynamic audit refusal preserves valid
+Prototype control while retaining authority metadata and latching
+desynchronization. Diagnostics split real, imagined, total, search-update, and
+internal-planning work.
+
+Together these are L0 proposal, scheduling, installation, audit,
+authorized-retirement/replacement, one-owner bridge, option-consumer, and search-control
+mechanisms, not empirical evidence that discovered subtasks help. Automatic
+timing and
+externally authorized retirement/replacement are present, but autonomous
+go/no-go authority, repeated lifecycle policy, caller authentication, matched
+control benefit, physical-dispatch and safety authority, WP7 exit, evidence
+promotion, SOTA, Alberta Plan completion, and a successful uninterrupted
+repeated-lifecycle outcome remain open.
+
 #### 6. OaK curation is manual and narrow
 
 OaK's utility is an EMA of pseudo-reward while an option executes. `curate()`
@@ -503,6 +1308,17 @@ govern the next primitive action without miscrediting its counterfactual. The
 default OaK loop still does not autonomously select or learn which chord to
 dispatch, and no lifetime-control or planning benefit has been measured.
 
+For higher-level option coordination, OaK can now adopt one already-evaluated,
+caller-authoritative STOMP result. The seam validates complete source and
+transition identity, both clock layers, endpoints, and success diagnostics,
+then performs OaK accounting without a second STOMP update. A separate
+quiescent rebind changes only one declared reset option slot and its extended-
+action head, preserving global/primitive state, RNG, and clocks while clearing
+only the corresponding OaK statistics. Optional extended-action masks keep
+cold slots out of behavior selection, real bootstraps, and planning. These
+unkeyed trusted-caller seams prove consistency, not caller authentication or
+autonomous retirement/replacement authority.
+
 #### 7. Prototype partner fusion is opt-in and action-changing
 
 The legacy IA companion still exposes augmentation and a recommendation as
@@ -517,8 +1333,39 @@ will receive the next credit, and the recurrent model cache receives the same
 effective action. Unsafe base dispatch or a corrupt resulting state rolls back
 the whole Prototype transition; stale, duplicate, or misattributed feedback is
 an atomic no-op. Start remains base-only, and cold-start accepts remain
-explicitly uncalibrated development exploration. The
-standalone recommendation protocol can alter a partner's action and has a
+explicitly uncalibrated development exploration. A new strict stress evaluator
+supplies the same frozen 96-event multi-partner stream to learned,
+outcome-blinded, and base-only conditions while holding tensor/state shapes and
+decision/feedback call counts fixed. Observable contexts recur across a hidden
+mid-life reliability reversal, with raw cost spikes, partner and total
+disconnects, hard-mask exclusions, actions, routes, feedback targets, and
+recovery descriptions retained. Its exact causal replay and prefix checkpoint
+are source/runtime bound, but the lane is threshold-free and `not_assessed`;
+one evaluator-owned schedule is neither confidence calibration nor a
+partner-benefit result. A separate consumed 12-execution lane now closes the
+mechanism-only gap between that stress trace and the real agent loop: three
+independently owned `PrototypeAgent`/fusion/environment arms receive only the
+same frozen exogenous context, noise, availability, cost, and mask schedule,
+then generate their own observations, rewards, messages, realized-assistance
+feedback, and actions. It exercises an uncued reliability reversal, total and
+partial disconnects, cost spikes, caller-owned hard masks, real action-changing
+updates, exact causal replay, and in-memory resume. This is still L0
+`not_assessed` instrumentation, not a matched causal comparison: the learner
+states and RNG streams are independent, the life is only 12 executions, and
+there are no thresholds, trials, calibration result, or promotion authority.
+A separate v2 evaluator removes that initialization confound: learned-feedback,
+fixed-zero outcome-blind, and empty-message base-only wrappers begin from
+bit-identical typed RNG, Prototype, fusion, and environment state. The
+context/noise/drift/availability/cost/mask schedule is paired, but each arm owns
+its later causal trajectory after action divergence. Exact raw hash chains,
+prefix reconstruction, replay, checkpoint/resume, source/runtime/config
+binding, eager/JIT Prototype parity, and matched logical work are covered. On
+the consumed 12-event run, learned and fixed-zero each changed the action three
+times with equal task/net return; base-only changed none. Learned and
+fixed-zero final Prototype states differ without realized behavioral
+separation. This is a null descriptive L0 `not_assessed` result with no
+threshold, winner, artifact, efficacy, or promotion authority.
+The standalone recommendation protocol can alter a partner's action and has a
 historical held-out **valid rejection**: reward uplift and both augmentation
 controls passed, but action-changing intervention prevalence missed its frozen
 threshold. The archived v1 rejection remains historical evidence; its prior
@@ -568,17 +1415,37 @@ and applicability make sparse comparisons explicitly unavailable instead of
 silently zero. Its v2 report and checkpoints bind canonical environment,
 probe, learner, budget, and metric-core identities.
 
-Every constructed report remains `not-assessed`. There is no completed
-Prototype candidate/baseline report, only simple scalar/control baselines, no
-factorial runner, no longitudinal component traces, and no accelerator-memory,
-energy, or safety backend. A strict paired multi-seed campaign runner now binds
+Every constructed report remains `not-assessed`. A fixed v1 in-memory
+development report now runs `PrototypeAgent`, a running-reward bandit, and a
+frozen-action baseline over consumed seeds 1701/1702 with independent
+functional environment states. It embeds reconstructing evaluator reports,
+raw action/decision ownership, exact opportunities and logical persistent
+bytes, deterministic logical latency, available parameter/policy/value churn,
+and explicit available/inapplicable/unavailable entries for every WP1
+diagnostic. Source/runtime replay and checkpoint continuation are validated.
+This is the literal versioned report-construction witness, not an outcome:
+there is no artifact writer, promotable seed panel, factorial runner, realized-
+compute match, accelerator-memory/energy backend, internal gradient/NTK
+measurement, or enabled dynamic-component/world-model diagnostic. A strict
+paired multi-seed campaign runner now binds
 seeded evaluator identities, embeds every raw report, preserves unavailable
 pairs, and reconstructs deterministic stratified-bootstrap intervals; no
-Prototype campaign has been executed through it. The held-out control probes
+promotable Prototype campaign has been executed through it. The held-out control probes
 score one action rather than a frozen-policy rollout, and fresh-per-regime,
 oracle-data, stationary-multitask, and realized-resource-matched references are
 still missing. These mechanisms become evidence only after those gaps are
 closed in a preregistered protocol.
+
+The fail-closed `complete_prototype_manifest` provides the distinct final
+accounting boundary. It enumerates all 18 acceptance properties and accepts a
+row only through immutable artifact bytes plus a trusted validator receipt for
+the same pinned prototype configuration and exact role, frozen L3 evidence,
+untouched held-out seeds, protocol/scientific-outcome digests, and complete
+source-hash closure. Its row statuses, aggregate flags, overall status, and
+self-digest are reconstructed before a command-style status code is returned.
+Enabling optional paper delight or Kondo adds actor-learning and measured-
+compute guardrail roles. With no default evidence bindings, it correctly
+reports that the current mechanism inventory is not a complete prototype.
 
 The concurrent [research-status matrix](RESEARCH_STATUS.md) is also a strong
 starting point: it separates mechanism, learning, comparison, and integration
@@ -685,12 +1552,18 @@ deviation, and points to the canonical reference below.
    `official_readme_global`, `official_experiment_global`,
    `official_experiment_local`, `paper_local_literal`, `safe_extended`) that
    keep the published paper/README/experiment-code discrepancies visible.
-   AdaUPGD and second-order utility remain future work.
+   It also keeps two adaptive identities separate: `OfficialAdaUPGD` is an
+   equation-level port bound to the released RL `AdaptiveUPGD` at commit
+   `b75e90ad4b09c28971ac9dbb902a8fd86709b28c` and preserves that source's
+   first/second moments, raw-utility maximum, noise placement, two-alpha
+   direction, one-alpha decay, and numeric quirks; `AlbertaAdaUPGD` is a
+   guarded derived first-order extension. Neither is an efficacy result or a
+   selected default. Second-order utility remains future work.
 4. **Partially done.** Fixed-perturbation tests in
-   `tests/test_canonical_upgd.py` pin each profile's update numerically;
-   parity against the official PyTorch process itself was established by
-   source audit of the pinned MIT commit, not by running the aged PyTorch
-   stack.
+   `tests/test_canonical_upgd.py` and `tests/test_canonical_adaupgd.py` pin each
+   profile's update numerically. Official adaptive parity is deliberately
+   bounded to the finite, all-active, single-group fixed-noise equation; the
+   aged PyTorch stack and its implicit RNG are not claimed bit-identical.
 5. **Open.** Compare signed versus absolute utility, global sigmoid versus
    local power scaling, protecting versus non-protecting,
    Gaussian/Rademacher/no noise, and trunk-only versus all eligible
@@ -745,14 +1618,60 @@ nonpromoting. See [UPGD_IPMNIST_V3_RUNBOOK.md](UPGD_IPMNIST_V3_RUNBOOK.md).
 | [ReCL](https://arxiv.org/abs/2411.06916) | C | Reconstructs samples from converged weights; reports that vanilla UPGD can be weak in task-boundary multi-epoch settings | Use as evidence that UPGD is protocol-dependent; do not adopt model inversion yet |
 | [FOGO](https://arxiv.org/abs/2606.10406) | C | Stores compressed gradient-direction history and orthogonalizes conflicting updates; outperforms UPGD in reported boundary-based Class-IL tests | Watch and reimplement only after stronger evidence/licensing |
 | [Loss of plasticity / Continual Backprop](https://www.nature.com/articles/s41586-024-07711-7) | A | Replaces low-utility mature units and zeroes outgoing weights; strong long-stream plasticity evidence | Required baseline; already partly present |
-| [Self-Normalized Resets](https://openreview.net/forum?id=G82uQztzxl) | A/B | Resets only when inactivity is statistically surprising relative to a unit's history | Add as a low-knob reset baseline |
+| [Self-Normalized Resets](https://openreview.net/forum?id=G82uQztzxl) | A/B | Resets only when inactivity is statistically surprising relative to a unit's history | Bounded L0 baseline now exists; run it in the matched matrix |
 | [L2-to-init / regenerative regularization](https://arxiv.org/abs/2308.11958) | B | Keeps parameters near initialization; often strong in RL and Forager | Required cheap baseline |
 | [Weight Clipping](https://arxiv.org/abs/2407.01704) | B | Bounds parameter growth after each update | Required cheap, noise-free baseline |
-| [Spectral regularization](https://arxiv.org/abs/2406.06811) | A/B | Controls layer spectral norms and gradient conditioning | Add as a mechanistically distinct baseline |
-| [C-CHAIN](https://arxiv.org/abs/2506.00592) | B/C | Links NTK-rank loss to output churn and penalizes out-of-batch churn | Benchmark after core baselines; canonical code lacks a reusable license |
+| [Spectral regularization](https://arxiv.org/abs/2406.06811) | A/B | Controls layer spectral norms and gradient conditioning | A source-profiled single-dense-layer L0 mechanism now exists; it still needs a generic network arm and matched matrix |
+| [C-CHAIN](https://proceedings.mlr.press/v267/tang25g.html) | B/C | Links NTK-rank loss to output churn and penalizes out-of-batch churn | An independent Equation 8/NTK L0 comparator now exists; benchmark only after implementing the full sequential arm, because the public code has no verified reusable license |
 | [FIRE](https://arxiv.org/abs/2602.08040) | A/C | Boundary-time projection toward isometry | Useful diagnostic comparator; boundary dependence conflicts with the primary setting |
-| [Dynamical Isometry / AdamO](https://arxiv.org/abs/2606.09762) | C | Regularizes Jacobian singular values and proposes an Adam-style optimizer | High-priority watch/reimplementation study |
-| [Calibrated Partial Resets](https://arxiv.org/abs/2607.24996) | C | Pulls low-utility neurons partway toward initialization; strong very-long-run claims | Experimental lane only; the preprint was three days old at this snapshot |
+| [Dynamical Isometry / AdamO](https://arxiv.org/abs/2606.09762) | C | Regularizes Jacobian singular values and proposes an Adam-style optimizer | A clean-room single-matrix Equation 16/19/20 L0 mechanism now exists; benchmark before any optimizer/default claim |
+| [Optimization-Centric Plasticity](https://arxiv.org/abs/2603.21173) | C | Argues that task-specific zero-gradient/local-optimum trapping, rather than capacity loss alone, drives apparent dormancy; parameter constraints reduce entrenchment | A bounded A/B/A gradient-flow/L2 diagnostic now exists; run it in the matched matrix and do not infer plasticity from dormant fraction alone |
+| [Calibrated Partial Resets](https://arxiv.org/abs/2607.24996) | C | Pulls low-utility neurons partway toward initialization; strong very-long-run claims | A pinned-reference single-layer L0 mechanism now exists; the week-old v1 preprint still warrants an experimental matched lane only |
+
+The new `SelfNormalizedResets` core makes that recommendation executable for
+one fixed-width dense ReLU layer. It uses exact per-unit ages and a bounded
+completed-gap ring, estimates a positive-support geometric law, evaluates the
+observed silent-run survival in stable log space, and applies deterministic
+post-optimizer reset slices to incoming weights/biases, outgoing weights, and
+supported optimizer state. Its explicit mapping is
+`P(A >= age + 1) = (1 - p)^age`; this is a documented Alberta indexing/window
+convention rather than a claim of bit-equivalence with the authors' released
+silent-age histogram. Long-clock, cap, corruption, reset-persistence,
+checkpoint, and eager/JIT/scan tests establish L0 mechanism integrity only.
+No plasticity/retention comparison or scientific result has selected it.
+
+The new clean-room `CChain` surface independently implements the paper's
+Equation 8 term, `0.5 * mean((f_current - stop_gradient(f_lag))**2)`, on a
+declared reference batch disjoint from the base-loss batch. It requires one
+scalar model output per reference sample and rejects vector-valued per-sample
+extensions. It forms one
+combined gradient only after exact state, parameter, lifetime, and declared
+sample-identity preflight; commit uses no autodiff and shifts the accepted
+source into a one-step-lag reference slot. The appendix running absolute-loss
+ratio is present with explicit Alberta window, warmup, epsilon, and clamp
+controls. Diagnostic empirical-NTK rank follows the paper's minimum
+singular-value-prefix definition and is kept separate from update authority.
+
+This closes an equation/instrumentation gap, not the C-CHAIN outcome gap. The
+surface does not reproduce the full sequential PPO/DQN algorithm, does not
+authenticate model/loss callables, dataset provenance, or caller-applied
+optimizer state, and is not composed into Prototype. It has no matched
+plasticity/retention/control result, default status, artifact, evidence, or
+promotion authority.
+
+The development-only
+`OptimizationCentricPlasticityDevelopmentReport` now crosses an ordinary
+nonlinear SGD learner and an initialization-centred L2-constrained twin on one
+frozen evaluator-owned A/B/A stream. Both start from the same immutable
+bit-exact parameters and receive the same samples and update opportunities.
+At each switch, raw old/incoming gradient vectors, alignment, fixed-radius
+local loss probes, and parameter displacement/churn are retained; dormancy is
+measured alongside them but is not an input to the fixed descriptive
+zero-gradient/local-neighbourhood flag. Source/runtime/config/protocol identity,
+full causal reconstruction, and zero output/evidence authority are explicit.
+The single 12-update schedule has no calibrated threshold or efficacy verdict,
+so it is a diagnostic mechanism rather than support for OCP, L2 constraints,
+or a default plasticity method.
 
 “Universal perturbation” usually refers to
 [universal adversarial perturbations](https://arxiv.org/abs/2005.08087): a
@@ -950,9 +1869,15 @@ Safety remains independently routable, and the `delight` field
 is accepted only when it exactly matches the float32 advantage-surprisal
 identity. The candidate-update audit independently enforces the same evidence
 identity before treating its eight-channel bundle as complete; it does not
-perform the paper's Kondo selection. This is L0 mechanism coverage: producer-declared uncertainty is not
-thereby calibrated, no consumer benefit has been demonstrated, and the router
-does not decide whether a sample receives a backward pass.
+perform the paper's Kondo selection. An opt-in Prototype owner now advances one
+persistent router state only with an accepted real outer transition and feeds
+the audit the raw candidate-evidence route. Representation-candidate validity
+gates only the candidate/probe facts, not producer availability; normalized
+values never enter the audit. The enabled composition is checkpointed as v19,
+while disabled configs and state PyTrees retain their historical bytes. This is
+L0 mechanism coverage: producer-declared uncertainty is not thereby calibrated,
+no consumer benefit has been demonstrated, and the router does not decide
+whether a sample receives a backward pass.
 
 ### 5. Candidate-update safety audit (separate from paper delight)
 
@@ -1006,8 +1931,9 @@ claim is made. Numeric controls must survive as finite normal float32 values.
 This is a local linear audit, not proof that the realized nonlinear update will
 improve the system.
 
-The corresponding `apply_gradient_joy_update` boundary reassesses the
-candidate internally, derives the effective stored delta after dtype cast and
+The canonical `apply_candidate_update` boundary (historically exported as the
+compatibility-only `apply_gradient_joy_update` alias) reassesses the candidate
+internally, derives the effective stored delta after dtype cast and
 parameter addition by promoting both stored endpoints to at least float32
 before subtraction, and conservatively re-audits that delta under the same
 evidence and thresholds. This prevents low-precision subtraction rounding from
@@ -1019,6 +1945,12 @@ formed-candidate assessment, effective-delta assessment, and parameter change
 finite-precision addition, and quantization-altered probe verdicts remain
 explicit no-ops. This closes the implementation boundary without upgrading the
 local first-order audit into realized-improvement evidence.
+
+The canonical public surface is `CandidateUpdateAudit*`,
+`assess_candidate_update`, `apply_candidate_update`,
+`PrototypeCandidateUpdateAuditEvidence`, and
+`candidate_update_audit_evidence`. Historical `GradientJoy*`, function, result,
+and Prototype keyword spellings remain exact compatibility aliases only.
 
 This candidate-update audit is distinct from the user's paper-defined meaning
 of “delight” and “sparks joy.” In
@@ -1049,8 +1981,12 @@ variance. The stop-gradient is part of the algorithm: differentiating through
 \(w_t\) defines a different update.
 
 [Does This Gradient Spark Joy?](https://arxiv.org/abs/2603.20526) then uses the
-same \(\chi_t\) to decide whether a sample deserves a backward pass. This is
-the intended meaning of “sparks joy.” A Kondo gate compares delight with
+same \(\chi_t\) to decide whether a sample deserves a backward pass. Delight is
+the exact float32 statistic \(A[-\log\pi(a\mid s)]\). The Kondo gate forms
+detached forward admission intent; “sparks joy” is true iff the actor consumer
+actually includes that exact contribution in a backward pass it executes. The
+fact is independent of gradient finiteness, parameter-update acceptance, and
+later outer-transaction acceptance. The forward gate compares delight with
 compute price \(c\):
 
 \[
@@ -1086,9 +2022,118 @@ of silently truncating an over-capacity selection, and exposes a config-bound
 fixed-capacity host gather for downstream autodiff. When capacity is below
 batch size, tests inspect the smaller backward JAXPR. The screen separately
 has eager/JIT/scan parity; invalid transactions, checkpoints, and accounting
-are covered. This establishes mechanism shape only: there is no integrated
-actor/replay/dream consumer, measured kernel/wall-clock saving, DG
-reproduction, learning benefit, or safety result.
+are covered.
+
+`KondoSparseActor` is now the first concrete actor consumer of that boundary.
+Its nonlinear categorical actor performs a full forward screen, binds exact
+action identity, policy revision, and bitwise behavior log probability, gathers
+the fixed-capacity actor-only batch, and invokes `jax.value_and_grad` only
+afterward. A capacity-3 versus batch-6 JAXPR witnesses the smaller backward
+shape. Sparse and full-shape execution tests perturb rejected features,
+actions, and detached advantages and require the selected mask, actor loss,
+and actor gradient to remain bit-identical. That makes “sparks joy” an
+observed fact that the contribution entered an executed actor backward,
+not merely the standalone gate's forward verdict. Forced guardrail rows and
+Bernoulli overflows take an explicitly labeled
+full-shape masked fallback that retains every selected sample. Full-batch
+protected arrays pass through with a canonical digest. Returns and baseline
+predictions enter the actor only through detached advantage; critic and safety
+features stay outside its loss, and the protected learners remain full-batch
+and ungated. Corrupt transactions roll back, and resources and source-bound
+checkpoint integrity are explicit.
+
+`KondoExecutedActionLineageBridge` now binds that actor execution to the
+action-stack decision that actually became `P`. Each unmasked proposal row
+commits to the full post-memory source, preparation, decision, candidate
+binding, actor snapshot, typed key, revision, sampled action, and bitwise
+behavior log probability. The bridge reconstructs public adoption and admits
+the row only when the proposal digest is the consumed planner candidate and
+the same action is planner-before-mask, final `P`, and the action named by the
+following real transition. A memory-selected or overridden row is rejected.
+Invalid rows are sanitized before one actor step, protected critic/baseline/
+return/safety arrays stay full-batch, and an all-invalid batch performs no
+backward and preserves the actor exactly. The nested `KondoSparseActorResult`
+is still the only canonical execution-level joy surface. These bindings are
+unkeyed host L0 integrity, not caller or physical-execution authentication,
+dispatch, safety/critic execution, efficacy, evidence, or promotion.
+
+`HCCLKondoContinualDyadRoute` v3 composes that lineage with the atomic HCCL donor.
+Its `event0` installs the first actor-owned `P` pair and compact certificate
+without actor backward. Each generic successor `event` consumes the prior
+certificate through one actor transaction before sampling and atomically
+installing the next pair. Actor input is the 23-wide post-memory base; the
+factorized planner is a disabled-dispatch learning shadow, masks must be all
+true, and two live action stacks remain the sole Prototype owners. The route
+prepares its causal-core event and then derives exactly one learned-memory input
+per agent: uncertainty unavailable, safety cost available exact `+0.0`,
+reliability one, row source identity, and provenance `2 * source_step + row`.
+No caller memory-metadata surface remains. A later child veto returns
+persistent state bit-exactly while the nested actor result still records any
+actor backward that already executed; the route exposes no joy alias. V3 owns
+the protected payload: each successor updates zero-initialized linear reward-
+value and cost-value heads over both exact transition rows using detached
+pre-update next-value targets, then passes the resulting baseline/return target
+directly to Kondo. Cost is current `PP safety_cost + message_charge`; both are
+zero in this world. Scheduling, keys, and masks remain external. The learner-
+only checkpoint is not composite route recovery. This is a working-tree L0
+mechanism refresh, not a revision of the frozen research conclusions or a
+claim of autonomous execution, authenticated dispatch, physical safety or
+critic efficacy, matched benefit, evidence, promotion, or Alberta Plan
+completion.
+
+A strict four-arm development evaluator now compares ordinary full backward,
+capacity-matched uniform sparse backward, Kondo top-k sparse backward, and a
+separate diagnostic overflow fallback from one immutable parameter snapshot
+and source trace. It discloses unequal selected samples, exact compiled
+backward shapes/invocations, logical multiplication proxies, held-out-within-
+development diagnostics, and parameter changes. Its separately provenance-
+bound timing section compiles, warms, blocks, and evaluator-interleaves the
+fixed kernels before retaining raw `perf_counter_ns` samples and nearest-rank
+p50/p95. Timing excludes host screening/gathering and measures neither memory,
+energy, nor end-to-end latency. Wall-clock bytes are outside exact deterministic
+replay, and every outcome remains threshold-free and `not_assessed`; no
+speedup, efficacy, safety, or promotion conclusion is formed.
+
+All three development evaluators now serialize v2 contracts. Cross-arm
+outcomes describe executed actor-backward inclusion neutrally; replay and
+on-policy records use `executed_actor_backward_mask` with canonical meaning
+`gradient-contribution-entered-executed-actor-backward`. The canonical
+execution-level use of `sparks_joy` is an actual `KondoSparseActorResult`:
+ordinary-full and uniform-sparse use manual backward kernels rather than Kondo
+transactions, and ordinary-full makes no delight-selection claim.
+
+A separate strict replay lane now composes the same actor consumer with
+full-batch baseline, critic, representation, world-model, and
+safety/guardrail learners over one uninterrupted A1/B/A2 contextual-gambling
+trace. Ordinary-full, capacity-matched uniform, paper top-k Kondo, and a
+fixed-capacity top-k-plus-minimum-random-reserve extension each receive one
+actor and one protected update opportunity per source batch. The protected
+gradients, results, predictions, and final states are independently
+bit-identical across arms, including the rare-failure stratum. It records
+current-policy delight, executed actor-backward inclusion masks, gather indices
+and shapes, full protected coverage, logical row-slot proxies, descriptive
+recurrence/recovery/retention readouts, and exact checkpoint-prefix replay.
+
+This replay is evaluator-supplied and action-fixed. It has no source behavior
+policy and applies no importance correction, so its actor updates are
+off-policy surrogates rather than valid policy-gradient or DG-efficacy
+estimates. The selected-action surprisal is the current actor's probability of
+the recorded action. The reserve is an Alberta extension, not paper Kondo, and
+the logical proxies are not measured FLOPs or runtime. The lane has no wall-
+clock, memory, energy, policy, safety, output, evidence, or promotion verdict;
+all status remains `not_assessed`.
+
+The adjacent closed-loop development lane samples each arm's own actions under
+one immutable actor revision per batch, then performs exactly one actor and one
+full protected update at the boundary. Evaluator-owned typed Threefry uniforms
+pair only exogenous randomness; trajectories are independent and never assumed
+equal. Exact actions, behavior log probabilities, revisions, environment
+parents, rare-failure coverage, source/runtime bindings, checkpoints, and
+causal replay are retained. Host Kondo screen/gather orchestration remains
+non-JIT while collection and fixed backward kernels are JIT-compatible. This
+is still L0 mechanism shape: there is no dream integration, measured compute
+saving, DG reproduction, learning benefit, safety result, evidence, or
+promotion. Unkeyed checkpoint digests are integrity checks, not authenticity.
 
 The surrounding family adds:
 
@@ -1097,8 +2142,9 @@ The surrounding family adds:
   without requiring behavior probabilities. It is a biased robustness
   heuristic, not importance sampling; retain clipped ratios or V-trace when
   behavior probabilities exist;
-- [Delightful Exploration](https://arxiv.org/abs/2605.13287): gate exploratory
-  overrides using prospective expected improvement times host-policy
+- [Delightful Exploration](https://arxiv.org/abs/2605.13287) (paper title;
+  repository code calls its non-gradient quantity an exploration score): gate
+  exploratory overrides using prospective expected improvement times host-policy
   surprisal. Its Pandora equivalence is exact only for revealed-value search;
   in noisy independent-arm bandits expected improvement is a
   value-of-perfect-information proxy that upper-bounds the one-step knowledge
@@ -1107,6 +2153,32 @@ The surrounding family adds:
   tabular convergence/corner-escape results plus an exact shared-function-
   approximation counterexample in which parameter coupling admits a suboptimal
   interior fixed point.
+
+The tree now contains a strict `ProspectiveExploration` L0 implementation of
+the separate exploration equation. One fixed candidate batch is scored by
+expected improvement times capped host-relative surprisal or by random,
+epsilon-greedy, ensemble-disagreement, information-gain, and learning-progress
+comparators under the same budget and logical RNG schedule. Event, owner,
+producer-revision, and pre-decision attestation receipts fail closed. Ranking
+is completed without reading the caller-owned hard shield; afterward the
+shield can admit the candidate or a separately permitted host fallback. The
+module estimates none of its supplied scores, and its Boolean shield is not
+physical-safety evidence. A separate consumed eight-event development lane
+closes that score-production loop only for a tiny synthetic setting: each of
+the six arms owns its environment, linear-TD ensemble, selector, and shield,
+and derives expected improvement, disagreement, information gain, and positive
+learning progress only from its own executed transitions. Pairing stops at
+exogenous noise. The world contains a progress-resetting noisy-TV action and a
+delayed invest/collect opportunity; the caller hard mask remains the sole
+admissibility owner. Exact causal replay, raw hash chains, in-memory resume,
+and matched logical budgets validate mechanics only. The report is
+`not_assessed`, consumed, threshold-free, artifact-free, and winner-free; the
+linear estimator is not exact sequential value of information. Neither lane
+establishes environmental efficacy or paper reproduction. The canonical v2
+API calls its non-gradient quantity an expected-improvement--surprisal score:
+it is not DG/Kondo delight and the selector executes no actor backward.
+Historical v1 `DelightfulExploration` import/config spellings are
+compatibility-only; v1 checkpoints remain fail-closed.
 
 All are **C** at this snapshot. DPG reports 100-seed contextual-bandit MNIST,
 30-seed token reversal, and 28 DeepMind Control tasks with only three seeds per
@@ -1152,8 +2224,10 @@ safety/nonstationarity extensions, not claims from the papers.
 
 Neither paper-defined delight nor the candidate-update audit should be folded
 into UPGD utility. UPGD asks whether a **parameter** is currently useful.
-Delight asks whether an **actor sample** should be emphasized or selected for
-a backward pass. The separate candidate-update audit asks whether a
+Delight is the scalar attached to an **actor sample**: DG uses it as a detached
+weight, while Kondo uses it to form forward admission intent and the actor
+consumer determines whether the sample actually enters a backward pass. The
+separate candidate-update audit asks whether a
 **candidate parameter update** passes objective,
 retention, safety, and trust checks. Epistemic surprise asks whether an
 **environment transition** can teach the model. These are different causal
@@ -1206,6 +2280,150 @@ pre-state queries are explicit. This is instrumentation and L0 integration,
 not a transfer result: no threshold is applied and the fallback has no matched
 storage allocation.
 
+A separate `LearnedExperientialMemoryController` now makes the narrow learned
+retrieval/eviction question executable. It retains the fixed store as the sole
+memory owner, learns only an additional admission veto over already-safe
+retrievals, and learns the nonnegative per-row utility values that the real
+eviction rule consumes. An admitted read owns one pending receipt; matching
+feedback updates only when the caller declares actual use and a bounded
+same-decision counterfactual delta. Insertion-clock, provenance, and source
+checks prevent feedback from following a slot across replacement. This is a
+bounded L0 mechanism with zero RNG and strict replay/checkpoint contracts, not
+an authenticated causal estimator, learned representation, or memory-benefit
+result.
+
+A separate v1 `ExternalLearnedStateLiveMemoryAdapter` now composes that
+controller as the sole memory owner around one external full-GRU/router/audit
+coordinator, with the inner Prototype historical memory disabled. It settles
+an exact prior receipt first, updates the coordinator exactly once, queries the
+next raw decision observation before writing the actually executed current
+transition, and permits only admitted exact one-hot retrievals to use
+Prototype's public cached-action replacement under the caller's hard mask.
+Soft retrievals and safe-base fallbacks have no action or learning authority.
+The pending binding preserves the memory transaction, Prototype decision,
+pre-retrieval base action, effective action, retrieval action, and exact mask;
+coordinator, memory, binding, and replacement adopt together or return the
+complete source for retry. This is host-orchestrated L0 ownership and causal
+ordering, not authenticated feedback, a transfer result, or promotion.
+
+A separate v1 `HCCLLearnedMemoryFeedbackBridge` now replaces the caller-shaped
+counterfactual input for one constrained HCCL path. It owns exactly one HCCL
+world/attribution adapter state, one learned-memory controller state, and one
+fixed pending binding. Preparation binds a categorical admitted retrieval to
+the exact controller transaction, HCCL source/decision and event, B/M receipt
+identities and contents, common hard mask, selected agent, retrieved action,
+and routing outcome. The exact eight-proposal event then supplies only that
+agent's immediate `memory_total.net_reward`; the other agent's effective B and
+M actions must match. Masked or unrouted retrievals settle through the
+controller's no-learning path, while any stale, tampered, cross-event,
+cross-slot, bound, or downstream failure preserves the whole composite for
+retry. This is memory-utility feedback: it computes no exact actor-sample
+delight statistic and executes no actor backward. Host/eager orchestration,
+strict in-memory checkpointing, and bounded resources are L0 contracts only;
+no agent, life, run, artifact, threshold, benefit, evidence, or promotion claim
+follows.
+
+The standalone `ConsolidatedMemory` adds fixed-capacity semantic and procedural
+stores. Semantic GVF, fact, and affordance records, plus procedural skill
+records, carry canonical identity and provenance hashes, generations,
+confidence, source/representation revisions, evidence moments, clocks,
+staleness, and invalidation. Procedural records also retain success/failure and
+outcome moments with an exact option-lifecycle link. Query always precedes a
+compatible same-generation merge, next-generation reset, or deterministic
+bounded replacement; stale and invalid records cannot be retrieved. Strict
+checkpoints and exact resources are L0 storage contracts. Two opt-in wrappers
+now consume the same store from live Prototype control. The procedural wrapper
+settles exact pending outcome feedback, preserves actual-action learning, then
+applies the conservative readout to the next cached primitive after
+experiential memory and partner fusion under the intersection of all hard-
+safety masks. A separately versioned semantic wrapper settles that procedural
+feedback first, performs a semantic pre-write query/current-record write on the
+shared store, and supplies the accepted prior payload—or an exact zero tail—to
+the ordinary Prototype representation for its next decision. Exact decision,
+request/record, provenance, generation, kind, lifecycle, and source/
+representation revision bindings fail closed. Terminal memory becomes a no-op
+while valid Prototype control continues. The same wrappers now persist a
+checksum-bound decision, selected primitive, and exact mask for post-envelope
+settlement. An admitted unchanged action is a no-op; a changed admitted
+fallback atomically rebinds Prototype's actual credit owner and cancels only
+matching procedural and partner recommendation owners. No-action, stale,
+disallowed, corrupt, or partially satisfiable settlements preserve the whole
+state for retry and write no learner, memory, reliability, or physical action.
+The caller settlement is not authentication that a command executed.
+
+`PrototypeEmbodiedCommandAdapter` now replaces that caller-shaped last edge
+with a narrow real-envelope identity transaction. A fixed bank gives each
+primitive exactly one float32 `EmbodiedCommand`; preparation binds the live
+semantic dispatch owner and hard mask to complete telemetry, control-clock,
+version, and envelope-source identity. Settlement recomputes
+`EmbodiedSafetyEnvelope`, bit-compares the whole result, and reverse-maps only
+a unique selected command or certified mask-admitted fallback before changing
+the semantic owner. A real no-action rejection and a stop-only capacity path
+still adopt the envelope ledger or latch, close the attempt, and retain the
+same semantic owner for a fresh-identity retry. This is neither a command-
+geometry proof nor physical dispatch, caller authentication, learned safety,
+deployment, evidence, or promotion authority.
+
+`PrototypeEmbodiedDevelopmentHarness` composes exactly one such adapter with
+a bounded deterministic plant and a grounded shadow state. For an accepted
+proposal or certified fallback, it obtains the actual plant reward and
+successor observation, settles the semantic owner, applies exactly one real
+Prototype transition, and atomically adopts the live rearmed owner with the
+transient shadow result. Two accepted cycles demonstrate reset-free alignment
+of plant observations and Prototype/OaK clocks. No-action remains an envelope-
+only retry; stop, fallback, shadow mismatch, replay, tamper, and checkpoint
+paths fail closed. Plant-capacity exhaustion stops future scheduling without
+inventing termination or truncation. This is L0 whole-agent reachability, not
+physical dispatch, a safety certificate, delight/KondoGate-intent/
+KondoSparseActor-backward assessment, efficacy, evidence, promotion, or a WP9
+exit.
+
+A paired slow development benchmark then gives adaptive STOMP and a
+`zero_stomp_step_size_control` separately owned copies of that harness. Exactly
+five STOMP optimizer step sizes may differ. After normalizing the materialized
+base-LMS step-size leaves, every other initial semantic array, RNG, cache,
+observation, trace, and clock must be dtype/shape/typed-key-implementation/
+host-byte exact. Starts require empty harness pending/last-commit records, an
+unset adapter settlement ledger, zero Prototype/OaK/adapter/plant clocks, and sufficient
+remaining capacity. V1 fixes four continuing attempts and the bridge
+disconnect at attempt 1, producing three real plant/Prototype commits plus one
+exact unavailable action/reward record per arm. Reports retain raw
+availability, fallbacks, plant state, clocks, rearming, adopted updates, shadow
+work, and exact logical/resource budgets. Both lifetime AUCs are normalized
+over named committed-transition or attempt indices, not adaptation or post-
+change AUC. Sixteen fast synthetic pytest contracts cover typed-key identity,
+exact sentinels, signed-zero identity, live selected-source/runtime drift,
+replay, externally supplied prefix reconstruction, and content-plus-resealed
+tampering. The real lane runs only through
+`alberta-prototype-embodied-paired-development`, emits JSON to stdout, and
+writes no artifact. The zero-step invariant covers only step-size-governed
+real-owner STOMP parameters, not decay-only option-model EMAs, semantic memory,
+shadow learning, traces, or caches. It remains `not_assessed`, with no winner,
+threshold, physical dispatch, efficacy/safety, delight/KondoGate-intent/
+KondoSparseActor-backward assessment, semantic use of historical `GradientJoy`
+compatibility names, evidence, deployment, promotion, or WP9-exit claim.
+
+A frozen 17-event development stress evaluator now compares this store with a
+same-kernel masked-readout ablation and a zero-storage/no-kernel comparator from
+one empty source-bound snapshot. Raw traces reconstruct query-before-write,
+precision, abstention, harm, recurrence/recovery, retained semantic utility,
+stale-skill harm, eviction/provenance, counters, and exact resources; strict
+source/runtime/protocol bindings, checkpoints, eager/compiled parity, and
+integrity-bound causal replay fail closed. This is `not-assessed` instrumentation. The
+no-memory arm is experience/opportunity matched but not storage/compute
+matched, the schedule is evaluator-owned and finite, and no threshold or
+efficacy result exists.
+
+`ConsolidatedProceduralMemoryPolicy` remains a separate stateless proposal
+boundary over an already-produced procedural retrieval. Exact lifecycle
+compatibility, evidence consistency, a Wilson success lower bound, finite
+outcome moments, derived uncertainty, nonnegative categorical score mass, and
+a caller hard-safety mask are all noncompensating gates. The policy itself
+makes no memory query or write, uses no RNG, and has no dispatch or promotion
+authority; the live wrapper, not this readout, owns the explicit cached-action
+composition. Neither wrapper establishes procedural/semantic transfer,
+negative-transfer, stale-skill efficacy, safety, or physical-dispatch benefit.
+
 Two newer end-to-end studies sharpen the same point:
 
 - [Experience-driven Lifelong Learning and StuLife](https://arxiv.org/abs/2508.19005)
@@ -1231,13 +2449,14 @@ should not import the research internals.
 | UPGD provenance and semantics | UPGD ICLR 2024, official MIT code | **Adopt faithful baseline; preserve local variant** |
 | Plasticity diagnostics | Nature loss-of-plasticity, C-CHAIN, spectral/isometry work | **Adopt diagnostics before choosing a method** |
 | Long-stream capacity renewal | Continual Backprop, SNR, L2-init, clipping | **Benchmark as required baselines** |
-| Learned state under partial observability | Forager, recurrent generate-and-test/trace literature | **Highest-priority capability work** |
+| Learned state under partial observability | Forager, recurrent generate-and-test/trace literature | **Highest-priority outcome/comparison work; strict live RTU replacement remains L0 only** |
+| Task-free context detection and expert reuse | [SWOKS](https://proceedings.mlr.press/v274/dick25a.html), [task-agnostic online GP mixtures](https://arxiv.org/abs/2006.11441) | **Compare after the fixed two-event quarantine; retain predict-before-outcome ownership and disclose their buffers, thresholds, growth/merge rules, and rollback delay** |
 | Continual world model | ICML 2025 online shallow model, Continual-Dreamer | **Adopt shallow reference and bounded replay** |
 | Memory-efficient model replay | ARROW | **Reproduce dual-buffer idea, not results by assertion** |
 | Actor forgets despite model memory | Dream Rehearsal preprint | **Component probes immediately; rehearsal experimentally** |
 | Noisy surprise | Disagreement, Plan2Explore, aleatoric mapping, learning progress | **Separate uncertainty channels** |
 | Delightful actor updates | DG and corner-escape papers | **Small isolated experiment** |
-| Compute-budgeted learning | Kondo gate | **L0 screen/gather exists; integrate and experiment after DG; retain minimum update floor** |
+| Compute-budgeted learning | Kondo gate | **L0 nonlinear actor consumer gathers before a real sparse backward; integrate with replay/actor-critic and measure after DG; retain minimum update floor** |
 | Search control | Plan2Explore, Delightful Exploration, prioritized sweeping | **Learn prospective priority; compare to random dreams** |
 | External experiential memory | Era of Experience, memory-reuse study | **Use bounded procedural memory with retrieval evaluation** |
 | Complete OaK lifecycle | Alberta Plan, reward-respecting subtasks, option keyboard | **Connect lifecycle to measured control/planning utility** |
@@ -1300,7 +2519,7 @@ into small local parity tests instead of adopting an aging training stack.
 | [`steventango/continual-foragax-agents`](https://github.com/steventango/continual-foragax-agents) | MIT | Benchmark-agent reference |
 | [`gurpnijjer/dream-rehearsal`](https://github.com/gurpnijjer/dream-rehearsal) | Apache-2.0 | Reproduction target for the new actor-rehearsal hypothesis |
 | [`ramanans1/plan2explore`](https://github.com/ramanans1/plan2explore) | Apache-2.0 | Conceptual/reference implementation for disagreement planning |
-| `C-CHAIN`, `FIRE`, and several newer research repos | No verified reusable license | Read and independently implement equations only, or obtain permission |
+| `C-CHAIN`, `FIRE`, and several newer research repos | No verified reusable license | Keep implementation independent: C-CHAIN's Equation 8/NTK comparator is now clean-room and L0; obtain permission before using repository code |
 | [`google-deepmind/egg@d005eac`](https://github.com/google-deepmind/egg/tree/d005eac307a0cb6ccb9c63ad03aee39a3e3c30d4) | Apache-2.0 | Pinned initial small DG/Kondo token reference; does not cover the full paper evidence, and its thresholded masked loss is not a sparse-backward implementation |
 | [`iosband/trl-dg`](https://github.com/iosband/trl-dg) | No declared software license | Inspect behavior; independently implement equations |
 | [`lalalune/kondo-gate`](https://github.com/lalalune/kondo-gate) | MIT; community implementation | Useful API comparison, but its masked full backward does not demonstrate compute savings |

@@ -52,17 +52,18 @@ from alberta_framework.core.checkpoints import (
     save_checkpoint,
 )
 from alberta_framework.core.delight import (
-    GradientJoyApplicationResult,
-    GradientJoyConfig,
-    GradientJoyEvidence,
+    CandidateUpdateAuditApplicationResult,
+    CandidateUpdateAuditConfig,
+    CandidateUpdateAuditEvidence,
     LearningValue,
     LearningValueAvailability,
-    apply_gradient_joy_update,
+    apply_candidate_update,
 )
 from alberta_framework.core.dreaming import (
     DreamingConfig,
     GuardedDreamer,
     RecentObservationBuffer,
+    RecentObservationBufferState,
 )
 from alberta_framework.core.experiential_memory import (
     ExperientialMemory,
@@ -72,6 +73,9 @@ from alberta_framework.core.experiential_memory import (
     ExperientialMemoryStepResult,
 )
 from alberta_framework.core.experiential_memory_policy import (
+    ExperientialMemoryAdvantageGate,
+    ExperientialMemoryAdvantageGateConfig,
+    ExperientialMemoryAdvantageGateDiagnostics,
     ExperientialMemoryPolicy,
     ExperientialMemoryPolicyProposal,
 )
@@ -79,19 +83,34 @@ from alberta_framework.core.horde import HordeLearner
 from alberta_framework.core.intelligence_amplification import (
     IAAgent,
     IAConfig,
+    IAUpdateResult,
+)
+from alberta_framework.core.interaction_features import (
+    CURATION_ACTIVE_INELIGIBLE_RANK,
+    CURATION_CANDIDATE_INELIGIBLE_RANK,
+    InteractionCurationPriorityOverride,
 )
 from alberta_framework.core.learning_signals import (
     LearningSignalAvailability,
+    LearningSignalCounterStatus,
     LearningSignalEstimator,
     LearningSignalEstimatorConfig,
     LearningSignalEstimatorState,
     TypedLearningSignals,
+)
+from alberta_framework.core.learning_value_router import (
+    LearningValueRouter,
+    LearningValueRouterConfig,
+    LearningValueRouterResourceBudget,
+    LearningValueRouterResult,
+    LearningValueRouterState,
 )
 from alberta_framework.core.model_replay_rehearsal import (
     ModelReplayRehearsal,
     ModelReplayRehearsalConfig,
     RealModelReplayEvent,
 )
+from alberta_framework.core.multi_head_learner import MultiHeadMLPState
 from alberta_framework.core.oak import (
     OaKAgent,
     OaKConfig,
@@ -107,6 +126,7 @@ from alberta_framework.core.option_search_control import (
 from alberta_framework.core.options import (
     DispatchedPrimitiveActionDecision,
     STOMPConfig,
+    STOMPUpdateResult,
     SubtaskSpec,
     check_option_terminated,
     compute_pseudo_reward,
@@ -125,11 +145,44 @@ from alberta_framework.core.partner_policy_fusion import (
 from alberta_framework.core.prototype_feature_lifecycle import (
     PrototypeFeatureConsumerBinding,
     PrototypeFeatureLifecycle,
+    PrototypeFeatureLifecycleAdoptionDiagnostics,
     PrototypeFeatureLifecycleConfig,
     PrototypeFeatureLifecycleDiagnostics,
     PrototypeFeatureLifecycleEvent,
+    PrototypeFeatureLifecycleHordeResult,
+    PrototypeFeatureLifecycleResult,
     PrototypeFeatureLifecycleState,
     PrototypePairGradientPullback,
+)
+from alberta_framework.core.prototype_feature_memory import (
+    PrototypeFeatureMemory,
+    PrototypeFeatureMemoryConfig,
+    PrototypeFeatureMemoryRebindDiagnostics,
+    PrototypeFeatureMemoryRebindResult,
+    PrototypeFeatureMemoryResourceBudget,
+    PrototypeFeatureMemoryState,
+)
+from alberta_framework.core.prototype_feature_utility import (
+    PrototypeFeatureUtilityAuditor,
+    PrototypeFeatureUtilityConfig,
+    PrototypeFeatureUtilityDiagnostics,
+    PrototypeFeatureUtilityEvent,
+    PrototypeFeatureUtilityResourceBudget,
+    PrototypeFeatureUtilityState,
+)
+from alberta_framework.core.prototype_feature_utility_curation import (
+    PrototypeFeatureUtilityCurationConfig,
+    PrototypeFeatureUtilityCurationDiagnostics,
+    PrototypeFeatureUtilityCurationPolicy,
+    PrototypeFeatureUtilityCurationResourceBudget,
+)
+from alberta_framework.core.prototype_routed_linear_world_model import (
+    PrototypeRoutedLinearWorldAdoptionDiagnostics,
+    PrototypeRoutedLinearWorldConfig,
+    PrototypeRoutedLinearWorldModel,
+    PrototypeRoutedLinearWorldPrepareResult,
+    PrototypeRoutedLinearWorldState,
+    PrototypeRoutedLinearWorldTransition,
 )
 from alberta_framework.core.recurrent_latent_world_model_ensemble import (
     RecurrentLatentDecisionCache,
@@ -147,19 +200,39 @@ from alberta_framework.core.representation_gradient_mixer import (
     RepresentationGradientMixResult,
     mix_representation_gradients,
 )
+from alberta_framework.core.rtu_generate_and_test import (
+    RTUGenerateAndTest,
+    RTUGenerateAndTestProposal,
+)
 from alberta_framework.core.state_builder import (
     IdentityStateBuilderConfig,
     OnlineGatedStateBuilderConfig,
+    RecurrentTraceUnitStateBuilder,
+    RecurrentTraceUnitStateBuilderState,
+    RecurrentTraceUnitStateBuilderTransitionResult,
     StateBuilder,
     StateBuilderConfig,
     StateBuilderLearningDiagnostics,
     replace_state_builder_learning_proposal_update,
     state_builder_from_config,
 )
-from alberta_framework.core.types import HordeSpec
+from alberta_framework.core.stomp_owner_finalization import (
+    STOMP_OWNER_STAGE_DYNA,
+    STOMP_OWNER_STAGE_FEATURE_ROUTE,
+    STOMP_OWNER_STAGE_MEMORY_DISPATCH,
+    STOMP_OWNER_STAGE_OPTION_SEARCH,
+    STOMP_OWNER_STAGE_PARTNER_DISPATCH,
+    STOMPOwnerFinalizationTrace,
+    make_stomp_owner_finalization_trace,
+    make_stomp_owner_stage_receipt,
+    stomp_owner_stage_delta_valid,
+    stomp_typed_tree_digest,
+)
+from alberta_framework.core.types import DemonType, GVFSpec, HordeSpec, LMSState
 from alberta_framework.core.world_model import (
     ActionConditionedWorldModel,
     ActionConditionedWorldModelConfig,
+    ActionConditionedWorldModelState,
 )
 from alberta_framework.core.world_model_ensemble import (
     WorldModelEnsemble,
@@ -168,7 +241,31 @@ from alberta_framework.core.world_model_ensemble import (
     WorldModelEnsembleState,
 )
 
-PROTOTYPE_CHECKPOINT_SCHEMA = "alberta.prototype_agent.v3"
+PROTOTYPE_CHECKPOINT_SCHEMA = "alberta.prototype_agent.v13"
+PROTOTYPE_FEATURE_UTILITY_CHECKPOINT_SCHEMA = "alberta.prototype_agent.v14"
+PROTOTYPE_FEATURE_UTILITY_CURATION_CHECKPOINT_SCHEMA = "alberta.prototype_agent.v15"
+PROTOTYPE_FEATURE_MEMORY_CHECKPOINT_SCHEMA = "alberta.prototype_agent.v16"
+PROTOTYPE_FEATURE_WORLD_MODEL_CHECKPOINT_SCHEMA = "alberta.prototype_agent.v17"
+PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_CHECKPOINT_SCHEMA = "alberta.prototype_agent.v18"
+PROTOTYPE_LEARNING_VALUE_ROUTER_CHECKPOINT_SCHEMA = "alberta.prototype_agent.v19"
+PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_CONFIG_SCHEMA = (
+    "alberta.prototype-atomic-feature-world-memory.config.v1"
+)
+PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_MECHANISM_STATUS = (
+    "l0-mechanism-only-not-assessed"
+)
+PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_SCIENTIFIC_PROMOTION_ALLOWED = False
+PROTOTYPE_FEATURE_WORLD_MODEL_SCHEMA_DIGEST_NBYTES = 32
+_PROTOTYPE_CHECKPOINT_SCHEMA_V12 = "alberta.prototype_agent.v12"
+_PROTOTYPE_CHECKPOINT_SCHEMA_V11 = "alberta.prototype_agent.v11"
+_PROTOTYPE_CHECKPOINT_SCHEMA_V10 = "alberta.prototype_agent.v10"
+_PROTOTYPE_CHECKPOINT_SCHEMA_V9 = "alberta.prototype_agent.v9"
+_PROTOTYPE_CHECKPOINT_SCHEMA_V8 = "alberta.prototype_agent.v8"
+_PROTOTYPE_CHECKPOINT_SCHEMA_V7 = "alberta.prototype_agent.v7"
+_PROTOTYPE_CHECKPOINT_SCHEMA_V6 = "alberta.prototype_agent.v6"
+_PROTOTYPE_CHECKPOINT_SCHEMA_V5 = "alberta.prototype_agent.v5"
+_PROTOTYPE_CHECKPOINT_SCHEMA_V4 = "alberta.prototype_agent.v4"
+_PROTOTYPE_CHECKPOINT_SCHEMA_V3 = "alberta.prototype_agent.v3"
 _PROTOTYPE_CHECKPOINT_SCHEMA_V2 = "alberta.prototype_agent.v2"
 _PROTOTYPE_CHECKPOINT_SCHEMA_V1 = "alberta.prototype_agent.v1"
 _DREAM_NEXT_OBSERVATION_STREAM_TAG = 0x44524D4F
@@ -176,6 +273,13 @@ _PROTOTYPE_V2_REPLAY_MIGRATION_TAG = 0x50525632
 _PROTOTYPE_FEATURE_LIFECYCLE_KEY_TAG = 0x50464C43
 _UINT32_MAX = 2**32 - 1
 _INT32_MAX = 2**31 - 1
+
+# Two telemetry int32 scalars and two exact two-word clocks.  The v7 outer
+# state added only the words, so its persistent delta from the pre-v7 wrapper
+# is sixteen bytes.  Nested OaK/STOMP/base-learner clocks report their own
+# budgets and are deliberately not double-counted here.
+PROTOTYPE_LIFETIME_COUNTER_NBYTES = 24
+PROTOTYPE_LIFETIME_COUNTER_DELTA_NBYTES = 16
 
 # ---------------------------------------------------------------------------
 # Standalone utility
@@ -220,7 +324,11 @@ def feature_to_subtask_specs(
     opt_q = oak_state.stomp_state.option_policies.q_weights      # (n_opts, n_prim, obs_dim)
     opt_q_abs = jnp.abs(opt_q)
     obs_dim = int(opt_q.shape[-1])
-    opt_importance = jnp.max(opt_q_abs.reshape(-1, obs_dim), axis=0)  # (obs_dim,)
+    opt_importance = (
+        jnp.max(opt_q_abs.reshape(-1, obs_dim), axis=0)
+        if opt_q.shape[0] > 0
+        else jnp.zeros((obs_dim,), dtype=jnp.float32)
+    )
 
     combined = feature_importance + opt_importance
     n = min(n_subtasks, obs_dim)
@@ -401,6 +509,127 @@ def _sample_one_hot_dream_observation(
     return sampled, valid
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class PrototypeAtomicFeatureWorldMemoryConfig:
+    """Opt into one all-consumer pair-bank transaction.
+
+    The authoritative component configurations remain the existing Prototype
+    ``oak``, ``prototype_feature_lifecycle``, ``world_model``, Horde, Identity
+    builder, and experiential-memory fields.  This enabled-only record owns
+    only the routed world's bounded physical-anchor and planning guards, so it
+    cannot become a second feature or consumer authority.
+    """
+
+    anchor_capacity: int = 8
+    planning_enabled: bool = False
+    planning_warmup_steps: int = 1
+    max_generation_model_error: float = 1_000_000.0
+    max_planned_backups: int = _INT32_MAX
+
+    def __post_init__(self) -> None:
+        if type(self.anchor_capacity) is not int or not 1 <= self.anchor_capacity <= 4_096:
+            raise ValueError("anchor_capacity must be a strict integer in [1, 4096]")
+        if type(self.planning_enabled) is not bool:
+            raise ValueError("planning_enabled must be an exact bool")
+        if (
+            type(self.planning_warmup_steps) is not int
+            or not 0 <= self.planning_warmup_steps <= _INT32_MAX
+        ):
+            raise ValueError(
+                "planning_warmup_steps must be a strict integer in [0, INT32_MAX]"
+            )
+        if (
+            isinstance(self.max_generation_model_error, bool)
+            or not isinstance(self.max_generation_model_error, (int, float))
+            or not math.isfinite(float(self.max_generation_model_error))
+            or float(self.max_generation_model_error) < 0.0
+            or not math.isfinite(float(jnp.float32(self.max_generation_model_error)))
+        ):
+            raise ValueError(
+                "max_generation_model_error must be finite, non-negative, and float32-safe"
+            )
+        if (
+            type(self.max_planned_backups) is not int
+            or not 1 <= self.max_planned_backups <= _INT32_MAX
+        ):
+            raise ValueError(
+                "max_planned_backups must be a strict integer in [1, INT32_MAX]"
+            )
+
+    def to_config(self) -> dict[str, Any]:
+        """Return the exact enabled-only composition record."""
+
+        return {
+            "schema": PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_CONFIG_SCHEMA,
+            "type": "PrototypeAtomicFeatureWorldMemoryConfig",
+            "mechanism_status": (
+                PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_MECHANISM_STATUS
+            ),
+            "scientific_promotion_allowed": False,
+            "authority_semantics": (
+                "one-lifecycle-router;one-oak-ordered-linear-horde;"
+                "one-fixed-physical-routed-world;one-exact-identity-memory"
+            ),
+            "planning_default": False,
+            "anchor_capacity": self.anchor_capacity,
+            "planning_enabled": self.planning_enabled,
+            "planning_warmup_steps": self.planning_warmup_steps,
+            "max_generation_model_error": self.max_generation_model_error,
+            "max_planned_backups": self.max_planned_backups,
+        }
+
+    @classmethod
+    def from_config(
+        cls,
+        payload: object,
+    ) -> PrototypeAtomicFeatureWorldMemoryConfig:
+        """Reconstruct only the exact current composition schema."""
+
+        if type(payload) is not dict:
+            raise TypeError("atomic feature/world/memory config must be an exact dict")
+        raw = cast(dict[str, object], payload)
+        expected = {
+            "schema",
+            "type",
+            "mechanism_status",
+            "scientific_promotion_allowed",
+            "authority_semantics",
+            "planning_default",
+            "anchor_capacity",
+            "planning_enabled",
+            "planning_warmup_steps",
+            "max_generation_model_error",
+            "max_planned_backups",
+        }
+        if set(raw) != expected:
+            raise ValueError("atomic feature/world/memory config fields differ from v1")
+        fixed = {
+            "schema": PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_CONFIG_SCHEMA,
+            "type": "PrototypeAtomicFeatureWorldMemoryConfig",
+            "mechanism_status": (
+                PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_MECHANISM_STATUS
+            ),
+            "scientific_promotion_allowed": False,
+            "authority_semantics": (
+                "one-lifecycle-router;one-oak-ordered-linear-horde;"
+                "one-fixed-physical-routed-world;one-exact-identity-memory"
+            ),
+            "planning_default": False,
+        }
+        if any(raw[name] != value for name, value in fixed.items()):
+            raise ValueError("atomic feature/world/memory fixed semantics differ")
+        return cls(
+            anchor_capacity=cast(int, raw["anchor_capacity"]),
+            planning_enabled=cast(bool, raw["planning_enabled"]),
+            planning_warmup_steps=cast(int, raw["planning_warmup_steps"]),
+            max_generation_model_error=cast(
+                float,
+                raw["max_generation_model_error"],
+            ),
+            max_planned_backups=cast(int, raw["max_planned_backups"]),
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class PrototypeAgentConfig:
     """Configuration for the experimental PrototypeAgent composition.
@@ -459,6 +688,9 @@ class PrototypeAgentConfig:
             observations and keys must match OaK's representation width,
             stored action mass must match the primitive action count, and the
             outcome stores the bootstrap representation plus scalar reward.
+            With the pair-feature lifecycle, the base builder must be exact
+            identity and every live row is rebound atomically from its stable
+            base prefix when the descriptor bank changes.
         state_builder: Canonical causal representation builder. Its output
             width must equal the feature lifecycle's base width when that lane
             is enabled, and ``oak.observation_dim`` otherwise. Mutually
@@ -481,12 +713,37 @@ class PrototypeAgentConfig:
             proposed builder update. Missing or incomplete probe evidence
             vetoes only the representation update; control and model learning
             continue.
+        learning_value_router: Optional owner-bound causal router for the
+            candidate audit's eight typed learning-value channels. It requires
+            the candidate-update audit and one causal ensemble signal producer.
+            Raw routed evidence, never normalized values or an aggregate score,
+            enters the audit. ``None`` preserves the historical config and
+            state PyTree exactly.
         prototype_feature_lifecycle: Optional fixed-budget pair-feature bank
-            between a supported base state builder and linear OaK.  This
-            narrow lane owns one scalar, owner-bound control-TD discovery
-            target and atomically routes every OaK observation axis when a
-            pair descriptor changes.  Consumers whose representation state
-            is not routed and versioned are rejected by configuration.
+            between a supported base state builder and linear OaK.  It always
+            owns one scalar, owner-bound control-TD discovery target.  Its
+            managed-Horde mode appends ordered linear-Horde TD targets, gives
+            control and the aggregate demon group equal proxy-utility mass,
+            and atomically routes every OaK/Horde feature axis when a pair
+            descriptor changes. Experiential memory is the first additional
+            supported consumer through an exact bank-bound re-encoding
+            adapter; other unversioned representation consumers are rejected.
+        experiential_memory_advantage_gate: Optional stateless conservative
+            dispatch-authority gate. It requires action-conditioned local
+            reward evidence for both the memory proposal and OaK's
+            counterfactual action before memory may replace that action.
+            ``None`` preserves the historical experiential-memory policy and
+            serialized configuration exactly.
+        prototype_feature_utility: Optional diagnostic-only auditor for the
+            shared linear OaK/Horde bank. It measures frozen old-consumer
+            one-step deletion loss and matched shadow-candidate insertion
+            gain, but has no curation authority. Its dimensions and lifetime
+            cap must match ``prototype_feature_lifecycle`` exactly.
+        prototype_feature_utility_curation: Optional ranking-only adapter that
+            supplies mature deletion and insertion ranks to the lifecycle's
+            existing within-cohort priority override. The auditor remains
+            diagnostic-only; ages, cadence, confirmation, proxy promotion
+            gates, and safe routing retain go/no-go authority.
     """
 
     oak: OaKConfig = dataclasses.field(default_factory=_default_oak_config)
@@ -509,17 +766,38 @@ class PrototypeAgentConfig:
     ia: IAConfig | None = None
     partner_policy_fusion: PartnerPolicyFusionConfig | None = None
     experiential_memory: ExperientialMemoryConfig | None = None
+    experiential_memory_advantage_gate: (
+        ExperientialMemoryAdvantageGateConfig | None
+    ) = None
     gru_perception: GRUPerceptionConfig | None = None
     state_builder: StateBuilderConfig | None = None
     learn_state_builder_from_world_model: bool = False
     representation_gradient_mixer: RepresentationGradientMixerConfig | None = None
-    gradient_joy: GradientJoyConfig | None = None
+    gradient_joy: CandidateUpdateAuditConfig | None = None
+    learning_value_router: LearningValueRouterConfig | None = None
     auto_curate_every: int = 0
     option_search_control: OptionSearchControlConfig | None = None
     prototype_feature_lifecycle: PrototypeFeatureLifecycleConfig | None = None
+    prototype_feature_utility: PrototypeFeatureUtilityConfig | None = None
+    prototype_feature_utility_curation: (
+        PrototypeFeatureUtilityCurationConfig | None
+    ) = None
+    prototype_atomic_feature_world_memory: (
+        PrototypeAtomicFeatureWorldMemoryConfig | None
+    ) = None
 
     def __post_init__(self) -> None:
         feature_lifecycle = self.prototype_feature_lifecycle
+        atomic_feature_world_memory = self.prototype_atomic_feature_world_memory
+        if (
+            atomic_feature_world_memory is not None
+            and type(atomic_feature_world_memory)
+            is not PrototypeAtomicFeatureWorldMemoryConfig
+        ):
+            raise ValueError(
+                "prototype_atomic_feature_world_memory must be an exact "
+                "PrototypeAtomicFeatureWorldMemoryConfig"
+            )
         if feature_lifecycle is not None and not isinstance(
             feature_lifecycle,
             PrototypeFeatureLifecycleConfig,
@@ -527,6 +805,83 @@ class PrototypeAgentConfig:
             raise ValueError(
                 "prototype_feature_lifecycle must be a "
                 "PrototypeFeatureLifecycleConfig"
+            )
+        if (
+            feature_lifecycle is not None
+            and self.experiential_memory is not None
+            and type(feature_lifecycle) is not PrototypeFeatureLifecycleConfig
+        ):
+            raise ValueError(
+                "prototype feature-memory composition requires an exact "
+                "PrototypeFeatureLifecycleConfig"
+            )
+        if (
+            feature_lifecycle is not None
+            and self.experiential_memory is not None
+            and type(self.experiential_memory) is not ExperientialMemoryConfig
+        ):
+            raise ValueError(
+                "prototype feature-memory composition requires an exact "
+                "ExperientialMemoryConfig"
+            )
+        feature_utility = self.prototype_feature_utility
+        if feature_utility is not None and type(feature_utility) is not (
+            PrototypeFeatureUtilityConfig
+        ):
+            raise ValueError(
+                "prototype_feature_utility must be a "
+                "PrototypeFeatureUtilityConfig"
+            )
+        if feature_utility is not None:
+            if (
+                feature_lifecycle is None
+                or feature_lifecycle.managed_horde_demons <= 0
+            ):
+                raise ValueError(
+                    "prototype_feature_utility requires the shared managed-Horde "
+                    "prototype_feature_lifecycle"
+                )
+            expected_dimensions = (
+                feature_lifecycle.base_feature_dim,
+                feature_lifecycle.active_pair_slots,
+                feature_lifecycle.candidate_pair_slots,
+                feature_lifecycle.managed_horde_demons,
+                feature_lifecycle.max_observations,
+            )
+            actual_dimensions = (
+                feature_utility.base_feature_dim,
+                feature_utility.active_pair_slots,
+                feature_utility.candidate_pair_slots,
+                feature_utility.managed_horde_demons,
+                feature_utility.max_observations,
+            )
+            if actual_dimensions != expected_dimensions:
+                raise ValueError(
+                    "prototype_feature_utility dimensions and max_observations "
+                    "must match prototype_feature_lifecycle"
+                )
+        feature_utility_curation = self.prototype_feature_utility_curation
+        if feature_utility_curation is not None:
+            if type(feature_utility_curation) is not (
+                PrototypeFeatureUtilityCurationConfig
+            ):
+                raise ValueError(
+                    "prototype_feature_utility_curation must be a "
+                    "PrototypeFeatureUtilityCurationConfig"
+                )
+            if feature_utility is None:
+                raise ValueError(
+                    "prototype_feature_utility_curation requires "
+                    "prototype_feature_utility"
+                )
+            if feature_utility.candidate_pair_slots <= 0:
+                raise ValueError(
+                    "prototype_feature_utility_curation requires at least one "
+                    "candidate pair slot"
+                )
+            PrototypeFeatureUtilityCurationPolicy(
+                feature_utility,
+                feature_utility_curation,
             )
         if self.option_search_control is not None:
             if not isinstance(
@@ -541,8 +896,8 @@ class PrototypeAgentConfig:
                     "option_search_control requires "
                     "oak.stomp.option_planning_backups_per_step == 0"
                 )
-        if self.buffer_capacity <= 0:
-            raise ValueError("buffer_capacity must be positive")
+        if not 0 < self.buffer_capacity <= _INT32_MAX:
+            raise ValueError("buffer_capacity must be in [1, INT32_MAX]")
         if self.n_dreams_per_step < 0:
             raise ValueError("n_dreams_per_step must be non-negative")
         if self.dream_next_observation_mode not in {
@@ -555,8 +910,10 @@ class PrototypeAgentConfig:
             )
         if self.horde_step_size <= 0.0:
             raise ValueError("horde_step_size must be positive")
-        if self.auto_curate_every < 0:
-            raise ValueError("auto_curate_every must be non-negative")
+        if not 0 <= self.auto_curate_every <= _INT32_MAX:
+            raise ValueError(
+                "auto_curate_every must be in [0, INT32_MAX] for exact cadence"
+            )
         if not isinstance(self.learn_state_builder_from_world_model, bool):
             raise ValueError("learn_state_builder_from_world_model must be boolean")
         mixer = self.representation_gradient_mixer
@@ -587,7 +944,19 @@ class PrototypeAgentConfig:
                 "n_dreams_per_step > 0 requires the legacy world_model to be configured"
             )
         if self.world_model is not None:
-            if self.world_model.observation_dim != self.oak.observation_dim:
+            expected_world_observation_dim = (
+                feature_lifecycle.base_feature_dim
+                if feature_lifecycle is not None
+                else self.oak.observation_dim
+            )
+            if self.world_model.observation_dim != expected_world_observation_dim:
+                if feature_lifecycle is not None:
+                    raise ValueError(
+                        "world_model.observation_dim must match the stable "
+                        "base_feature_dim from prototype_feature_lifecycle, got "
+                        f"{self.world_model.observation_dim} and "
+                        f"{feature_lifecycle.base_feature_dim}"
+                    )
                 raise ValueError(
                     "world_model.observation_dim must match oak.observation_dim, "
                     f"got {self.world_model.observation_dim} and "
@@ -759,6 +1128,27 @@ class PrototypeAgentConfig:
                 raise ValueError(
                     "PrototypeAgent gradient_joy must use candidate_semantics='update'"
                 )
+        learning_value_router = self.learning_value_router
+        if (
+            learning_value_router is not None
+            and type(learning_value_router) is not LearningValueRouterConfig
+        ):
+            raise ValueError(
+                "learning_value_router must be an exact LearningValueRouterConfig"
+            )
+        if learning_value_router is not None:
+            if self.gradient_joy is None:
+                raise ValueError(
+                    "learning_value_router requires the candidate-update audit"
+                )
+            if (
+                self.world_model_ensemble is None
+                and self.model_replay_rehearsal is None
+                and self.recurrent_latent_world_model_ensemble is None
+            ):
+                raise ValueError(
+                    "learning_value_router requires causal ensemble learning signals"
+                )
         if self.ia is not None:
             ia_obs = self.ia.cortex.observation_dim
             oak_obs = self.oak.observation_dim
@@ -821,11 +1211,121 @@ class PrototypeAgentConfig:
                     "oak.observation_dim + 1 "
                     f"({expected_outcome_dim}), got {memory.outcome_dim}"
                 )
+        advantage_gate = self.experiential_memory_advantage_gate
+        if advantage_gate is not None:
+            if type(advantage_gate) is not ExperientialMemoryAdvantageGateConfig:
+                raise ValueError(
+                    "experiential_memory_advantage_gate must be an exact "
+                    "ExperientialMemoryAdvantageGateConfig"
+                )
+            if self.experiential_memory is None:
+                raise ValueError(
+                    "experiential_memory_advantage_gate requires experiential_memory"
+                )
+            if advantage_gate.min_action_support > self.experiential_memory.top_k:
+                raise ValueError(
+                    "experiential_memory_advantage_gate.min_action_support must "
+                    "not exceed experiential_memory.top_k"
+                )
 
         if feature_lifecycle is not None:
-            if feature_lifecycle.n_tasks != 1:
+            managed_horde_demons = feature_lifecycle.managed_horde_demons
+            if managed_horde_demons == 0 and feature_lifecycle.n_tasks != 1:
                 raise ValueError(
                     "prototype_feature_lifecycle.n_tasks must equal 1"
+                )
+            if managed_horde_demons > 0:
+                horde_spec = self.horde_spec
+                if type(horde_spec) is not HordeSpec:
+                    raise ValueError(
+                        "managed prototype feature Horde requires an exact "
+                        "HordeSpec"
+                    )
+                demons = horde_spec.demons
+                if (
+                    type(demons) is not tuple
+                    or len(demons) != managed_horde_demons
+                    or not all(type(demon) is GVFSpec for demon in demons)
+                ):
+                    raise ValueError(
+                        "managed prototype feature Horde demon count and "
+                        "ordered exact specifications must match"
+                    )
+                if not all(
+                    type(demon.name) is str
+                    and type(demon.demon_type) is DemonType
+                    and type(demon.gamma) is float
+                    and math.isfinite(demon.gamma)
+                    and 0.0 <= demon.gamma <= 1.0
+                    and type(demon.lamda) is float
+                    and math.isfinite(demon.lamda)
+                    and 0.0 <= demon.lamda <= 1.0
+                    and type(demon.cumulant_index) is int
+                    and demon.cumulant_index >= -1
+                    and type(demon.terminal_reward) is float
+                    and math.isfinite(demon.terminal_reward)
+                    for demon in demons
+                ):
+                    raise ValueError(
+                        "managed prototype feature Horde questions must have "
+                        "strict finite canonical metadata"
+                    )
+                expected_horde_tasks = 1 + managed_horde_demons
+                if feature_lifecycle.n_tasks != expected_horde_tasks:
+                    raise ValueError(
+                        "managed prototype feature lifecycle n_tasks must equal "
+                        "1 + managed_horde_demons"
+                    )
+                expected_gammas = jnp.asarray(
+                    [demon.gamma for demon in demons],
+                    dtype=jnp.float32,
+                )
+                expected_lamdas = jnp.asarray(
+                    [demon.lamda for demon in demons],
+                    dtype=jnp.float32,
+                )
+                gamma_contract_valid = (
+                    hasattr(horde_spec.gammas, "shape")
+                    and hasattr(horde_spec.gammas, "dtype")
+                    and horde_spec.gammas.shape == (managed_horde_demons,)
+                    and horde_spec.gammas.dtype == jnp.float32
+                )
+                lambda_contract_valid = (
+                    hasattr(horde_spec.lamdas, "shape")
+                    and hasattr(horde_spec.lamdas, "dtype")
+                    and horde_spec.lamdas.shape == (managed_horde_demons,)
+                    and horde_spec.lamdas.dtype == jnp.float32
+                )
+                if (
+                    not gamma_contract_valid
+                    or not lambda_contract_valid
+                    or not bool(jnp.array_equal(horde_spec.gammas, expected_gammas))
+                    or not bool(jnp.array_equal(horde_spec.lamdas, expected_lamdas))
+                ):
+                    raise ValueError(
+                        "managed prototype feature Horde cached gamma/lambda "
+                        "arrays must exactly match the ordered specifications"
+                    )
+                if type(self.horde_hidden_sizes) is not tuple or self.horde_hidden_sizes != ():
+                    raise ValueError(
+                        "managed prototype feature Horde requires "
+                        "horde_hidden_sizes == ()"
+                    )
+                if (
+                    type(self.horde_step_size) is not float
+                    or not math.isfinite(self.horde_step_size)
+                    or self.horde_step_size <= 0.0
+                    or not math.isfinite(float(jnp.float32(self.horde_step_size)))
+                    or float(jnp.float32(self.horde_step_size)) <= 0.0
+                ):
+                    raise ValueError(
+                        "managed prototype feature Horde step size must be a "
+                        "positive float32-representable strict float"
+                    )
+            elif self.horde_spec is not None:
+                raise ValueError(
+                    "prototype_feature_lifecycle requires "
+                    "managed_horde_demons for a Horde consumer"
                 )
             if feature_lifecycle.n_options != self.oak.n_options:
                 raise ValueError(
@@ -868,6 +1368,11 @@ class PrototypeAgentConfig:
                 IdentityStateBuilderConfig,
                 OnlineGatedStateBuilderConfig,
             }:
+                if self.world_model is not None:
+                    raise ValueError(
+                        "prototype feature/world-model composition requires an "
+                        "exact Identity state_builder"
+                    )
                 raise ValueError(
                     "prototype_feature_lifecycle requires an Identity or "
                     "OnlineGated state_builder"
@@ -877,22 +1382,59 @@ class PrototypeAgentConfig:
                     "prototype_feature_lifecycle is incompatible with "
                     "gru_perception"
                 )
+            if (
+                self.experiential_memory is not None
+                and type(self.state_builder) is not IdentityStateBuilderConfig
+            ):
+                raise ValueError(
+                    "prototype_feature_lifecycle with experiential_memory "
+                    "requires an exact Identity state_builder so stored base "
+                    "prefixes remain reconstructable across feature-bank changes"
+                )
+            if self.world_model is not None:
+                if type(feature_lifecycle) is not PrototypeFeatureLifecycleConfig:
+                    raise ValueError(
+                        "prototype feature/world-model composition requires an "
+                        "exact PrototypeFeatureLifecycleConfig"
+                    )
+                if type(self.world_model) is not ActionConditionedWorldModelConfig:
+                    raise ValueError(
+                        "prototype feature/world-model composition requires an "
+                        "exact ActionConditionedWorldModelConfig"
+                    )
+                if type(self.state_builder) is not IdentityStateBuilderConfig:
+                    raise ValueError(
+                        "prototype feature/world-model composition requires an "
+                        "exact Identity state_builder"
+                    )
+                if self.dreaming is not None or self.n_dreams_per_step != 0:
+                    raise ValueError(
+                        "dreaming is disabled for the stable-base prototype "
+                        "feature/world-model composition"
+                    )
+            partner_fusion_with_replaceable_feature_axis = (
+                self.partner_policy_fusion is not None
+                and (
+                    feature_lifecycle.replacement_interval != 0
+                    or self.auto_curate_every != 0
+                    or feature_utility_curation is not None
+                    or atomic_feature_world_memory is not None
+                )
+            )
             unsupported_consumers = (
-                self.world_model is not None
-                or self.world_model_ensemble is not None
+                self.world_model_ensemble is not None
                 or self.model_replay_rehearsal is not None
                 or self.recurrent_latent_world_model_ensemble is not None
-                or self.dreaming is not None
+                or (self.world_model is None and self.dreaming is not None)
                 or self.n_dreams_per_step != 0
-                or self.horde_spec is not None
                 or self.ia is not None
-                or self.partner_policy_fusion is not None
-                or self.experiential_memory is not None
+                or partner_fusion_with_replaceable_feature_axis
             )
             if unsupported_consumers:
                 raise ValueError(
-                    "prototype_feature_lifecycle rejects world-model, dreaming, "
-                    "Horde, IA, partner-fusion, and experiential-memory consumers"
+                    "prototype_feature_lifecycle rejects dreaming, "
+                    "ensemble/replay/recurrent world-model, IA, and partner "
+                    "fusion over a replaceable feature axis"
                 )
             if self.learn_state_builder_from_world_model:
                 raise ValueError(
@@ -916,6 +1458,63 @@ class PrototypeAgentConfig:
                 raise ValueError(
                     "prototype_feature_lifecycle requires auto_curate_every == 0"
                 )
+        if atomic_feature_world_memory is not None:
+            if (
+                feature_lifecycle is None
+                or feature_lifecycle.managed_horde_demons <= 0
+            ):
+                raise ValueError(
+                    "atomic feature/world/memory requires the ordered managed "
+                    "linear-Horde feature lifecycle"
+                )
+            if type(self.world_model) is not ActionConditionedWorldModelConfig:
+                raise ValueError(
+                    "atomic feature/world/memory requires an exact linear "
+                    "ActionConditionedWorldModelConfig"
+                )
+            if type(self.experiential_memory) is not ExperientialMemoryConfig:
+                raise ValueError(
+                    "atomic feature/world/memory requires exact experiential memory"
+                )
+            if type(self.state_builder) is not IdentityStateBuilderConfig:
+                raise ValueError(
+                    "atomic feature/world/memory requires an exact Identity state_builder"
+                )
+            if self.prototype_feature_utility is not None or (
+                self.prototype_feature_utility_curation is not None
+            ):
+                raise ValueError(
+                    "atomic feature/world/memory excludes utility-auditor curation"
+                )
+            if self.experiential_memory_advantage_gate is not None:
+                raise ValueError(
+                    "atomic feature/world/memory excludes the memory advantage gate"
+                )
+            if self.option_search_control is not None:
+                raise ValueError(
+                    "atomic feature/world/memory excludes option search control"
+                )
+            if self.representation_gradient_mixer is not None:
+                raise ValueError(
+                    "atomic feature/world/memory excludes representation-gradient mixing"
+                )
+            PrototypeRoutedLinearWorldConfig(
+                feature_lifecycle=feature_lifecycle,
+                world_model=self.world_model,
+                oak=self.oak,
+                anchor_capacity=atomic_feature_world_memory.anchor_capacity,
+                planning_enabled=atomic_feature_world_memory.planning_enabled,
+                planning_warmup_steps=(
+                    atomic_feature_world_memory.planning_warmup_steps
+                ),
+                max_generation_model_error=(
+                    atomic_feature_world_memory.max_generation_model_error
+                ),
+                max_planned_backups=(
+                    atomic_feature_world_memory.max_planned_backups
+                ),
+                carry_survivors=feature_lifecycle.carry_survivors,
+            )
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dictionary."""
@@ -937,6 +1536,14 @@ class PrototypeAgentConfig:
         if self.prototype_feature_lifecycle is not None:
             payload["prototype_feature_lifecycle"] = (
                 self.prototype_feature_lifecycle.to_config()
+            )
+        if self.prototype_feature_utility is not None:
+            payload["prototype_feature_utility"] = (
+                self.prototype_feature_utility.to_config()
+            )
+        if self.prototype_feature_utility_curation is not None:
+            payload["prototype_feature_utility_curation"] = (
+                self.prototype_feature_utility_curation.to_config()
             )
         if self.world_model is not None:
             payload["world_model"] = self.world_model.to_config()
@@ -962,6 +1569,10 @@ class PrototypeAgentConfig:
             )
         if self.experiential_memory is not None:
             payload["experiential_memory"] = self.experiential_memory.to_config()
+        if self.experiential_memory_advantage_gate is not None:
+            payload["experiential_memory_advantage_gate"] = (
+                self.experiential_memory_advantage_gate.to_config()
+            )
         if self.gru_perception is not None:
             payload["gru_perception"] = self.gru_perception.to_config()
         if self.state_builder is not None:
@@ -974,6 +1585,14 @@ class PrototypeAgentConfig:
             )
         if self.gradient_joy is not None:
             payload["gradient_joy"] = self.gradient_joy.to_config()
+        if self.learning_value_router is not None:
+            payload["learning_value_router"] = (
+                self.learning_value_router.to_config()
+            )
+        if self.prototype_atomic_feature_world_memory is not None:
+            payload["prototype_atomic_feature_world_memory"] = (
+                self.prototype_atomic_feature_world_memory.to_config()
+            )
         return payload
 
     @classmethod
@@ -1012,6 +1631,40 @@ class PrototypeAgentConfig:
         prototype_feature_lifecycle = (
             PrototypeFeatureLifecycleConfig.from_config(feature_lifecycle_raw)
             if feature_lifecycle_raw is not None
+            else None
+        )
+
+        feature_utility_raw = data.pop("prototype_feature_utility", None)
+        if feature_utility_raw is not None and not isinstance(
+            feature_utility_raw,
+            dict,
+        ):
+            raise ValueError(
+                "prototype_feature_utility must be a configuration object"
+            )
+        prototype_feature_utility = (
+            PrototypeFeatureUtilityConfig.from_config(feature_utility_raw)
+            if feature_utility_raw is not None
+            else None
+        )
+
+        feature_utility_curation_raw = data.pop(
+            "prototype_feature_utility_curation",
+            None,
+        )
+        if feature_utility_curation_raw is not None and not isinstance(
+            feature_utility_curation_raw,
+            dict,
+        ):
+            raise ValueError(
+                "prototype_feature_utility_curation must be a configuration "
+                "object"
+            )
+        prototype_feature_utility_curation = (
+            PrototypeFeatureUtilityCurationConfig.from_config(
+                feature_utility_curation_raw
+            )
+            if feature_utility_curation_raw is not None
             else None
         )
 
@@ -1070,6 +1723,22 @@ class PrototypeAgentConfig:
             if experiential_memory_raw is not None
             else None
         )
+        advantage_gate_raw = data.pop(
+            "experiential_memory_advantage_gate",
+            None,
+        )
+        if advantage_gate_raw is not None and not isinstance(
+            advantage_gate_raw,
+            dict,
+        ):
+            raise ValueError(
+                "experiential_memory_advantage_gate must be a configuration object"
+            )
+        experiential_memory_advantage_gate = (
+            ExperientialMemoryAdvantageGateConfig.from_config(advantage_gate_raw)
+            if advantage_gate_raw is not None
+            else None
+        )
         gru_raw = data.pop("gru_perception", None)
         gru_perception = (
             GRUPerceptionConfig.from_config(gru_raw) if gru_raw is not None else None
@@ -1110,8 +1779,33 @@ class PrototypeAgentConfig:
         ):
             raise ValueError("gradient_joy type must be 'GradientJoyConfig'")
         gradient_joy = (
-            GradientJoyConfig.from_config(gradient_joy_raw)
+            CandidateUpdateAuditConfig.from_config(gradient_joy_raw)
             if gradient_joy_raw is not None
+            else None
+        )
+        learning_value_router_raw = data.pop("learning_value_router", None)
+        if learning_value_router_raw is not None and not isinstance(
+            learning_value_router_raw,
+            dict,
+        ):
+            raise ValueError(
+                "learning_value_router must be a configuration object"
+            )
+        learning_value_router = (
+            LearningValueRouterConfig.from_config(learning_value_router_raw)
+            if learning_value_router_raw is not None
+            else None
+        )
+
+        atomic_feature_world_memory_raw = data.pop(
+            "prototype_atomic_feature_world_memory",
+            None,
+        )
+        prototype_atomic_feature_world_memory = (
+            PrototypeAtomicFeatureWorldMemoryConfig.from_config(
+                atomic_feature_world_memory_raw
+            )
+            if atomic_feature_world_memory_raw is not None
             else None
         )
 
@@ -1146,6 +1840,9 @@ class PrototypeAgentConfig:
             ia=ia,
             partner_policy_fusion=partner_policy_fusion,
             experiential_memory=experiential_memory,
+            experiential_memory_advantage_gate=(
+                experiential_memory_advantage_gate
+            ),
             gru_perception=gru_perception,
             state_builder=state_builder,
             learn_state_builder_from_world_model=(
@@ -1153,9 +1850,199 @@ class PrototypeAgentConfig:
             ),
             representation_gradient_mixer=representation_gradient_mixer,
             gradient_joy=gradient_joy,
+            learning_value_router=learning_value_router,
             auto_curate_every=auto_curate_every,
             prototype_feature_lifecycle=prototype_feature_lifecycle,
+            prototype_feature_utility=prototype_feature_utility,
+            prototype_feature_utility_curation=(
+                prototype_feature_utility_curation
+            ),
+            prototype_atomic_feature_world_memory=(
+                prototype_atomic_feature_world_memory
+            ),
         )
+
+
+def _prototype_feature_horde_schema_digest(
+    config: PrototypeAgentConfig,
+) -> Array:
+    """Bind one shared feature bank to its ordered consumer semantics."""
+
+    feature_config = config.prototype_feature_lifecycle
+    horde_spec = config.horde_spec
+    if (
+        feature_config is None
+        or feature_config.managed_horde_demons <= 0
+        or type(horde_spec) is not HordeSpec
+    ):
+        raise ValueError("shared feature/Horde schema requires both components")
+    payload = {
+        "schema": "alberta.prototype_feature_oak_horde.v1",
+        "channel_mapping": {
+            "control_target": 0,
+            "ordered_horde_targets_start": 1,
+        },
+        "feature_lifecycle": feature_config.to_config(),
+        "oak": config.oak.to_config(),
+        "horde_spec": horde_spec.to_config(),
+        "horde_hidden_sizes": list(config.horde_hidden_sizes),
+        "horde_step_size": config.horde_step_size,
+    }
+    encoded = json.dumps(
+        payload,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return jnp.asarray(
+        tuple(hashlib.sha256(encoded).digest()),
+        dtype=jnp.uint8,
+    )
+
+
+def _prototype_feature_world_model_schema_digest(
+    config: PrototypeAgentConfig,
+) -> Array:
+    """Bind a v17 feature/world state to the complete serialized agent config."""
+
+    if (
+        config.prototype_feature_lifecycle is None
+        or config.world_model is None
+    ):
+        raise ValueError(
+            "feature/world-model schema requires both configured components"
+        )
+    payload = {
+        "schema": "alberta.prototype_feature_world_model.v1",
+        "agent_config": config.to_config(),
+    }
+    encoded = json.dumps(
+        payload,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return jnp.asarray(
+        tuple(hashlib.sha256(encoded).digest()),
+        dtype=jnp.uint8,
+    )
+
+
+def _prototype_atomic_feature_world_memory_schema_digest(
+    config: PrototypeAgentConfig,
+) -> Array:
+    """Bind the v18 state shell to the complete enabled Prototype config."""
+
+    if config.prototype_atomic_feature_world_memory is None:
+        raise ValueError("atomic feature/world/memory schema requires opt-in config")
+    payload = {
+        "schema": "alberta.prototype_atomic_feature_world_memory.v1",
+        "agent_config": config.to_config(),
+    }
+    encoded = json.dumps(
+        payload,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return jnp.asarray(
+        tuple(hashlib.sha256(encoded).digest()),
+        dtype=jnp.uint8,
+    )
+
+
+def _prototype_feature_utility_schema_digest(
+    config: PrototypeAgentConfig,
+) -> Array:
+    """Bind causal-utility semantics to the exact shared consumer schema."""
+
+    feature_config = config.prototype_feature_lifecycle
+    utility_config = config.prototype_feature_utility
+    horde_spec = config.horde_spec
+    if (
+        feature_config is None
+        or utility_config is None
+        or feature_config.managed_horde_demons <= 0
+        or type(horde_spec) is not HordeSpec
+    ):
+        raise ValueError(
+            "feature utility schema requires the shared feature/Horde lane"
+        )
+    payload = {
+        "schema": "alberta.prototype_feature_utility_composition.v1",
+        "task_mapping": {
+            "control_target": 0,
+            "ordered_horde_targets_start": 1,
+        },
+        "feature_utility": utility_config.to_config(),
+        "feature_lifecycle": feature_config.to_config(),
+        "oak": config.oak.to_config(),
+        "horde_spec": horde_spec.to_config(),
+        "horde_hidden_sizes": list(config.horde_hidden_sizes),
+        "horde_step_size": config.horde_step_size,
+    }
+    encoded = json.dumps(
+        payload,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return jnp.asarray(
+        tuple(hashlib.sha256(encoded).digest()),
+        dtype=jnp.uint8,
+    )
+
+
+def _prototype_feature_utility_curation_schema_digest(
+    config: PrototypeAgentConfig,
+) -> Array:
+    """Bind v6 ranking semantics around the exact v5 utility composition."""
+
+    feature_config = config.prototype_feature_lifecycle
+    utility_config = config.prototype_feature_utility
+    curation_config = config.prototype_feature_utility_curation
+    horde_spec = config.horde_spec
+    if (
+        feature_config is None
+        or utility_config is None
+        or curation_config is None
+        or feature_config.managed_horde_demons <= 0
+        or type(horde_spec) is not HordeSpec
+    ):
+        raise ValueError(
+            "feature utility curation schema requires the shared v5 utility "
+            "composition"
+        )
+    payload = {
+        "schema": "alberta.prototype_feature_utility_curation_composition.v1",
+        "rank_semantics": {
+            "active_direction": "ascending_deletion_utility",
+            "candidate_direction": "descending_insertion_utility",
+            "active_ineligible_rank": "float32:+0x1.fffffep+127",
+            "candidate_ineligible_rank": "float32:-0x1.fffffep+127",
+            "evidence_gate": "all_configured_tasks",
+            "missing_task_mass": "fixed_without_renormalization",
+            "cross_cohort_audit_comparison": False,
+            "legacy_proxy_promotion_gate_retained": True,
+        },
+        "feature_utility_curation": curation_config.to_config(),
+        "feature_utility": utility_config.to_config(),
+        "feature_lifecycle": feature_config.to_config(),
+        "oak": config.oak.to_config(),
+        "horde_spec": horde_spec.to_config(),
+        "horde_hidden_sizes": list(config.horde_hidden_sizes),
+        "horde_step_size": config.horde_step_size,
+    }
+    encoded = json.dumps(
+        payload,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return jnp.asarray(
+        tuple(hashlib.sha256(encoded).digest()),
+        dtype=jnp.uint8,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1229,6 +2116,37 @@ class PrototypeFeatureRepresentationState:
 
 
 @chex.dataclass(frozen=True)
+class PrototypeLearningValueRouterState:
+    """Enabled-only owner bundle in the historical builder-state slot.
+
+    ``representation_state`` is exactly the PyTree that would occupy
+    ``PrototypeAgentState.state_builder_state`` with routing disabled. Keeping
+    the router in this opt-in outer shell leaves every historical config and
+    checkpoint template unchanged while binding one causal router state to the
+    accepted real-transition owner.
+    """
+
+    representation_state: Any
+    learning_value_router_state: LearningValueRouterState
+
+
+@chex.dataclass(frozen=True)
+class PrototypeFeatureWorldModelState:
+    """V17 world-model state bound to the exact full Prototype config."""
+
+    model_state: ActionConditionedWorldModelState
+    schema_digest: UInt[Array, " 32"]
+
+
+@chex.dataclass(frozen=True)
+class PrototypeAtomicFeatureWorldMemoryState:
+    """V18 routed-world slot bound to the complete atomic composition."""
+
+    world_state: PrototypeRoutedLinearWorldState
+    schema_digest: UInt[Array, " 32"]
+
+
+@chex.dataclass(frozen=True)
 class PrototypeFeatureOaKState:
     """Enabled-only OaK subtree coupled to its exact feature-bank identity."""
 
@@ -1237,18 +2155,113 @@ class PrototypeFeatureOaKState:
 
 
 @chex.dataclass(frozen=True)
+class PrototypeFeatureOaKHordeState:
+    """Atomic OaK/Horde consumers bound to one ordered feature-bank schema.
+
+    This wrapper exists only for the narrow linear-Horde feature-lifecycle
+    composition.  The historical top-level ``horde_state`` slot remains
+    ``None`` so the two feature-indexed consumers cannot be swapped or
+    restored independently.
+    """
+
+    oak_state: OaKState
+    horde_state: MultiHeadMLPState
+    consumer_binding: PrototypeFeatureConsumerBinding
+    schema_digest: UInt[Array, " 32"]
+
+
+@chex.dataclass(frozen=True)
+class PrototypeFeatureOaKHordeUtilityState:
+    """Enabled-only atomic consumers plus bound causal-utility audit state."""
+
+    consumer_state: PrototypeFeatureOaKHordeState
+    feature_utility_state: PrototypeFeatureUtilityState
+    schema_digest: UInt[Array, " 32"]
+
+    @property
+    def oak_state(self) -> OaKState:
+        """Expose the nested OaK state without duplicating persistent leaves."""
+
+        return self.consumer_state.oak_state
+
+    @property
+    def horde_state(self) -> MultiHeadMLPState:
+        """Expose the nested Horde state without duplicating persistent leaves."""
+
+        return self.consumer_state.horde_state
+
+    @property
+    def consumer_binding(self) -> PrototypeFeatureConsumerBinding:
+        """Expose the nested bank identity."""
+
+        return self.consumer_state.consumer_binding
+
+
+@chex.dataclass(frozen=True)
+class PrototypeFeatureOaKHordeUtilityCurationState:
+    """V6 shell binding ranking semantics around the unchanged v5 bundle."""
+
+    utility_state: PrototypeFeatureOaKHordeUtilityState
+    schema_digest: UInt[Array, " 32"]
+
+    @property
+    def oak_state(self) -> OaKState:
+        """Expose the nested OaK state without duplicating it."""
+
+        return self.utility_state.oak_state
+
+    @property
+    def horde_state(self) -> MultiHeadMLPState:
+        """Expose the nested Horde state without duplicating it."""
+
+        return self.utility_state.horde_state
+
+    @property
+    def consumer_binding(self) -> PrototypeFeatureConsumerBinding:
+        """Expose the nested feature-bank identity."""
+
+        return self.utility_state.consumer_binding
+
+    @property
+    def feature_utility_state(self) -> PrototypeFeatureUtilityState:
+        """Expose the unchanged v5 auditor state."""
+
+        return self.utility_state.feature_utility_state
+
+
+@chex.dataclass(frozen=True)
 class PrototypeAgentState:
     """Full prototype agent state.
 
     Optional sub-states (``world_model_state``, ``buffer_state``,
-    ``horde_state``, ``ia_state``) are ``None`` when the corresponding
-    component is disabled in the configuration.  The PyTree structure is
-    fixed for a given :class:`PrototypeAgent` instance — never switch between
+    ``horde_state``, ``ia_state``) are normally ``None`` when the corresponding
+    component is disabled.  The shared feature/Horde lane is the deliberate
+    exception: its top-level ``horde_state`` is ``None`` because the live
+    Horde is atomically stored with OaK in
+    :class:`PrototypeFeatureOaKHordeState`, or inside
+    :class:`PrototypeFeatureOaKHordeUtilityState` on the diagnostic utility
+    lane, or one additional
+    :class:`PrototypeFeatureOaKHordeUtilityCurationState` shell on the v6
+    ranking-influence lane. The opt-in learning-value router similarly wraps
+    the otherwise unchanged ``state_builder_state`` in exactly one
+    :class:`PrototypeLearningValueRouterState`. The PyTree structure is fixed
+    for a given :class:`PrototypeAgent` instance — never switch between
     ``None`` and a real state after initialisation.
+
+    ``step_words`` and ``observation_event_words`` make the Prototype's outer
+    real-transition and observation identities exact. IA, partner fusion, and
+    feature lifecycle and feature utility authenticate their own exact word
+    identities against these clocks; explicitly smaller observation budgets
+    remain deliberate capacity caps. The feature/action-world lane binds its
+    model clock exactly to the outer transaction; the legacy direct-world lane
+    may lag after a best-effort model refusal. Other recurrent/model lanes
+    retain configured update caps or bounded owner counters and are outside
+    this outer-clock lifetime claim. Exact identity never implies unbounded
+    child capacity or infinite-precision utility estimates.
     """
 
     oak_state: Any  # OaKState | PrototypeFeatureOaKState
-    world_model_state: Any  # ActionConditionedWorldModelState | None
+    world_model_state: Any  # Configured model state or exact composition wrapper.
     buffer_state: Any  # RecentObservationBufferState | None
     horde_state: Any  # MultiHeadMLPState | None
     ia_state: Any  # IAState | None
@@ -1259,8 +2272,43 @@ class PrototypeAgentState:
     current_action: Int[Array, ""]
     current_decision_id: UInt[Array, " 4"]
     started: Bool[Array, ""]
+    # The int32 scalars are saturating compatibility telemetry.  Scheduling,
+    # ownership, and checkpoint identity use the exact uint32 word clocks.
     observation_event_count: Int[Array, ""]
+    observation_event_words: UInt[Array, " 2"]
     step_count: Int[Array, ""]
+    step_words: UInt[Array, " 2"]
+
+
+@dataclasses.dataclass(frozen=True)
+class PrototypeAgentStateResourceMeasurement:
+    """Measured persistent JAX-array resources for one concrete Prototype state.
+
+    Bundle names follow the top-level state ownership boundary.  For example,
+    a shared feature/Horde lane is counted once inside ``oak_bundle_nbytes``;
+    experiential memory is counted once inside
+    ``interaction_memory_bundle_nbytes``. Python objects are excluded. Legacy
+    host timing scalars that :meth:`PrototypeAgent.init` materializes as JAX
+    arrays are included in the measured bytes, elements, and leaves even
+    though they remain outside the learning-state identity semantics.
+    """
+
+    total_nbytes: int
+    total_array_elements: int
+    total_array_leaves: int
+    oak_bundle_nbytes: int
+    world_model_bundle_nbytes: int
+    buffer_nbytes: int
+    standalone_horde_nbytes: int
+    interaction_memory_bundle_nbytes: int
+    gru_nbytes: int
+    state_builder_feature_bundle_nbytes: int
+    outer_nbytes: int
+
+    def to_config(self) -> dict[str, int]:
+        """Return an exact JSON-compatible measurement payload."""
+
+        return dataclasses.asdict(self)
 
 
 @chex.dataclass(frozen=True)
@@ -1290,7 +2338,10 @@ class PrototypeMemoryInteractionState:
     """
 
     interaction_state: Any
-    experiential_memory_state: ExperientialMemoryState
+    # The enabled-only feature-lifecycle composition stores a
+    # PrototypeFeatureMemoryState here; every historical/no-lifecycle memory
+    # configuration retains the bare ExperientialMemoryState PyTree.
+    experiential_memory_state: Any
 
 
 @chex.dataclass(frozen=True)
@@ -1346,9 +2397,35 @@ class PrototypeDecision:
 
 
 @chex.dataclass(frozen=True)
+class PrototypeCachedPrimitiveActionReplacement:
+    """Atomic replacement of every owner of one cached primitive dispatch.
+
+    ``committed`` is the authority for the outer transaction. The nested
+    STOMP diagnostic may describe a valid counterfactual replacement even
+    when stale Prototype provenance vetoes the commit; in that case the
+    complete Prototype state and returned action are exact no-ops.
+    """
+
+    state: PrototypeAgentState
+    action: Int[Array, ""]
+    dispatch_replacement: DispatchedPrimitiveActionDecision
+    decision_id_matches: Bool[Array, ""]
+    observation_matches: Bool[Array, ""]
+    state_valid_before: Bool[Array, ""]
+    state_valid_after: Bool[Array, ""]
+    committed: Bool[Array, ""]
+
+
+@chex.dataclass(frozen=True)
 class PrototypeTransitionDiagnostics:
     """Fail-closed ownership and boundary checks for one real transition."""
 
+    pre_step_words: UInt[Array, " 2"]
+    proposed_step_words: UInt[Array, " 2"]
+    pre_observation_event_words: UInt[Array, " 2"]
+    proposed_observation_event_words: UInt[Array, " 2"]
+    outer_counter_valid: Bool[Array, ""]
+    current_counter_capacity_available: Bool[Array, ""]
     started: Bool[Array, ""]
     inputs_finite: Bool[Array, ""]
     action_in_range: Bool[Array, ""]
@@ -1365,6 +2442,46 @@ class PrototypeTransitionDiagnostics:
     post_update_consistent: Bool[Array, ""]
     valid: Bool[Array, ""]
     rejected: Bool[Array, ""]
+
+
+@chex.dataclass(frozen=True)
+class PrototypeRTUTransitionPreparation:
+    """Read-only RTU recurrence preparation for an external causal learner.
+
+    Preparation owns the exact source state and normalized transition, advances
+    the RTU through the real bootstrap plus optional reset/restart observation,
+    and performs no control/model learner update or action-selection RNG draw.
+    :meth:`PrototypeAgent.finalize_rtu_transition` recomputes this record before
+    accepting an externally learned/recycled destination.
+    """
+
+    source_state: PrototypeAgentState
+    transition: PrototypeTransition
+    transition_diagnostics: PrototypeTransitionDiagnostics
+    source_builder_state: RecurrentTraceUnitStateBuilderState
+    bootstrap_transition: RecurrentTraceUnitStateBuilderTransitionResult
+    decision_builder_state: RecurrentTraceUnitStateBuilderState
+    decision_representation: Float[Array, " representation_dim"]
+    execution_boundary: Bool[Array, ""]
+    preparation_valid: Bool[Array, ""]
+
+
+@chex.dataclass(frozen=True)
+class PrototypeRTUFinalizationReceipt:
+    """Content-bound RTU proposal and derived destination for one preparation.
+
+    The tag detects mutation but grants no authority by itself.  Finalization
+    independently recomputes the proposal through the exact supplied RTU
+    mechanism before accepting the destination.  Neither step authenticates
+    the external caller's lifecycle source, downstream objective/gradient, or
+    source-bound ordinary learning proposal.
+    """
+
+    preparation: PrototypeRTUTransitionPreparation
+    rtu_proposal: RTUGenerateAndTestProposal
+    final_builder_state: RecurrentTraceUnitStateBuilderState
+    replaced_unit_mask: Bool[Array, " hidden_dim"]
+    content_tag_words: UInt[Array, " 8"]
 
 
 @chex.dataclass(frozen=True)
@@ -1446,13 +2563,47 @@ class PrototypeFeatureLifecycleIntegrationDiagnostics:
     pullback_semantic_generation: Int[Array, ""]
     prediction: Float[Array, ""]
     error: Float[Array, ""]
+    task_targets: Float[Array, " n_tasks"]
+    task_target_available: Bool[Array, " n_tasks"]
+    task_predictions: Float[Array, " n_tasks"]
+    task_errors: Float[Array, " n_tasks"]
     metrics: Float[Array, " 7"]
     lifecycle: PrototypeFeatureLifecycleDiagnostics
     outer_transaction_committed: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
-class PrototypeGradientJoyEvidence:
+class PrototypeFeatureUtilityIntegrationDiagnostics:
+    """Separate old-bank scoring from any destination-generation rebind."""
+
+    observation: PrototypeFeatureUtilityDiagnostics
+    rebind: PrototypeFeatureUtilityDiagnostics
+    rebind_required: Bool[Array, ""]
+    outer_transaction_committed: Bool[Array, ""]
+
+
+@chex.dataclass(frozen=True)
+class PrototypeFeatureUtilityCurationIntegrationDiagnostics:
+    """Audit-ranked curation facts without cross-cohort promotion authority."""
+
+    policy: PrototypeFeatureUtilityCurationDiagnostics
+    observation_applied: Bool[Array, ""]
+    priority_override_supplied: Bool[Array, ""]
+    priority_override_consulted: Bool[Array, ""]
+    curation_allowed: Bool[Array, ""]
+    selected_active_slot: Int[Array, ""]
+    selected_candidate_slot: Int[Array, ""]
+    selected_active_descriptor: Int[Array, " 2"]
+    selected_candidate_descriptor: Int[Array, " 2"]
+    lifecycle_curation_proposed: Bool[Array, ""]
+    lifecycle_curation_deferred: Bool[Array, ""]
+    lifecycle_curation_committed: Bool[Array, ""]
+    lifecycle_curation_rolled_back: Bool[Array, ""]
+    outer_transaction_committed: Bool[Array, ""]
+
+
+@chex.dataclass(frozen=True)
+class PrototypeCandidateUpdateAuditEvidence:
     """Decision-bound probe evidence for one representation update.
 
     The three parameter-gradient probes must be measured independently of the
@@ -1466,8 +2617,8 @@ class PrototypeGradientJoyEvidence:
     Every availability flag is explicit. Missing evidence, a stale decision
     ID, a false independence attestation, or any unavailable/non-finite input
     causes the candidate-update audit to fail closed without invalidating the
-    real control transition. This class name is retained for API compatibility;
-    it does not represent the paper's Kondo backward-selection decision.
+    real control transition. It is a candidate-update audit sidecar, not the
+    paper's Kondo backward-selection decision.
     """
 
     decision_id: UInt[Array, " 4"]
@@ -1484,6 +2635,12 @@ class PrototypeGradientJoyEvidence:
     advantage_available: Bool[Array, ""]
     action_surprisal_available: Bool[Array, ""]
     safety_cost_available: Bool[Array, ""]
+
+
+# Historical compatibility spelling. Canonical callers use the candidate-audit
+# name above so “gradient sparks joy” remains reserved for an executed actor
+# backward contribution.
+PrototypeGradientJoyEvidence = PrototypeCandidateUpdateAuditEvidence
 
 
 @chex.dataclass(frozen=True)
@@ -1522,6 +2679,7 @@ class PrototypeExperientialMemoryDiagnostics:
     """Complete causal memory, categorical proposal, and dispatch audit."""
 
     proposal: ExperientialMemoryPolicyProposal
+    advantage_gate: ExperientialMemoryAdvantageGateDiagnostics | None
     dispatch_replacement: DispatchedPrimitiveActionDecision
     input_supplied: Bool[Array, ""]
     input_available: Bool[Array, ""]
@@ -1541,6 +2699,47 @@ class PrototypeExperientialMemoryDiagnostics:
     effective_action: Int[Array, ""]
 
 
+@chex.dataclass(frozen=True)
+class PrototypeFeatureMemoryIntegrationDiagnostics:
+    """Exact feature-bank migration and memory-version composition audit."""
+
+    rebind: PrototypeFeatureMemoryRebindDiagnostics
+    query_source_version_matches: Bool[Array, ""]
+    entry_source_version_matches: Bool[Array, ""]
+    source_versions_match: Bool[Array, ""]
+    current_destination_encoding_valid: Bool[Array, ""]
+    bootstrap_destination_encoding_valid: Bool[Array, ""]
+    decision_destination_encoding_valid: Bool[Array, ""]
+    post_memory_state_valid: Bool[Array, ""]
+    outer_transaction_committed: Bool[Array, ""]
+
+
+@chex.dataclass(frozen=True)
+class PrototypeAtomicFeatureWorldMemoryDiagnostics:
+    """Audit one all-consumer readiness and adoption decision."""
+
+    available: Bool[Array, ""]
+    descriptor_change_requested: Bool[Array, ""]
+    lifecycle_destination_ready: Bool[Array, ""]
+    world_ordinary_ready: Bool[Array, ""]
+    world_destination_ready: Bool[Array, ""]
+    memory_destination_ready: Bool[Array, ""]
+    all_consumers_ready: Bool[Array, ""]
+    destination_adopted: Bool[Array, ""]
+    ordinary_updates_retained: Bool[Array, ""]
+    external_curation_rolled_back: Bool[Array, ""]
+    lifecycle_adoption: PrototypeFeatureLifecycleAdoptionDiagnostics
+    world_adoption: PrototypeRoutedLinearWorldAdoptionDiagnostics
+    oak_update_evaluations: Int[Array, ""]
+    horde_update_evaluations: Int[Array, ""]
+    feature_learner_update_evaluations: Int[Array, ""]
+    lifecycle_router_evaluations: Int[Array, ""]
+    world_learner_update_evaluations: Int[Array, ""]
+    world_router_evaluations: Int[Array, ""]
+    memory_rebind_evaluations: Int[Array, ""]
+    memory_step_evaluations: Int[Array, ""]
+
+
 @dataclasses.dataclass(frozen=True)
 class PrototypeExperientialMemoryResourceDeclaration:
     """Exact persistent allocation and bounded work per required transaction."""
@@ -1556,6 +2755,40 @@ class PrototypeExperientialMemoryResourceDeclaration:
 
     def to_config(self) -> dict[str, int]:
         """Return the exact JSON-compatible resource declaration."""
+
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class PrototypeAtomicFeatureWorldMemoryResourceBudget:
+    """Exact enabled-state ownership and per-transition call maxima."""
+
+    mechanism_status: str
+    scientific_promotion_allowed: bool
+    persistent_state_nbytes: int
+    persistent_capacity_growth: int
+    lifecycle_authority_count: int
+    router_authority_count: int
+    oak_consumer_count: int
+    ordered_linear_horde_count: int
+    routed_world_count: int
+    world_model_buffer_count: int
+    experiential_memory_count: int
+    mirrored_binding_cache_count: int
+    mirrored_binding_cache_nbytes: int
+    oak_update_evaluations_per_transition: int
+    horde_update_evaluations_per_transition: int
+    feature_learner_update_evaluations_per_transition: int
+    lifecycle_router_evaluations_per_transition: int
+    world_learner_update_evaluations_per_transition: int
+    world_router_evaluations_per_transition: int
+    memory_rebind_evaluations_per_transition: int
+    memory_step_evaluations_per_transition: int
+    deterministic_prestate_memory_queries_per_transition: int
+    memory_writes_attempted_per_transition: int
+
+    def to_config(self) -> dict[str, str | int | bool]:
+        """Return an exact JSON-compatible declaration."""
 
         return dataclasses.asdict(self)
 
@@ -1618,15 +2851,34 @@ class PrototypeUpdateResult:
     Candidate audit acceptance and committed application are deliberately
     separate finite-precision facts. The ``sparks_joy`` and
     ``joyful_gradient_applied`` properties are historical compatibility names;
-    paper-defined “sparks joy” refers to Kondo backward selection.
+    paper-defined “sparks joy” means the sample gradient actually enters an
+    executed ``KondoSparseActor`` backward.
+
+    ``learning_value_router_result`` is ``None`` on historical disabled
+    configs. On the opt-in lane it is the one raw/normalized routing receipt
+    for an accepted transition, or an explicit no-event receipt when the outer
+    transaction rejects. Candidate auditing consumes only its raw evidence
+    route.
     """
 
     state: PrototypeAgentState
     action: Int[Array, ""]
     oak_td_error: Float[Array, ""]
     oak_average_reward: Float[Array, ""]
+    oak_stomp_update_result: STOMPUpdateResult
+    oak_stomp_update_available: Bool[Array, ""]
+    oak_stomp_update_evaluations: Int[Array, ""]
+    oak_owner_finalization_trace: STOMPOwnerFinalizationTrace
+    oak_real_stomp_update_evaluations: Int[Array, ""]
+    oak_imagined_stomp_update_evaluations: Int[Array, ""]
+    oak_total_stomp_update_evaluations: Int[Array, ""]
+    oak_option_search_learner_updates: Int[Array, ""]
+    oak_bootstrap_observation: Float[Array, " observation_dim"]
+    oak_decision_observation: Float[Array, " observation_dim"]
+    oak_execution_boundary: Bool[Array, ""]
     world_model_error: Any  # Float[Array, ""] | None
     learning_signals: TypedLearningSignals
+    learning_value_router_result: LearningValueRouterResult | None
     world_model_representation_gradient: Float[Array, " observation_dim"]
     world_model_representation_gradient_valid: Bool[Array, ""]
     behavior_gradient_result: PrototypeBehaviorGradientResult
@@ -1639,31 +2891,61 @@ class PrototypeUpdateResult:
     model_replay_updates_applied: Int[Array, ""]
     model_replay_padding_count: Int[Array, ""]
     state_builder_learning_diagnostics: StateBuilderLearningDiagnostics
-    gradient_joy_application: Any  # GradientJoyApplicationResult | None
+    gradient_joy_application: Any  # CandidateUpdateAuditApplicationResult | None
     gradient_joy_evidence_supplied: Bool[Array, ""]
     gradient_joy_decision_id_matches: Bool[Array, ""]
     option_search_control_diagnostics: OptionSearchControlDiagnostics | None
     prototype_feature_lifecycle_diagnostics: (
         PrototypeFeatureLifecycleIntegrationDiagnostics | None
     )
+    prototype_feature_utility_diagnostics: (
+        PrototypeFeatureUtilityIntegrationDiagnostics | None
+    )
+    prototype_feature_utility_curation_diagnostics: (
+        PrototypeFeatureUtilityCurationIntegrationDiagnostics | None
+    )
     dream_td_errors: Any  # Float[Array, " n_dreams"] | None
     horde_td_errors: Any  # Float[Array, " n_demons"] | None
     ia_augmented_obs: Any  # Float[Array, " augmented_dim"] | None
     ia_recommendation: Any  # Int[Array, ""] | None
+    ia_update_applied: Bool[Array, ""]
     experiential_memory_diagnostics: PrototypeExperientialMemoryDiagnostics | None
+    prototype_feature_memory_diagnostics: (
+        PrototypeFeatureMemoryIntegrationDiagnostics | None
+    )
     partner_policy_fusion_diagnostics: PrototypePartnerPolicyFusionDiagnostics | None
     transition_diagnostics: PrototypeTransitionDiagnostics
+    prototype_atomic_feature_world_memory_diagnostics: (
+        PrototypeAtomicFeatureWorldMemoryDiagnostics | None
+    ) = None
+
+    @property
+    def candidate_update_audit_application(
+        self,
+    ) -> CandidateUpdateAuditApplicationResult | None:
+        """Return the historical audit application's canonical view."""
+        return cast(
+            CandidateUpdateAuditApplicationResult | None,
+            self.gradient_joy_application,
+        )
+
+    @property
+    def candidate_update_audit_evidence_supplied(self) -> Bool[Array, ""]:
+        """Return whether a candidate-audit evidence sidecar was supplied."""
+        return self.gradient_joy_evidence_supplied
+
+    @property
+    def candidate_update_audit_decision_id_matches(self) -> Bool[Array, ""]:
+        """Return whether candidate-audit evidence names this decision."""
+        return self.gradient_joy_decision_id_matches
 
     @property
     def candidate_update_audit_passed(self) -> Bool[Array, ""]:
         """Return whether this event's multi-objective candidate audit passed."""
-        application = self.gradient_joy_application
+        application = self.candidate_update_audit_application
         if application is None:
             return jnp.asarray(False, dtype=jnp.bool_)
-        return cast(
-            GradientJoyApplicationResult,
-            application,
-        ).assessment.candidate_update_audit_passed
+        return application.assessment.candidate_update_audit_passed
 
     @property
     def sparks_joy(self) -> Bool[Array, ""]:
@@ -1693,13 +2975,10 @@ class PrototypeUpdateResult:
     @property
     def audited_candidate_update_applied(self) -> Bool[Array, ""]:
         """Report whether the audited finite-precision update was committed."""
-        application = self.gradient_joy_application
+        application = self.candidate_update_audit_application
         if application is None:
             return jnp.asarray(False, dtype=jnp.bool_)
-        return (
-            cast(GradientJoyApplicationResult, application).applied
-            & self.state_builder_learning_diagnostics.applied
-        )
+        return application.applied & self.state_builder_learning_diagnostics.applied
 
     @property
     def joyful_gradient_applied(self) -> Bool[Array, ""]:
@@ -1709,7 +2988,15 @@ class PrototypeUpdateResult:
 
 @chex.dataclass(frozen=True)
 class PrototypeArrayResult:
-    """Result from :meth:`PrototypeAgent.scan` over a batch of transitions."""
+    """Result from :meth:`PrototypeAgent.scan` over a batch of transitions.
+
+    ``gradient_sparks_joy`` and ``joyful_gradient_applied`` are serialized
+    compatibility fields for the historical candidate-update audit. Prefer
+    the canonical vector properties ``candidate_update_audit_passed`` and
+    ``audited_candidate_update_applied``. These values do not answer the
+    paper's question; actual Kondo actor-backward admission is reported by
+    :class:`~alberta_framework.core.kondo_sparse_actor.KondoSparseActorResult`.
+    """
 
     state: PrototypeAgentState
     actions: Int[Array, " num_steps"]
@@ -1719,6 +3006,16 @@ class PrototypeArrayResult:
     state_builder_learning_applied: Bool[Array, " num_steps"]
     gradient_sparks_joy: Bool[Array, " num_steps"]
     joyful_gradient_applied: Bool[Array, " num_steps"]
+
+    @property
+    def candidate_update_audit_passed(self) -> Bool[Array, " num_steps"]:
+        """Return the per-transition candidate-update audit decisions."""
+        return self.gradient_sparks_joy
+
+    @property
+    def audited_candidate_update_applied(self) -> Bool[Array, " num_steps"]:
+        """Return the per-transition audited update application decisions."""
+        return self.joyful_gradient_applied
 
 
 def _contains_tracer(value: Any) -> bool:
@@ -1762,6 +3059,129 @@ def _tree_arrays_equal(left: Any, right: Any) -> Bool[Array, ""]:
     )
 
 
+def _prototype_rtu_uint32_words(value: Array) -> UInt[Array, " words"]:
+    """Return exact words for one supported RTU finalization leaf."""
+
+    array = jnp.asarray(value)
+    if jnp.issubdtype(array.dtype, jax.dtypes.prng_key):
+        return jr.key_data(array).reshape((-1,)).astype(jnp.uint32)
+    if array.dtype == jnp.dtype(jnp.uint32):
+        return array.reshape((-1,))
+    if array.dtype in {jnp.dtype(jnp.float32), jnp.dtype(jnp.int32)}:
+        return jax.lax.bitcast_convert_type(array, jnp.uint32).reshape((-1,))
+    if array.dtype == jnp.dtype(jnp.bool_):
+        return array.astype(jnp.uint32).reshape((-1,))
+    raise TypeError(f"RTU finalization tag does not support dtype {array.dtype}")
+
+
+def _prototype_rtu_tree_exact(left: Any, right: Any) -> Bool[Array, ""]:
+    """Compare a fixed RTU receipt PyTree by exact typed array content."""
+
+    left_leaves, left_structure = jax.tree.flatten(left)
+    right_leaves, right_structure = jax.tree.flatten(right)
+    if (
+        cast(Any, left_structure) != right_structure
+        or len(left_leaves) != len(right_leaves)
+    ):
+        return jnp.asarray(False, dtype=jnp.bool_)
+    predicates: list[Array] = []
+    for left_leaf, right_leaf in zip(left_leaves, right_leaves, strict=True):
+        left_array = jnp.asarray(left_leaf)
+        right_array = jnp.asarray(right_leaf)
+        if (
+            left_array.shape != right_array.shape
+            or left_array.dtype != right_array.dtype
+        ):
+            return jnp.asarray(False, dtype=jnp.bool_)
+        predicates.append(
+            jnp.array_equal(
+                _prototype_rtu_uint32_words(left_array),
+                _prototype_rtu_uint32_words(right_array),
+            )
+        )
+    if not predicates:
+        return jnp.asarray(True, dtype=jnp.bool_)
+    return jnp.all(jnp.stack(predicates))
+
+
+def _prototype_rtu_destination_tag(
+    preparation: PrototypeRTUTransitionPreparation,
+    rtu_proposal: RTUGenerateAndTestProposal,
+    final_builder_state: RecurrentTraceUnitStateBuilderState,
+    replaced_unit_mask: Array,
+) -> UInt[Array, " 8"]:
+    """Bind the exact prepared event, RTU proposal, destination, and reset mask."""
+
+    lanes = jnp.asarray(
+        (
+            0x6A09E667,
+            0xBB67AE85,
+            0x3C6EF372,
+            0xA54FF53A,
+            0x510E527F,
+            0x9B05688C,
+            0x1F83D9AB,
+            0x5BE0CD19,
+        ),
+        dtype=jnp.uint32,
+    )
+    multipliers = jnp.asarray(
+        (
+            0x9E3779B1,
+            0x85EBCA77,
+            0xC2B2AE3D,
+            0x27D4EB2F,
+            0x165667B1,
+            0xD3A2646D,
+            0xFD7046C5,
+            0xB55A4F09,
+        ),
+        dtype=jnp.uint32,
+    )
+    bound_values = (
+        preparation.source_state.current_decision_id,
+        preparation.source_state.step_words,
+        preparation.source_state.observation_event_words,
+        preparation.transition.observation,
+        preparation.transition.action,
+        preparation.transition.reward,
+        preparation.transition.discount,
+        preparation.transition.terminated,
+        preparation.transition.truncated,
+        preparation.transition.next_observation,
+        preparation.transition.next_decision_observation,
+        preparation.source_builder_state,
+        preparation.bootstrap_transition,
+        preparation.decision_builder_state,
+        preparation.decision_representation,
+        rtu_proposal,
+        final_builder_state,
+        replaced_unit_mask,
+    )
+    words = jnp.concatenate(
+        tuple(
+            _prototype_rtu_uint32_words(leaf)
+            for leaf in jax.tree.leaves(bound_values)
+        )
+    )
+
+    def mix(index: Array, state: Array) -> Array:
+        word = words[index]
+        lane = index & jnp.asarray(7, dtype=jnp.int32)
+        mixed = state.at[lane].set(
+            (state[lane] ^ word) * multipliers[lane]
+        )
+        neighbor = (lane + jnp.asarray(3, dtype=jnp.int32)) & jnp.asarray(
+            7,
+            dtype=jnp.int32,
+        )
+        return mixed.at[neighbor].set(
+            mixed[neighbor] + jnp.left_shift(word, index & 15)
+        )
+
+    return jax.lax.fori_loop(0, words.shape[0], mix, lanes).astype(jnp.uint32)
+
+
 def _recurrent_nll_estimator_offset(
     config: RecurrentLatentWorldModelEnsembleConfig,
 ) -> float:
@@ -1779,6 +3199,7 @@ def _unavailable_learning_signals() -> TypedLearningSignals:
     """Return finite zeros whose typed channels are explicitly unavailable."""
     zero = jnp.asarray(0.0, dtype=jnp.float32)
     unavailable = jnp.asarray(False, dtype=jnp.bool_)
+    zero_words = jnp.zeros((2,), dtype=jnp.uint32)
     return TypedLearningSignals(
         epistemic_disagreement=zero,
         epistemic_surprise=zero,
@@ -1796,6 +3217,95 @@ def _unavailable_learning_signals() -> TypedLearningSignals:
             learning_progress=unavailable,
             change_probability=unavailable,
         ),
+        counter_status=LearningSignalCounterStatus(
+            pre_step_words=zero_words,
+            post_step_words=zero_words,
+            pre_valid_words=zero_words,
+            post_valid_words=zero_words,
+            pre_invalid_words=zero_words,
+            post_invalid_words=zero_words,
+            lifetime_counter_valid=unavailable,
+            lifetime_capacity_available=unavailable,
+            state_valid=unavailable,
+            event_recorded=unavailable,
+            valid_event_recorded=unavailable,
+            invalid_event_recorded=unavailable,
+        ),
+    )
+
+
+def _unavailable_stomp_update_result(oak_state: OaKState) -> STOMPUpdateResult:
+    """Return a fixed-tree no-evaluation trace for a rejected Prototype step."""
+
+    stomp = oak_state.stomp_state
+    zero_float = jnp.asarray(0.0, dtype=jnp.float32)
+    zero_int = jnp.asarray(0, dtype=jnp.int32)
+    false = jnp.asarray(False, dtype=jnp.bool_)
+    return STOMPUpdateResult(
+        state=stomp,
+        td_error=zero_float,
+        average_reward=stomp.base_average_reward,
+        primitive_action=stomp.last_primitive_action,
+        executing_option=stomp.executing_option,
+        option_terminated=false,
+        pseudo_reward=zero_float,
+        option_importance_ratio=zero_float,
+        planning_backups=zero_int,
+        planning_td_error=zero_float,
+        pre_step_words=stomp.step_words,
+        post_step_words=stomp.step_words,
+        inputs_valid=false,
+        lifetime_counter_valid=false,
+        lifetime_capacity_available=false,
+        nested_lifetime_counter_valid=false,
+        nested_lifetime_capacity_available=false,
+        nested_updates_required=zero_int,
+        nested_updates_applied=zero_int,
+        proposed_state_valid=false,
+        update_applied=false,
+    )
+
+
+def _unavailable_stomp_owner_finalization_trace(
+    oak_state: OaKState,
+) -> STOMPOwnerFinalizationTrace:
+    """Return a fixed-tree no-work trace for a rejected Prototype step."""
+
+    stomp = oak_state.stomp_state
+    false = jnp.asarray(False, dtype=jnp.bool_)
+    true = jnp.asarray(True, dtype=jnp.bool_)
+    zero = jnp.asarray(0, dtype=jnp.int32)
+    zero_digest = jnp.zeros((8,), dtype=jnp.uint32)
+    stages = tuple(
+        make_stomp_owner_stage_receipt(
+            stomp,
+            stomp,
+            stage_kind=stage_kind,
+            configured=false,
+            evaluated=false,
+            stomp_update_evaluations=zero,
+            learner_updates_applied=zero,
+            source_digest=zero_digest,
+            destination_digest=zero_digest,
+            classified_delta_valid=true,
+        )
+        for stage_kind in (
+            STOMP_OWNER_STAGE_OPTION_SEARCH,
+            STOMP_OWNER_STAGE_FEATURE_ROUTE,
+            STOMP_OWNER_STAGE_DYNA,
+            STOMP_OWNER_STAGE_MEMORY_DISPATCH,
+            STOMP_OWNER_STAGE_PARTNER_DISPATCH,
+        )
+    )
+    return make_stomp_owner_finalization_trace(
+        stomp,
+        cast(Any, stages),
+        stomp,
+        real_control_stomp_evaluations=zero,
+        imagined_stomp_evaluations=zero,
+        option_search_learner_updates=zero,
+        raw_digest=zero_digest,
+        final_digest=zero_digest,
     )
 
 
@@ -1914,6 +3424,32 @@ def _gate_recurrent_learning_signals(
             normalized_residual=uncertainty_available,
             learning_progress=progress_available,
             change_probability=change_available,
+        ),
+        counter_status=signals.counter_status.replace(
+            post_step_words=jnp.where(
+                transaction_applied,
+                signals.counter_status.post_step_words,
+                signals.counter_status.pre_step_words,
+            ),
+            post_valid_words=jnp.where(
+                transaction_applied,
+                signals.counter_status.post_valid_words,
+                signals.counter_status.pre_valid_words,
+            ),
+            post_invalid_words=jnp.where(
+                transaction_applied,
+                signals.counter_status.post_invalid_words,
+                signals.counter_status.pre_invalid_words,
+            ),
+            event_recorded=(
+                transaction_applied & signals.counter_status.event_recorded
+            ),
+            valid_event_recorded=(
+                transaction_applied & signals.counter_status.valid_event_recorded
+            ),
+            invalid_event_recorded=(
+                transaction_applied & signals.counter_status.invalid_event_recorded
+            ),
         ),
     )
 
@@ -2068,6 +3604,15 @@ def _strict_bool_scalar(value: Any, *, name: str) -> Array:
     return jnp.asarray(array, dtype=jnp.bool_)
 
 
+def _strict_bool_array(value: Any, shape: tuple[int, ...], *, name: str) -> Array:
+    """Require an exact fixed-shape boolean array."""
+
+    array = jnp.asarray(value)
+    if array.dtype != jnp.bool_ or array.shape != shape:
+        raise ValueError(f"{name} must have shape {shape} and dtype bool")
+    return jnp.asarray(array, dtype=jnp.bool_)
+
+
 def _strict_action_scalar(value: Any, *, name: str) -> Array:
     """Require one scalar integer action that round-trips through int32."""
     array = jnp.asarray(value)
@@ -2128,10 +3673,120 @@ def _decision_generation_available(decision_id: Array) -> Array:
     return ~jnp.all(decision_id[2:] == maximum)
 
 
-def _step_counter_can_process(step_count: Array) -> Bool[Array, ""]:
-    """Return whether one already-dispatched transition can still be counted."""
-    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
-    return (step_count >= 0) & (step_count < maximum)
+def _checked_lifetime_words_add(
+    words: Array,
+    delta: int,
+) -> tuple[UInt[Array, " 2"], Bool[Array, ""]]:
+    """Advance one uint64 word clock by a small non-negative host delta."""
+
+    if getattr(words, "shape", None) != (2,):
+        raise ValueError("lifetime counter words must have shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("lifetime counter words must have dtype uint32")
+    if type(delta) is not int or not 0 <= delta <= 2:
+        raise ValueError("lifetime word delta must be one of 0, 1, or 2")
+    if delta == 0:
+        return jnp.asarray(words, dtype=jnp.uint32), jnp.asarray(True)
+    maximum = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+    delta_word = jnp.asarray(delta, dtype=jnp.uint32)
+    low_capacity = words[1] <= maximum - delta_word
+    high_capacity = words[0] < maximum
+    capacity_available = low_capacity | high_capacity
+    low = words[1] + delta_word
+    carry = (low < words[1]).astype(jnp.uint32)
+    candidate = jnp.stack((words[0] + carry, low))
+    return (
+        jnp.where(capacity_available, candidate, words).astype(jnp.uint32),
+        capacity_available,
+    )
+
+
+def _lifetime_counter_valid(
+    words: Array,
+    telemetry: Array,
+) -> Bool[Array, ""]:
+    """Authenticate one exact uint64 identity against int32 telemetry."""
+
+    if getattr(words, "shape", None) != (2,):
+        raise ValueError("lifetime counter words must have shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("lifetime counter words must have dtype uint32")
+    if getattr(telemetry, "shape", None) != ():
+        raise ValueError("lifetime counter telemetry must be scalar")
+    if getattr(telemetry, "dtype", None) != jnp.dtype(jnp.int32):
+        raise TypeError("lifetime counter telemetry must have dtype int32")
+    expected = _lifetime_words_to_int32_telemetry(words)
+    return (telemetry >= 0) & (telemetry == expected)
+
+
+def _lifetime_words_to_int32_telemetry(words: Array) -> Int[Array, ""]:
+    """Project one exact uint64 identity to saturating scalar telemetry."""
+
+    if getattr(words, "shape", None) != (2,):
+        raise ValueError("lifetime counter words must have shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("lifetime counter words must have dtype uint32")
+    maximum_i32 = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    maximum_u32 = jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+    fits = (words[0] == 0) & (words[1] <= maximum_u32)
+    return jnp.where(fits, words[1].astype(jnp.int32), maximum_i32)
+
+
+def _current_counter_capacity_available(
+    state: PrototypeAgentState,
+) -> Bool[Array, ""]:
+    """Reserve one transition and a possible two-observation boundary."""
+
+    _, step_capacity = _checked_lifetime_words_add(state.step_words, 1)
+    _, observation_capacity = _checked_lifetime_words_add(
+        state.observation_event_words,
+        2,
+    )
+    return step_capacity & observation_capacity
+
+
+def _lifetime_words_less_than(left: Array, right: Array) -> Bool[Array, ""]:
+    """Lexicographically compare two big-endian uint32 word clocks."""
+
+    return (left[0] < right[0]) | (
+        (left[0] == right[0]) & (left[1] < right[1])
+    )
+
+
+def _lifetime_words_less_equal(left: Array, right: Array) -> Bool[Array, ""]:
+    """Return ``left <= right`` for exact big-endian word clocks."""
+
+    return _lifetime_words_less_than(left, right) | jnp.all(left == right)
+
+
+def _prototype_observation_clock_relation_valid(
+    step_words: Array,
+    observation_words: Array,
+) -> Bool[Array, ""]:
+    """Authenticate the possible observation history for a transition clock.
+
+    A pristine state owns ``(steps, observations) == (0, 0)``. After start,
+    the initial observation plus one or two observations per real transition
+    implies ``steps < observations <= 2 * steps + 1``. Once ``steps >= 2**63``
+    the mathematical upper bound exceeds uint64, so every representable
+    observation clock already satisfies it.
+    """
+
+    zero = jnp.zeros((2,), dtype=jnp.uint32)
+    pristine = jnp.all(step_words == zero) & jnp.all(observation_words == zero)
+    strictly_later = _lifetime_words_less_than(step_words, observation_words)
+    high_half = jnp.asarray(2**31, dtype=jnp.uint32)
+    upper_unbounded = step_words[0] >= high_half
+    doubled_low = step_words[1] + step_words[1]
+    carry = (doubled_low < step_words[1]).astype(jnp.uint32)
+    doubled = jnp.stack(
+        (step_words[0] + step_words[0] + carry, doubled_low)
+    )
+    upper, upper_capacity = _checked_lifetime_words_add(doubled, 1)
+    upper_valid = upper_unbounded | (
+        upper_capacity & _lifetime_words_less_equal(observation_words, upper)
+    )
+    return pristine | (strictly_later & upper_valid)
 
 
 def _next_counter_capacity_available(
@@ -2139,19 +3794,46 @@ def _next_counter_capacity_available(
     *,
     execution_boundary: Array,
 ) -> Bool[Array, ""]:
-    """Reserve enough signed-counter capacity for the next dispatched action."""
-    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
-    next_step_count = _saturating_int32_increment(state.step_count)
-    next_observation_count = jnp.where(
-        execution_boundary,
-        _saturating_int32_increment(
-            _saturating_int32_increment(state.observation_event_count)
-        ),
-        _saturating_int32_increment(state.observation_event_count),
+    """Reserve exact capacity for this event and any next boundary event."""
+
+    post_step_words, current_step_capacity = _checked_lifetime_words_add(
+        state.step_words,
+        1,
     )
-    # A future transition may itself be an autoreset boundary and consume two
-    # observation events, so retain two free observation-event slots.
-    return (next_step_count < maximum) & (next_observation_count <= maximum - 2)
+    observation_delta = jnp.where(
+        execution_boundary,
+        jnp.asarray(2, dtype=jnp.int32),
+        jnp.asarray(1, dtype=jnp.int32),
+    )
+    # ``delta`` is static in the helper, so select between both bounded
+    # proposals instead of materialising a traced host integer.
+    post_observation_one, observation_one_capacity = (
+        _checked_lifetime_words_add(state.observation_event_words, 1)
+    )
+    post_observation_two, observation_two_capacity = (
+        _checked_lifetime_words_add(state.observation_event_words, 2)
+    )
+    post_observation_words = jnp.where(
+        observation_delta == 2,
+        post_observation_two,
+        post_observation_one,
+    )
+    current_observation_capacity = jnp.where(
+        observation_delta == 2,
+        observation_two_capacity,
+        observation_one_capacity,
+    )
+    _, next_step_capacity = _checked_lifetime_words_add(post_step_words, 1)
+    _, next_observation_capacity = _checked_lifetime_words_add(
+        post_observation_words,
+        2,
+    )
+    return (
+        current_step_capacity
+        & current_observation_capacity
+        & next_step_capacity
+        & next_observation_capacity
+    )
 
 
 def _increment_decision_id(decision_id: Array) -> Array:
@@ -2168,6 +3850,131 @@ def _saturating_int32_increment(value: Array) -> Array:
     maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
     counter = jnp.asarray(value, dtype=jnp.int32)
     return jnp.minimum(jnp.maximum(counter, 0), maximum - 1) + 1
+
+
+def _lifetime_words_modulo(words: Array, interval: int) -> UInt[Array, ""]:
+    """Return an exact uint64 clock modulo a positive int without x64 mode."""
+
+    if type(interval) is not int or interval <= 0 or interval > _INT32_MAX:
+        raise ValueError("lifetime interval must be in [1, INT32_MAX]")
+    if getattr(words, "shape", None) != (2,) or getattr(
+        words, "dtype", None
+    ) != jnp.dtype(jnp.uint32):
+        raise ValueError("lifetime counter words must be uint32 with shape (2,)")
+    divisor = jnp.asarray(interval, dtype=jnp.uint32)
+    remainder = jnp.asarray(0, dtype=jnp.uint32)
+    # ``remainder < interval <= INT32_MAX`` keeps every doubled intermediate
+    # below uint32 overflow, including the injected bit.
+    for word in (words[0], words[1]):
+        for bit_index in range(31, -1, -1):
+            bit = (word >> jnp.asarray(bit_index, dtype=jnp.uint32)) & jnp.asarray(
+                1,
+                dtype=jnp.uint32,
+            )
+            remainder = jnp.mod(remainder + remainder + bit, divisor)
+    return remainder
+
+
+def _lifetime_words_multiple_of(words: Array, interval: int) -> Bool[Array, ""]:
+    """Test an exact uint64 clock modulo a validated positive host interval."""
+
+    return _lifetime_words_modulo(words, interval) == 0
+
+
+def prototype_lifetime_counter_nbytes() -> int:
+    """Return bytes for both Prototype telemetry/exact outer clocks."""
+
+    return PROTOTYPE_LIFETIME_COUNTER_NBYTES
+
+
+def _prototype_tree_array_resources(tree: object) -> tuple[int, int, int]:
+    """Return ``(nbytes, elements, leaves)`` for persistent JAX arrays."""
+
+    arrays = tuple(leaf for leaf in jax.tree.leaves(tree) if isinstance(leaf, Array))
+    return (
+        sum(int(leaf.size) * int(leaf.dtype.itemsize) for leaf in arrays),
+        sum(int(leaf.size) for leaf in arrays),
+        len(arrays),
+    )
+
+
+def _prototype_tree_static_contract_matches(value: object, template: object) -> bool:
+    """Compare exact PyTree structure plus every persistent array shape/dtype."""
+
+    value_leaves, value_structure = jax.tree.flatten(value)
+    template_leaves, template_structure = jax.tree.flatten(template)
+    if cast(Any, value_structure) != template_structure or len(value_leaves) != len(
+        template_leaves
+    ):
+        return False
+    for value_leaf, template_leaf in zip(
+        value_leaves,
+        template_leaves,
+        strict=True,
+    ):
+        if isinstance(template_leaf, Array):
+            if not isinstance(value_leaf, Array):
+                return False
+            if (
+                value_leaf.shape != template_leaf.shape
+                or value_leaf.dtype != template_leaf.dtype
+            ):
+                return False
+        elif type(value_leaf) is not type(template_leaf):
+            return False
+    return True
+
+
+def measure_prototype_agent_state_resources(
+    state: PrototypeAgentState,
+) -> PrototypeAgentStateResourceMeasurement:
+    """Measure a concrete Prototype state's persistent JAX-array footprint.
+
+    The result is a top-level ownership partition and therefore sums exactly
+    to ``total_nbytes`` without counting nested shared feature/Horde or
+    interaction/memory bundles twice.  It measures fixed persistent state,
+    not transient compilation buffers, optimizer workspaces, or latency.
+    """
+
+    if type(state) is not PrototypeAgentState:
+        raise TypeError("state must be an exact PrototypeAgentState")
+    bundles = (
+        state.oak_state,
+        state.world_model_state,
+        state.buffer_state,
+        state.horde_state,
+        state.ia_state,
+        state.gru_state,
+        state.state_builder_state,
+    )
+    bundle_resources = tuple(_prototype_tree_array_resources(bundle) for bundle in bundles)
+    outer = (
+        state.current_raw_observation,
+        state.current_representation,
+        state.current_action,
+        state.current_decision_id,
+        state.started,
+        state.observation_event_count,
+        state.observation_event_words,
+        state.step_count,
+        state.step_words,
+    )
+    outer_resources = _prototype_tree_array_resources(outer)
+    all_resources = (*bundle_resources, outer_resources)
+    nbytes = tuple(resources[0] for resources in all_resources)
+    return PrototypeAgentStateResourceMeasurement(
+        total_nbytes=sum(nbytes),
+        total_array_elements=sum(resources[1] for resources in all_resources),
+        total_array_leaves=sum(resources[2] for resources in all_resources),
+        oak_bundle_nbytes=nbytes[0],
+        world_model_bundle_nbytes=nbytes[1],
+        buffer_nbytes=nbytes[2],
+        standalone_horde_nbytes=nbytes[3],
+        interaction_memory_bundle_nbytes=nbytes[4],
+        gru_nbytes=nbytes[5],
+        state_builder_feature_bundle_nbytes=nbytes[6],
+        outer_nbytes=nbytes[7],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2229,10 +4036,92 @@ class PrototypeAgent:
             if config.state_builder is not None
             else None
         )
+        self._learning_value_router: LearningValueRouter | None = (
+            LearningValueRouter(config.learning_value_router)
+            if config.learning_value_router is not None
+            else None
+        )
         self._prototype_feature_lifecycle: PrototypeFeatureLifecycle | None = None
         if config.prototype_feature_lifecycle is not None:
             self._prototype_feature_lifecycle = PrototypeFeatureLifecycle(
                 config.prototype_feature_lifecycle
+            )
+        self._prototype_feature_horde_digest: Array | None = None
+        if (
+            config.prototype_feature_lifecycle is not None
+            and config.prototype_feature_lifecycle.managed_horde_demons > 0
+        ):
+            self._prototype_feature_horde_digest = (
+                _prototype_feature_horde_schema_digest(config)
+            )
+        self._prototype_feature_world_model_digest: Array | None = None
+        if (
+            config.prototype_feature_lifecycle is not None
+            and config.world_model is not None
+            and config.prototype_atomic_feature_world_memory is None
+        ):
+            self._prototype_feature_world_model_digest = (
+                _prototype_feature_world_model_schema_digest(config)
+            )
+        self._prototype_atomic_feature_world_memory_digest: Array | None = None
+        self._prototype_routed_linear_world_model: (
+            PrototypeRoutedLinearWorldModel | None
+        ) = None
+        if config.prototype_atomic_feature_world_memory is not None:
+            feature_config = config.prototype_feature_lifecycle
+            world_config = config.world_model
+            if feature_config is None or world_config is None:
+                raise RuntimeError(
+                    "validated atomic feature/world/memory config is incomplete"
+                )
+            atomic_config = config.prototype_atomic_feature_world_memory
+            self._prototype_routed_linear_world_model = (
+                PrototypeRoutedLinearWorldModel(
+                    PrototypeRoutedLinearWorldConfig(
+                        feature_lifecycle=feature_config,
+                        world_model=world_config,
+                        oak=config.oak,
+                        anchor_capacity=atomic_config.anchor_capacity,
+                        planning_enabled=atomic_config.planning_enabled,
+                        planning_warmup_steps=atomic_config.planning_warmup_steps,
+                        max_generation_model_error=(
+                            atomic_config.max_generation_model_error
+                        ),
+                        max_planned_backups=atomic_config.max_planned_backups,
+                        carry_survivors=feature_config.carry_survivors,
+                    )
+                )
+            )
+            self._prototype_atomic_feature_world_memory_digest = (
+                _prototype_atomic_feature_world_memory_schema_digest(config)
+            )
+        self._prototype_feature_utility: PrototypeFeatureUtilityAuditor | None = None
+        self._prototype_feature_utility_digest: Array | None = None
+        if config.prototype_feature_utility is not None:
+            self._prototype_feature_utility = PrototypeFeatureUtilityAuditor(
+                config.prototype_feature_utility
+            )
+            self._prototype_feature_utility_digest = (
+                _prototype_feature_utility_schema_digest(config)
+            )
+        self._prototype_feature_utility_curation: (
+            PrototypeFeatureUtilityCurationPolicy | None
+        ) = None
+        self._prototype_feature_utility_curation_digest: Array | None = None
+        if config.prototype_feature_utility_curation is not None:
+            utility_config = config.prototype_feature_utility
+            if utility_config is None:
+                raise RuntimeError(
+                    "feature utility curation requires the utility auditor"
+                )
+            self._prototype_feature_utility_curation = (
+                PrototypeFeatureUtilityCurationPolicy(
+                    utility_config,
+                    config.prototype_feature_utility_curation,
+                )
+            )
+            self._prototype_feature_utility_curation_digest = (
+                _prototype_feature_utility_curation_schema_digest(config)
             )
 
         self._world_model: ActionConditionedWorldModel | None = None
@@ -2245,12 +4134,32 @@ class PrototypeAgent:
         self._recurrent_signal_nll_offset = 0.0
         self._buffer: RecentObservationBuffer | None = None
         self._dreamer: GuardedDreamer | None = None
-        if config.world_model is not None:
+        self._world_model_state_contract_template: (
+            ActionConditionedWorldModelState | None
+        ) = None
+        if (
+            config.world_model is not None
+            and self._prototype_routed_linear_world_model is None
+        ):
             self._world_model = ActionConditionedWorldModel(config.world_model)
-            self._buffer = RecentObservationBuffer(
-                config.buffer_capacity, config.oak.observation_dim
+            self._world_model_state_contract_template = cast(
+                ActionConditionedWorldModelState,
+                jax.tree.map(
+                    lambda leaf: (
+                        jnp.asarray(leaf)
+                        if isinstance(leaf, (bool, int, float))
+                        else leaf
+                    ),
+                    self._world_model.init(jr.key(0)),
+                ),
             )
-            self._dreamer = GuardedDreamer(config.dreaming or DreamingConfig())
+            self._buffer = RecentObservationBuffer(
+                config.buffer_capacity, config.world_model.observation_dim
+            )
+            if config.n_dreams_per_step > 0:
+                self._dreamer = GuardedDreamer(
+                    config.dreaming or DreamingConfig()
+                )
         elif config.world_model_ensemble is not None:
             self._world_model_ensemble = WorldModelEnsemble(
                 config.world_model_ensemble
@@ -2304,12 +4213,48 @@ class PrototypeAgent:
 
         self._experiential_memory: ExperientialMemory | None = None
         self._experiential_memory_policy: ExperientialMemoryPolicy | None = None
+        self._experiential_memory_advantage_gate: (
+            ExperientialMemoryAdvantageGate | None
+        ) = None
         if config.experiential_memory is not None:
             self._experiential_memory = ExperientialMemory(
                 config.experiential_memory
             )
             self._experiential_memory_policy = ExperientialMemoryPolicy(
                 self._experiential_memory
+            )
+        self._prototype_feature_memory: PrototypeFeatureMemory | None = None
+        if (
+            config.prototype_feature_lifecycle is not None
+            and config.experiential_memory is not None
+        ):
+            if type(config.state_builder) is not IdentityStateBuilderConfig:
+                raise RuntimeError(
+                    "feature-memory composition requires its validated identity builder"
+                )
+            self._prototype_feature_memory = PrototypeFeatureMemory(
+                PrototypeFeatureMemoryConfig(
+                    feature_lifecycle=config.prototype_feature_lifecycle,
+                    experiential_memory=config.experiential_memory,
+                    base_state_builder=config.state_builder,
+                )
+            )
+            # Keep policy and direct memory operations on the exact substrate
+            # authenticated by the feature-memory adapter.
+            self._experiential_memory = self._prototype_feature_memory.memory
+            self._experiential_memory_policy = ExperientialMemoryPolicy(
+                self._experiential_memory
+            )
+        if config.experiential_memory_advantage_gate is not None:
+            if self._experiential_memory is None:
+                raise RuntimeError(
+                    "experiential-memory advantage gate requires memory"
+                )
+            self._experiential_memory_advantage_gate = (
+                ExperientialMemoryAdvantageGate(
+                    self._experiential_memory,
+                    config.experiential_memory_advantage_gate,
+                )
             )
 
     # -- Properties -----------------------------------------------------------
@@ -2346,14 +4291,123 @@ class PrototypeAgent:
         return self._state_builder
 
     @property
+    def learning_value_router(self) -> LearningValueRouter | None:
+        """Return the optional owner-bound typed learning-value router."""
+
+        return self._learning_value_router
+
+    @property
+    def learning_value_router_resource_budget(
+        self,
+    ) -> LearningValueRouterResourceBudget | None:
+        """Return the router's exact fixed persistent/work declaration."""
+
+        if self._learning_value_router is None:
+            return None
+        return self._learning_value_router.resource_budget()
+
+    @property
     def prototype_feature_lifecycle(self) -> PrototypeFeatureLifecycle | None:
         """Return the opt-in bounded pair-feature lifecycle."""
 
         return self._prototype_feature_lifecycle
 
-    def _builder_component_state(self, slot: Any) -> Any:
-        """Unwrap the historical builder slot only on the feature lane."""
+    @property
+    def prototype_routed_linear_world_model(
+        self,
+    ) -> PrototypeRoutedLinearWorldModel | None:
+        """Return the enabled-only fixed-physical routed world model."""
 
+        return self._prototype_routed_linear_world_model
+
+    @property
+    def prototype_feature_utility(
+        self,
+    ) -> PrototypeFeatureUtilityAuditor | None:
+        """Return the opt-in diagnostic actual-consumer utility auditor."""
+
+        return self._prototype_feature_utility
+
+    @property
+    def prototype_feature_utility_resource_budget(
+        self,
+    ) -> PrototypeFeatureUtilityResourceBudget | None:
+        """Return the auditor's exact fixed persistent/work declaration."""
+
+        if self._prototype_feature_utility is None:
+            return None
+        return self._prototype_feature_utility.resource_budget()
+
+    @property
+    def prototype_feature_utility_curation(
+        self,
+    ) -> PrototypeFeatureUtilityCurationPolicy | None:
+        """Return the opt-in audit-ranked curation policy."""
+
+        return self._prototype_feature_utility_curation
+
+    @property
+    def prototype_feature_utility_curation_resource_budget(
+        self,
+    ) -> PrototypeFeatureUtilityCurationResourceBudget | None:
+        """Return the stateless policy's exact transient-work declaration."""
+
+        if self._prototype_feature_utility_curation is None:
+            return None
+        return self._prototype_feature_utility_curation.resource_budget()
+
+    def _feature_utility_enabled(self) -> bool:
+        """Return whether actual-consumer utility instrumentation is enabled."""
+
+        return self._prototype_feature_utility is not None
+
+    def _feature_utility_curation_enabled(self) -> bool:
+        """Return whether v6 audit-ranked curation influence is enabled."""
+
+        return self._prototype_feature_utility_curation is not None
+
+    def _shared_feature_horde_enabled(self) -> bool:
+        """Return whether OaK and an exact linear Horde share the bank."""
+
+        feature_config = self._config.prototype_feature_lifecycle
+        return (
+            feature_config is not None
+            and feature_config.managed_horde_demons > 0
+        )
+
+    def _representation_component_state(self, slot: Any) -> Any:
+        """Unwrap only the opt-in router shell around historical state."""
+
+        if self._learning_value_router is None:
+            return slot
+        if type(slot) is not PrototypeLearningValueRouterState:
+            raise TypeError(
+                "state_builder_state must be a "
+                "PrototypeLearningValueRouterState when "
+                "learning_value_router is configured"
+            )
+        return slot.representation_state
+
+    def _learning_value_router_component_state(
+        self,
+        slot: Any,
+    ) -> LearningValueRouterState:
+        """Return the single router state from its owner-bound shell."""
+
+        if self._learning_value_router is None:
+            raise RuntimeError("learning-value router is disabled")
+        if type(slot) is not PrototypeLearningValueRouterState:
+            raise TypeError(
+                "state_builder_state must be a "
+                "PrototypeLearningValueRouterState when "
+                "learning_value_router is configured"
+            )
+        return slot.learning_value_router_state
+
+    def _builder_component_state(self, slot: Any) -> Any:
+        """Unwrap router and feature shells around the historical builder."""
+
+        slot = self._representation_component_state(slot)
         if self._prototype_feature_lifecycle is None:
             return slot
         if not isinstance(slot, PrototypeFeatureRepresentationState):
@@ -2372,6 +4426,7 @@ class PrototypeAgent:
 
         if self._prototype_feature_lifecycle is None:
             raise RuntimeError("prototype feature lifecycle is disabled")
+        slot = self._representation_component_state(slot)
         if not isinstance(slot, PrototypeFeatureRepresentationState):
             raise TypeError(
                 "state_builder_state must be a "
@@ -2384,18 +4439,104 @@ class PrototypeAgent:
         self,
         builder_state: Any,
         feature_lifecycle_state: PrototypeFeatureLifecycleState | None,
+        learning_value_router_state: LearningValueRouterState | None = None,
     ) -> Any:
         """Compose the builder slot without changing disabled PyTrees."""
 
         if self._prototype_feature_lifecycle is None:
-            return builder_state
-        if feature_lifecycle_state is None:
-            raise RuntimeError(
-                "configured prototype feature lifecycle requires persistent state"
+            representation_state = builder_state
+        else:
+            if feature_lifecycle_state is None:
+                raise RuntimeError(
+                    "configured prototype feature lifecycle requires persistent state"
+                )
+            representation_state = PrototypeFeatureRepresentationState(
+                builder_state=builder_state,
+                feature_lifecycle_state=feature_lifecycle_state,
             )
-        return PrototypeFeatureRepresentationState(
-            builder_state=builder_state,
-            feature_lifecycle_state=feature_lifecycle_state,
+        if self._learning_value_router is None:
+            if learning_value_router_state is not None:
+                raise RuntimeError(
+                    "disabled learning-value router cannot own persistent state"
+                )
+            return representation_state
+        if type(learning_value_router_state) is not LearningValueRouterState:
+            raise RuntimeError(
+                "configured learning-value router requires its exact persistent state"
+            )
+        return PrototypeLearningValueRouterState(
+            representation_state=representation_state,
+            learning_value_router_state=learning_value_router_state,
+        )
+
+    def _action_world_model_component_state(
+        self,
+        slot: Any,
+    ) -> ActionConditionedWorldModelState:
+        """Unwrap the v17 feature/config binding on the stable-base lane."""
+
+        if self._world_model is None:
+            raise RuntimeError("legacy action-conditioned world model is disabled")
+        if self._prototype_feature_lifecycle is None:
+            if type(slot) is not ActionConditionedWorldModelState:
+                raise TypeError(
+                    "legacy world-model slot must contain an exact model state"
+                )
+            return slot
+        if type(slot) is not PrototypeFeatureWorldModelState:
+            raise TypeError(
+                "feature/world-model slot must contain its exact v17 wrapper"
+            )
+        if type(slot.model_state) is not ActionConditionedWorldModelState:
+            raise TypeError("v17 wrapper contains the wrong model-state type")
+        return slot.model_state
+
+    def _action_world_model_state_slot(
+        self,
+        model_state: ActionConditionedWorldModelState,
+    ) -> ActionConditionedWorldModelState | PrototypeFeatureWorldModelState:
+        """Bind stable-base model state to the exact v17 composition config."""
+
+        if type(model_state) is not ActionConditionedWorldModelState:
+            raise TypeError("world-model state must be exact")
+        if self._prototype_feature_lifecycle is None:
+            return model_state
+        digest = self._prototype_feature_world_model_digest
+        if digest is None:
+            raise RuntimeError("feature/world-model composition digest is unavailable")
+        return PrototypeFeatureWorldModelState(
+            model_state=model_state,
+            schema_digest=digest,
+        )
+
+    def _atomic_routed_world_component_state(
+        self,
+        slot: Any,
+    ) -> PrototypeRoutedLinearWorldState:
+        """Unwrap and authenticate the enabled-only v18 world slot type."""
+
+        if self._prototype_routed_linear_world_model is None:
+            raise RuntimeError("atomic routed world composition is disabled")
+        if type(slot) is not PrototypeAtomicFeatureWorldMemoryState:
+            raise TypeError("v18 world slot has the wrong exact wrapper type")
+        if type(slot.world_state) is not PrototypeRoutedLinearWorldState:
+            raise TypeError("v18 wrapper contains the wrong routed-world state")
+        return slot.world_state
+
+    def _atomic_routed_world_state_slot(
+        self,
+        world_state: PrototypeRoutedLinearWorldState,
+    ) -> PrototypeAtomicFeatureWorldMemoryState:
+        """Bind one routed world to the complete v18 Prototype config."""
+
+        if type(world_state) is not PrototypeRoutedLinearWorldState:
+            raise TypeError("routed world state must be exact")
+        digest = self._prototype_atomic_feature_world_memory_digest
+        if digest is None:
+            raise RuntimeError("atomic feature/world/memory digest is unavailable")
+        return PrototypeAtomicFeatureWorldMemoryState(
+            world_state=world_state,
+            schema_digest=digest,
         )
 
     def _oak_component_state(self, slot: Any) -> OaKState:
@@ -2403,14 +4544,77 @@ class PrototypeAgent:
 
         if self._prototype_feature_lifecycle is None:
             return cast(OaKState, slot)
-        if type(slot) is not PrototypeFeatureOaKState:
-            raise TypeError(
-                "oak_state must be a PrototypeFeatureOaKState when "
-                "prototype_feature_lifecycle is configured"
-            )
-        if type(slot.oak_state) is not OaKState:
+        consumer: PrototypeFeatureOaKHordeState | PrototypeFeatureOaKState
+        if self._shared_feature_horde_enabled():
+            consumer = self._shared_feature_horde_bundle(slot)
+        else:
+            if type(slot) is not PrototypeFeatureOaKState:
+                raise TypeError(
+                    "oak_state has the wrong enabled feature-consumer wrapper"
+                )
+            consumer = slot
+        if type(consumer.oak_state) is not OaKState:
             raise TypeError("bound feature consumer must contain an exact OaKState")
-        return slot.oak_state
+        return consumer.oak_state
+
+    def _shared_feature_horde_bundle(
+        self,
+        slot: Any,
+    ) -> PrototypeFeatureOaKHordeState:
+        """Unwrap exact consumers from the optional v5/v6 shells."""
+
+        if not self._shared_feature_horde_enabled():
+            raise RuntimeError("shared feature/Horde composition is disabled")
+        consumer = slot
+        if self._feature_utility_curation_enabled():
+            if type(consumer) is not (
+                PrototypeFeatureOaKHordeUtilityCurationState
+            ):
+                raise TypeError(
+                    "feature utility curation requires a "
+                    "PrototypeFeatureOaKHordeUtilityCurationState"
+                )
+            consumer = consumer.utility_state
+        if self._feature_utility_enabled():
+            if type(consumer) is not PrototypeFeatureOaKHordeUtilityState:
+                raise TypeError(
+                    "feature utility requires a "
+                    "PrototypeFeatureOaKHordeUtilityState"
+                )
+            consumer = consumer.consumer_state
+        if type(consumer) is not PrototypeFeatureOaKHordeState:
+            raise TypeError(
+                "managed feature Horde requires a PrototypeFeatureOaKHordeState"
+            )
+        return consumer
+
+    def _feature_utility_component_state(
+        self,
+        slot: Any,
+    ) -> PrototypeFeatureUtilityState:
+        """Return the auditor state bound around the shared consumers."""
+
+        if self._prototype_feature_utility is None:
+            raise RuntimeError("prototype feature utility is disabled")
+        utility_slot = slot
+        if self._feature_utility_curation_enabled():
+            if type(utility_slot) is not (
+                PrototypeFeatureOaKHordeUtilityCurationState
+            ):
+                raise TypeError(
+                    "feature utility curation requires a "
+                    "PrototypeFeatureOaKHordeUtilityCurationState"
+                )
+            utility_slot = utility_slot.utility_state
+        if type(utility_slot) is not PrototypeFeatureOaKHordeUtilityState:
+            raise TypeError(
+                "feature utility requires a PrototypeFeatureOaKHordeUtilityState"
+            )
+        if type(utility_slot.feature_utility_state) is not (
+            PrototypeFeatureUtilityState
+        ):
+            raise TypeError("feature utility bundle contains the wrong state type")
+        return utility_slot.feature_utility_state
 
     def _feature_consumer_binding(
         self,
@@ -2420,21 +4624,167 @@ class PrototypeAgent:
 
         if self._prototype_feature_lifecycle is None:
             raise RuntimeError("prototype feature lifecycle is disabled")
-        if type(slot) is not PrototypeFeatureOaKState:
-            raise TypeError(
-                "oak_state must be a PrototypeFeatureOaKState when "
-                "prototype_feature_lifecycle is configured"
-            )
-        if type(slot.consumer_binding) is not PrototypeFeatureConsumerBinding:
+        consumer: PrototypeFeatureOaKHordeState | PrototypeFeatureOaKState
+        if self._shared_feature_horde_enabled():
+            consumer = self._shared_feature_horde_bundle(slot)
+        else:
+            if type(slot) is not PrototypeFeatureOaKState:
+                raise TypeError(
+                    "oak_state has the wrong enabled feature-consumer wrapper"
+                )
+            consumer = slot
+        if type(consumer.consumer_binding) is not PrototypeFeatureConsumerBinding:
             raise TypeError(
                 "bound feature consumer must contain an exact consumer binding"
             )
-        return slot.consumer_binding
+        return consumer.consumer_binding
+
+    def _horde_component_state(self, state: PrototypeAgentState) -> Any:
+        """Unwrap Horde from its atomic feature bundle only when managed."""
+
+        if not self._shared_feature_horde_enabled():
+            return state.horde_state
+        if state.horde_state is not None:
+            raise TypeError(
+                "managed feature Horde requires the top-level horde_state to be None"
+            )
+        consumer = self._shared_feature_horde_bundle(state.oak_state)
+        if type(consumer.horde_state) is not MultiHeadMLPState:
+            raise TypeError("managed feature Horde must contain an exact linear state")
+        return consumer.horde_state
+
+    def _feature_horde_bundle_identity_valid(
+        self,
+        state: PrototypeAgentState,
+    ) -> Bool[Array, ""]:
+        """Validate atomic placement and the ordered static schema digest."""
+
+        if not self._shared_feature_horde_enabled():
+            return jnp.asarray(True, dtype=jnp.bool_)
+        slot = state.oak_state
+        curation_identity_valid = jnp.asarray(True, dtype=jnp.bool_)
+        if self._feature_utility_curation_enabled():
+            curation_digest = self._prototype_feature_utility_curation_digest
+            if (
+                type(slot) is not PrototypeFeatureOaKHordeUtilityCurationState
+                or curation_digest is None
+                or not hasattr(slot.schema_digest, "shape")
+                or slot.schema_digest.shape != (32,)
+                or slot.schema_digest.dtype != jnp.uint8
+            ):
+                return jnp.asarray(False, dtype=jnp.bool_)
+            curation_identity_valid = jnp.array_equal(
+                slot.schema_digest,
+                curation_digest,
+            )
+            slot = slot.utility_state
+        utility_identity_valid = jnp.asarray(True, dtype=jnp.bool_)
+        if self._feature_utility_enabled():
+            utility_digest = self._prototype_feature_utility_digest
+            if (
+                type(slot) is not PrototypeFeatureOaKHordeUtilityState
+                or utility_digest is None
+                or not hasattr(slot.schema_digest, "shape")
+                or slot.schema_digest.shape != (32,)
+                or slot.schema_digest.dtype != jnp.uint8
+            ):
+                return jnp.asarray(False, dtype=jnp.bool_)
+            utility_identity_valid = jnp.array_equal(
+                slot.schema_digest,
+                utility_digest,
+            )
+            slot = slot.consumer_state
+        digest = self._prototype_feature_horde_digest
+        if (
+            type(slot) is not PrototypeFeatureOaKHordeState
+            or state.horde_state is not None
+            or type(slot.horde_state) is not MultiHeadMLPState
+            or digest is None
+            or not hasattr(slot.schema_digest, "shape")
+            or slot.schema_digest.shape != (32,)
+            or slot.schema_digest.dtype != jnp.uint8
+        ):
+            return jnp.asarray(False, dtype=jnp.bool_)
+        return (
+            curation_identity_valid
+            & utility_identity_valid
+            & jnp.array_equal(slot.schema_digest, digest)
+        )
+
+    def _managed_horde_optimizer_matches_config(
+        self,
+        horde_state: Any,
+    ) -> Bool[Array, ""]:
+        """Bind every linear-head LMS scalar to the serialized step size."""
+
+        feature_config = self._config.prototype_feature_lifecycle
+        if (
+            feature_config is None
+            or type(horde_state) is not MultiHeadMLPState
+            or type(horde_state.head_optimizer_states) is not tuple
+            or len(horde_state.head_optimizer_states)
+            != feature_config.managed_horde_demons
+        ):
+            return jnp.asarray(False, dtype=jnp.bool_)
+        expected = jnp.asarray(
+            self._config.horde_step_size,
+            dtype=jnp.float32,
+        )
+        valid = jnp.asarray(True, dtype=jnp.bool_)
+        for optimizer_pair in horde_state.head_optimizer_states:
+            if (
+                type(optimizer_pair) is not tuple
+                or len(optimizer_pair) != 2
+                or any(type(item) is not LMSState for item in optimizer_pair)
+            ):
+                return jnp.asarray(False, dtype=jnp.bool_)
+            for optimizer_state in optimizer_pair:
+                valid = valid & jnp.array_equal(
+                    optimizer_state.step_size,
+                    expected,
+                )
+        return valid
+
+    def _action_world_model_optimizer_matches_config(
+        self,
+        learner_state: Any,
+    ) -> Bool[Array, ""]:
+        """Bind every action-world-model LMS scalar to its serialized config."""
+
+        world_config = self._config.world_model
+        if (
+            world_config is None
+            or type(learner_state) is not MultiHeadMLPState
+            or type(learner_state.trunk_optimizer_states) is not tuple
+            or type(learner_state.head_optimizer_states) is not tuple
+        ):
+            return jnp.asarray(False, dtype=jnp.bool_)
+        expected = jnp.asarray(world_config.step_size, dtype=jnp.float32)
+        valid = jnp.asarray(True, dtype=jnp.bool_)
+        for optimizer_state in learner_state.trunk_optimizer_states:
+            if type(optimizer_state) is not LMSState:
+                return jnp.asarray(False, dtype=jnp.bool_)
+            valid = valid & jnp.array_equal(optimizer_state.step_size, expected)
+        for optimizer_pair in learner_state.head_optimizer_states:
+            if (
+                type(optimizer_pair) is not tuple
+                or len(optimizer_pair) != 2
+                or any(type(item) is not LMSState for item in optimizer_pair)
+            ):
+                return jnp.asarray(False, dtype=jnp.bool_)
+            for optimizer_state in optimizer_pair:
+                valid = valid & jnp.array_equal(
+                    optimizer_state.step_size,
+                    expected,
+                )
+        return valid
 
     def _oak_state_slot(
         self,
         oak_state: OaKState,
         consumer_binding: PrototypeFeatureConsumerBinding | None,
+        horde_state: Any = None,
+        feature_utility_state: PrototypeFeatureUtilityState | None = None,
     ) -> Any:
         """Compose the enabled-only bound OaK subtree."""
 
@@ -2446,6 +4796,52 @@ class PrototypeAgent:
             raise TypeError(
                 "configured prototype feature lifecycle requires a consumer binding"
             )
+        if self._shared_feature_horde_enabled():
+            digest = self._prototype_feature_horde_digest
+            if type(horde_state) is not MultiHeadMLPState or digest is None:
+                raise TypeError(
+                    "managed feature lifecycle requires an exact Horde state and digest"
+                )
+            consumer_state = PrototypeFeatureOaKHordeState(
+                oak_state=oak_state,
+                horde_state=horde_state,
+                consumer_binding=consumer_binding,
+                schema_digest=digest,
+            )
+            if self._feature_utility_enabled():
+                utility_digest = self._prototype_feature_utility_digest
+                if (
+                    type(feature_utility_state) is not PrototypeFeatureUtilityState
+                    or utility_digest is None
+                ):
+                    raise TypeError(
+                        "feature utility requires its exact state and schema digest"
+                    )
+                utility_state = PrototypeFeatureOaKHordeUtilityState(
+                    consumer_state=consumer_state,
+                    feature_utility_state=feature_utility_state,
+                    schema_digest=utility_digest,
+                )
+                if self._feature_utility_curation_enabled():
+                    curation_digest = (
+                        self._prototype_feature_utility_curation_digest
+                    )
+                    if curation_digest is None:
+                        raise TypeError(
+                            "feature utility curation requires its schema digest"
+                        )
+                    return PrototypeFeatureOaKHordeUtilityCurationState(
+                        utility_state=utility_state,
+                        schema_digest=curation_digest,
+                    )
+                return utility_state
+            if feature_utility_state is not None:
+                raise TypeError("disabled feature utility cannot contain audit state")
+            return consumer_state
+        if horde_state is not None:
+            raise TypeError("feature-only OaK wrapper cannot contain Horde state")
+        if feature_utility_state is not None:
+            raise TypeError("feature-only OaK wrapper cannot contain audit state")
         return PrototypeFeatureOaKState(
             oak_state=oak_state,
             consumer_binding=consumer_binding,
@@ -2468,6 +4864,94 @@ class PrototypeAgent:
         """Return the read-only categorical memory proposal boundary."""
 
         return self._experiential_memory_policy
+
+    @property
+    def experiential_memory_advantage_gate(
+        self,
+    ) -> ExperientialMemoryAdvantageGate | None:
+        """Return the optional conservative memory dispatch-authority gate."""
+
+        return self._experiential_memory_advantage_gate
+
+    @property
+    def prototype_feature_memory(self) -> PrototypeFeatureMemory | None:
+        """Return the exact pair-bank memory adapter when configured."""
+
+        return self._prototype_feature_memory
+
+    @property
+    def prototype_feature_memory_resource_budget(
+        self,
+    ) -> PrototypeFeatureMemoryResourceBudget | None:
+        """Return fixed wrapper bytes and worst-case re-encoding work."""
+
+        if self._prototype_feature_memory is None:
+            return None
+        return self._prototype_feature_memory.resource_budget()
+
+    def prototype_atomic_feature_world_memory_resource_budget(
+        self,
+        state: PrototypeAgentState,
+    ) -> PrototypeAtomicFeatureWorldMemoryResourceBudget:
+        """Measure one enabled state and declare exact transition call maxima."""
+
+        if self._prototype_routed_linear_world_model is None:
+            raise RuntimeError("atomic feature/world/memory composition is disabled")
+        if self._prototype_feature_memory is None or self._horde is None:
+            raise RuntimeError("atomic composition components are unavailable")
+        if type(state) is not PrototypeAgentState:
+            raise TypeError("state must be an exact PrototypeAgentState")
+        if not bool(jax.device_get(self._checkpoint_state_valid(state))):
+            raise ValueError("atomic resource measurement requires a valid state")
+        oak_binding = self._feature_consumer_binding(state.oak_state)
+        world_binding = self._atomic_routed_world_component_state(
+            state.world_model_state
+        ).consumer_binding
+        memory_binding = self._feature_memory_component_state(
+            state.ia_state
+        ).consumer_binding
+        mirrored_nbytes = sum(
+            _prototype_tree_array_resources(binding)[0]
+            for binding in (oak_binding, world_binding, memory_binding)
+        )
+        memory_declaration = self.experiential_memory_resource_declaration
+        if memory_declaration is None:
+            raise RuntimeError("atomic composition memory declaration is unavailable")
+        return PrototypeAtomicFeatureWorldMemoryResourceBudget(
+            mechanism_status=(
+                PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_MECHANISM_STATUS
+            ),
+            scientific_promotion_allowed=(
+                PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_SCIENTIFIC_PROMOTION_ALLOWED
+            ),
+            persistent_state_nbytes=(
+                measure_prototype_agent_state_resources(state).total_nbytes
+            ),
+            persistent_capacity_growth=0,
+            lifecycle_authority_count=1,
+            router_authority_count=1,
+            oak_consumer_count=1,
+            ordered_linear_horde_count=1,
+            routed_world_count=1,
+            world_model_buffer_count=1,
+            experiential_memory_count=1,
+            mirrored_binding_cache_count=3,
+            mirrored_binding_cache_nbytes=mirrored_nbytes,
+            oak_update_evaluations_per_transition=1,
+            horde_update_evaluations_per_transition=1,
+            feature_learner_update_evaluations_per_transition=1,
+            lifecycle_router_evaluations_per_transition=2,
+            world_learner_update_evaluations_per_transition=1,
+            world_router_evaluations_per_transition=1,
+            memory_rebind_evaluations_per_transition=1,
+            memory_step_evaluations_per_transition=1,
+            deterministic_prestate_memory_queries_per_transition=(
+                memory_declaration.total_deterministic_prestate_queries
+            ),
+            memory_writes_attempted_per_transition=(
+                memory_declaration.writes_attempted
+            ),
+        )
 
     @property
     def experiential_memory_resource_declaration(
@@ -2561,7 +5045,15 @@ class PrototypeAgent:
         self,
         slot: Any,
     ) -> ExperientialMemoryState:
-        """Return persistent memory from the opt-in outer wrapper."""
+        """Return the generic memory substrate from the opt-in wrapper."""
+
+        memory_slot = self._memory_slot_component_state(slot)
+        if self._prototype_feature_memory is not None:
+            return cast(PrototypeFeatureMemoryState, memory_slot).memory_state
+        return cast(ExperientialMemoryState, memory_slot)
+
+    def _memory_slot_component_state(self, slot: Any) -> Any:
+        """Return the raw or exact feature-bound payload stored in memory slot."""
 
         if self._experiential_memory is None:
             raise RuntimeError("experiential memory is disabled")
@@ -2570,14 +5062,38 @@ class PrototypeAgent:
                 "ia_state must be a PrototypeMemoryInteractionState when "
                 "experiential memory is configured"
             )
-        return slot.experiential_memory_state
+        payload = slot.experiential_memory_state
+        if self._prototype_feature_memory is not None:
+            if type(payload) is not PrototypeFeatureMemoryState:
+                raise TypeError(
+                    "feature-lifecycle memory slot must contain an exact "
+                    "PrototypeFeatureMemoryState"
+                )
+        elif type(payload) is not ExperientialMemoryState:
+            raise TypeError(
+                "legacy memory slot must contain an exact ExperientialMemoryState"
+            )
+        return payload
+
+    def _feature_memory_component_state(
+        self,
+        slot: Any,
+    ) -> PrototypeFeatureMemoryState:
+        """Return the exact bank-bound memory wrapper."""
+
+        if self._prototype_feature_memory is None:
+            raise RuntimeError("prototype feature memory is disabled")
+        return cast(
+            PrototypeFeatureMemoryState,
+            self._memory_slot_component_state(slot),
+        )
 
     def _interaction_slot(
         self,
         ia_state: Any,
         partner_state: Any,
         *,
-        experiential_memory_state: ExperientialMemoryState | None = None,
+        experiential_memory_state: Any = None,
         feedback_prototype_decision_id: Array | None = None,
         feedback_prototype_decision_id_available: Array | None = None,
     ) -> Any:
@@ -2612,6 +5128,15 @@ class PrototypeAgent:
         if experiential_memory_state is None:
             raise RuntimeError(
                 "configured experiential memory requires a persistent state"
+            )
+        if self._prototype_feature_memory is not None:
+            if type(experiential_memory_state) is not PrototypeFeatureMemoryState:
+                raise TypeError(
+                    "feature-lifecycle memory composition requires its exact wrapper"
+                )
+        elif type(experiential_memory_state) is not ExperientialMemoryState:
+            raise TypeError(
+                "memory composition requires an exact ExperientialMemoryState"
             )
         return PrototypeMemoryInteractionState(
             interaction_state=interaction_state,
@@ -2829,10 +5354,10 @@ class PrototypeAgent:
             raise RuntimeError("online state-builder learning is not configured")
         return builder_config.parameter_count()
 
-    def _missing_gradient_joy_evidence(
+    def _missing_candidate_update_audit_evidence(
         self,
         decision_id: Array,
-    ) -> PrototypeGradientJoyEvidence:
+    ) -> PrototypeCandidateUpdateAuditEvidence:
         """Construct explicit unavailable evidence for a fail-closed audit."""
         zeros = jnp.zeros(
             (self._state_builder_parameter_count(),),
@@ -2840,7 +5365,7 @@ class PrototypeAgent:
         )
         zero = jnp.asarray(0.0, dtype=jnp.float32)
         unavailable = jnp.asarray(False, dtype=jnp.bool_)
-        return PrototypeGradientJoyEvidence(
+        return PrototypeCandidateUpdateAuditEvidence(
             decision_id=decision_id,
             objective_probe_gradient=zeros,
             retention_probe_gradient=zeros,
@@ -2857,22 +5382,23 @@ class PrototypeAgent:
             safety_cost_available=unavailable,
         )
 
-    def _normalize_gradient_joy_evidence(
+    def _normalize_candidate_update_audit_evidence(
         self,
         state: PrototypeAgentState,
-        evidence: PrototypeGradientJoyEvidence | None,
-    ) -> tuple[PrototypeGradientJoyEvidence | None, Array, Array]:
+        evidence: PrototypeCandidateUpdateAuditEvidence | None,
+    ) -> tuple[PrototypeCandidateUpdateAuditEvidence | None, Array, Array]:
         """Validate one optimizer-control sidecar without owning the transition.
 
         Static shape or dtype drift raises. Runtime non-finiteness and a stale
-        decision binding clear the corresponding availability flags so the joy
-        audit rejects, while the authoritative environment transition remains
-        eligible for normal control/model learning.
+        decision binding clear the corresponding availability flags so the
+        candidate-update audit rejects, while the authoritative environment
+        transition remains eligible for normal control/model learning.
         """
         if self._config.gradient_joy is None:
             if evidence is not None:
                 raise ValueError(
-                    "gradient_joy_evidence requires gradient_joy to be configured"
+                    "candidate_update_audit_evidence requires the candidate-update "
+                    "audit to be configured (legacy config field gradient_joy)"
                 )
             unavailable = jnp.asarray(False, dtype=jnp.bool_)
             return None, unavailable, unavailable
@@ -2880,19 +5406,20 @@ class PrototypeAgent:
         if evidence is None:
             unavailable = jnp.asarray(False, dtype=jnp.bool_)
             return (
-                self._missing_gradient_joy_evidence(state.current_decision_id),
+                self._missing_candidate_update_audit_evidence(state.current_decision_id),
                 unavailable,
                 unavailable,
             )
-        if not isinstance(evidence, PrototypeGradientJoyEvidence):
+        if not isinstance(evidence, PrototypeCandidateUpdateAuditEvidence):
             raise TypeError(
-                "gradient_joy_evidence must be PrototypeGradientJoyEvidence"
+                "candidate_update_audit_evidence must be "
+                "PrototypeCandidateUpdateAuditEvidence"
             )
 
         parameter_shape = (self._state_builder_parameter_count(),)
         decision_id = _strict_decision_id(
             evidence.decision_id,
-            name="gradient_joy_evidence.decision_id",
+            name="candidate_update_audit_evidence.decision_id",
         )
         decision_matches = jnp.array_equal(
             decision_id,
@@ -2902,64 +5429,64 @@ class PrototypeAgent:
             "objective_probe_gradient": _strict_float32_array(
                 evidence.objective_probe_gradient,
                 parameter_shape,
-                name="gradient_joy_evidence.objective_probe_gradient",
+                name="candidate_update_audit_evidence.objective_probe_gradient",
             ),
             "retention_probe_gradient": _strict_float32_array(
                 evidence.retention_probe_gradient,
                 parameter_shape,
-                name="gradient_joy_evidence.retention_probe_gradient",
+                name="candidate_update_audit_evidence.retention_probe_gradient",
             ),
             "safety_cost_gradient": _strict_float32_array(
                 evidence.safety_cost_gradient,
                 parameter_shape,
-                name="gradient_joy_evidence.safety_cost_gradient",
+                name="candidate_update_audit_evidence.safety_cost_gradient",
             ),
         }
         scalars = {
             "advantage": _strict_float32_array(
                 evidence.advantage,
                 (),
-                name="gradient_joy_evidence.advantage",
+                name="candidate_update_audit_evidence.advantage",
             ),
             "action_surprisal": _strict_float32_array(
                 evidence.action_surprisal,
                 (),
-                name="gradient_joy_evidence.action_surprisal",
+                name="candidate_update_audit_evidence.action_surprisal",
             ),
             "safety_cost": _strict_float32_array(
                 evidence.safety_cost,
                 (),
-                name="gradient_joy_evidence.safety_cost",
+                name="candidate_update_audit_evidence.safety_cost",
             ),
         }
         flags = {
             "objective_probe_available": _strict_bool_scalar(
                 evidence.objective_probe_available,
-                name="gradient_joy_evidence.objective_probe_available",
+                name="candidate_update_audit_evidence.objective_probe_available",
             ),
             "retention_probe_available": _strict_bool_scalar(
                 evidence.retention_probe_available,
-                name="gradient_joy_evidence.retention_probe_available",
+                name="candidate_update_audit_evidence.retention_probe_available",
             ),
             "safety_probe_available": _strict_bool_scalar(
                 evidence.safety_probe_available,
-                name="gradient_joy_evidence.safety_probe_available",
+                name="candidate_update_audit_evidence.safety_probe_available",
             ),
             "probe_independence_attested": _strict_bool_scalar(
                 evidence.probe_independence_attested,
-                name="gradient_joy_evidence.probe_independence_attested",
+                name="candidate_update_audit_evidence.probe_independence_attested",
             ),
             "advantage_available": _strict_bool_scalar(
                 evidence.advantage_available,
-                name="gradient_joy_evidence.advantage_available",
+                name="candidate_update_audit_evidence.advantage_available",
             ),
             "action_surprisal_available": _strict_bool_scalar(
                 evidence.action_surprisal_available,
-                name="gradient_joy_evidence.action_surprisal_available",
+                name="candidate_update_audit_evidence.action_surprisal_available",
             ),
             "safety_cost_available": _strict_bool_scalar(
                 evidence.safety_cost_available,
-                name="gradient_joy_evidence.safety_cost_available",
+                name="candidate_update_audit_evidence.safety_cost_available",
             ),
         }
         gradient_finite = {
@@ -2974,7 +5501,7 @@ class PrototypeAgent:
             ),
             "safety_cost": jnp.isfinite(scalars["safety_cost"]),
         }
-        normalized = PrototypeGradientJoyEvidence(
+        normalized = PrototypeCandidateUpdateAuditEvidence(
             decision_id=decision_id,
             objective_probe_gradient=jnp.where(
                 gradient_finite["objective_probe_gradient"],
@@ -3226,6 +5753,8 @@ class PrototypeAgent:
                 available=unavailable,
                 decision_id=missing,
                 executed_event_id=missing,
+                decision_words=jnp.zeros((2,), dtype=jnp.uint32),
+                executed_event_words=jnp.zeros((2,), dtype=jnp.uint32),
                 executed_action=missing,
                 partner_id=missing,
                 assistance_value_available=unavailable,
@@ -3346,6 +5875,16 @@ class PrototypeAgent:
                 core_feedback.executed_event_id,
                 name="partner_policy_fusion_feedback.executed_event_id",
             ),
+            decision_words=_strict_uint32_words(
+                core_feedback.decision_words,
+                (2,),
+                name="partner_policy_fusion_feedback.decision_words",
+            ),
+            executed_event_words=_strict_uint32_words(
+                core_feedback.executed_event_words,
+                (2,),
+                name="partner_policy_fusion_feedback.executed_event_words",
+            ),
             executed_action=_strict_action_scalar(
                 core_feedback.executed_action,
                 name="partner_policy_fusion_feedback.executed_action",
@@ -3388,11 +5927,92 @@ class PrototypeAgent:
         return normalized, jnp.asarray(True, dtype=jnp.bool_)
 
     @staticmethod
-    def _gradient_joy_evidence_from_signals(
-        sidecar: PrototypeGradientJoyEvidence,
+    def _learning_value_router_inputs(
+        sidecar: PrototypeCandidateUpdateAuditEvidence,
+        signals: TypedLearningSignals,
+    ) -> tuple[LearningValue, LearningValueAvailability]:
+        """Build detached producer channels without candidate-validity gating."""
+
+        delight = jnp.asarray(
+            sidecar.advantage * sidecar.action_surprisal,
+            dtype=jnp.float32,
+        )
+        signal_input_available = signals.availability.input_valid
+        return (
+            LearningValue(
+                advantage=sidecar.advantage,
+                action_surprisal=sidecar.action_surprisal,
+                delight=delight,
+                epistemic_surprise=signals.epistemic_surprise,
+                aleatoric_uncertainty=signals.aleatoric_uncertainty,
+                learning_progress=signals.learning_progress,
+                change_probability=signals.change_probability,
+                safety_cost=sidecar.safety_cost,
+            ),
+            LearningValueAvailability(
+                advantage=sidecar.advantage_available,
+                action_surprisal=sidecar.action_surprisal_available,
+                delight=(
+                    sidecar.advantage_available
+                    & sidecar.action_surprisal_available
+                ),
+                epistemic_surprise=(
+                    signal_input_available & signals.availability.epistemic
+                ),
+                aleatoric_uncertainty=(
+                    signal_input_available & signals.availability.aleatoric
+                ),
+                learning_progress=(
+                    signal_input_available
+                    & signals.availability.learning_progress
+                ),
+                change_probability=(
+                    signal_input_available
+                    & signals.availability.change_probability
+                ),
+                safety_cost=sidecar.safety_cost_available,
+            ),
+        )
+
+    @staticmethod
+    def _candidate_update_audit_evidence_from_route(
+        sidecar: PrototypeCandidateUpdateAuditEvidence,
+        router_result: LearningValueRouterResult,
+        representation_gradient_valid: Array,
+    ) -> CandidateUpdateAuditEvidence:
+        """Join candidate/probe validity to the router's raw evidence route."""
+
+        candidate_available = jnp.asarray(
+            representation_gradient_valid,
+            dtype=jnp.bool_,
+        )
+        raw_route = router_result.candidate_update_audit_evidence
+        return CandidateUpdateAuditEvidence(
+            objective_probe_gradient=sidecar.objective_probe_gradient,
+            retention_probe_gradient=sidecar.retention_probe_gradient,
+            safety_cost_gradient=sidecar.safety_cost_gradient,
+            objective_probe_available=(
+                sidecar.objective_probe_available & candidate_available
+            ),
+            retention_probe_available=(
+                sidecar.retention_probe_available & candidate_available
+            ),
+            safety_probe_available=(
+                sidecar.safety_probe_available & candidate_available
+            ),
+            probe_independence_attested=(
+                sidecar.probe_independence_attested & candidate_available
+            ),
+            learning_value=raw_route.values,
+            learning_value_availability=raw_route.availability,
+        )
+
+    @staticmethod
+    def _candidate_update_audit_evidence_from_signals(
+        sidecar: PrototypeCandidateUpdateAuditEvidence,
         signals: TypedLearningSignals,
         representation_gradient_valid: Array,
-    ) -> GradientJoyEvidence:
+    ) -> CandidateUpdateAuditEvidence:
         """Join decision-bound probes to causal ensemble learning signals."""
         candidate_available = jnp.asarray(
             representation_gradient_valid,
@@ -3410,7 +6030,7 @@ class PrototypeAgent:
         surprisal_available = (
             sidecar.action_surprisal_available & candidate_available
         )
-        return GradientJoyEvidence(
+        return CandidateUpdateAuditEvidence(
             objective_probe_gradient=sidecar.objective_probe_gradient,
             retention_probe_gradient=sidecar.retention_probe_gradient,
             safety_cost_gradient=sidecar.safety_cost_gradient,
@@ -3647,11 +6267,15 @@ class PrototypeAgent:
             option_terminates,
             parameters_finite,
             source_indices_valid,
-        ) = jax.lax.cond(
-            executing,
-            intra_option_source,
-            base_source,
-            operand=None,
+        ) = (
+            base_source(None)
+            if stomp_config.n_options == 0
+            else jax.lax.cond(
+                executing,
+                intra_option_source,
+                base_source,
+                operand=None,
+            )
         )
         inputs_finite = (
             jnp.all(jnp.isfinite(current))
@@ -3728,6 +6352,72 @@ class PrototypeAgent:
             diagnostics=diagnostics,
         )
 
+    def _behavior_active_pair_weights(
+        self,
+        state: PrototypeAgentState,
+    ) -> Float[Array, " active_pair_slots"]:
+        """Return the exact old control owner's active pair coefficients."""
+
+        feature_config = self._config.prototype_feature_lifecycle
+        if feature_config is None:
+            raise RuntimeError("active pair weights require the feature lifecycle")
+        active_slots = feature_config.active_pair_slots
+        stomp_state = self._oak_component_state(state.oak_state).stomp_state
+        stomp_config = self._config.oak.stomp
+        base_action = jnp.clip(
+            stomp_state.base_last_action,
+            0,
+            stomp_config.n_primitive_actions - 1,
+        )
+        base_weight_rows = jnp.stack(
+            tuple(
+                jnp.ravel(weights)
+                for weights in stomp_state.base_learner_state.head_params.weights
+            ),
+            axis=0,
+        )
+        base_weights = base_weight_rows[base_action, -active_slots:]
+        if stomp_config.n_options == 0:
+            return base_weights
+        option_index = jnp.clip(
+            stomp_state.executing_option,
+            0,
+            stomp_config.n_options - 1,
+        )
+        intra_action = jnp.clip(
+            stomp_state.option_last_intra_action,
+            0,
+            stomp_config.n_primitive_actions - 1,
+        )
+        option_weights = stomp_state.option_policies.q_weights[
+            option_index,
+            intra_action,
+            -active_slots:,
+        ]
+        return jnp.where(
+            stomp_state.executing_option >= 0,
+            option_weights,
+            base_weights,
+        )
+
+    def _horde_active_pair_weights(
+        self,
+        state: MultiHeadMLPState,
+    ) -> Float[Array, "n_demons active_pair_slots"]:
+        """Return ordered old linear-Horde active pair coefficients."""
+
+        feature_config = self._config.prototype_feature_lifecycle
+        if feature_config is None or feature_config.managed_horde_demons <= 0:
+            raise RuntimeError("Horde pair weights require the shared feature lane")
+        active_slots = feature_config.active_pair_slots
+        return jnp.stack(
+            tuple(
+                jnp.ravel(weights)[-active_slots:]
+                for weights in state.head_params.weights
+            ),
+            axis=0,
+        )
+
     def _apply_state_builder_learning(
         self,
         source_state: Any,
@@ -3735,11 +6425,12 @@ class PrototypeAgent:
         representation_gradient: Array,
         representation_gradient_valid: Array,
         signals: TypedLearningSignals,
-        joy_sidecar: PrototypeGradientJoyEvidence | None,
+        candidate_audit_sidecar: PrototypeCandidateUpdateAuditEvidence | None,
+        learning_value_router_result: LearningValueRouterResult | None,
     ) -> tuple[
         Any,
         StateBuilderLearningDiagnostics,
-        GradientJoyApplicationResult | None,
+        CandidateUpdateAuditApplicationResult | None,
     ]:
         """Propose from the causal source and commit into advanced recurrence."""
         if not self._state_builder_learning_enabled():
@@ -3755,21 +6446,34 @@ class PrototypeAgent:
             source_state,
             representation_gradient,
         )
-        application: GradientJoyApplicationResult | None = None
+        application: CandidateUpdateAuditApplicationResult | None = None
         approved = jnp.asarray(
             representation_gradient_valid,
             dtype=jnp.bool_,
         )
         candidate_update = proposal.candidate_parameter_update
         if self._config.gradient_joy is not None:
-            if joy_sidecar is None:
-                raise RuntimeError("configured gradient joy requires a sidecar")
-            audit_evidence = self._gradient_joy_evidence_from_signals(
-                joy_sidecar,
-                signals,
-                approved,
-            )
-            application = apply_gradient_joy_update(
+            if candidate_audit_sidecar is None:
+                raise RuntimeError(
+                    "configured candidate-update audit requires a sidecar"
+                )
+            if self._learning_value_router is None:
+                audit_evidence = self._candidate_update_audit_evidence_from_signals(
+                    candidate_audit_sidecar,
+                    signals,
+                    approved,
+                )
+            else:
+                if learning_value_router_result is None:
+                    raise RuntimeError(
+                        "configured learning-value router requires one routed result"
+                    )
+                audit_evidence = self._candidate_update_audit_evidence_from_route(
+                    candidate_audit_sidecar,
+                    learning_value_router_result,
+                    approved,
+                )
+            application = apply_candidate_update(
                 proposal.source_parameters,
                 candidate_update,
                 audit_evidence,
@@ -3815,6 +6519,20 @@ class PrototypeAgent:
             )
         return lifecycle.augment(feature_state, base_representation)
 
+    @staticmethod
+    def _feature_candidate_descriptors(
+        state: PrototypeFeatureLifecycleState,
+    ) -> Int[Array, " candidate_pair_slots 2"]:
+        """Return candidate identities in their declared slot order."""
+
+        return jnp.stack(
+            (
+                state.learner_state.candidate_left,
+                state.learner_state.candidate_right,
+            ),
+            axis=1,
+        ).astype(jnp.int32)
+
     def _unavailable_feature_lifecycle_diagnostics(
         self,
         state: PrototypeFeatureLifecycleState,
@@ -3839,8 +6557,240 @@ class PrototypeAgent:
             pullback_semantic_generation=generation,
             prediction=zero,
             error=zero,
+            task_targets=jnp.zeros(
+                (lifecycle.config.n_tasks,),
+                dtype=jnp.float32,
+            ),
+            task_target_available=jnp.zeros(
+                (lifecycle.config.n_tasks,),
+                dtype=jnp.bool_,
+            ),
+            task_predictions=jnp.zeros(
+                (lifecycle.config.n_tasks,),
+                dtype=jnp.float32,
+            ),
+            task_errors=jnp.zeros(
+                (lifecycle.config.n_tasks,),
+                dtype=jnp.float32,
+            ),
             metrics=jnp.zeros((7,), dtype=jnp.float32),
             lifecycle=lifecycle.unavailable_diagnostics(generation),
+            outer_transaction_committed=false,
+        )
+
+    def _unavailable_feature_utility_diagnostics(
+        self,
+        state: PrototypeFeatureUtilityState,
+    ) -> PrototypeFeatureUtilityDiagnostics:
+        """Return a finite neutral utility record without observing twice."""
+
+        auditor = self._prototype_feature_utility
+        if auditor is None:
+            raise RuntimeError("prototype feature utility is disabled")
+        return auditor.unavailable_diagnostics(state)
+
+    def _unavailable_feature_utility_integration_diagnostics(
+        self,
+        state: PrototypeFeatureUtilityState,
+    ) -> PrototypeFeatureUtilityIntegrationDiagnostics:
+        """Return two neutral phases without observing or rebinding state."""
+
+        neutral = self._unavailable_feature_utility_diagnostics(state)
+        false = jnp.asarray(False, dtype=jnp.bool_)
+        return PrototypeFeatureUtilityIntegrationDiagnostics(
+            observation=neutral,
+            rebind=neutral,
+            rebind_required=false,
+            outer_transaction_committed=false,
+        )
+
+    def _unavailable_feature_memory_integration_diagnostics(
+        self,
+        state: PrototypeAgentState,
+        memory_input: PrototypeExperientialMemoryInput,
+    ) -> PrototypeFeatureMemoryIntegrationDiagnostics:
+        """Return a bank-authenticated no-op without querying or writing memory."""
+
+        adapter = self._prototype_feature_memory
+        if adapter is None:
+            raise RuntimeError("prototype feature memory is disabled")
+        wrapper = self._feature_memory_component_state(state.ia_state)
+        binding = self._feature_consumer_binding(state.oak_state)
+        rebind = adapter.rebind(wrapper, binding, binding)
+        query_matches = (
+            memory_input.query_representation_version
+            == binding.semantic_generation
+        )
+        entry_matches = (
+            memory_input.entry_representation_version
+            == binding.semantic_generation
+        )
+        representation_finite = jnp.all(
+            jnp.isfinite(state.current_representation)
+        )
+        return PrototypeFeatureMemoryIntegrationDiagnostics(
+            rebind=rebind.diagnostics,
+            query_source_version_matches=query_matches,
+            entry_source_version_matches=entry_matches,
+            source_versions_match=query_matches & entry_matches,
+            current_destination_encoding_valid=representation_finite,
+            bootstrap_destination_encoding_valid=representation_finite,
+            decision_destination_encoding_valid=representation_finite,
+            post_memory_state_valid=adapter.state_valid(wrapper, binding),
+            outer_transaction_committed=jnp.asarray(False, dtype=jnp.bool_),
+        )
+
+    @staticmethod
+    def _unavailable_atomic_feature_world_memory_diagnostics(
+    ) -> PrototypeAtomicFeatureWorldMemoryDiagnostics:
+        """Return one fixed-shape no-attempt atomic-composition audit."""
+
+        false = jnp.asarray(False, dtype=jnp.bool_)
+        zero = jnp.asarray(0, dtype=jnp.int32)
+        lifecycle = PrototypeFeatureLifecycleAdoptionDiagnostics(
+            source_state_matches=false,
+            source_oak_state_matches=false,
+            source_horde_state_matches=false,
+            source_consumer_binding_matches=false,
+            receipt_matches_preparation=false,
+            preparation_internally_valid=false,
+            all_consumers_ready=false,
+            destination_adopted=false,
+            ordinary_update_retained=false,
+            external_curation_rolled_back=false,
+            transaction_applied=false,
+            rejected=jnp.asarray(True, dtype=jnp.bool_),
+            preparation_learner_update_evaluations=zero,
+            adoption_learner_update_evaluations=zero,
+            total_learner_update_evaluations=zero,
+        )
+        world = PrototypeRoutedLinearWorldAdoptionDiagnostics(
+            source_state_matches=false,
+            source_router_state_matches=false,
+            receipt_matches_preparation=false,
+            ordinary_successor_valid=false,
+            destination_candidate_valid=false,
+            preparation_internally_valid=false,
+            all_consumers_ready=false,
+            destination_adopted=false,
+            ordinary_update_retained=false,
+            external_route_rolled_back=false,
+            transaction_applied=false,
+            rejected=jnp.asarray(True, dtype=jnp.bool_),
+            preparation_learner_update_evaluations=zero,
+            adoption_learner_update_evaluations=zero,
+            total_learner_update_evaluations=zero,
+            preparation_router_evaluations=zero,
+            adoption_router_evaluations=zero,
+            total_router_evaluations=zero,
+        )
+        return PrototypeAtomicFeatureWorldMemoryDiagnostics(
+            available=false,
+            descriptor_change_requested=false,
+            lifecycle_destination_ready=false,
+            world_ordinary_ready=false,
+            world_destination_ready=false,
+            memory_destination_ready=false,
+            all_consumers_ready=false,
+            destination_adopted=false,
+            ordinary_updates_retained=false,
+            external_curation_rolled_back=false,
+            lifecycle_adoption=lifecycle,
+            world_adoption=world,
+            oak_update_evaluations=zero,
+            horde_update_evaluations=zero,
+            feature_learner_update_evaluations=zero,
+            lifecycle_router_evaluations=zero,
+            world_learner_update_evaluations=zero,
+            world_router_evaluations=zero,
+            memory_rebind_evaluations=zero,
+            memory_step_evaluations=zero,
+        )
+
+    def _unavailable_feature_utility_curation_integration_diagnostics(
+        self,
+        feature_state: PrototypeFeatureLifecycleState,
+        utility_state: PrototypeFeatureUtilityState,
+    ) -> PrototypeFeatureUtilityCurationIntegrationDiagnostics:
+        """Return one finite no-attempt v6 ranking record."""
+
+        policy = self._prototype_feature_utility_curation
+        if policy is None:
+            raise RuntimeError("prototype feature utility curation is disabled")
+        ranked = policy.rank(
+            utility_state,
+            source_semantic_generation=(
+                feature_state.router_state.generation_count
+            ),
+            source_semantic_generation_words=(
+                feature_state.router_state.generation_words
+            ),
+            source_active_descriptors=(
+                feature_state.router_state.descriptors
+            ),
+            source_candidate_descriptors=(
+                self._feature_candidate_descriptors(feature_state)
+            ),
+        )
+        false = jnp.asarray(False, dtype=jnp.bool_)
+        rejected_index = jnp.asarray(-1, dtype=jnp.int32)
+        rejected_descriptor = jnp.full((2,), -1, dtype=jnp.int32)
+        diagnostics = ranked.diagnostics
+        neutral_policy = cast(
+            PrototypeFeatureUtilityCurationDiagnostics,
+            diagnostics.replace(
+                available=false,
+                transaction_valid=false,
+                override_enabled=false,
+                any_active_rank_ready=false,
+                any_candidate_rank_ready=false,
+                curation_ready=false,
+                active_task_evidence_ready=jnp.zeros_like(
+                    diagnostics.active_task_evidence_ready
+                ),
+                candidate_task_evidence_ready=jnp.zeros_like(
+                    diagnostics.candidate_task_evidence_ready
+                ),
+                active_all_tasks_evidence_ready=jnp.zeros_like(
+                    diagnostics.active_all_tasks_evidence_ready
+                ),
+                candidate_all_tasks_evidence_ready=jnp.zeros_like(
+                    diagnostics.candidate_all_tasks_evidence_ready
+                ),
+                candidate_collision_mask=jnp.zeros_like(
+                    diagnostics.candidate_collision_mask
+                ),
+                candidate_rank_ready_mask=jnp.zeros_like(
+                    diagnostics.candidate_rank_ready_mask
+                ),
+                raw_active_fixed_mass_utilities=jnp.zeros_like(
+                    diagnostics.raw_active_fixed_mass_utilities
+                ),
+                raw_candidate_fixed_mass_utilities=jnp.zeros_like(
+                    diagnostics.raw_candidate_fixed_mass_utilities
+                ),
+                emitted_active_ranks=jnp.zeros_like(
+                    diagnostics.emitted_active_ranks
+                ),
+                emitted_candidate_ranks=jnp.zeros_like(
+                    diagnostics.emitted_candidate_ranks
+                ),
+            ),
+        )
+        return PrototypeFeatureUtilityCurationIntegrationDiagnostics(
+            policy=neutral_policy,
+            observation_applied=false,
+            priority_override_supplied=false,
+            priority_override_consulted=false,
+            curation_allowed=false,
+            selected_active_slot=rejected_index,
+            selected_candidate_slot=rejected_index,
+            selected_active_descriptor=rejected_descriptor,
+            selected_candidate_descriptor=rejected_descriptor,
+            lifecycle_curation_proposed=false,
+            lifecycle_curation_deferred=false,
+            lifecycle_curation_committed=false,
+            lifecycle_curation_rolled_back=false,
             outer_transaction_committed=false,
         )
 
@@ -3851,13 +6801,185 @@ class PrototypeAgent:
             return self._config.gru_perception.observation_dim
         return self._config.oak.observation_dim
 
+    @staticmethod
+    def _oak_state_numeric_valid(
+        oak_agent: OaKAgent,
+        state: OaKState,
+    ) -> Array:
+        """Authenticate one OaK wrapper and its complete nested STOMP state."""
+
+        counter_ceiling = jnp.where(
+            state.step_count < jnp.asarray(_INT32_MAX, dtype=jnp.int32),
+            state.step_count + jnp.asarray(1, dtype=jnp.int32),
+            state.step_count,
+        )
+        return (
+            _lifetime_counter_valid(state.step_words, state.step_count)
+            & _lifetime_counter_valid(
+                state.stomp_state.step_words,
+                state.stomp_state.step_count,
+            )
+            & jnp.all(state.step_words == state.stomp_state.step_words)
+            & (state.step_count == state.stomp_state.step_count)
+            & jnp.all(state.execution_counts >= 0)
+            & jnp.all(state.execution_counts <= counter_ceiling)
+            & jnp.all(jnp.isfinite(state.cumulative_pseudo_rewards))
+            & jnp.all(jnp.isfinite(state.utility_ema))
+            & oak_agent.stomp_agent.state_valid(state.stomp_state)
+        )
+
     def _state_numeric_valid(self, state: PrototypeAgentState) -> Array:
         """Validate state numerics while preserving world-model init sentinels."""
+        oak_component = self._oak_component_state(state.oak_state)
+        outer_lifetime_valid = (
+            _lifetime_counter_valid(state.step_words, state.step_count)
+            & _lifetime_counter_valid(
+                state.observation_event_words,
+                state.observation_event_count,
+            )
+            & _prototype_observation_clock_relation_valid(
+                state.step_words,
+                state.observation_event_words,
+            )
+            & jnp.all(state.step_words == oak_component.step_words)
+            & jnp.all(state.step_words == oak_component.stomp_state.step_words)
+            & (state.step_count == oak_component.step_count)
+            & (state.step_count == oak_component.stomp_state.step_count)
+            & self._oak_state_numeric_valid(self._oak, oak_component)
+        )
         sanitized_state = state
         world_model_bounds_valid = jnp.asarray(True)
         state_builder_valid = jnp.asarray(True)
+        learning_value_router_valid = jnp.asarray(True, dtype=jnp.bool_)
         feature_lifecycle_valid = jnp.asarray(True, dtype=jnp.bool_)
+        feature_horde_valid = jnp.asarray(True, dtype=jnp.bool_)
+        feature_utility_valid = jnp.asarray(True, dtype=jnp.bool_)
         interaction_state_valid = jnp.asarray(True, dtype=jnp.bool_)
+        ia_state_valid = jnp.asarray(True, dtype=jnp.bool_)
+        horde_lifetime_valid = jnp.asarray(True, dtype=jnp.bool_)
+        buffer_state_valid = jnp.asarray(True, dtype=jnp.bool_)
+        if self._buffer is not None:
+            if type(state.buffer_state) is not RecentObservationBufferState:
+                buffer_state_valid = jnp.asarray(False, dtype=jnp.bool_)
+            else:
+                buffer_state = state.buffer_state
+                static_buffer_contract = (
+                    buffer_state.observations.shape
+                    == (
+                        self._config.buffer_capacity,
+                        self._buffer.observation_dim,
+                    )
+                    and buffer_state.observations.dtype == jnp.dtype(jnp.float32)
+                    and buffer_state.size.shape == ()
+                    and buffer_state.size.dtype == jnp.dtype(jnp.int32)
+                    and buffer_state.index.shape == ()
+                    and buffer_state.index.dtype == jnp.dtype(jnp.int32)
+                )
+                capacity = jnp.asarray(
+                    self._config.buffer_capacity,
+                    dtype=jnp.int32,
+                )
+                zero_words = jnp.zeros((2,), dtype=jnp.uint32)
+                has_observation = jnp.any(state.observation_event_words != 0)
+                insertion_low = (
+                    state.observation_event_words[1]
+                    - jnp.asarray(1, dtype=jnp.uint32)
+                )
+                insertion_borrow = (
+                    state.observation_event_words[1]
+                    == jnp.asarray(0, dtype=jnp.uint32)
+                ).astype(jnp.uint32)
+                insertion_words = jnp.where(
+                    has_observation,
+                    jnp.stack(
+                        (
+                            state.observation_event_words[0] - insertion_borrow,
+                            insertion_low,
+                        )
+                    ),
+                    zero_words,
+                )
+                capacity_words = jnp.asarray(
+                    (0, self._config.buffer_capacity),
+                    dtype=jnp.uint32,
+                )
+                buffer_not_full = _lifetime_words_less_than(
+                    insertion_words,
+                    capacity_words,
+                )
+                expected_buffer_size = jnp.where(
+                    buffer_not_full,
+                    insertion_words[1].astype(jnp.int32),
+                    capacity,
+                )
+                expected_buffer_index = _lifetime_words_modulo(
+                    insertion_words,
+                    self._config.buffer_capacity,
+                ).astype(jnp.int32)
+                unused_rows_are_zero = jnp.all(
+                    jnp.where(
+                        (
+                            jnp.arange(
+                                self._config.buffer_capacity,
+                                dtype=jnp.int32,
+                            )
+                            >= expected_buffer_size
+                        )[:, None],
+                        buffer_state.observations == 0.0,
+                        jnp.ones_like(
+                            buffer_state.observations,
+                            dtype=jnp.bool_,
+                        ),
+                    )
+                )
+                buffer_state_valid = (
+                    jnp.asarray(static_buffer_contract, dtype=jnp.bool_)
+                    & jnp.all(jnp.isfinite(buffer_state.observations))
+                    & (buffer_state.size >= 0)
+                    & (buffer_state.size <= capacity)
+                    & (buffer_state.index >= 0)
+                    & (buffer_state.index < capacity)
+                    & jnp.where(
+                        buffer_state.size < capacity,
+                        buffer_state.index == buffer_state.size,
+                        jnp.asarray(True, dtype=jnp.bool_),
+                    )
+                    & (buffer_state.size == expected_buffer_size)
+                    & (buffer_state.index == expected_buffer_index)
+                    & unused_rows_are_zero
+                )
+        elif state.buffer_state is not None:
+            buffer_state_valid = jnp.asarray(False, dtype=jnp.bool_)
+        if self._ia is not None:
+            ia_state = self._ia_component_state(state.ia_state)
+            ia_cortex = ia_state.cortex_state
+            ia_state_valid = (
+                self._ia.state_is_valid(ia_state)
+                & (ia_state.step_count == state.step_count)
+                & jnp.all(ia_state.step_words == state.step_words)
+                & (ia_state.cerebellum_state.step_count == state.step_count)
+                & jnp.all(
+                    ia_state.cerebellum_state.step_words == state.step_words
+                )
+                & jnp.all(ia_cortex.step_words == state.step_words)
+                & jnp.all(
+                    ia_cortex.stomp_state.step_words == state.step_words
+                )
+                & self._oak_state_numeric_valid(
+                    self._ia.cortex._oak,
+                    ia_cortex,
+                )
+            )
+        if self._horde is not None:
+            horde_state = self._horde_component_state(state)
+            horde_lifetime_valid = (
+                _lifetime_counter_valid(
+                    horde_state.step_words,
+                    horde_state.step_count,
+                )
+                & (horde_state.step_count == state.step_count)
+                & jnp.all(horde_state.step_words == state.step_words)
+            )
         if self._partner_policy_fusion is not None:
             interaction = self._partner_interaction_state(state.ia_state)
             if (
@@ -3906,6 +7028,17 @@ class PrototypeAgent:
                 interaction_state_valid
                 & self._experiential_memory_policy.state_valid(memory_state)
             )
+            if self._prototype_feature_memory is not None:
+                feature_memory_state = self._feature_memory_component_state(
+                    state.ia_state
+                )
+                interaction_state_valid = (
+                    interaction_state_valid
+                    & self._prototype_feature_memory.state_valid(
+                        feature_memory_state,
+                        self._feature_consumer_binding(state.oak_state),
+                    )
+                )
         if self._state_builder is not None:
             builder_state = self._builder_component_state(
                 state.state_builder_state
@@ -3913,18 +7046,43 @@ class PrototypeAgent:
             state_builder_valid = self._state_builder.state_valid(
                 builder_state
             )
+        if self._learning_value_router is not None:
+            router_state = self._learning_value_router_component_state(
+                state.state_builder_state
+            )
+            router_owner_step = jnp.minimum(
+                state.step_count,
+                jnp.asarray(
+                    self._learning_value_router.config.max_steps,
+                    dtype=jnp.int32,
+                ),
+            )
+            learning_value_router_valid = (
+                self._learning_value_router.state_valid(router_state)
+                & (router_state.step_count == router_owner_step)
+            )
         if self._prototype_feature_lifecycle is not None:
             feature_state = self._feature_lifecycle_component_state(
                 state.state_builder_state
             )
             consumer_binding = self._feature_consumer_binding(state.oak_state)
-            maximum_observations = jnp.asarray(
-                self._config.prototype_feature_lifecycle.max_observations,
-                dtype=jnp.int32,
+            maximum_observations = (
+                self._config.prototype_feature_lifecycle.max_observations
             )
-            expected_observations = jnp.minimum(
-                jnp.maximum(state.step_count, jnp.asarray(0, dtype=jnp.int32)),
-                maximum_observations,
+            maximum_observation_words = jnp.asarray(
+                (
+                    (maximum_observations >> 32) & _UINT32_MAX,
+                    maximum_observations & _UINT32_MAX,
+                ),
+                dtype=jnp.uint32,
+            )
+            expected_observation_words = jnp.where(
+                _lifetime_words_less_equal(
+                    state.step_words,
+                    maximum_observation_words,
+                ),
+                state.step_words,
+                maximum_observation_words,
             )
             feature_lifecycle_valid = (
                 self._prototype_feature_lifecycle.state_valid(feature_state)
@@ -3932,9 +7090,125 @@ class PrototypeAgent:
                     feature_state,
                     consumer_binding,
                 )
-                & (feature_state.observe_count == expected_observations)
+                & jnp.all(
+                    feature_state.observe_words
+                    == expected_observation_words
+                )
+                & (
+                    feature_state.observe_count
+                    == _lifetime_words_to_int32_telemetry(
+                        expected_observation_words
+                    )
+                )
             )
+            if self._shared_feature_horde_enabled():
+                bundle_identity_valid = self._feature_horde_bundle_identity_valid(
+                    state
+                )
+                try:
+                    shared_consumer = self._shared_feature_horde_bundle(
+                        state.oak_state
+                    )
+                except TypeError:
+                    shared_consumer = None
+                if type(shared_consumer) is PrototypeFeatureOaKHordeState:
+                    managed_horde_state = shared_consumer.horde_state
+                    feature_horde_valid = (
+                        bundle_identity_valid
+                        & self._prototype_feature_lifecycle.horde_state_valid(
+                            managed_horde_state
+                        )
+                        & self._managed_horde_optimizer_matches_config(
+                            managed_horde_state
+                        )
+                        & (managed_horde_state.step_count == state.step_count)
+                        & jnp.all(managed_horde_state.step_words == state.step_words)
+                    )
+                else:
+                    feature_horde_valid = jnp.asarray(False, dtype=jnp.bool_)
+            if self._prototype_feature_utility is not None:
+                utility_state = self._feature_utility_component_state(
+                    state.oak_state
+                )
+                expected_candidates = self._feature_candidate_descriptors(
+                    feature_state
+                )
+                feature_utility_valid = (
+                    self._prototype_feature_utility.state_valid(utility_state)
+                    & jnp.array_equal(
+                        utility_state.active_descriptors,
+                        feature_state.router_state.descriptors,
+                    )
+                    & jnp.array_equal(
+                        utility_state.candidate_descriptors,
+                        expected_candidates,
+                    )
+                    & (
+                        utility_state.semantic_generation
+                        == feature_state.router_state.generation_count
+                    )
+                    & jnp.all(
+                        utility_state.semantic_generation_words
+                        == feature_state.router_state.generation_words
+                    )
+                    & (
+                        utility_state.observation_count
+                        == feature_state.observe_count
+                    )
+                    & jnp.all(
+                        utility_state.observation_words
+                        == feature_state.observe_words
+                    )
+                )
         if (
+            self._prototype_routed_linear_world_model is not None
+            and state.world_model_state is not None
+        ):
+            world_slot = state.world_model_state
+            expected_digest = self._prototype_atomic_feature_world_memory_digest
+            if (
+                type(world_slot) is not PrototypeAtomicFeatureWorldMemoryState
+                or type(world_slot.world_state)
+                is not PrototypeRoutedLinearWorldState
+                or expected_digest is None
+                or getattr(world_slot.schema_digest, "shape", None) != (32,)
+                or getattr(world_slot.schema_digest, "dtype", None)
+                != jnp.dtype(jnp.uint8)
+            ):
+                world_model_bounds_valid = jnp.asarray(False, dtype=jnp.bool_)
+            else:
+                routed_state = world_slot.world_state
+                feature_state = self._feature_lifecycle_component_state(
+                    state.state_builder_state
+                )
+                authoritative_binding = self._feature_consumer_binding(
+                    state.oak_state
+                )
+                world_model_bounds_valid = (
+                    jnp.array_equal(world_slot.schema_digest, expected_digest)
+                    & self._prototype_routed_linear_world_model.state_valid(
+                        routed_state
+                    )
+                    & _tree_arrays_equal(
+                        routed_state.consumer_binding,
+                        authoritative_binding,
+                    )
+                    & self._prototype_routed_linear_world_model._router_matches_binding(
+                        feature_state.router_state,
+                        routed_state.consumer_binding,
+                    )
+                    & jnp.all(
+                        routed_state.model_state.step_words == state.step_words
+                    )
+                    & (
+                        routed_state.model_state.step_count == state.step_count
+                    )
+                )
+            sanitized_state = cast(
+                PrototypeAgentState,
+                state.replace(world_model_state=None),
+            )
+        elif (
             self._recurrent_latent_world_model_ensemble is not None
             and state.world_model_state is not None
         ):
@@ -3971,43 +7245,153 @@ class PrototypeAgent:
                 state.replace(world_model_state=None),
             )
         elif self._world_model is not None and state.world_model_state is not None:
-            world_model_state = state.world_model_state
-            observation_min = world_model_state.observation_min
-            observation_max = world_model_state.observation_max
-            reward_min = world_model_state.reward_min
-            reward_max = world_model_state.reward_max
-            pristine_bounds = (
-                jnp.all(jnp.isposinf(observation_min))
-                & jnp.all(jnp.isneginf(observation_max))
-                & jnp.isposinf(reward_min)
-                & jnp.isneginf(reward_max)
+            world_model_slot = state.world_model_state
+            template = self._world_model_state_contract_template
+            schema_identity_valid = jnp.asarray(True, dtype=jnp.bool_)
+            world_model_state: ActionConditionedWorldModelState | None = None
+            if self._prototype_feature_lifecycle is None:
+                if type(world_model_slot) is ActionConditionedWorldModelState:
+                    world_model_state = world_model_slot
+            else:
+                expected_digest = self._prototype_feature_world_model_digest
+                if (
+                    type(world_model_slot) is PrototypeFeatureWorldModelState
+                    and type(world_model_slot.model_state)
+                    is ActionConditionedWorldModelState
+                    and expected_digest is not None
+                    and getattr(world_model_slot.schema_digest, "shape", None)
+                    == (32,)
+                    and getattr(world_model_slot.schema_digest, "dtype", None)
+                    == jnp.dtype(jnp.uint8)
+                ):
+                    world_model_state = world_model_slot.model_state
+                    schema_identity_valid = jnp.array_equal(
+                        world_model_slot.schema_digest,
+                        expected_digest,
+                    )
+            static_contract_valid = (
+                world_model_state is not None
+                and template is not None
+                and _prototype_tree_static_contract_matches(
+                    world_model_state,
+                    template,
+                )
             )
-            finite_bounds = (
-                jnp.all(jnp.isfinite(observation_min))
-                & jnp.all(jnp.isfinite(observation_max))
-                & jnp.isfinite(reward_min)
-                & jnp.isfinite(reward_max)
-            )
-            world_model_bounds_valid = jnp.where(
-                world_model_state.step_count == 0,
-                pristine_bounds,
-                finite_bounds,
-            )
-            sanitized_world_model_state = world_model_state.replace(
-                observation_min=jnp.zeros_like(observation_min),
-                observation_max=jnp.zeros_like(observation_max),
-                reward_min=jnp.zeros_like(reward_min),
-                reward_max=jnp.zeros_like(reward_max),
-            )
+            if not static_contract_valid:
+                world_model_bounds_valid = jnp.asarray(False, dtype=jnp.bool_)
+                sanitized_state = cast(
+                    PrototypeAgentState,
+                    state.replace(world_model_state=None),
+                )
+            else:
+                exact_world_state = cast(
+                    ActionConditionedWorldModelState,
+                    world_model_state,
+                )
+                observation_min = exact_world_state.observation_min
+                observation_max = exact_world_state.observation_max
+                reward_min = exact_world_state.reward_min
+                reward_max = exact_world_state.reward_max
+                pristine_bounds = (
+                    jnp.all(jnp.isposinf(observation_min))
+                    & jnp.all(jnp.isneginf(observation_max))
+                    & jnp.isposinf(reward_min)
+                    & jnp.isneginf(reward_max)
+                )
+                finite_bounds = (
+                    jnp.all(jnp.isfinite(observation_min))
+                    & jnp.all(jnp.isfinite(observation_max))
+                    & jnp.isfinite(reward_min)
+                    & jnp.isfinite(reward_max)
+                    & jnp.all(observation_min <= observation_max)
+                    & (reward_min <= reward_max)
+                )
+                learner_status = self._world_model.learner._counter_status(
+                    exact_world_state.learner_state
+                )
+                if self._prototype_feature_lifecycle is None:
+                    model_outer_counter_valid = (
+                        exact_world_state.step_count <= state.step_count
+                    ) & _lifetime_words_less_equal(
+                        exact_world_state.step_words,
+                        state.step_words,
+                    )
+                else:
+                    model_outer_counter_valid = (
+                        exact_world_state.step_count == state.step_count
+                    ) & jnp.all(
+                        exact_world_state.step_words == state.step_words
+                    )
+                wrapper_counter_valid = (
+                    _lifetime_counter_valid(
+                        exact_world_state.step_words,
+                        exact_world_state.step_count,
+                    )
+                    & (
+                        exact_world_state.step_count
+                        == exact_world_state.learner_state.step_count
+                    )
+                    & jnp.all(
+                        exact_world_state.step_words
+                        == exact_world_state.learner_state.step_words
+                    )
+                    & model_outer_counter_valid
+                    & learner_status.lifetime_counter_valid
+                    & learner_status.normalizer_counter_aligned
+                    & self._action_world_model_optimizer_matches_config(
+                        exact_world_state.learner_state
+                    )
+                )
+                world_model_bounds_valid = (
+                    schema_identity_valid
+                    & wrapper_counter_valid
+                    & jnp.where(
+                        jnp.all(exact_world_state.step_words == 0),
+                        pristine_bounds,
+                        finite_bounds,
+                    )
+                    & jnp.isfinite(exact_world_state.model_error_ema)
+                    & (exact_world_state.model_error_ema >= 0.0)
+                )
+                sanitized_world_model_state = exact_world_state.replace(
+                    observation_min=jnp.zeros_like(observation_min),
+                    observation_max=jnp.zeros_like(observation_max),
+                    reward_min=jnp.zeros_like(reward_min),
+                    reward_max=jnp.zeros_like(reward_max),
+                )
+                sanitized_state = cast(
+                    PrototypeAgentState,
+                    state.replace(
+                        world_model_state=self._action_world_model_state_slot(
+                            sanitized_world_model_state
+                        )
+                    ),
+                )
+        elif (
+            self._prototype_routed_linear_world_model is not None
+            or self._world_model is not None
+            or self._world_model_ensemble is not None
+            or self._model_replay_rehearsal is not None
+            or self._recurrent_latent_world_model_ensemble is not None
+            or state.world_model_state is not None
+        ):
+            world_model_bounds_valid = jnp.asarray(False, dtype=jnp.bool_)
             sanitized_state = cast(
                 PrototypeAgentState,
-                state.replace(world_model_state=sanitized_world_model_state),
+                state.replace(world_model_state=None),
             )
         return (
-            world_model_bounds_valid
+            outer_lifetime_valid
+            & world_model_bounds_valid
             & state_builder_valid
+            & learning_value_router_valid
             & feature_lifecycle_valid
+            & feature_horde_valid
+            & feature_utility_valid
             & interaction_state_valid
+            & ia_state_valid
+            & horde_lifetime_valid
+            & buffer_state_valid
             & _floating_tree_is_finite(sanitized_state)
         )
 
@@ -4046,6 +7430,14 @@ class PrototypeAgent:
                 builder_state.step_count
                 == state.observation_event_count
             )
+            if hasattr(builder_state, "step_words"):
+                builder_count_consistent = (
+                    builder_count_consistent
+                    & jnp.all(
+                        builder_state.step_words
+                        == state.observation_event_words
+                    )
+                )
         elif state.gru_state is not None:
             representation_consistent = jnp.array_equal(
                 jnp.concatenate(
@@ -4058,12 +7450,24 @@ class PrototypeAgent:
                 state.current_raw_observation,
                 state.current_representation,
             )
+        horde_count_consistent = jnp.asarray(True, dtype=jnp.bool_)
+        if self._shared_feature_horde_enabled():
+            horde_count_consistent = (
+                self._horde_component_state(state).step_count
+                == state.step_count
+            ) & jnp.all(
+                self._horde_component_state(state).step_words
+                == state.step_words
+            )
         return (
             jnp.all(jnp.isfinite(state.current_raw_observation))
             & jnp.all(jnp.isfinite(state.current_representation))
             & (state.observation_event_count >= 1)
             & (oak_state.step_count == state.step_count)
             & (oak_state.stomp_state.step_count == state.step_count)
+            & jnp.all(oak_state.step_words == state.step_words)
+            & jnp.all(oak_state.stomp_state.step_words == state.step_words)
+            & horde_count_consistent
             & representation_consistent
             & builder_count_consistent
             & jnp.array_equal(
@@ -4106,7 +7510,6 @@ class PrototypeAgent:
             recurrent_cache_consistent = self._recurrent_armed_cache_consistent(
                 state
             )
-        observation_maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
         return (
             self._representation_cache_consistent(state)
             & action_in_range
@@ -4114,8 +7517,7 @@ class PrototypeAgent:
             & (state.current_action == stomp_state.last_primitive_action)
             & control_gradient_owner_matches
             & option_identity_matches
-            & _step_counter_can_process(state.step_count)
-            & (state.observation_event_count <= observation_maximum - 2)
+            & _current_counter_capacity_available(state)
             & recurrent_cache_consistent
         )
 
@@ -4133,10 +7535,9 @@ class PrototypeAgent:
         """Validate a state disarmed by decision- or counter-capacity exhaustion."""
         counter = state.current_decision_id[2:]
         generation_maximum = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
-        step_maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
         exhausted = jnp.all(counter == generation_maximum) | (
-            state.step_count >= step_maximum - 1
-        ) | (state.observation_event_count >= step_maximum - 1)
+            ~_current_counter_capacity_available(state)
+        )
         recurrent_cache_disarmed = jnp.asarray(True, dtype=jnp.bool_)
         if self._recurrent_latent_world_model_ensemble is not None:
             recurrent_wrapper = cast(
@@ -4187,6 +7588,21 @@ class PrototypeAgent:
         elif state.gru_state is not None:
             recurrent_fresh = jnp.all(state.gru_state.hidden == 0.0)
         recurrent_world_fresh = jnp.asarray(True, dtype=jnp.bool_)
+        if self._prototype_routed_linear_world_model is not None:
+            routed_world = self._atomic_routed_world_component_state(
+                state.world_model_state
+            )
+            recurrent_world_fresh = (
+                (routed_world.model_state.step_count == 0)
+                & jnp.all(routed_world.model_state.step_words == 0)
+                & (routed_world.buffer_state.size == 0)
+                & (routed_world.buffer_state.index == 0)
+                & jnp.all(routed_world.buffer_state.observations == 0.0)
+                & (routed_world.generation_update_count == 0)
+                & jnp.all(routed_world.generation_update_words == 0)
+                & (routed_world.planned_backup_count == 0)
+                & jnp.all(routed_world.planned_backup_words == 0)
+            )
         if self._recurrent_latent_world_model_ensemble is not None:
             recurrent_wrapper = cast(
                 PrototypeRecurrentLatentWorldModelState,
@@ -4209,21 +7625,43 @@ class PrototypeAgent:
                 self._experiential_memory_component_state(state.ia_state),
                 self._experiential_memory.init(),
             )
+        buffer_fresh = jnp.asarray(True, dtype=jnp.bool_)
+        if self._buffer is not None:
+            if type(state.buffer_state) is RecentObservationBufferState:
+                buffer_fresh = (
+                    (state.buffer_state.size == 0)
+                    & (state.buffer_state.index == 0)
+                    & jnp.all(state.buffer_state.observations == 0.0)
+                )
+            else:
+                buffer_fresh = jnp.asarray(False, dtype=jnp.bool_)
+        horde_fresh = jnp.asarray(True, dtype=jnp.bool_)
+        if self._shared_feature_horde_enabled():
+            horde_fresh = (
+                self._horde_component_state(state).step_count
+                == jnp.asarray(0, dtype=jnp.int32)
+            )
         return (
             (~state.started)
             & (state.step_count == 0)
             & (state.observation_event_count == 0)
+            & jnp.all(state.step_words == 0)
+            & jnp.all(state.observation_event_words == 0)
             & (state.current_action == -1)
             & jnp.all(state.current_decision_id[2:] == 0)
             & jnp.all(state.current_raw_observation == 0.0)
             & jnp.all(state.current_representation == 0.0)
             & (oak_state.step_count == 0)
             & (oak_state.stomp_state.step_count == 0)
+            & jnp.all(oak_state.step_words == 0)
+            & jnp.all(oak_state.stomp_state.step_words == 0)
+            & horde_fresh
             & jnp.all(oak_state.stomp_state.base_last_obs == 0.0)
             & recurrent_fresh
             & recurrent_world_fresh
             & partner_fusion_fresh
             & experiential_memory_fresh
+            & buffer_fresh
         )
 
     def _pristine_state_consistent(self, state: PrototypeAgentState) -> Array:
@@ -4282,7 +7720,9 @@ class PrototypeAgent:
         wm_state: Any = None
         buf_state: Any = None
         if self._world_model is not None and self._buffer is not None:
-            wm_state = self._world_model.init(wm_key)
+            wm_state = self._action_world_model_state_slot(
+                self._world_model.init(wm_key)
+            )
             buf_state = self._buffer.init()
         elif self._world_model_ensemble is not None:
             wm_state = self._world_model_ensemble.init(wm_key)
@@ -4323,11 +7763,6 @@ class PrototypeAgent:
         experiential_memory_state: ExperientialMemoryState | None = None
         if self._experiential_memory is not None:
             experiential_memory_state = self._experiential_memory.init()
-        interaction_state = self._interaction_slot(
-            ia_state,
-            partner_fusion_state,
-            experiential_memory_state=experiential_memory_state,
-        )
 
         gru_state: Any = None
         if self._config.gru_perception is not None:
@@ -4338,6 +7773,7 @@ class PrototypeAgent:
             builder_state = self._state_builder.init(builder_key)
         feature_lifecycle_state: PrototypeFeatureLifecycleState | None = None
         feature_consumer_binding: PrototypeFeatureConsumerBinding | None = None
+        feature_utility_state: PrototypeFeatureUtilityState | None = None
         if self._prototype_feature_lifecycle is not None:
             feature_key = jr.fold_in(
                 builder_key,
@@ -4347,19 +7783,81 @@ class PrototypeAgent:
                 feature_lifecycle_state,
                 feature_consumer_binding,
             ) = self._prototype_feature_lifecycle.init_bound(feature_key)
+        if self._prototype_routed_linear_world_model is not None:
+            if (
+                feature_lifecycle_state is None
+                or feature_consumer_binding is None
+            ):
+                raise RuntimeError(
+                    "atomic routed-world initialization requires the live bank"
+                )
+            wm_state = self._atomic_routed_world_state_slot(
+                self._prototype_routed_linear_world_model.init(
+                    wm_key,
+                    feature_consumer_binding,
+                    feature_lifecycle_state.router_state,
+                )
+            )
+            buf_state = None
+        memory_slot_state: Any = experiential_memory_state
+        if self._prototype_feature_memory is not None:
+            if (
+                experiential_memory_state is None
+                or feature_consumer_binding is None
+            ):
+                raise RuntimeError(
+                    "feature-memory initialization requires memory and bank binding"
+                )
+            memory_slot_state = self._prototype_feature_memory.init(
+                feature_consumer_binding,
+                experiential_memory_state,
+            )
+        interaction_state = self._interaction_slot(
+            ia_state,
+            partner_fusion_state,
+            experiential_memory_state=memory_slot_state,
+        )
+        if self._prototype_feature_utility is not None:
+            if feature_lifecycle_state is None:
+                raise RuntimeError(
+                    "prototype feature utility requires lifecycle state"
+                )
+            feature_utility_state = self._prototype_feature_utility.init(
+                active_descriptors=(
+                    feature_lifecycle_state.router_state.descriptors
+                ),
+                candidate_descriptors=self._feature_candidate_descriptors(
+                    feature_lifecycle_state
+                ),
+                semantic_generation=(
+                    feature_lifecycle_state.router_state.generation_count
+                ),
+                semantic_generation_words=(
+                    feature_lifecycle_state.router_state.generation_words
+                ),
+            )
         representation_state = self._representation_state_slot(
             builder_state,
             feature_lifecycle_state,
+            (
+                self._learning_value_router.init()
+                if self._learning_value_router is not None
+                else None
+            ),
         )
 
         initial_state = PrototypeAgentState(
             oak_state=self._oak_state_slot(
                 oak_state,
                 feature_consumer_binding,
+                horde_state,
+                feature_utility_state,
             ),
             world_model_state=wm_state,
             buffer_state=buf_state,
-            horde_state=horde_state,
+            horde_state=(
+                None if self._shared_feature_horde_enabled() else horde_state
+            ),
             ia_state=interaction_state,
             gru_state=gru_state,
             state_builder_state=representation_state,
@@ -4377,7 +7875,9 @@ class PrototypeAgent:
             ),
             started=jnp.array(False),
             observation_event_count=jnp.array(0, dtype=jnp.int32),
+            observation_event_words=jnp.zeros((2,), dtype=jnp.uint32),
             step_count=jnp.array(0, dtype=jnp.int32),
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
         )
         return cast(
             PrototypeAgentState,
@@ -4395,6 +7895,8 @@ class PrototypeAgent:
         self,
         state: PrototypeAgentState,
         initial_observation: Array,
+        *,
+        extended_action_mask: Array | None = None,
     ) -> PrototypeAgentState:
         """Prime the agent with an initial observation.
 
@@ -4412,6 +7914,23 @@ class PrototypeAgent:
             (self._raw_observation_dim(),),
             name="initial_observation",
         )
+        action_mask = (
+            None
+            if extended_action_mask is None
+            else _strict_bool_array(
+                extended_action_mask,
+                (self._config.oak.stomp.n_total_actions,),
+                name="extended_action_mask",
+            )
+        )
+        mask_valid = (
+            jnp.asarray(True, dtype=jnp.bool_)
+            if action_mask is None
+            else jnp.all(
+                action_mask[: self._config.oak.n_primitive_actions]
+            )
+            & jnp.any(action_mask)
+        )
         finite = jnp.all(jnp.isfinite(raw_obs))
         pristine = self._pristine_state_consistent(state)
         if not _contains_tracer((raw_obs, state.started, state.step_count)):
@@ -4419,6 +7938,8 @@ class PrototypeAgent:
                 raise RuntimeError("start requires a fresh unstarted PrototypeAgentState")
             if not bool(finite):
                 raise ValueError("initial_observation must be finite")
+            if not bool(mask_valid):
+                raise ValueError("extended_action_mask must keep every primitive live")
         safe_raw_obs = jnp.where(finite, raw_obs, jnp.zeros_like(raw_obs))
 
         def prime(fresh_state: PrototypeAgentState) -> PrototypeAgentState:
@@ -4453,9 +7974,15 @@ class PrototypeAgent:
                 if self._prototype_feature_lifecycle is not None
                 else None
             )
+            feature_utility_state = (
+                self._feature_utility_component_state(fresh_state.oak_state)
+                if self._prototype_feature_utility is not None
+                else None
+            )
             new_oak = self._oak.start(
                 self._oak_component_state(fresh_state.oak_state),
                 obs_for_oak,
+                extended_action_mask=action_mask,
             )
             previous_ia = self._ia_component_state(fresh_state.ia_state)
             new_ia = previous_ia
@@ -4466,9 +7993,9 @@ class PrototypeAgent:
                 partner_state = self._partner_fusion_component_state(
                     fresh_state.ia_state
                 )
-            memory_state: ExperientialMemoryState | None = None
+            memory_state: Any = None
             if self._experiential_memory is not None:
-                memory_state = self._experiential_memory_component_state(
+                memory_state = self._memory_slot_component_state(
                     fresh_state.ia_state
                 )
             new_interaction_state = self._interaction_slot(
@@ -4499,6 +8026,8 @@ class PrototypeAgent:
                     oak_state=self._oak_state_slot(
                         new_oak,
                         feature_consumer_binding,
+                        self._horde_component_state(fresh_state),
+                        feature_utility_state,
                     ),
                     world_model_state=new_world_model_state,
                     ia_state=new_interaction_state,
@@ -4506,6 +8035,13 @@ class PrototypeAgent:
                     state_builder_state=self._representation_state_slot(
                         new_builder_state,
                         feature_state,
+                        (
+                            self._learning_value_router_component_state(
+                                fresh_state.state_builder_state
+                            )
+                            if self._learning_value_router is not None
+                            else None
+                        ),
                     ),
                     current_raw_observation=safe_raw_obs,
                     current_representation=obs_for_oak,
@@ -4515,6 +8051,10 @@ class PrototypeAgent:
                     ),
                     started=jnp.array(True),
                     observation_event_count=jnp.array(1, dtype=jnp.int32),
+                    observation_event_words=jnp.asarray(
+                        (0, 1),
+                        dtype=jnp.uint32,
+                    ),
                 ),
             )
             return cast(
@@ -4529,10 +8069,15 @@ class PrototypeAgent:
 
         result = cast(
             PrototypeAgentState,
-            jax.lax.cond(pristine & finite, prime, lambda unchanged: unchanged, state),
+            jax.lax.cond(
+                pristine & finite & mask_valid,
+                prime,
+                lambda unchanged: unchanged,
+                state,
+            ),
         )
         if not _contains_tracer((raw_obs, state.started, state.step_count)):
-            if bool(pristine & finite) and not bool(result.started):
+            if bool(pristine & finite & mask_valid) and not bool(result.started):
                 raise ValueError("initial_observation produced a non-finite agent state")
         return result
 
@@ -4602,6 +8147,140 @@ class PrototypeAgent:
             armed=armed_consistent,
         )
 
+    def validate_state(self, state: PrototypeAgentState) -> Bool[Array, ""]:
+        """Return whether a pristine, armed, or exhausted state is checkpoint-safe."""
+
+        return self._checkpoint_state_valid(state)
+
+    def replace_cached_primitive_action(
+        self,
+        state: PrototypeAgentState,
+        *,
+        decision_id: Array,
+        decision_observation: Array,
+        proposed_action: Array,
+        safety_action_mask: Array,
+    ) -> PrototypeCachedPrimitiveActionReplacement:
+        """Atomically replace the currently dispatchable primitive command.
+
+        The exact four-word Prototype decision ID and encoded decision
+        observation are ownership assertions. On a stale/misattributed ID,
+        observation mismatch, invalid STOMP owner, unsafe fallback, or invalid
+        proposed action, the complete Prototype state is unchanged. A commit
+        synchronizes the base or active-option STOMP credit owner,
+        ``current_action``, and the optional recurrent world-model decision
+        cache without advancing counters or consuming RNG.
+        """
+
+        expected_decision_id = _strict_decision_id(
+            decision_id,
+            name="decision_id",
+        )
+        observation = _strict_float_array(
+            decision_observation,
+            (self._config.oak.observation_dim,),
+            name="decision_observation",
+        )
+        current_oak_state = self._oak_component_state(state.oak_state)
+        replacement = replace_dispatched_primitive_action(
+            current_oak_state.stomp_state,
+            observation,
+            proposed_action,
+            safety_action_mask=safety_action_mask,
+        )
+        decision_id_matches = jnp.array_equal(
+            expected_decision_id,
+            state.current_decision_id,
+        )
+        observation_matches = (
+            replacement.decision.observation_matches
+            & jnp.array_equal(observation, state.current_representation)
+        )
+        state_valid_before = state.started & self._state_cache_consistent(state)
+        replacement_accepted = ~replacement.decision.failed_closed
+        candidate_action = jnp.where(
+            replacement_accepted,
+            replacement.decision.effective_action,
+            state.current_action,
+        ).astype(jnp.int32)
+        candidate_oak_state = cast(
+            OaKState,
+            current_oak_state.replace(stomp_state=replacement.state),
+        )
+        feature_binding = (
+            self._feature_consumer_binding(state.oak_state)
+            if self._prototype_feature_lifecycle is not None
+            else None
+        )
+        managed_horde_state = (
+            self._horde_component_state(state)
+            if self._shared_feature_horde_enabled()
+            else None
+        )
+        feature_utility_state = (
+            self._feature_utility_component_state(state.oak_state)
+            if self._feature_utility_enabled()
+            else None
+        )
+        candidate_world_model_state = state.world_model_state
+        if self._recurrent_latent_world_model_ensemble is not None:
+            recurrent_wrapper = cast(
+                PrototypeRecurrentLatentWorldModelState,
+                state.world_model_state,
+            )
+            candidate_world_model_state = recurrent_wrapper.replace(
+                decision_cache=self._recurrent_decision_for_observation(
+                    recurrent_wrapper.model_state,
+                    state.current_representation,
+                    candidate_action,
+                    state.started,
+                )
+            )
+        candidate = cast(
+            PrototypeAgentState,
+            state.replace(
+                oak_state=self._oak_state_slot(
+                    candidate_oak_state,
+                    feature_binding,
+                    managed_horde_state,
+                    feature_utility_state,
+                ),
+                world_model_state=candidate_world_model_state,
+                current_action=candidate_action,
+            ),
+        )
+        state_valid_after = self._state_cache_consistent(candidate)
+        committed = (
+            state_valid_before
+            & decision_id_matches
+            & observation_matches
+            & replacement_accepted
+            & state_valid_after
+        )
+        final_state = cast(
+            PrototypeAgentState,
+            jax.lax.cond(
+                committed,
+                lambda _: candidate,
+                lambda _: state,
+                operand=None,
+            ),
+        )
+        return PrototypeCachedPrimitiveActionReplacement(
+            state=final_state,
+            action=jnp.where(
+                committed,
+                candidate_action,
+                state.current_action,
+            ).astype(jnp.int32),
+            dispatch_replacement=replacement.decision,
+            decision_id_matches=decision_id_matches,
+            observation_matches=observation_matches,
+            state_valid_before=state_valid_before,
+            state_valid_after=state_valid_after,
+            committed=committed,
+        )
+
     def greedy_action(
         self,
         state: PrototypeAgentState,
@@ -4656,6 +8335,8 @@ class PrototypeAgent:
             n_primitive + n_options - 1,
         )
         base_score = base_values[base_index]
+        if n_options == 0:
+            return base_score
         option_index = jnp.clip(stomp.executing_option, 0, n_options - 1)
         primitive_index = jnp.clip(
             stomp.last_primitive_action,
@@ -4684,6 +8365,8 @@ class PrototypeAgent:
         transaction_allowed: Array,
         memory_input: PrototypeExperientialMemoryInput,
         input_supplied: Array,
+        source_representation_version: Array | None = None,
+        destination_representation_version: Array | None = None,
     ) -> tuple[
         ExperientialMemoryState,
         OaKState,
@@ -4696,6 +8379,35 @@ class PrototypeAgent:
         policy = self._experiential_memory_policy
         if memory is None or policy is None:
             raise RuntimeError("experiential memory is disabled")
+        if (source_representation_version is None) != (
+            destination_representation_version is None
+        ):
+            raise RuntimeError(
+                "feature-owned memory versions require both source and destination"
+            )
+        feature_owned_versions = source_representation_version is not None
+        source_version = (
+            jnp.asarray(source_representation_version, dtype=jnp.int32)
+            if feature_owned_versions
+            else memory_input.query_representation_version
+        )
+        destination_version = (
+            jnp.asarray(destination_representation_version, dtype=jnp.int32)
+            if feature_owned_versions
+            else memory_input.query_representation_version
+        )
+        query_source_version_matches = (
+            memory_input.query_representation_version == source_version
+        )
+        entry_source_version_matches = (
+            memory_input.entry_representation_version == source_version
+        )
+        version_metadata_valid = jnp.where(
+            jnp.asarray(feature_owned_versions, dtype=jnp.bool_),
+            query_source_version_matches & entry_source_version_matches,
+            (memory_input.query_representation_version >= 0)
+            & (memory_input.entry_representation_version >= 0),
+        )
         transaction_gate = jnp.asarray(transaction_allowed, dtype=jnp.bool_)
         current_id_matches = jnp.array_equal(
             memory_input.current_prototype_decision_id,
@@ -4738,8 +8450,7 @@ class PrototypeAgent:
             )
         )
         metadata_valid = (
-            (memory_input.query_representation_version >= 0)
-            & (memory_input.entry_representation_version >= 0)
+            version_metadata_valid
             & query_uncertainty_valid
             & entry_uncertainty_valid
             & safety_cost_valid
@@ -4760,7 +8471,7 @@ class PrototypeAgent:
         )
         query_version = jnp.where(
             transaction_required,
-            memory_input.query_representation_version,
+            destination_version,
             jnp.asarray(0, dtype=jnp.int32),
         )
         query_uncertainty = jnp.where(
@@ -4806,7 +8517,11 @@ class PrototypeAgent:
             reliability=memory_input.reliability,
             utility=memory_input.utility,
             utility_available=memory_input.utility_available,
-            representation_version=memory_input.entry_representation_version,
+            representation_version=(
+                destination_version
+                if feature_owned_versions
+                else memory_input.entry_representation_version
+            ),
             valid=jnp.asarray(True, dtype=jnp.bool_),
             age=jnp.asarray(0, dtype=jnp.int32),
             provenance_id=memory_input.provenance_id,
@@ -4817,7 +8532,7 @@ class PrototypeAgent:
             return memory.step(
                 memory_state,
                 decision_representation,
-                memory_input.query_representation_version,
+                destination_version,
                 memory_input.query_uncertainty,
                 memory_input.query_uncertainty_available,
                 entry,
@@ -4850,8 +8565,20 @@ class PrototypeAgent:
             transaction_required & step.wrote & retrieval_matches
         )
         counterfactual_action = oak_state.stomp_state.last_primitive_action
+        advantage_gate_diagnostics = None
+        proposal_authorized = proposal.available
+        advantage_gate = self._experiential_memory_advantage_gate
+        if advantage_gate is not None:
+            advantage_gate_diagnostics = advantage_gate.assess(
+                memory_state,
+                proposal,
+                counterfactual_action,
+            )
+            proposal_authorized = (
+                advantage_gate_diagnostics.replacement_allowed
+            )
         proposed_action = jnp.where(
-            transaction_required & proposal.available,
+            transaction_required & proposal_authorized,
             proposal.action,
             counterfactual_action,
         )
@@ -4875,6 +8602,7 @@ class PrototypeAgent:
         )
         diagnostics = PrototypeExperientialMemoryDiagnostics(
             proposal=proposal,
+            advantage_gate=advantage_gate_diagnostics,
             dispatch_replacement=replacement.decision,
             input_supplied=input_supplied,
             input_available=memory_input.available,
@@ -4908,6 +8636,8 @@ class PrototypeAgent:
         *,
         derived_decision_id: Array,
         derived_event_id: Array,
+        derived_decision_words: Array,
+        derived_event_words: Array,
         derived_prototype_decision_id: Array,
         next_armed: Array,
         transaction_allowed: Array,
@@ -5016,6 +8746,14 @@ class PrototypeAgent:
             feedback_result.state,
             decision_id=jnp.asarray(derived_decision_id, dtype=jnp.int32),
             event_id=jnp.asarray(derived_event_id, dtype=jnp.int32),
+            decision_words=jnp.asarray(
+                derived_decision_words,
+                dtype=jnp.uint32,
+            ),
+            event_words=jnp.asarray(
+                derived_event_words,
+                dtype=jnp.uint32,
+            ),
             observation_id=jnp.where(
                 decision_gate,
                 decision_input.observation_id,
@@ -5090,14 +8828,27 @@ class PrototypeAgent:
     # -- Dreaming scan (JIT-compiled as a method so the closure is stable) ----
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def _run_dreams(
+    def _run_dreams_with_count(
         self,
         oak_state: OaKState,
         wm_state: Any,
         buf_state: Any,
         rng_key: Array,
-    ) -> tuple[OaKState, Float[Array, " n_dreams"]]:
+        extended_action_mask: Array | None = None,
+    ) -> tuple[
+        OaKState,
+        Float[Array, " n_dreams"],
+        Int[Array, ""],
+    ]:
         n_prim = self._config.oak.n_primitive_actions
+        action_mask = (
+            jnp.ones(
+                (self._config.oak.stomp.n_total_actions,),
+                dtype=jnp.bool_,
+            )
+            if extended_action_mask is None
+            else extended_action_mask
+        )
         sample_one_hot = (
             self._config.dream_next_observation_mode == "sample_one_hot"
         )
@@ -5109,7 +8860,7 @@ class PrototypeAgent:
 
         def _dream_step(
             carry: tuple[OaKState, Array], dream_index: Array
-        ) -> tuple[tuple[OaKState, Array], Float[Array, ""]]:
+        ) -> tuple[tuple[OaKState, Array], tuple[Float[Array, ""], Array]]:
             oak_s, k = carry
             # Keep this legacy split unchanged so raw and sampled-one-hot
             # ablations share identical anchor/action key streams.
@@ -5150,6 +8901,7 @@ class PrototypeAgent:
                 proposal.transition.reward,
                 dream_next_observation,
                 proposal.transition.discount,
+                extended_action_mask=action_mask,
                 enable_option_planning=False,
             )
 
@@ -5174,14 +8926,40 @@ class PrototypeAgent:
                 dream_result.td_error,
                 jnp.array(0.0, dtype=jnp.float32),
             )
-            return (new_oak_s, k), td_err
+            return (new_oak_s, k), (
+                td_err,
+                dream_accepted.astype(jnp.int32),
+            )
 
-        (new_oak_state, _), dream_td_errors = jax.lax.scan(
+        (new_oak_state, _), (dream_td_errors, applied_updates) = jax.lax.scan(
             _dream_step,
             (oak_state, rng_key),
             jnp.arange(self._config.n_dreams_per_step),
         )
-        return new_oak_state, dream_td_errors
+        return (
+            new_oak_state,
+            dream_td_errors,
+            jnp.sum(applied_updates, dtype=jnp.int32),
+        )
+
+    def _run_dreams(
+        self,
+        oak_state: OaKState,
+        wm_state: Any,
+        buf_state: Any,
+        rng_key: Array,
+        extended_action_mask: Array | None = None,
+    ) -> tuple[OaKState, Float[Array, " n_dreams"]]:
+        """Compatibility wrapper that omits the internal applied-work count."""
+
+        next_state, td_errors, _ = self._run_dreams_with_count(
+            oak_state,
+            wm_state,
+            buf_state,
+            rng_key,
+            extended_action_mask,
+        )
+        return next_state, td_errors
 
     # -- Core update ----------------------------------------------------------
 
@@ -5246,6 +9024,12 @@ class PrototypeAgent:
                 oak_state=self._oak_state_slot(
                     legacy_oak_state,
                     feature_consumer_binding,
+                    self._horde_component_state(state),
+                    (
+                        self._feature_utility_component_state(state.oak_state)
+                        if self._prototype_feature_utility is not None
+                        else None
+                    ),
                 ),
                 current_raw_observation=legacy_representation[
                     : self._raw_observation_dim()
@@ -5298,8 +9082,11 @@ class PrototypeAgent:
         self,
         state: PrototypeAgentState,
         transition: PrototypeTransition,
-        gradient_joy_evidence: PrototypeGradientJoyEvidence | None = None,
+        candidate_update_audit_evidence: (
+            PrototypeCandidateUpdateAuditEvidence | None
+        ) = None,
         *,
+        gradient_joy_evidence: PrototypeGradientJoyEvidence | None = None,
         experiential_memory_input: (
             PrototypeExperientialMemoryInput | None
         ) = None,
@@ -5309,6 +9096,7 @@ class PrototypeAgent:
         partner_policy_fusion_feedback: (
             PrototypePartnerPolicyFusionFeedback | None
         ) = None,
+        extended_action_mask: Array | None = None,
     ) -> PrototypeUpdateResult:
         """Process one explicit real-time continuing transition.
 
@@ -5328,15 +9116,31 @@ class PrototypeAgent:
             transition: Reward, raw next observation, continuation discount,
                 and optional Horde signals. The world model and control
                 learner consume exactly this scalar discount.
+            candidate_update_audit_evidence: Canonical optional representation-
+                update audit sidecar. The historical ``gradient_joy_evidence``
+                keyword is accepted only when this argument is absent.
 
         Returns:
             :class:`PrototypeUpdateResult` with updated state, selected action,
             and per-component diagnostics.
         """
-        normalized_joy_evidence, joy_supplied, joy_decision_matches = (
-            self._normalize_gradient_joy_evidence(
+        if (
+            candidate_update_audit_evidence is not None
+            and gradient_joy_evidence is not None
+        ):
+            raise ValueError(
+                "candidate_update_audit_evidence and gradient_joy_evidence "
+                "cannot both be supplied"
+            )
+        selected_audit_evidence = (
+            candidate_update_audit_evidence
+            if candidate_update_audit_evidence is not None
+            else gradient_joy_evidence
+        )
+        normalized_audit_evidence, audit_supplied, audit_decision_matches = (
+            self._normalize_candidate_update_audit_evidence(
                 state,
-                gradient_joy_evidence,
+                selected_audit_evidence,
             )
         )
         normalized_memory_input, memory_input_supplied = (
@@ -5355,14 +9159,23 @@ class PrototypeAgent:
             )
         )
         normalized, diagnostics = self._normalize_transition(state, transition)
+        action_mask = (
+            None
+            if extended_action_mask is None
+            else _strict_bool_array(
+                extended_action_mask,
+                (self._config.oak.stomp.n_total_actions,),
+                name="extended_action_mask",
+            )
+        )
         return self._update_transition_impl(
             state,
             normalized,
             diagnostics,
             control_discount=normalized.discount,
-            gradient_joy_evidence=normalized_joy_evidence,
-            gradient_joy_evidence_supplied=joy_supplied,
-            gradient_joy_decision_id_matches=joy_decision_matches,
+            gradient_joy_evidence=normalized_audit_evidence,
+            gradient_joy_evidence_supplied=audit_supplied,
+            gradient_joy_decision_id_matches=audit_decision_matches,
             experiential_memory_input=normalized_memory_input,
             experiential_memory_input_supplied=memory_input_supplied,
             partner_policy_fusion_input=normalized_partner_input,
@@ -5371,6 +9184,329 @@ class PrototypeAgent:
             partner_policy_fusion_feedback_supplied=(
                 partner_feedback_supplied
             ),
+            extended_action_mask=action_mask,
+        )
+
+    def assess_transition(
+        self,
+        state: PrototypeAgentState,
+        transition: PrototypeTransition,
+    ) -> PrototypeTransitionDiagnostics:
+        """Read-only ownership and boundary assessment for one transition.
+
+        This exposes the same exact pre-transaction validation used by
+        :meth:`update_transition` without advancing learners, counters, RNG,
+        optional sidecars, or the cached dispatch.
+        """
+
+        _, diagnostics = self._normalize_transition(state, transition)
+        return diagnostics
+
+    def _prepare_rtu_transition_record(
+        self,
+        state: PrototypeAgentState,
+        transition: PrototypeTransition,
+    ) -> PrototypeRTUTransitionPreparation:
+        """Build the pure recurrence-only half of the RTU transition seam."""
+
+        if type(self._state_builder) is not RecurrentTraceUnitStateBuilder:
+            raise ValueError(
+                "RTU transition preparation requires an exact RTU state builder"
+            )
+        normalized, diagnostics = self._normalize_transition(state, transition)
+        source_builder = cast(
+            RecurrentTraceUnitStateBuilderState,
+            self._builder_component_state(state.state_builder_state),
+        )
+        bootstrap = self._state_builder.update_with_status(
+            source_builder,
+            normalized.next_observation,
+            normalized.action,
+            normalized.reward,
+            normalized.discount,
+        )
+        boundary = normalized.terminated | normalized.truncated
+        reset_builder = self._state_builder.reset_episode(bootstrap.state)
+        restart = self._state_builder.update_with_status(
+            reset_builder,
+            normalized.next_decision_observation,
+            jnp.asarray(-1, dtype=jnp.int32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp.asarray(1.0, dtype=jnp.float32),
+        )
+        decision_builder = cast(
+            RecurrentTraceUnitStateBuilderState,
+            jax.lax.cond(
+                boundary,
+                lambda: restart.state,
+                lambda: bootstrap.state,
+            ),
+        )
+        decision_representation = self._state_builder.encode(
+            decision_builder,
+            normalized.next_decision_observation,
+        )
+        preparation_valid = (
+            diagnostics.valid
+            & bootstrap.transition_applied
+            & jnp.where(
+                boundary,
+                restart.transition_applied,
+                jnp.asarray(True, dtype=jnp.bool_),
+            )
+            & self._state_builder.state_valid(decision_builder)
+            & jnp.all(jnp.isfinite(decision_representation))
+        )
+        return PrototypeRTUTransitionPreparation(
+            source_state=state,
+            transition=normalized,
+            transition_diagnostics=diagnostics,
+            source_builder_state=source_builder,
+            bootstrap_transition=bootstrap,
+            decision_builder_state=decision_builder,
+            decision_representation=decision_representation,
+            execution_boundary=boundary,
+            preparation_valid=preparation_valid,
+        )
+
+    def prepare_rtu_transition(
+        self,
+        state: PrototypeAgentState,
+        transition: PrototypeTransition,
+    ) -> PrototypeRTUTransitionPreparation:
+        """Advance only RTU recurrence; do not learn, select, or draw RNG."""
+
+        if type(state) is not PrototypeAgentState:
+            raise TypeError("state must be an exact PrototypeAgentState")
+        if type(transition) is not PrototypeTransition:
+            raise TypeError("transition must be an exact PrototypeTransition")
+        return self._prepare_rtu_transition_record(state, transition)
+
+    def bind_rtu_finalization(
+        self,
+        preparation: PrototypeRTUTransitionPreparation,
+        final_builder_state: RecurrentTraceUnitStateBuilderState,
+        replaced_unit_mask: Array,
+        rtu_proposal: RTUGenerateAndTestProposal,
+    ) -> PrototypeRTUFinalizationReceipt:
+        """Content-bind one RTU proposal and claimed derived destination.
+
+        Binding is not authorization.  :meth:`finalize_rtu_transition` accepts
+        the receipt only after the supplied RTU mechanism independently
+        recomputes the proposal and its committed destination.
+        """
+
+        if type(preparation) is not PrototypeRTUTransitionPreparation:
+            raise TypeError(
+                "preparation must be an exact PrototypeRTUTransitionPreparation"
+            )
+        if type(final_builder_state) is not RecurrentTraceUnitStateBuilderState:
+            raise TypeError(
+                "final_builder_state must be an exact RTU builder state"
+            )
+        if type(rtu_proposal) is not RTUGenerateAndTestProposal:
+            raise TypeError("rtu_proposal must be an exact RTU proposal")
+        if type(self._state_builder) is not RecurrentTraceUnitStateBuilder:
+            raise ValueError(
+                "RTU finalization binding requires an exact RTU state builder"
+            )
+        builder = self._state_builder
+        builder.state_valid(final_builder_state)
+        mask = jnp.asarray(replaced_unit_mask)
+        expected_shape = (builder.config.hidden_dim,)
+        if mask.shape != expected_shape:
+            raise ValueError(
+                f"replaced_unit_mask must have shape {expected_shape}, got {mask.shape}"
+            )
+        if mask.dtype != jnp.bool_:
+            raise TypeError(
+                f"replaced_unit_mask must have dtype bool, got {mask.dtype}"
+            )
+        return PrototypeRTUFinalizationReceipt(
+            preparation=preparation,
+            rtu_proposal=rtu_proposal,
+            final_builder_state=final_builder_state,
+            replaced_unit_mask=mask,
+            content_tag_words=_prototype_rtu_destination_tag(
+                preparation,
+                rtu_proposal,
+                final_builder_state,
+                mask,
+            ),
+        )
+
+    def finalize_rtu_transition(
+        self,
+        state: PrototypeAgentState,
+        transition: PrototypeTransition,
+        receipt: PrototypeRTUFinalizationReceipt,
+        rtu_generate_and_test: RTUGenerateAndTest,
+    ) -> PrototypeUpdateResult:
+        """Recompute RTU provenance, then learn/select once from its destination.
+
+        The supplied RTU mechanism and proposal prove deterministic derivation
+        from their supplied lifecycle source.  They do not authenticate an
+        external caller's authority over that lifecycle source, downstream
+        objective/gradient, or source-bound ordinary learning proposal.  The
+        comprehensive live adapter closes all three boundaries by constructing
+        the gradient and proposal internally and exact-matching its owned
+        lifecycle source before accepting the result.
+        """
+
+        if type(receipt) is not PrototypeRTUFinalizationReceipt:
+            raise TypeError(
+                "receipt must be an exact PrototypeRTUFinalizationReceipt"
+            )
+        if type(rtu_generate_and_test) is not RTUGenerateAndTest:
+            raise TypeError(
+                "rtu_generate_and_test must be an exact RTUGenerateAndTest"
+            )
+        if type(self._state_builder) is not RecurrentTraceUnitStateBuilder:
+            raise ValueError(
+                "RTU transition finalization requires an exact RTU state builder"
+            )
+        if rtu_generate_and_test.config.builder != self._state_builder.config:
+            raise ValueError(
+                "RTU finalization mechanism builder must exactly match Prototype"
+            )
+        expected = self._prepare_rtu_transition_record(state, transition)
+        preparation_matches = _prototype_rtu_tree_exact(
+            expected,
+            receipt.preparation,
+        )
+        expected_tag = _prototype_rtu_destination_tag(
+            receipt.preparation,
+            receipt.rtu_proposal,
+            receipt.final_builder_state,
+            receipt.replaced_unit_mask,
+        )
+        tag_matches = jnp.array_equal(
+            receipt.content_tag_words,
+            expected_tag,
+        )
+        builder = self._state_builder
+        expected_advance_receipt = rtu_generate_and_test.make_advance_receipt(
+            expected.source_builder_state,
+            bootstrap_observation=expected.transition.next_observation,
+            previous_action=expected.transition.action,
+            previous_reward=expected.transition.reward,
+            previous_discount=expected.transition.discount,
+            episode_boundary=expected.execution_boundary,
+            restart_observation=expected.transition.next_decision_observation,
+        )
+        proposal_source_builder_matches = _prototype_rtu_tree_exact(
+            receipt.rtu_proposal.pre_update_builder_state,
+            expected.source_builder_state,
+        )
+        if receipt.rtu_proposal.advance_receipt is None:
+            advance_receipt_matches = jnp.asarray(False, dtype=jnp.bool_)
+        else:
+            advance_receipt_matches = _prototype_rtu_tree_exact(
+                receipt.rtu_proposal.advance_receipt,
+                expected_advance_receipt,
+            )
+        ordinary_learning_present = (
+            receipt.rtu_proposal.learning_proposal is not None
+            and receipt.rtu_proposal.ordinary_learning_diagnostics is not None
+        )
+        authorized_rtu_result = rtu_generate_and_test.commit(
+            receipt.rtu_proposal.source_state,
+            receipt.rtu_proposal.live_builder_state,
+            receipt.rtu_proposal,
+        )
+        authorized_destination_matches = _prototype_rtu_tree_exact(
+            receipt.final_builder_state,
+            authorized_rtu_result.builder_state,
+        )
+        authorized_mask_matches = jnp.array_equal(
+            receipt.replaced_unit_mask,
+            authorized_rtu_result.diagnostics.selected_mask,
+        )
+        final_builder_valid = builder.state_valid(receipt.final_builder_state)
+        step_owner_matches = jnp.array_equal(
+            receipt.final_builder_state.step_words,
+            expected.decision_builder_state.step_words,
+        )
+        ordinary_update_words, ordinary_capacity = _checked_lifetime_words_add(
+            expected.source_builder_state.update_words,
+            1,
+        )
+        replacement_update_words, replacement_capacity = (
+            _checked_lifetime_words_add(ordinary_update_words, 1)
+        )
+        replacement_event = jnp.any(receipt.replaced_unit_mask)
+        expected_update_words = jnp.where(
+            replacement_event,
+            replacement_update_words,
+            ordinary_update_words,
+        )
+        revision_matches = jnp.array_equal(
+            receipt.final_builder_state.update_words,
+            expected_update_words,
+        )
+        source_oak = self._oak_component_state(state.oak_state)
+        active_option_safe = (~replacement_event) | (
+            source_oak.stomp_state.executing_option < 0
+        )
+        authorization = (
+            expected.preparation_valid
+            & preparation_matches
+            & tag_matches
+            & proposal_source_builder_matches
+            & advance_receipt_matches
+            & jnp.asarray(ordinary_learning_present, dtype=jnp.bool_)
+            & authorized_rtu_result.diagnostics.applied
+            & authorized_destination_matches
+            & authorized_mask_matches
+            & final_builder_valid
+            & step_owner_matches
+            & revision_matches
+            & ordinary_capacity
+            & jnp.where(
+                replacement_event,
+                replacement_capacity,
+                jnp.asarray(True, dtype=jnp.bool_),
+            )
+            & active_option_safe
+        )
+        diagnostics = cast(
+            PrototypeTransitionDiagnostics,
+            expected.transition_diagnostics.replace(
+                valid=expected.transition_diagnostics.valid & authorization,
+                rejected=~(
+                    expected.transition_diagnostics.valid & authorization
+                ),
+            ),
+        )
+        raw_prefix = (
+            builder.config.observation_dim
+            if builder.config.include_raw_observation
+            else 0
+        )
+        feature_reset_mask = jnp.concatenate(
+            (
+                jnp.zeros((raw_prefix,), dtype=jnp.bool_),
+                receipt.replaced_unit_mask,
+                receipt.replaced_unit_mask,
+            )
+        )
+        return self._update_transition_impl(
+            state,
+            expected.transition,
+            diagnostics,
+            control_discount=expected.transition.discount,
+            gradient_joy_evidence=None,
+            gradient_joy_evidence_supplied=jnp.asarray(False, dtype=jnp.bool_),
+            gradient_joy_decision_id_matches=jnp.asarray(False, dtype=jnp.bool_),
+            experiential_memory_input=None,
+            experiential_memory_input_supplied=jnp.asarray(False, dtype=jnp.bool_),
+            partner_policy_fusion_input=None,
+            partner_policy_fusion_input_supplied=jnp.asarray(False, dtype=jnp.bool_),
+            partner_policy_fusion_feedback=None,
+            partner_policy_fusion_feedback_supplied=jnp.asarray(False, dtype=jnp.bool_),
+            rtu_preparation=expected,
+            external_final_builder_state=receipt.final_builder_state,
+            preselection_feature_reset_mask=feature_reset_mask,
         )
 
     def _normalize_transition(
@@ -5446,6 +9582,35 @@ class PrototypeAgent:
         )
         discount_valid = jnp.isfinite(discount) & (discount >= 0.0) & (discount <= 1.0)
         boundary = terminated | truncated
+        proposed_step_words, step_capacity_available = (
+            _checked_lifetime_words_add(state.step_words, 1)
+        )
+        proposed_observation_one, observation_one_capacity = (
+            _checked_lifetime_words_add(state.observation_event_words, 1)
+        )
+        proposed_observation_two, observation_two_capacity = (
+            _checked_lifetime_words_add(state.observation_event_words, 2)
+        )
+        proposed_observation_event_words = jnp.where(
+            boundary,
+            proposed_observation_two,
+            proposed_observation_one,
+        )
+        current_counter_capacity_available = step_capacity_available & jnp.where(
+            boundary,
+            observation_two_capacity,
+            observation_one_capacity,
+        )
+        outer_counter_valid = _lifetime_counter_valid(
+            state.step_words,
+            state.step_count,
+        ) & _lifetime_counter_valid(
+            state.observation_event_words,
+            state.observation_event_count,
+        ) & _prototype_observation_clock_relation_valid(
+            state.step_words,
+            state.observation_event_words,
+        )
         next_counter_capacity_available = _next_counter_capacity_available(
             state,
             execution_boundary=boundary,
@@ -5507,6 +9672,16 @@ class PrototypeAgent:
             & horde_valid
         )
         diagnostics = PrototypeTransitionDiagnostics(
+            pre_step_words=state.step_words,
+            proposed_step_words=proposed_step_words,
+            pre_observation_event_words=state.observation_event_words,
+            proposed_observation_event_words=(
+                proposed_observation_event_words
+            ),
+            outer_counter_valid=outer_counter_valid,
+            current_counter_capacity_available=(
+                current_counter_capacity_available
+            ),
             started=started,
             inputs_finite=inputs_finite & horde_valid,
             action_in_range=action_in_range,
@@ -5574,7 +9749,7 @@ class PrototypeAgent:
         state: PrototypeAgentState,
         diagnostics: PrototypeTransitionDiagnostics,
         *,
-        gradient_joy_evidence: PrototypeGradientJoyEvidence | None,
+        gradient_joy_evidence: PrototypeCandidateUpdateAuditEvidence | None,
         gradient_joy_evidence_supplied: Array,
         gradient_joy_decision_id_matches: Array,
         experiential_memory_input: PrototypeExperientialMemoryInput | None,
@@ -5591,7 +9766,8 @@ class PrototypeAgent:
         world_model_error: Any = (
             zero
             if (
-                self._world_model is not None
+                self._prototype_routed_linear_world_model is not None
+                or self._world_model is not None
                 or self._world_model_ensemble is not None
                 or self._model_replay_rehearsal is not None
                 or self._recurrent_latent_world_model_ensemble is not None
@@ -5622,6 +9798,34 @@ class PrototypeAgent:
                     )
                 )
             )
+        atomic_feature_world_memory_diagnostics: (
+            PrototypeAtomicFeatureWorldMemoryDiagnostics | None
+        ) = None
+        if self._prototype_routed_linear_world_model is not None:
+            atomic_feature_world_memory_diagnostics = (
+                self._unavailable_atomic_feature_world_memory_diagnostics()
+            )
+        feature_utility_diagnostics: (
+            PrototypeFeatureUtilityIntegrationDiagnostics | None
+        ) = None
+        if self._prototype_feature_utility is not None:
+            feature_utility_diagnostics = (
+                self._unavailable_feature_utility_integration_diagnostics(
+                    self._feature_utility_component_state(state.oak_state)
+                )
+            )
+        feature_utility_curation_diagnostics: (
+            PrototypeFeatureUtilityCurationIntegrationDiagnostics | None
+        ) = None
+        if self._prototype_feature_utility_curation is not None:
+            feature_utility_curation_diagnostics = (
+                self._unavailable_feature_utility_curation_integration_diagnostics(
+                    self._feature_lifecycle_component_state(
+                        state.state_builder_state
+                    ),
+                    self._feature_utility_component_state(state.oak_state),
+                )
+            )
         horde_td_errors: Any = None
         if self._horde is not None:
             horde_td_errors = jnp.zeros(
@@ -5637,6 +9841,9 @@ class PrototypeAgent:
             )
             ia_recommendation = state.current_action
         memory_diagnostics: PrototypeExperientialMemoryDiagnostics | None = None
+        feature_memory_diagnostics: (
+            PrototypeFeatureMemoryIntegrationDiagnostics | None
+        ) = None
         current_memory_state: ExperientialMemoryState | None = None
         if self._experiential_memory is not None:
             if experiential_memory_input is None:
@@ -5668,6 +9875,13 @@ class PrototypeAgent:
                 memory_input=experiential_memory_input,
                 input_supplied=experiential_memory_input_supplied,
             )
+            if self._prototype_feature_memory is not None:
+                feature_memory_diagnostics = (
+                    self._unavailable_feature_memory_integration_diagnostics(
+                        state,
+                        experiential_memory_input,
+                    )
+                )
         partner_fusion_diagnostics: (
             PrototypePartnerPolicyFusionDiagnostics | None
         ) = None
@@ -5687,11 +9901,15 @@ class PrototypeAgent:
                 self._ia_component_state(state.ia_state),
                 self._oak_component_state(state.oak_state),
                 state.current_representation,
-                derived_decision_id=_saturating_int32_increment(
-                    state.step_count
+                derived_decision_id=_lifetime_words_to_int32_telemetry(
+                    diagnostics.proposed_step_words
                 ),
-                derived_event_id=_saturating_int32_increment(
-                    state.observation_event_count
+                derived_event_id=_lifetime_words_to_int32_telemetry(
+                    diagnostics.proposed_observation_event_words
+                ),
+                derived_decision_words=diagnostics.proposed_step_words,
+                derived_event_words=(
+                    diagnostics.proposed_observation_event_words
                 ),
                 derived_prototype_decision_id=_increment_decision_id(
                     state.current_decision_id
@@ -5707,6 +9925,15 @@ class PrototypeAgent:
                     partner_policy_fusion_feedback_supplied
                 ),
             )
+        learning_value_router_result: LearningValueRouterResult | None = None
+        if self._learning_value_router is not None:
+            learning_value_router_result = (
+                self._learning_value_router.unavailable_result(
+                    self._learning_value_router_component_state(
+                        state.state_builder_state
+                    )
+                )
+            )
         (
             _,
             builder_learning_diagnostics,
@@ -5721,14 +9948,45 @@ class PrototypeAgent:
             jnp.asarray(False),
             _unavailable_learning_signals(),
             gradient_joy_evidence,
+            learning_value_router_result,
         )
         return PrototypeUpdateResult(
             state=state,
             action=state.current_action,
             oak_td_error=zero,
             oak_average_reward=zero,
+            oak_stomp_update_result=_unavailable_stomp_update_result(
+                self._oak_component_state(state.oak_state)
+            ),
+            oak_stomp_update_available=jnp.asarray(False, dtype=jnp.bool_),
+            oak_stomp_update_evaluations=jnp.asarray(0, dtype=jnp.int32),
+            oak_owner_finalization_trace=(
+                _unavailable_stomp_owner_finalization_trace(
+                    self._oak_component_state(state.oak_state)
+                )
+            ),
+            oak_real_stomp_update_evaluations=jnp.asarray(
+                0,
+                dtype=jnp.int32,
+            ),
+            oak_imagined_stomp_update_evaluations=jnp.asarray(
+                0,
+                dtype=jnp.int32,
+            ),
+            oak_total_stomp_update_evaluations=jnp.asarray(
+                0,
+                dtype=jnp.int32,
+            ),
+            oak_option_search_learner_updates=jnp.asarray(
+                0,
+                dtype=jnp.int32,
+            ),
+            oak_bootstrap_observation=state.current_representation,
+            oak_decision_observation=state.current_representation,
+            oak_execution_boundary=jnp.asarray(False, dtype=jnp.bool_),
             world_model_error=world_model_error,
             learning_signals=_unavailable_learning_signals(),
+            learning_value_router_result=learning_value_router_result,
             world_model_representation_gradient=jnp.zeros(
                 (self._config.oak.observation_dim,),
                 dtype=jnp.float32,
@@ -5766,13 +10024,24 @@ class PrototypeAgent:
             prototype_feature_lifecycle_diagnostics=(
                 feature_lifecycle_diagnostics
             ),
+            prototype_feature_utility_diagnostics=(
+                feature_utility_diagnostics
+            ),
+            prototype_feature_utility_curation_diagnostics=(
+                feature_utility_curation_diagnostics
+            ),
             dream_td_errors=dream_td_errors,
             horde_td_errors=horde_td_errors,
             ia_augmented_obs=ia_augmented_obs,
             ia_recommendation=ia_recommendation,
+            ia_update_applied=jnp.asarray(False, dtype=jnp.bool_),
             experiential_memory_diagnostics=memory_diagnostics,
+            prototype_feature_memory_diagnostics=feature_memory_diagnostics,
             partner_policy_fusion_diagnostics=partner_fusion_diagnostics,
             transition_diagnostics=diagnostics,
+            prototype_atomic_feature_world_memory_diagnostics=(
+                atomic_feature_world_memory_diagnostics
+            ),
         )
 
     def _update_transition_impl(
@@ -5782,7 +10051,7 @@ class PrototypeAgent:
         diagnostics: PrototypeTransitionDiagnostics,
         *,
         control_discount: Array | None,
-        gradient_joy_evidence: PrototypeGradientJoyEvidence | None,
+        gradient_joy_evidence: PrototypeCandidateUpdateAuditEvidence | None,
         gradient_joy_evidence_supplied: Array,
         gradient_joy_decision_id_matches: Array,
         experiential_memory_input: PrototypeExperientialMemoryInput | None,
@@ -5793,6 +10062,12 @@ class PrototypeAgent:
             PrototypePartnerPolicyFusionFeedback | None
         ),
         partner_policy_fusion_feedback_supplied: Array,
+        rtu_preparation: PrototypeRTUTransitionPreparation | None = None,
+        external_final_builder_state: (
+            RecurrentTraceUnitStateBuilderState | None
+        ) = None,
+        preselection_feature_reset_mask: Array | None = None,
+        extended_action_mask: Array | None = None,
     ) -> PrototypeUpdateResult:
         """Atomically apply a valid transition or return an exact no-op."""
 
@@ -5821,6 +10096,12 @@ class PrototypeAgent:
                 partner_policy_fusion_feedback_supplied=(
                     partner_policy_fusion_feedback_supplied
                 ),
+                rtu_preparation=rtu_preparation,
+                external_final_builder_state=external_final_builder_state,
+                preselection_feature_reset_mask=(
+                    preselection_feature_reset_mask
+                ),
+                extended_action_mask=extended_action_mask,
             )
             post_finite = self._state_numeric_valid(result.state)
             post_consistent = self._checkpoint_state_structurally_valid(
@@ -5842,6 +10123,66 @@ class PrototypeAgent:
                     (~memory_diagnostics.transaction_required)
                     | memory_diagnostics.transaction_applied
                 )
+            feature_memory_transaction_valid = jnp.asarray(
+                True,
+                dtype=jnp.bool_,
+            )
+            if self._prototype_feature_memory is not None:
+                feature_memory_diagnostics = (
+                    result.prototype_feature_memory_diagnostics
+                )
+                if feature_memory_diagnostics is None:
+                    raise RuntimeError(
+                        "configured feature memory requires diagnostics"
+                    )
+                rebind = feature_memory_diagnostics.rebind
+                change_requested = (
+                    rebind.destination_descriptors_changed
+                    | rebind.destination_generation_changed
+                )
+                feature_memory_transaction_valid = (
+                    jnp.where(
+                        change_requested,
+                        rebind.transaction_applied,
+                        rebind.transaction_noop,
+                    )
+                    & feature_memory_diagnostics.post_memory_state_valid
+                )
+            ia_transaction_valid = jnp.asarray(True, dtype=jnp.bool_)
+            if self._ia is not None:
+                ia_transaction_valid = result.ia_update_applied
+            feature_transaction_valid = jnp.asarray(True, dtype=jnp.bool_)
+            if self._prototype_feature_lifecycle is not None:
+                feature_diagnostics = (
+                    result.prototype_feature_lifecycle_diagnostics
+                )
+                if feature_diagnostics is None:
+                    raise RuntimeError(
+                        "configured prototype feature lifecycle requires diagnostics"
+                    )
+                feature_transaction_valid = (
+                    feature_diagnostics.lifecycle.transaction_applied
+                    | ~feature_diagnostics.lifecycle.update_capacity_available
+                )
+            feature_utility_curation_transaction_valid = jnp.asarray(
+                True,
+                dtype=jnp.bool_,
+            )
+            if self._prototype_feature_utility_curation is not None:
+                curation_diagnostics = (
+                    result.prototype_feature_utility_curation_diagnostics
+                )
+                if curation_diagnostics is None:
+                    raise RuntimeError(
+                        "configured feature utility curation requires diagnostics"
+                    )
+                feature_utility_curation_transaction_valid = (
+                    curation_diagnostics.policy.transaction_valid
+                    & (
+                        curation_diagnostics.observation_applied
+                        | curation_diagnostics.policy.observation_capacity_capped
+                    )
+                )
             # Recurrent state cannot skip an accepted environment event. If
             # the model/signal transaction rejects, roll back the *entire*
             # Prototype transition so the armed cache and every learner/RNG
@@ -5851,6 +10192,10 @@ class PrototypeAgent:
                 & post_consistent
                 & recurrent_transaction_valid
                 & memory_transaction_valid
+                & feature_memory_transaction_valid
+                & ia_transaction_valid
+                & feature_transaction_valid
+                & feature_utility_curation_transaction_valid
             )
             final_diagnostics = cast(
                 PrototypeTransitionDiagnostics,
@@ -5875,12 +10220,60 @@ class PrototypeAgent:
                         )
                     ),
                 )
+            accepted_utility_diagnostics = (
+                result.prototype_feature_utility_diagnostics
+            )
+            if accepted_utility_diagnostics is not None:
+                accepted_utility_diagnostics = cast(
+                    PrototypeFeatureUtilityIntegrationDiagnostics,
+                    accepted_utility_diagnostics.replace(
+                        outer_transaction_committed=jnp.asarray(
+                            True,
+                            dtype=jnp.bool_,
+                        )
+                    ),
+                )
+            accepted_utility_curation_diagnostics = (
+                result.prototype_feature_utility_curation_diagnostics
+            )
+            if accepted_utility_curation_diagnostics is not None:
+                accepted_utility_curation_diagnostics = cast(
+                    PrototypeFeatureUtilityCurationIntegrationDiagnostics,
+                    accepted_utility_curation_diagnostics.replace(
+                        outer_transaction_committed=jnp.asarray(
+                            True,
+                            dtype=jnp.bool_,
+                        )
+                    ),
+                )
+            accepted_feature_memory_diagnostics = (
+                result.prototype_feature_memory_diagnostics
+            )
+            if accepted_feature_memory_diagnostics is not None:
+                accepted_feature_memory_diagnostics = cast(
+                    PrototypeFeatureMemoryIntegrationDiagnostics,
+                    accepted_feature_memory_diagnostics.replace(
+                        outer_transaction_committed=jnp.asarray(
+                            True,
+                            dtype=jnp.bool_,
+                        )
+                    ),
+                )
             accepted = cast(
                 PrototypeUpdateResult,
                 result.replace(
                     transition_diagnostics=final_diagnostics,
                     prototype_feature_lifecycle_diagnostics=(
                         accepted_feature_diagnostics
+                    ),
+                    prototype_feature_utility_diagnostics=(
+                        accepted_utility_diagnostics
+                    ),
+                    prototype_feature_utility_curation_diagnostics=(
+                        accepted_utility_curation_diagnostics
+                    ),
+                    prototype_feature_memory_diagnostics=(
+                        accepted_feature_memory_diagnostics
                     ),
                 ),
             )
@@ -5984,6 +10377,96 @@ class PrototypeAgent:
                             )
                         ),
                     )
+                if self._prototype_feature_utility is not None:
+                    attempted_utility = (
+                        result.prototype_feature_utility_diagnostics
+                    )
+                    if attempted_utility is None:
+                        raise RuntimeError(
+                            "configured prototype feature utility requires "
+                            "diagnostics"
+                        )
+                    rejected = cast(
+                        PrototypeUpdateResult,
+                        rejected.replace(
+                            prototype_feature_utility_diagnostics=(
+                                attempted_utility.replace(
+                                    outer_transaction_committed=jnp.asarray(
+                                        False,
+                                        dtype=jnp.bool_,
+                                    )
+                                )
+                            )
+                        ),
+                    )
+                if self._prototype_feature_utility_curation is not None:
+                    attempted_utility_curation = (
+                        result.prototype_feature_utility_curation_diagnostics
+                    )
+                    if attempted_utility_curation is None:
+                        raise RuntimeError(
+                            "configured feature utility curation requires "
+                            "diagnostics"
+                        )
+                    rejected = cast(
+                        PrototypeUpdateResult,
+                        rejected.replace(
+                            prototype_feature_utility_curation_diagnostics=(
+                                attempted_utility_curation.replace(
+                                    outer_transaction_committed=jnp.asarray(
+                                        False,
+                                        dtype=jnp.bool_,
+                                    )
+                                )
+                            )
+                        ),
+                    )
+                if self._prototype_feature_memory is not None:
+                    attempted_feature_memory = (
+                        result.prototype_feature_memory_diagnostics
+                    )
+                    if attempted_feature_memory is None:
+                        raise RuntimeError(
+                            "configured feature memory requires diagnostics"
+                        )
+                    rejected = cast(
+                        PrototypeUpdateResult,
+                        rejected.replace(
+                            prototype_feature_memory_diagnostics=(
+                                attempted_feature_memory.replace(
+                                    outer_transaction_committed=jnp.asarray(
+                                        False,
+                                        dtype=jnp.bool_,
+                                    )
+                                )
+                            )
+                        ),
+                    )
+                if self._prototype_routed_linear_world_model is not None:
+                    attempted_atomic = (
+                        result.prototype_atomic_feature_world_memory_diagnostics
+                    )
+                    if attempted_atomic is None:
+                        raise RuntimeError(
+                            "configured atomic composition requires diagnostics"
+                        )
+                    rejected = cast(
+                        PrototypeUpdateResult,
+                        rejected.replace(
+                            prototype_atomic_feature_world_memory_diagnostics=(
+                                attempted_atomic.replace(
+                                    destination_adopted=jnp.asarray(
+                                        False,
+                                        dtype=jnp.bool_,
+                                    ),
+                                    ordinary_updates_retained=jnp.asarray(
+                                        False,
+                                        dtype=jnp.bool_,
+                                    ),
+                                )
+                            )
+                        ),
+                    )
                 return rejected
 
             return jax.lax.cond(
@@ -6025,6 +10508,43 @@ class PrototypeAgent:
             operand=None,
         )
 
+    def _update_horde_for_transition(
+        self,
+        horde_state: MultiHeadMLPState,
+        last_observation: Array,
+        bootstrap_observation: Array,
+        transition: PrototypeTransition,
+    ) -> Any:
+        """Update the configured Horde under one unchanged feature bank."""
+
+        if self._horde is None:
+            raise RuntimeError("Horde update requested while Horde is disabled")
+        horde_cumulants = transition.horde_cumulants
+        if horde_cumulants is None:
+            horde_cumulants = jnp.full(
+                (self._horde.n_demons,),
+                transition.reward,
+                dtype=jnp.float32,
+            )
+        horde_discounts = transition.horde_discounts
+        if horde_discounts is None:
+            # Preserve each question's declared continuing horizon. A true
+            # global terminal zeros every bootstrap, matching the historical
+            # standalone-Horde ordering exactly.
+            horde_spec = cast(HordeSpec, self._config.horde_spec)
+            horde_discounts = jnp.where(
+                transition.discount > 0.0,
+                horde_spec.gammas,
+                jnp.zeros_like(horde_spec.gammas),
+            )
+        return self._horde.update_with_discounts(
+            horde_state,
+            last_observation,
+            horde_cumulants,
+            bootstrap_observation,
+            horde_discounts,
+        )
+
     def _apply_valid_transition_impl(
         self,
         state: PrototypeAgentState,
@@ -6032,7 +10552,7 @@ class PrototypeAgent:
         diagnostics: PrototypeTransitionDiagnostics,
         *,
         control_discount: Array | None,
-        gradient_joy_evidence: PrototypeGradientJoyEvidence | None,
+        gradient_joy_evidence: PrototypeCandidateUpdateAuditEvidence | None,
         gradient_joy_evidence_supplied: Array,
         gradient_joy_decision_id_matches: Array,
         experiential_memory_input: PrototypeExperientialMemoryInput | None,
@@ -6043,8 +10563,22 @@ class PrototypeAgent:
             PrototypePartnerPolicyFusionFeedback | None
         ),
         partner_policy_fusion_feedback_supplied: Array,
+        rtu_preparation: PrototypeRTUTransitionPreparation | None = None,
+        external_final_builder_state: (
+            RecurrentTraceUnitStateBuilderState | None
+        ) = None,
+        preselection_feature_reset_mask: Array | None = None,
+        extended_action_mask: Array | None = None,
     ) -> PrototypeUpdateResult:
         """Apply one normalized, ownership-validated real transition."""
+        effective_extended_action_mask = (
+            jnp.ones(
+                (self._config.oak.stomp.n_total_actions,),
+                dtype=jnp.bool_,
+            )
+            if extended_action_mask is None
+            else extended_action_mask
+        )
         bootstrap_raw_obs = transition.next_observation
         decision_raw_obs = transition.next_decision_observation
         execution_boundary = transition.terminated | transition.truncated
@@ -6071,9 +10605,24 @@ class PrototypeAgent:
             else None
         )
         new_feature_consumer_binding = old_feature_consumer_binding
+        old_feature_utility_state = (
+            self._feature_utility_component_state(state.oak_state)
+            if self._prototype_feature_utility is not None
+            else None
+        )
+        new_feature_utility_state = old_feature_utility_state
         bootstrap_base_obs = bootstrap_raw_obs
         decision_base_obs = decision_raw_obs
-        if self._state_builder is not None:
+        if rtu_preparation is not None:
+            bootstrap_builder_state = (
+                rtu_preparation.bootstrap_transition.state
+            )
+            bootstrap_base_obs = (
+                rtu_preparation.bootstrap_transition.representation
+            )
+            new_builder_state = rtu_preparation.decision_builder_state
+            decision_base_obs = rtu_preparation.decision_representation
+        elif self._state_builder is not None:
             (
                 bootstrap_builder_state,
                 bootstrap_base_obs,
@@ -6161,24 +10710,56 @@ class PrototypeAgent:
         model_replay_sampled = jnp.asarray(False)
         model_replay_updates_applied = jnp.asarray(0, dtype=jnp.int32)
         model_replay_padding_count = jnp.asarray(0, dtype=jnp.int32)
+        atomic_world_prepare: PrototypeRoutedLinearWorldPrepareResult | None = None
 
-        if self._world_model is not None and self._buffer is not None:
+        if self._prototype_routed_linear_world_model is not None:
+            if old_feature_state is None:
+                raise RuntimeError(
+                    "atomic routed world requires the source feature authority"
+                )
+            atomic_world_prepare = (
+                self._prototype_routed_linear_world_model.prepare_transition(
+                    self._atomic_routed_world_component_state(
+                        state.world_model_state
+                    ),
+                    old_feature_state.router_state,
+                    last_base_obs,
+                    last_action,
+                )
+            )
+        elif self._world_model is not None and self._buffer is not None:
+            stable_base_world_model = self._prototype_feature_lifecycle is not None
+            world_last_observation = (
+                last_base_obs if stable_base_world_model else last_obs
+            )
+            world_bootstrap_observation = (
+                bootstrap_base_obs if stable_base_world_model else bootstrap_obs
+            )
+            world_decision_observation = (
+                decision_base_obs if stable_base_world_model else decision_obs
+            )
+            source_world_model_state = self._action_world_model_component_state(
+                state.world_model_state
+            )
             wm_result = self._world_model.update(
-                state.world_model_state,
-                last_obs,
+                source_world_model_state,
+                world_last_observation,
                 last_action,
                 rew,
                 transition.discount,
-                bootstrap_obs,
+                world_bootstrap_observation,
             )
-            new_wm_state = wm_result.state
+            new_wm_state = self._action_world_model_state_slot(wm_result.state)
             bootstrap_buffer_state = self._buffer.add(
                 state.buffer_state,
-                bootstrap_obs,
+                world_bootstrap_observation,
             )
             new_buf_state = jax.lax.cond(
                 execution_boundary,
-                lambda buffer_state: self._buffer.add(buffer_state, decision_obs),
+                lambda buffer_state: self._buffer.add(
+                    buffer_state,
+                    world_decision_observation,
+                ),
                 lambda buffer_state: buffer_state,
                 bootstrap_buffer_state,
             )
@@ -6202,7 +10783,9 @@ class PrototypeAgent:
             ensemble_diagnostics = ensemble_result.diagnostics
         elif self._model_replay_rehearsal is not None:
             representation_version = (
-                state.state_builder_state.update_count
+                self._builder_component_state(
+                    state.state_builder_state
+                ).update_count
                 if isinstance(
                     self._config.state_builder,
                     OnlineGatedStateBuilderConfig,
@@ -6390,6 +10973,30 @@ class PrototypeAgent:
                 next_decision_cached=jnp.asarray(False, dtype=jnp.bool_),
             )
 
+        learning_value_router_result: LearningValueRouterResult | None = None
+        new_learning_value_router_state: LearningValueRouterState | None = None
+        if self._learning_value_router is not None:
+            if gradient_joy_evidence is None:
+                raise RuntimeError(
+                    "configured learning-value router requires its fixed sidecar"
+                )
+            learning_value, learning_value_availability = (
+                self._learning_value_router_inputs(
+                    gradient_joy_evidence,
+                    learning_signals,
+                )
+            )
+            (
+                new_learning_value_router_state,
+                learning_value_router_result,
+            ) = self._learning_value_router.route(
+                self._learning_value_router_component_state(
+                    state.state_builder_state
+                ),
+                learning_value,
+                learning_value_availability,
+            )
+
         builder_representation_gradient = representation_gradient
         builder_representation_gradient_valid = representation_gradient_valid
         mixer_config = self._config.representation_gradient_mixer
@@ -6424,6 +11031,11 @@ class PrototypeAgent:
             if old_feature_state is not None
             else jnp.asarray(0, dtype=jnp.int32)
         )
+        pullback_generation_words = (
+            old_feature_state.router_state.generation_words
+            if old_feature_state is not None
+            else jnp.zeros((2,), dtype=jnp.uint32)
+        )
         pair_gradient_pullback = PrototypePairGradientPullback(
             gradient=jnp.zeros(
                 (self._base_representation_dim(),),
@@ -6431,6 +11043,7 @@ class PrototypeAgent:
             ),
             valid=jnp.asarray(False, dtype=jnp.bool_),
             semantic_generation=pullback_generation,
+            semantic_generation_words=pullback_generation_words,
         )
         if self._prototype_feature_lifecycle is not None:
             if old_feature_state is None:
@@ -6444,6 +11057,9 @@ class PrototypeAgent:
                     builder_representation_gradient,
                     old_feature_state.router_state.generation_count,
                     old_feature_state.router_state.descriptors,
+                    expected_generation_words=(
+                        old_feature_state.router_state.generation_words
+                    ),
                 )
             )
             pullback_valid = (
@@ -6452,6 +11068,10 @@ class PrototypeAgent:
                 & (
                     candidate_pullback.semantic_generation
                     == old_feature_state.router_state.generation_count
+                )
+                & jnp.all(
+                    candidate_pullback.semantic_generation_words
+                    == old_feature_state.router_state.generation_words
                 )
             )
             builder_representation_gradient = jnp.where(
@@ -6481,18 +11101,41 @@ class PrototypeAgent:
             builder_representation_gradient_valid,
             learning_signals,
             gradient_joy_evidence,
+            learning_value_router_result,
         )
 
+        if external_final_builder_state is not None:
+            if type(self._state_builder) is not RecurrentTraceUnitStateBuilder:
+                raise RuntimeError(
+                    "external RTU finalization requires an exact RTU builder"
+                )
+            new_builder_state = external_final_builder_state
+            decision_base_obs = self._state_builder.encode(
+                external_final_builder_state,
+                decision_raw_obs,
+            )
+            decision_obs = self._augment_base_representation(
+                old_feature_state,
+                decision_base_obs,
+            )
+
         # -- Steps 5/6/10/11: OaK update (real transition) -------------------
-        oak_result = self._oak.update(
+        oak_trace = self._oak.update_with_stomp_trace(
             current_oak_state,
             rew,
             bootstrap_obs,
             control_discount,
             decision_observation=decision_obs,
             execution_boundary=execution_boundary,
+            extended_action_mask=effective_extended_action_mask,
+            preselection_feature_reset_mask=(
+                preselection_feature_reset_mask
+            ),
         )
+        oak_result = oak_trace.update
         new_oak_state = oak_result.state
+        raw_stomp_owner = oak_trace.stomp_result.state
+        option_search_learner_updates = jnp.asarray(0, dtype=jnp.int32)
 
         # -- Opt-in bounded option-model search control ----------------------
         # The legacy STOMP planning budget is statically required to be zero
@@ -6508,6 +11151,7 @@ class PrototypeAgent:
             option_search_result = self._option_search_control.apply(
                 new_oak_state.stomp_state,
                 decision_obs,
+                extended_action_mask=effective_extended_action_mask,
             )
             new_oak_state = cast(
                 OaKState,
@@ -6516,14 +11160,51 @@ class PrototypeAgent:
                 ),
             )
             option_search_diagnostics = option_search_result.diagnostics
+            option_search_learner_updates = (
+                option_search_result.diagnostics.applied_count
+            )
+        option_search_destination_owner = new_oak_state.stomp_state
 
         next_armed = (
             diagnostics.next_generation_available
             & diagnostics.next_counter_capacity_available
         )
+        # Shared consumers must both learn under the old descriptors before
+        # either is routed. The standalone-Horde path remains in its historical
+        # position below, so configurations outside this opt-in composition
+        # retain their exact update order.
+        new_horde_state = self._horde_component_state(state)
+        old_horde_state = new_horde_state
+        horde_tderrs: Any = None
+        shared_horde_td_targets: Any = None
+        shared_horde_predictions: Any = None
+        if self._horde is not None and self._shared_feature_horde_enabled():
+            shared_horde_result = self._update_horde_for_transition(
+                cast(MultiHeadMLPState, new_horde_state),
+                last_obs,
+                bootstrap_obs,
+                transition,
+            )
+            new_horde_state = shared_horde_result.state
+            horde_tderrs = shared_horde_result.td_errors
+            shared_horde_td_targets = shared_horde_result.td_targets
+            shared_horde_predictions = shared_horde_result.predictions
+
         feature_lifecycle_diagnostics: (
             PrototypeFeatureLifecycleIntegrationDiagnostics | None
         ) = None
+        feature_utility_diagnostics: (
+            PrototypeFeatureUtilityIntegrationDiagnostics | None
+        ) = None
+        feature_utility_curation_diagnostics: (
+            PrototypeFeatureUtilityCurationIntegrationDiagnostics | None
+        ) = None
+        atomic_feature_world_memory_diagnostics: (
+            PrototypeAtomicFeatureWorldMemoryDiagnostics | None
+        ) = None
+        atomic_memory_rebind_result: PrototypeFeatureMemoryRebindResult | None = None
+        atomic_all_consumers_ready = jnp.asarray(False, dtype=jnp.bool_)
+        atomic_lifecycle_capacity_capped = jnp.asarray(False, dtype=jnp.bool_)
         if self._prototype_feature_lifecycle is not None:
             if old_feature_state is None:
                 raise RuntimeError(
@@ -6535,31 +11216,601 @@ class PrototypeAgent:
                 behavior_gradient_result.diagnostics.target,
                 jnp.asarray(0.0, dtype=jnp.float32),
             )
-            feature_targets = jnp.where(
+            control_feature_targets = jnp.where(
                 target_available,
                 jnp.reshape(automatic_target, (1,)),
                 jnp.full((1,), jnp.nan, dtype=jnp.float32),
             )
-            feature_result = (
-                self._prototype_feature_lifecycle.observe_and_route(
-                    old_feature_state,
-                    new_oak_state,
-                    old_feature_consumer_binding,
-                    PrototypeFeatureLifecycleEvent(
-                        observation=last_base_obs,
-                        targets=feature_targets,
-                        next_observation=decision_base_obs,
-                        allow_curation=jnp.asarray(
-                            next_armed,
-                            dtype=jnp.bool_,
+            lifecycle_event = PrototypeFeatureLifecycleEvent(
+                observation=last_base_obs,
+                targets=(
+                    jnp.concatenate(
+                        (
+                            control_feature_targets,
+                            shared_horde_td_targets,
+                        )
+                    )
+                    if self._shared_feature_horde_enabled()
+                    else control_feature_targets
+                ),
+                next_observation=decision_base_obs,
+                allow_curation=jnp.asarray(
+                    next_armed,
+                    dtype=jnp.bool_,
+                ),
+            )
+            utility_observation_diagnostics: (
+                PrototypeFeatureUtilityDiagnostics | None
+            ) = None
+            utility_curation_policy_diagnostics: (
+                PrototypeFeatureUtilityCurationDiagnostics | None
+            ) = None
+            curation_priority_override: (
+                InteractionCurationPriorityOverride | None
+            ) = None
+            curation_allowed = jnp.asarray(False, dtype=jnp.bool_)
+            utility_tail_weights: Array | None = None
+            if self._prototype_feature_utility is not None:
+                if (
+                    old_feature_utility_state is None
+                    or shared_horde_predictions is None
+                    or shared_horde_td_targets is None
+                    or type(old_horde_state) is not MultiHeadMLPState
+                ):
+                    raise RuntimeError(
+                        "feature utility requires old shared-consumer data"
+                    )
+                ordered_predictions = jnp.concatenate(
+                    (
+                        jnp.reshape(
+                            behavior_gradient_result.diagnostics.prediction,
+                            (1,),
+                        ),
+                        shared_horde_predictions,
+                    )
+                )
+                utility_task_available = (
+                    jnp.isfinite(lifecycle_event.targets)
+                    & jnp.isfinite(ordered_predictions)
+                )
+                utility_tail_weights = jnp.concatenate(
+                    (
+                        self._behavior_active_pair_weights(state)[None, :],
+                        self._horde_active_pair_weights(old_horde_state),
+                    ),
+                    axis=0,
+                )
+                utility_observation_result = (
+                    self._prototype_feature_utility.observe(
+                        old_feature_utility_state,
+                        PrototypeFeatureUtilityEvent(
+                            base_observation=last_base_obs,
+                            augmented_observation=last_obs,
+                            targets=jnp.where(
+                                utility_task_available,
+                                lifecycle_event.targets,
+                                jnp.zeros_like(lifecycle_event.targets),
+                            ),
+                            predictions=jnp.where(
+                                jnp.isfinite(ordered_predictions),
+                                ordered_predictions,
+                                jnp.zeros_like(ordered_predictions),
+                            ),
+                            target_available=utility_task_available,
+                            active_consumer_tail_weights=(
+                                utility_tail_weights
+                            ),
+                            semantic_generation=(
+                                old_feature_state.router_state.generation_count
+                            ),
+                            semantic_generation_words=(
+                                old_feature_state.router_state.generation_words
+                            ),
+                            active_descriptors=(
+                                old_feature_state.router_state.descriptors
+                            ),
+                            candidate_descriptors=(
+                                self._feature_candidate_descriptors(
+                                    old_feature_state
+                                )
+                            ),
+                        ),
+                    )
+                )
+                new_feature_utility_state = utility_observation_result.state
+                utility_observation_diagnostics = (
+                    utility_observation_result.diagnostics
+                )
+            if self._prototype_feature_utility_curation is not None:
+                if (
+                    new_feature_utility_state is None
+                    or utility_observation_diagnostics is None
+                ):
+                    raise RuntimeError(
+                        "feature utility curation requires an audit observation"
+                    )
+                utility_curation_result = (
+                    self._prototype_feature_utility_curation.rank(
+                        new_feature_utility_state,
+                        source_semantic_generation=(
+                            old_feature_state.router_state.generation_count
+                        ),
+                        source_semantic_generation_words=(
+                            old_feature_state.router_state.generation_words
+                        ),
+                        source_active_descriptors=(
+                            old_feature_state.router_state.descriptors
+                        ),
+                        source_candidate_descriptors=(
+                            self._feature_candidate_descriptors(
+                                old_feature_state
+                            )
+                        ),
+                    )
+                )
+                utility_curation_policy_diagnostics = (
+                    utility_curation_result.diagnostics
+                )
+                observation_applied = (
+                    utility_observation_diagnostics.transaction_applied
+                )
+                policy_transaction_acceptable = (
+                    utility_curation_result.diagnostics.transaction_valid
+                    & (
+                        observation_applied
+                        | utility_curation_result.diagnostics.observation_capacity_capped
+                    )
+                )
+                fail_closed_override = ~policy_transaction_acceptable
+                policy_override = utility_curation_result.override
+                curation_priority_override = cast(
+                    InteractionCurationPriorityOverride,
+                    policy_override.replace(
+                        enabled=(
+                            fail_closed_override
+                            | (policy_override.enabled & observation_applied)
+                        ),
+                        active_ranks=jnp.where(
+                            fail_closed_override,
+                            jnp.full_like(
+                                policy_override.active_ranks,
+                                CURATION_ACTIVE_INELIGIBLE_RANK,
+                            ),
+                            policy_override.active_ranks,
+                        ),
+                        candidate_ranks=jnp.where(
+                            fail_closed_override,
+                            jnp.full_like(
+                                policy_override.candidate_ranks,
+                                CURATION_CANDIDATE_INELIGIBLE_RANK,
+                            ),
+                            policy_override.candidate_ranks,
                         ),
                     ),
                 )
+                curation_allowed = (
+                    lifecycle_event.allow_curation
+                    & observation_applied
+                    & utility_curation_result.diagnostics.curation_ready
+                )
+                lifecycle_event = cast(
+                    PrototypeFeatureLifecycleEvent,
+                    lifecycle_event.replace(
+                        allow_curation=curation_allowed,
+                    ),
+                )
+            feature_result: (
+                PrototypeFeatureLifecycleResult
+                | PrototypeFeatureLifecycleHordeResult
             )
+            if self._shared_feature_horde_enabled():
+                if shared_horde_td_targets is None:
+                    raise RuntimeError(
+                        "managed feature Horde requires causal TD targets"
+                    )
+                if self._prototype_routed_linear_world_model is not None:
+                    if (
+                        atomic_world_prepare is None
+                        or self._prototype_feature_memory is None
+                        or old_feature_consumer_binding is None
+                    ):
+                        raise RuntimeError(
+                            "atomic feature/world/memory preparation is incomplete"
+                        )
+                    prepared_feature = (
+                        self._prototype_feature_lifecycle.prepare_observe_and_route_with_horde(
+                            old_feature_state,
+                            new_oak_state,
+                            cast(MultiHeadMLPState, new_horde_state),
+                            old_feature_consumer_binding,
+                            lifecycle_event,
+                        )
+                    )
+                    destination_feature = prepared_feature.destination_result
+                    capacity_diagnostics = destination_feature.diagnostics
+                    maximum_observations = (
+                        self._config.prototype_feature_lifecycle.max_observations
+                    )
+                    maximum_observation_words = jnp.asarray(
+                        (
+                            (maximum_observations >> 32) & _UINT32_MAX,
+                            maximum_observations & _UINT32_MAX,
+                        ),
+                        dtype=jnp.uint32,
+                    )
+                    atomic_lifecycle_capacity_capped = (
+                        destination_feature.horde_diagnostics.lifecycle_capacity_capped
+                        & jnp.all(
+                            old_feature_state.observe_words
+                            == maximum_observation_words
+                        )
+                        & ~capacity_diagnostics.update_capacity_available
+                        & capacity_diagnostics.post_update_consumer_clock_valid
+                        & capacity_diagnostics.learner_update_rejected
+                        & ~capacity_diagnostics.transaction_applied
+                        & ~capacity_diagnostics.curation_proposed
+                        & ~capacity_diagnostics.curation_deferred
+                        & ~capacity_diagnostics.routing_attempted
+                        & ~capacity_diagnostics.curation_committed
+                        & ~capacity_diagnostics.curation_rolled_back
+                        & _tree_arrays_equal(
+                            destination_feature.state,
+                            old_feature_state,
+                        )
+                        & _tree_arrays_equal(
+                            destination_feature.oak_state,
+                            new_oak_state,
+                        )
+                        & _tree_arrays_equal(
+                            destination_feature.horde_state,
+                            new_horde_state,
+                        )
+                        & _tree_arrays_equal(
+                            destination_feature.consumer_binding,
+                            old_feature_consumer_binding,
+                        )
+                        & jnp.array_equal(
+                            destination_feature.next_augmented_observation,
+                            self._augment_base_representation(
+                                old_feature_state,
+                                decision_base_obs,
+                            ),
+                        )
+                    )
+                    source_routed_world = self._atomic_routed_world_component_state(
+                        state.world_model_state
+                    )
+                    world_event = PrototypeRoutedLinearWorldTransition(
+                        prepared=atomic_world_prepare.prepared,
+                        reward=rew,
+                        discount=transition.discount,
+                        next_base_observation=bootstrap_base_obs,
+                        destination_router_state=(
+                            destination_feature.state.router_state
+                        ),
+                        destination_binding=(
+                            destination_feature.consumer_binding
+                        ),
+                    )
+                    prepared_world = (
+                        self._prototype_routed_linear_world_model.prepare_observe_and_route(
+                            source_routed_world,
+                            old_feature_state.router_state,
+                            world_event,
+                        )
+                    )
+                    source_feature_memory = self._feature_memory_component_state(
+                        state.ia_state
+                    )
+                    atomic_memory_rebind_result = (
+                        self._prototype_feature_memory.rebind(
+                            source_feature_memory,
+                            old_feature_consumer_binding,
+                            destination_feature.consumer_binding,
+                        )
+                    )
+                    route_attempted = (
+                        destination_feature.diagnostics.routing_attempted
+                    )
+                    lifecycle_destination_ready = (
+                        prepared_feature.internally_valid
+                        & jnp.where(
+                            route_attempted,
+                            destination_feature.diagnostics.curation_committed,
+                            jnp.asarray(True, dtype=jnp.bool_),
+                        )
+                    )
+                    memory_rebind = atomic_memory_rebind_result.diagnostics
+                    memory_destination_ready = jnp.where(
+                        memory_rebind.rebind_required,
+                        memory_rebind.transaction_applied,
+                        memory_rebind.transaction_noop,
+                    )
+                    atomic_all_consumers_ready = (
+                        lifecycle_destination_ready
+                        & prepared_world.destination_valid
+                        & memory_destination_ready
+                    )
+                    feature_receipt = (
+                        self._prototype_feature_lifecycle.horde_external_readiness_receipt(
+                            prepared_feature,
+                            atomic_all_consumers_ready,
+                        )
+                    )
+                    feature_adoption = (
+                        self._prototype_feature_lifecycle.adopt_prepared_route_with_horde(
+                            old_feature_state,
+                            new_oak_state,
+                            cast(MultiHeadMLPState, new_horde_state),
+                            old_feature_consumer_binding,
+                            prepared_feature,
+                            feature_receipt,
+                        )
+                    )
+                    world_receipt = (
+                        self._prototype_routed_linear_world_model.external_readiness_receipt(
+                            prepared_world,
+                            atomic_all_consumers_ready,
+                        )
+                    )
+                    world_adoption = (
+                        self._prototype_routed_linear_world_model.adopt_prepared_route(
+                            source_routed_world,
+                            old_feature_state.router_state,
+                            prepared_world,
+                            world_receipt,
+                        )
+                    )
+                    shared_feature_result = feature_adoption.result
+                    new_wm_state = self._atomic_routed_world_state_slot(
+                        world_adoption.result.state
+                    )
+                    wm_error = world_adoption.result.prediction_error
+                    atomic_feature_world_memory_diagnostics = (
+                        PrototypeAtomicFeatureWorldMemoryDiagnostics(
+                            available=jnp.asarray(True, dtype=jnp.bool_),
+                            descriptor_change_requested=route_attempted,
+                            lifecycle_destination_ready=(
+                                lifecycle_destination_ready
+                            ),
+                            world_ordinary_ready=prepared_world.ordinary_valid,
+                            world_destination_ready=(
+                                prepared_world.destination_valid
+                            ),
+                            memory_destination_ready=(
+                                memory_destination_ready
+                            ),
+                            all_consumers_ready=atomic_all_consumers_ready,
+                            destination_adopted=(
+                                feature_adoption.diagnostics.destination_adopted
+                                & world_adoption.diagnostics.destination_adopted
+                                & memory_destination_ready
+                                & atomic_all_consumers_ready
+                            ),
+                            ordinary_updates_retained=(
+                                (
+                                    feature_adoption.diagnostics.ordinary_update_retained
+                                    | atomic_lifecycle_capacity_capped
+                                )
+                                & world_adoption.diagnostics.ordinary_update_retained
+                            ),
+                            external_curation_rolled_back=(
+                                feature_adoption.diagnostics.external_curation_rolled_back
+                            ),
+                            lifecycle_adoption=feature_adoption.diagnostics,
+                            world_adoption=world_adoption.diagnostics,
+                            oak_update_evaluations=jnp.int32(1),
+                            horde_update_evaluations=jnp.int32(1),
+                            feature_learner_update_evaluations=(
+                                feature_adoption.diagnostics.total_learner_update_evaluations
+                            ),
+                            lifecycle_router_evaluations=jnp.int32(2),
+                            world_learner_update_evaluations=(
+                                world_adoption.diagnostics.total_learner_update_evaluations
+                            ),
+                            world_router_evaluations=(
+                                world_adoption.diagnostics.total_router_evaluations
+                            ),
+                            memory_rebind_evaluations=jnp.int32(1),
+                            memory_step_evaluations=jnp.int32(1),
+                        )
+                    )
+                else:
+                    shared_feature_result = (
+                        self._prototype_feature_lifecycle.observe_and_route_with_horde(
+                            old_feature_state,
+                            new_oak_state,
+                            cast(MultiHeadMLPState, new_horde_state),
+                            old_feature_consumer_binding,
+                            lifecycle_event,
+                            curation_priority_override=(
+                                curation_priority_override
+                            ),
+                        )
+                    )
+                feature_result = shared_feature_result
+                new_horde_state = shared_feature_result.horde_state
+            else:
+                feature_result = self._prototype_feature_lifecycle.observe_and_route(
+                    old_feature_state,
+                    new_oak_state,
+                    old_feature_consumer_binding,
+                    lifecycle_event,
+                    curation_priority_override=curation_priority_override,
+                )
             new_feature_state = feature_result.state
             new_oak_state = feature_result.oak_state
             new_feature_consumer_binding = feature_result.consumer_binding
             decision_obs = feature_result.next_augmented_observation
+            if self._prototype_feature_utility_curation is not None:
+                if (
+                    utility_curation_policy_diagnostics is None
+                    or utility_observation_diagnostics is None
+                ):
+                    raise RuntimeError(
+                        "feature utility curation diagnostics are unavailable"
+                    )
+                lifecycle_diagnostics = feature_result.diagnostics
+                selected_active_slot = (
+                    lifecycle_diagnostics.curation_selected_active_worst_slot
+                )
+                selected_candidate_slot = (
+                    lifecycle_diagnostics.curation_selected_promotion_candidate
+                )
+                source_active_descriptors = (
+                    old_feature_state.router_state.descriptors
+                )
+                source_candidate_descriptors = (
+                    self._feature_candidate_descriptors(old_feature_state)
+                )
+                active_slot_valid = (
+                    (selected_active_slot >= 0)
+                    & (
+                        selected_active_slot
+                        < self._config.prototype_feature_utility.active_pair_slots
+                    )
+                )
+                candidate_slot_valid = (
+                    (selected_candidate_slot >= 0)
+                    & (
+                        selected_candidate_slot
+                        < self._config.prototype_feature_utility.candidate_pair_slots
+                    )
+                )
+                safe_active_slot = jnp.clip(
+                    selected_active_slot,
+                    0,
+                    self._config.prototype_feature_utility.active_pair_slots - 1,
+                )
+                safe_candidate_slot = jnp.clip(
+                    selected_candidate_slot,
+                    0,
+                    self._config.prototype_feature_utility.candidate_pair_slots - 1,
+                )
+                rejected_descriptor = jnp.full((2,), -1, dtype=jnp.int32)
+                selected_active_descriptor = jnp.where(
+                    active_slot_valid,
+                    source_active_descriptors[safe_active_slot],
+                    rejected_descriptor,
+                )
+                selected_candidate_descriptor = jnp.where(
+                    candidate_slot_valid,
+                    source_candidate_descriptors[safe_candidate_slot],
+                    rejected_descriptor,
+                )
+                feature_utility_curation_diagnostics = (
+                    PrototypeFeatureUtilityCurationIntegrationDiagnostics(
+                        policy=utility_curation_policy_diagnostics,
+                        observation_applied=(
+                            utility_observation_diagnostics.transaction_applied
+                        ),
+                        priority_override_supplied=jnp.asarray(
+                            True,
+                            dtype=jnp.bool_,
+                        ),
+                        priority_override_consulted=(
+                            lifecycle_diagnostics.curation_priority_override_applied
+                        ),
+                        curation_allowed=curation_allowed,
+                        selected_active_slot=selected_active_slot,
+                        selected_candidate_slot=selected_candidate_slot,
+                        selected_active_descriptor=(
+                            selected_active_descriptor
+                        ),
+                        selected_candidate_descriptor=(
+                            selected_candidate_descriptor
+                        ),
+                        lifecycle_curation_proposed=(
+                            lifecycle_diagnostics.curation_proposed
+                        ),
+                        lifecycle_curation_deferred=(
+                            lifecycle_diagnostics.curation_deferred
+                        ),
+                        lifecycle_curation_committed=(
+                            lifecycle_diagnostics.curation_committed
+                        ),
+                        lifecycle_curation_rolled_back=(
+                            lifecycle_diagnostics.curation_rolled_back
+                        ),
+                        outer_transaction_committed=jnp.asarray(
+                            False,
+                            dtype=jnp.bool_,
+                        ),
+                    )
+                )
+            if self._prototype_feature_utility is not None:
+                if (
+                    new_feature_utility_state is None
+                    or utility_observation_diagnostics is None
+                ):
+                    raise RuntimeError(
+                        "feature utility observation result is unavailable"
+                    )
+                observed_utility_state = new_feature_utility_state
+                rebind_required = (
+                    ~jnp.all(
+                        new_feature_state.router_state.generation_words
+                        == observed_utility_state.semantic_generation_words
+                    )
+                )
+                utility_rebind_result = self._prototype_feature_utility.rebind(
+                    observed_utility_state,
+                    active_descriptors=(
+                        new_feature_state.router_state.descriptors
+                    ),
+                    candidate_descriptors=self._feature_candidate_descriptors(
+                        new_feature_state
+                    ),
+                    semantic_generation=(
+                        new_feature_state.router_state.generation_count
+                    ),
+                    semantic_generation_words=(
+                        new_feature_state.router_state.generation_words
+                    ),
+                )
+                neutral_rebind_diagnostics = (
+                    self._prototype_feature_utility.unavailable_diagnostics(
+                        observed_utility_state
+                    )
+                )
+                new_feature_utility_state = cast(
+                    PrototypeFeatureUtilityState,
+                    jax.tree.map(
+                        lambda rebound, observed: jnp.where(
+                            rebind_required,
+                            rebound,
+                            observed,
+                        ),
+                        utility_rebind_result.state,
+                        observed_utility_state,
+                    ),
+                )
+                selected_rebind_diagnostics = cast(
+                    PrototypeFeatureUtilityDiagnostics,
+                    jax.tree.map(
+                        lambda rebound, neutral: jnp.where(
+                            rebind_required,
+                            rebound,
+                            neutral,
+                        ),
+                        utility_rebind_result.diagnostics,
+                        neutral_rebind_diagnostics,
+                    ),
+                )
+                feature_utility_diagnostics = (
+                    PrototypeFeatureUtilityIntegrationDiagnostics(
+                        observation=utility_observation_diagnostics,
+                        rebind=selected_rebind_diagnostics,
+                        rebind_required=jnp.asarray(
+                            rebind_required,
+                            dtype=jnp.bool_,
+                        ),
+                        outer_transaction_committed=jnp.asarray(
+                            False,
+                            dtype=jnp.bool_,
+                        ),
+                    )
+                )
             prediction = feature_result.predictions[0]
             error = feature_result.errors[0]
             feature_lifecycle_diagnostics = (
@@ -6582,6 +11833,24 @@ class PrototypeAgent:
                         error,
                         jnp.asarray(0.0, dtype=jnp.float32),
                     ),
+                    task_targets=jnp.where(
+                        jnp.isfinite(lifecycle_event.targets),
+                        lifecycle_event.targets,
+                        jnp.zeros_like(lifecycle_event.targets),
+                    ),
+                    task_target_available=jnp.isfinite(
+                        lifecycle_event.targets
+                    ),
+                    task_predictions=jnp.where(
+                        jnp.isfinite(feature_result.predictions),
+                        feature_result.predictions,
+                        jnp.zeros_like(feature_result.predictions),
+                    ),
+                    task_errors=jnp.where(
+                        jnp.isfinite(feature_result.errors),
+                        feature_result.errors,
+                        jnp.zeros_like(feature_result.errors),
+                    ),
                     metrics=feature_result.metrics,
                     lifecycle=feature_result.diagnostics,
                     outer_transaction_committed=jnp.asarray(
@@ -6591,8 +11860,11 @@ class PrototypeAgent:
                 )
             )
 
+        feature_route_destination_owner = new_oak_state.stomp_state
+
         # -- Step 9: guarded Dyna dreaming ------------------------------------
         dream_td_errors: Any = None
+        dream_learner_updates = jnp.asarray(0, dtype=jnp.int32)
 
         if (
             self._world_model is not None
@@ -6601,37 +11873,26 @@ class PrototypeAgent:
             and self._config.n_dreams_per_step > 0
         ):
             rng_key = new_oak_state.stomp_state.rng_key
-            new_oak_state, dream_td_errors = self._run_dreams(
-                new_oak_state, new_wm_state, new_buf_state, rng_key
+            (
+                new_oak_state,
+                dream_td_errors,
+                dream_learner_updates,
+            ) = self._run_dreams_with_count(
+                new_oak_state,
+                new_wm_state,
+                new_buf_state,
+                rng_key,
+                effective_extended_action_mask,
             )
+        dyna_destination_owner = new_oak_state.stomp_state
 
         # -- Step 3: Horde GVF update -----------------------------------------
-        new_horde_state = state.horde_state
-        horde_tderrs: Any = None
-
-        if self._horde is not None:
-            horde_cumulants = transition.horde_cumulants
-            if horde_cumulants is None:
-                horde_cumulants = jnp.full(
-                    (self._horde.n_demons,), rew, dtype=jnp.float32
-                )
-            horde_discounts = transition.horde_discounts
-            if horde_discounts is None:
-                # Default terminal/global rule: preserve each GVF's declared
-                # horizon on every continuing transition. Only a true global
-                # terminal (discount == 0) zeros all bootstraps.
-                horde_spec = cast(HordeSpec, self._config.horde_spec)
-                horde_discounts = jnp.where(
-                    transition.discount > 0.0,
-                    horde_spec.gammas,
-                    jnp.zeros_like(horde_spec.gammas),
-                )
-            horde_result = self._horde.update_with_discounts(
-                state.horde_state,
+        if self._horde is not None and not self._shared_feature_horde_enabled():
+            horde_result = self._update_horde_for_transition(
+                cast(MultiHeadMLPState, new_horde_state),
                 last_obs,
-                horde_cumulants,
                 bootstrap_obs,
-                horde_discounts,
+                transition,
             )
             new_horde_state = horde_result.state
             horde_tderrs = horde_result.td_errors
@@ -6641,9 +11902,10 @@ class PrototypeAgent:
         new_ia_component_state = current_ia_state
         ia_augmented: Any = None
         ia_recommendation: Any = None
+        ia_update_applied = jnp.asarray(False, dtype=jnp.bool_)
 
         if self._ia is not None and current_ia_state is not None:
-            ia_result = self._ia.update(
+            ia_result: IAUpdateResult = self._ia.update(
                 current_ia_state,
                 last_obs,
                 rew,
@@ -6656,14 +11918,29 @@ class PrototypeAgent:
             new_ia_component_state = ia_result.state
             ia_augmented = ia_result.augmented_obs
             ia_recommendation = ia_result.recommendation
+            ia_update_applied = ia_result.update_applied
 
         next_step_count = _saturating_int32_increment(state.step_count)
+        next_step_words, _ = _checked_lifetime_words_add(state.step_words, 1)
         next_observation_event_count = jnp.where(
             execution_boundary,
             _saturating_int32_increment(
                 _saturating_int32_increment(state.observation_event_count)
             ),
             _saturating_int32_increment(state.observation_event_count),
+        )
+        next_observation_event_words_one, _ = _checked_lifetime_words_add(
+            state.observation_event_words,
+            1,
+        )
+        next_observation_event_words_two, _ = _checked_lifetime_words_add(
+            state.observation_event_words,
+            2,
+        )
+        next_observation_event_words = jnp.where(
+            execution_boundary,
+            next_observation_event_words_two,
+            next_observation_event_words_one,
         )
         counterfactual_next_action = jnp.where(
             next_armed,
@@ -6678,6 +11955,10 @@ class PrototypeAgent:
         current_memory_state: ExperientialMemoryState | None = None
         new_memory_state: ExperientialMemoryState | None = None
         memory_diagnostics: PrototypeExperientialMemoryDiagnostics | None = None
+        feature_memory_diagnostics: (
+            PrototypeFeatureMemoryIntegrationDiagnostics | None
+        ) = None
+        new_memory_slot_state: Any = None
         partner_fusion_diagnostics: (
             PrototypePartnerPolicyFusionDiagnostics | None
         ) = None
@@ -6691,9 +11972,125 @@ class PrototypeAgent:
                 raise RuntimeError(
                     "configured experiential memory requires a fixed sidecar"
                 )
-            current_memory_state = self._experiential_memory_component_state(
-                state.ia_state
-            )
+            memory_current_representation = last_obs
+            memory_bootstrap_representation = bootstrap_obs
+            memory_decision_representation = decision_obs
+            source_representation_version: Array | None = None
+            destination_representation_version: Array | None = None
+            rebound_feature_memory_state: PrototypeFeatureMemoryState | None = None
+            rebind_diagnostics: PrototypeFeatureMemoryRebindDiagnostics | None = None
+            if self._prototype_feature_memory is not None:
+                if (
+                    old_feature_state is None
+                    or new_feature_state is None
+                    or old_feature_consumer_binding is None
+                    or new_feature_consumer_binding is None
+                ):
+                    raise RuntimeError(
+                        "feature-memory update requires source and destination banks"
+                    )
+                source_feature_memory_state = self._feature_memory_component_state(
+                    state.ia_state
+                )
+                if self._prototype_routed_linear_world_model is not None:
+                    if atomic_memory_rebind_result is None:
+                        raise RuntimeError(
+                            "atomic memory update requires its readiness candidate"
+                        )
+                    rebind_candidate = atomic_memory_rebind_result
+                    rebound_feature_memory_state = cast(
+                        PrototypeFeatureMemoryState,
+                        jax.lax.cond(
+                            atomic_all_consumers_ready,
+                            lambda _: rebind_candidate.state,
+                            lambda _: source_feature_memory_state,
+                            operand=None,
+                        ),
+                    )
+                    rebind_diagnostics = rebind_candidate.diagnostics.replace(
+                        destination_descriptors_changed=(
+                            rebind_candidate.diagnostics.destination_descriptors_changed
+                            & atomic_all_consumers_ready
+                        ),
+                        destination_generation_changed=(
+                            rebind_candidate.diagnostics.destination_generation_changed
+                            & atomic_all_consumers_ready
+                        ),
+                        transition_consistent=jnp.where(
+                            atomic_all_consumers_ready,
+                            rebind_candidate.diagnostics.transition_consistent,
+                            rebind_candidate.diagnostics.source_state_valid
+                            & rebind_candidate.diagnostics.source_binding_valid
+                            & rebind_candidate.diagnostics.source_binding_matches,
+                        ),
+                        rebind_required=(
+                            rebind_candidate.diagnostics.rebind_required
+                            & atomic_all_consumers_ready
+                        ),
+                        transaction_applied=(
+                            rebind_candidate.diagnostics.transaction_applied
+                            & atomic_all_consumers_ready
+                        ),
+                        transaction_noop=jnp.where(
+                            atomic_all_consumers_ready,
+                            rebind_candidate.diagnostics.transaction_noop,
+                            rebind_candidate.diagnostics.source_state_valid
+                            & rebind_candidate.diagnostics.source_binding_valid
+                            & rebind_candidate.diagnostics.source_binding_matches,
+                        ),
+                        valid_rows_reencoded=jnp.where(
+                            atomic_all_consumers_ready,
+                            rebind_candidate.diagnostics.valid_rows_reencoded,
+                            jnp.asarray(0, dtype=jnp.int32),
+                        ),
+                        requested_generation_words=(
+                            new_feature_consumer_binding.semantic_generation_words
+                        ),
+                        committed_generation_words=(
+                            rebound_feature_memory_state.consumer_binding.semantic_generation_words
+                        ),
+                        memory_step_words_after=(
+                            rebound_feature_memory_state.memory_state.step_words
+                        ),
+                    )
+                else:
+                    rebind_result = self._prototype_feature_memory.rebind(
+                        source_feature_memory_state,
+                        old_feature_consumer_binding,
+                        new_feature_consumer_binding,
+                    )
+                    rebound_feature_memory_state = rebind_result.state
+                    rebind_diagnostics = rebind_result.diagnostics
+                current_memory_state = rebound_feature_memory_state.memory_state
+                # OaK/Horde learned under the source bank above. Memory now
+                # migrates first, then queries and writes entirely in the
+                # destination bank so no row mixes feature meanings.
+                memory_current_representation = self._augment_base_representation(
+                    new_feature_state,
+                    last_base_obs,
+                )
+                memory_bootstrap_representation = (
+                    self._augment_base_representation(
+                        new_feature_state,
+                        bootstrap_base_obs,
+                    )
+                )
+                memory_decision_representation = (
+                    self._augment_base_representation(
+                        new_feature_state,
+                        decision_base_obs,
+                    )
+                )
+                source_representation_version = (
+                    old_feature_consumer_binding.semantic_generation
+                )
+                destination_representation_version = (
+                    new_feature_consumer_binding.semantic_generation
+                )
+            else:
+                current_memory_state = self._experiential_memory_component_state(
+                    state.ia_state
+                )
             (
                 new_memory_state,
                 new_oak_state,
@@ -6702,23 +12099,101 @@ class PrototypeAgent:
             ) = self._apply_experiential_memory(
                 current_memory_state,
                 new_oak_state,
-                last_obs,
-                bootstrap_obs,
-                decision_obs,
+                memory_current_representation,
+                memory_bootstrap_representation,
+                memory_decision_representation,
                 transition.action,
                 rew,
                 current_prototype_decision_id=state.current_decision_id,
                 next_prototype_decision_id=next_decision_id,
                 next_armed=next_armed,
-                transaction_allowed=jnp.asarray(True, dtype=jnp.bool_),
+                transaction_allowed=(
+                    (
+                        (
+                            atomic_feature_world_memory_diagnostics.lifecycle_adoption.transaction_applied
+                            | atomic_lifecycle_capacity_capped
+                        )
+                        & atomic_feature_world_memory_diagnostics.world_adoption.transaction_applied
+                    )
+                    if atomic_feature_world_memory_diagnostics is not None
+                    else jnp.asarray(True, dtype=jnp.bool_)
+                ),
                 memory_input=experiential_memory_input,
                 input_supplied=experiential_memory_input_supplied,
+                source_representation_version=source_representation_version,
+                destination_representation_version=(
+                    destination_representation_version
+                ),
             )
+            new_memory_slot_state = new_memory_state
+            if self._prototype_feature_memory is not None:
+                if (
+                    rebound_feature_memory_state is None
+                    or rebind_diagnostics is None
+                    or new_feature_consumer_binding is None
+                    or source_representation_version is None
+                ):
+                    raise RuntimeError(
+                        "feature-memory diagnostics require a completed rebind"
+                    )
+                rebound_with_event = cast(
+                    PrototypeFeatureMemoryState,
+                    rebound_feature_memory_state.replace(
+                        memory_state=new_memory_state,
+                    ),
+                )
+                post_memory_state_valid = self._prototype_feature_memory.state_valid(
+                    rebound_with_event,
+                    new_feature_consumer_binding,
+                )
+                new_memory_slot_state = rebound_with_event
+                query_source_version_matches = (
+                    experiential_memory_input.query_representation_version
+                    == source_representation_version
+                )
+                entry_source_version_matches = (
+                    experiential_memory_input.entry_representation_version
+                    == source_representation_version
+                )
+                feature_memory_diagnostics = (
+                    PrototypeFeatureMemoryIntegrationDiagnostics(
+                        rebind=rebind_diagnostics,
+                        query_source_version_matches=(
+                            query_source_version_matches
+                        ),
+                        entry_source_version_matches=(
+                            entry_source_version_matches
+                        ),
+                        source_versions_match=(
+                            query_source_version_matches
+                            & entry_source_version_matches
+                        ),
+                        current_destination_encoding_valid=(
+                            jnp.all(jnp.isfinite(memory_current_representation))
+                        ),
+                        bootstrap_destination_encoding_valid=(
+                            jnp.all(jnp.isfinite(memory_bootstrap_representation))
+                        ),
+                        decision_destination_encoding_valid=(
+                            jnp.all(jnp.isfinite(memory_decision_representation))
+                            & jnp.array_equal(
+                                memory_decision_representation,
+                                decision_obs,
+                            )
+                        ),
+                        post_memory_state_valid=post_memory_state_valid,
+                        outer_transaction_committed=jnp.asarray(
+                            False,
+                            dtype=jnp.bool_,
+                        ),
+                    )
+                )
             memory_safety_mask = jnp.where(
                 memory_diagnostics.transaction_required,
                 experiential_memory_input.next_action_safety_mask,
                 memory_safety_mask,
             )
+        memory_dispatch_destination_owner = new_oak_state.stomp_state
         new_interaction_state = self._interaction_slot(
             new_ia_component_state,
             (
@@ -6726,7 +12201,7 @@ class PrototypeAgent:
                 if self._partner_policy_fusion is not None
                 else None
             ),
-            experiential_memory_state=new_memory_state,
+            experiential_memory_state=new_memory_slot_state,
             feedback_prototype_decision_id=(
                 self._partner_interaction_state(
                     state.ia_state
@@ -6758,8 +12233,13 @@ class PrototypeAgent:
                 new_ia_component_state,
                 new_oak_state,
                 decision_obs,
+                # The scalar IDs are authenticated saturating telemetry. The
+                # exact outer clocks below remain the ordering and ownership
+                # authorities after signed telemetry saturates.
                 derived_decision_id=next_step_count,
                 derived_event_id=next_observation_event_count,
+                derived_decision_words=next_step_words,
+                derived_event_words=next_observation_event_words,
                 derived_prototype_decision_id=next_decision_id,
                 next_armed=next_armed,
                 transaction_allowed=jnp.asarray(True, dtype=jnp.bool_),
@@ -6772,6 +12252,7 @@ class PrototypeAgent:
                     partner_policy_fusion_feedback_supplied
                 ),
             )
+        partner_dispatch_destination_owner = new_oak_state.stomp_state
         if self._recurrent_latent_world_model_ensemble is not None:
             recurrent_wrapper = cast(
                 PrototypeRecurrentLatentWorldModelState,
@@ -6793,19 +12274,207 @@ class PrototypeAgent:
                     & next_recurrent_decision.valid
                 ),
             )
+        false = jnp.asarray(False, dtype=jnp.bool_)
+        true = jnp.asarray(True, dtype=jnp.bool_)
+        zero_work = jnp.asarray(0, dtype=jnp.int32)
+        option_search_configured = jnp.asarray(
+            self._option_search_control is not None,
+            dtype=jnp.bool_,
+        )
+        feature_route_configured = jnp.asarray(
+            self._prototype_feature_lifecycle is not None,
+            dtype=jnp.bool_,
+        )
+        dyna_configured = jnp.asarray(
+            self._world_model is not None
+            and self._buffer is not None
+            and self._dreamer is not None
+            and self._config.n_dreams_per_step > 0,
+            dtype=jnp.bool_,
+        )
+        memory_dispatch_configured = jnp.asarray(
+            self._experiential_memory is not None,
+            dtype=jnp.bool_,
+        )
+        partner_dispatch_configured = jnp.asarray(
+            self._partner_policy_fusion is not None,
+            dtype=jnp.bool_,
+        )
+        raw_owner_digest = stomp_typed_tree_digest(raw_stomp_owner)
+        if self._option_search_control is None:
+            option_search_destination_digest = raw_owner_digest
+            option_search_delta_valid = true
+        else:
+            option_search_destination_digest = stomp_typed_tree_digest(
+                option_search_destination_owner
+            )
+            option_search_delta_valid = stomp_owner_stage_delta_valid(
+                raw_stomp_owner,
+                option_search_destination_owner,
+                stage_kind=STOMP_OWNER_STAGE_OPTION_SEARCH,
+            )
+        if self._prototype_feature_lifecycle is None:
+            feature_route_destination_digest = option_search_destination_digest
+            feature_route_delta_valid = true
+        else:
+            feature_route_destination_digest = stomp_typed_tree_digest(
+                feature_route_destination_owner
+            )
+            feature_route_delta_valid = stomp_owner_stage_delta_valid(
+                option_search_destination_owner,
+                feature_route_destination_owner,
+                stage_kind=STOMP_OWNER_STAGE_FEATURE_ROUTE,
+            )
+        dyna_enabled = (
+            self._world_model is not None
+            and self._buffer is not None
+            and self._dreamer is not None
+            and self._config.n_dreams_per_step > 0
+        )
+        if not dyna_enabled:
+            dyna_destination_digest = feature_route_destination_digest
+            dyna_delta_valid = true
+        else:
+            dyna_destination_digest = stomp_typed_tree_digest(
+                dyna_destination_owner
+            )
+            dyna_delta_valid = stomp_owner_stage_delta_valid(
+                feature_route_destination_owner,
+                dyna_destination_owner,
+                stage_kind=STOMP_OWNER_STAGE_DYNA,
+            )
+        if self._experiential_memory is None:
+            memory_dispatch_destination_digest = dyna_destination_digest
+            memory_dispatch_delta_valid = true
+        else:
+            memory_dispatch_destination_digest = stomp_typed_tree_digest(
+                memory_dispatch_destination_owner
+            )
+            memory_dispatch_delta_valid = stomp_owner_stage_delta_valid(
+                dyna_destination_owner,
+                memory_dispatch_destination_owner,
+                stage_kind=STOMP_OWNER_STAGE_MEMORY_DISPATCH,
+            )
+        if self._partner_policy_fusion is None:
+            partner_dispatch_destination_digest = (
+                memory_dispatch_destination_digest
+            )
+            partner_dispatch_delta_valid = true
+        else:
+            partner_dispatch_destination_digest = stomp_typed_tree_digest(
+                partner_dispatch_destination_owner
+            )
+            partner_dispatch_delta_valid = stomp_owner_stage_delta_valid(
+                memory_dispatch_destination_owner,
+                partner_dispatch_destination_owner,
+                stage_kind=STOMP_OWNER_STAGE_PARTNER_DISPATCH,
+            )
+        owner_finalization_stages = (
+            make_stomp_owner_stage_receipt(
+                raw_stomp_owner,
+                option_search_destination_owner,
+                stage_kind=STOMP_OWNER_STAGE_OPTION_SEARCH,
+                configured=option_search_configured,
+                evaluated=jnp.where(option_search_configured, true, false),
+                stomp_update_evaluations=zero_work,
+                learner_updates_applied=option_search_learner_updates,
+                source_digest=raw_owner_digest,
+                destination_digest=option_search_destination_digest,
+                classified_delta_valid=option_search_delta_valid,
+            ),
+            make_stomp_owner_stage_receipt(
+                option_search_destination_owner,
+                feature_route_destination_owner,
+                stage_kind=STOMP_OWNER_STAGE_FEATURE_ROUTE,
+                configured=feature_route_configured,
+                evaluated=jnp.where(feature_route_configured, true, false),
+                stomp_update_evaluations=zero_work,
+                learner_updates_applied=zero_work,
+                source_digest=option_search_destination_digest,
+                destination_digest=feature_route_destination_digest,
+                classified_delta_valid=feature_route_delta_valid,
+            ),
+            make_stomp_owner_stage_receipt(
+                feature_route_destination_owner,
+                dyna_destination_owner,
+                stage_kind=STOMP_OWNER_STAGE_DYNA,
+                configured=dyna_configured,
+                evaluated=jnp.where(dyna_configured, true, false),
+                stomp_update_evaluations=jnp.where(
+                    dyna_configured,
+                    jnp.asarray(
+                        self._config.n_dreams_per_step,
+                        dtype=jnp.int32,
+                    ),
+                    zero_work,
+                ),
+                learner_updates_applied=dream_learner_updates,
+                source_digest=feature_route_destination_digest,
+                destination_digest=dyna_destination_digest,
+                classified_delta_valid=dyna_delta_valid,
+            ),
+            make_stomp_owner_stage_receipt(
+                dyna_destination_owner,
+                memory_dispatch_destination_owner,
+                stage_kind=STOMP_OWNER_STAGE_MEMORY_DISPATCH,
+                configured=memory_dispatch_configured,
+                evaluated=jnp.where(memory_dispatch_configured, true, false),
+                stomp_update_evaluations=zero_work,
+                learner_updates_applied=zero_work,
+                source_digest=dyna_destination_digest,
+                destination_digest=memory_dispatch_destination_digest,
+                classified_delta_valid=memory_dispatch_delta_valid,
+            ),
+            make_stomp_owner_stage_receipt(
+                memory_dispatch_destination_owner,
+                partner_dispatch_destination_owner,
+                stage_kind=STOMP_OWNER_STAGE_PARTNER_DISPATCH,
+                configured=partner_dispatch_configured,
+                evaluated=jnp.where(partner_dispatch_configured, true, false),
+                stomp_update_evaluations=zero_work,
+                learner_updates_applied=zero_work,
+                source_digest=memory_dispatch_destination_digest,
+                destination_digest=partner_dispatch_destination_digest,
+                classified_delta_valid=partner_dispatch_delta_valid,
+            ),
+        )
+        imagined_stomp_evaluations = jnp.where(
+            dyna_configured,
+            jnp.asarray(self._config.n_dreams_per_step, dtype=jnp.int32),
+            zero_work,
+        )
+        owner_finalization_trace = make_stomp_owner_finalization_trace(
+            raw_stomp_owner,
+            owner_finalization_stages,
+            partner_dispatch_destination_owner,
+            real_control_stomp_evaluations=(
+                oak_trace.stomp_update_evaluations
+            ),
+            imagined_stomp_evaluations=imagined_stomp_evaluations,
+            option_search_learner_updates=option_search_learner_updates,
+            raw_digest=raw_owner_digest,
+            final_digest=partner_dispatch_destination_digest,
+        )
         new_state = PrototypeAgentState(
             oak_state=self._oak_state_slot(
                 new_oak_state,
                 new_feature_consumer_binding,
+                new_horde_state,
+                new_feature_utility_state,
             ),
             world_model_state=new_wm_state,
             buffer_state=new_buf_state,
-            horde_state=new_horde_state,
+            horde_state=(
+                None
+                if self._shared_feature_horde_enabled()
+                else new_horde_state
+            ),
             ia_state=new_interaction_state,
             gru_state=new_gru_state,
             state_builder_state=self._representation_state_slot(
                 new_builder_state,
                 new_feature_state,
+                new_learning_value_router_state,
             ),
             current_raw_observation=decision_raw_obs,
             current_representation=decision_obs,
@@ -6813,7 +12482,9 @@ class PrototypeAgent:
             current_decision_id=next_decision_id,
             started=next_armed,
             observation_event_count=next_observation_event_count,
+            observation_event_words=next_observation_event_words,
             step_count=next_step_count,
+            step_words=next_step_words,
         )
 
         return PrototypeUpdateResult(
@@ -6821,8 +12492,32 @@ class PrototypeAgent:
             action=next_action,
             oak_td_error=oak_result.td_error,
             oak_average_reward=oak_result.average_reward,
+            oak_stomp_update_result=oak_trace.stomp_result,
+            oak_stomp_update_available=(
+                oak_result.update_applied
+                & (oak_trace.stomp_update_evaluations == 1)
+            ),
+            oak_stomp_update_evaluations=oak_trace.stomp_update_evaluations,
+            oak_owner_finalization_trace=owner_finalization_trace,
+            oak_real_stomp_update_evaluations=(
+                oak_trace.stomp_update_evaluations
+            ),
+            oak_imagined_stomp_update_evaluations=(
+                imagined_stomp_evaluations
+            ),
+            oak_total_stomp_update_evaluations=(
+                oak_trace.stomp_update_evaluations
+                + imagined_stomp_evaluations
+            ),
+            oak_option_search_learner_updates=(
+                option_search_learner_updates
+            ),
+            oak_bootstrap_observation=bootstrap_obs,
+            oak_decision_observation=decision_obs,
+            oak_execution_boundary=execution_boundary,
             world_model_error=wm_error,
             learning_signals=learning_signals,
+            learning_value_router_result=learning_value_router_result,
             world_model_representation_gradient=representation_gradient,
             world_model_representation_gradient_valid=(
                 representation_gradient_valid
@@ -6846,13 +12541,24 @@ class PrototypeAgent:
             prototype_feature_lifecycle_diagnostics=(
                 feature_lifecycle_diagnostics
             ),
+            prototype_feature_utility_diagnostics=(
+                feature_utility_diagnostics
+            ),
+            prototype_feature_utility_curation_diagnostics=(
+                feature_utility_curation_diagnostics
+            ),
             dream_td_errors=dream_td_errors,
             horde_td_errors=horde_tderrs,
             ia_augmented_obs=ia_augmented,
             ia_recommendation=ia_recommendation,
+            ia_update_applied=ia_update_applied,
             experiential_memory_diagnostics=memory_diagnostics,
+            prototype_feature_memory_diagnostics=feature_memory_diagnostics,
             partner_policy_fusion_diagnostics=partner_fusion_diagnostics,
             transition_diagnostics=diagnostics,
+            prototype_atomic_feature_world_memory_diagnostics=(
+                atomic_feature_world_memory_diagnostics
+            ),
         )
 
     # -- Scan-based loop ------------------------------------------------------
@@ -6979,8 +12685,8 @@ class PrototypeAgent:
                 result.oak_average_reward,
                 result.transition_diagnostics.valid,
                 result.state_builder_learning_diagnostics.applied,
-                result.sparks_joy,
-                result.joyful_gradient_applied,
+                result.candidate_update_audit_passed,
+                result.audited_candidate_update_applied,
             )
 
         scan_discounts = (
@@ -7014,8 +12720,8 @@ class PrototypeAgent:
             oak_avg_rewards,
             transition_valid,
             builder_learning_applied,
-            gradient_sparks_joy,
-            joyful_gradient_applied,
+            candidate_update_audit_passed,
+            audited_candidate_update_applied,
         ) = outputs
 
         return PrototypeArrayResult(
@@ -7025,16 +12731,19 @@ class PrototypeAgent:
             oak_average_rewards=oak_avg_rewards,
             transition_valid=transition_valid,
             state_builder_learning_applied=builder_learning_applied,
-            gradient_sparks_joy=gradient_sparks_joy,
-            joyful_gradient_applied=joyful_gradient_applied,
+            gradient_sparks_joy=candidate_update_audit_passed,
+            joyful_gradient_applied=audited_candidate_update_applied,
         )
 
     def scan_transitions(
         self,
         state: PrototypeAgentState,
         transitions: PrototypeTransition,
-        gradient_joy_evidence: PrototypeGradientJoyEvidence | None = None,
+        candidate_update_audit_evidence: (
+            PrototypeCandidateUpdateAuditEvidence | None
+        ) = None,
         *,
+        gradient_joy_evidence: PrototypeGradientJoyEvidence | None = None,
         experiential_memory_input: (
             PrototypeExperientialMemoryInput | None
         ) = None,
@@ -7046,6 +12755,20 @@ class PrototypeAgent:
         ) = None,
     ) -> PrototypeArrayResult:
         """Run authoritative transitions and fixed optional sidecars through scan."""
+
+        if (
+            candidate_update_audit_evidence is not None
+            and gradient_joy_evidence is not None
+        ):
+            raise ValueError(
+                "candidate_update_audit_evidence and gradient_joy_evidence "
+                "cannot both be supplied"
+            )
+        gradient_joy_evidence = (
+            candidate_update_audit_evidence
+            if candidate_update_audit_evidence is not None
+            else gradient_joy_evidence
+        )
 
         use_partner_input = partner_policy_fusion_input is not None
         use_partner_feedback = partner_policy_fusion_feedback is not None
@@ -7070,8 +12793,8 @@ class PrototypeAgent:
                 result.oak_average_reward,
                 result.transition_diagnostics.valid,
                 result.state_builder_learning_diagnostics.applied,
-                result.sparks_joy,
-                result.joyful_gradient_applied,
+                result.candidate_update_audit_passed,
+                result.audited_candidate_update_applied,
             )
 
         def transition_only_step(
@@ -7098,9 +12821,12 @@ class PrototypeAgent:
             self._partner_policy_fusion is None
             and self._experiential_memory is None
         ):
-            def transition_with_joy_step(
+            def transition_with_candidate_audit_step(
                 carry: PrototypeAgentState,
-                inputs: tuple[PrototypeTransition, PrototypeGradientJoyEvidence],
+                inputs: tuple[
+                    PrototypeTransition,
+                    PrototypeCandidateUpdateAuditEvidence,
+                ],
             ) -> tuple[
                 PrototypeAgentState,
                 tuple[Array, Array, Array, Array, Array, Array, Array],
@@ -7110,7 +12836,7 @@ class PrototypeAgent:
                 return result.state, outputs_from_result(result)
 
             final_state, outputs = jax.lax.scan(
-                transition_with_joy_step,
+                transition_with_candidate_audit_step,
                 state,
                 (transitions, gradient_joy_evidence),
             )
@@ -7174,7 +12900,7 @@ class PrototypeAgent:
                     carry: PrototypeAgentState,
                     inputs: tuple[
                         PrototypeTransition,
-                        PrototypeGradientJoyEvidence,
+                        PrototypeCandidateUpdateAuditEvidence,
                         PrototypePartnerPolicyFusionInput,
                         PrototypePartnerPolicyFusionFeedback,
                     ],
@@ -7182,11 +12908,11 @@ class PrototypeAgent:
                     PrototypeAgentState,
                     tuple[Array, Array, Array, Array, Array, Array, Array],
                 ]:
-                    transition, joy, fusion_input, fusion_feedback = inputs
+                    transition, audit_sidecar, fusion_input, fusion_feedback = inputs
                     result = self.update_transition(
                         carry,
                         transition,
-                        joy,
+                        audit_sidecar,
                         partner_policy_fusion_input=(
                             fusion_input if use_partner_input else None
                         ),
@@ -7245,22 +12971,22 @@ class PrototypeAgent:
                         (transitions, scan_memory_input),
                     )
                 else:
-                    def transition_with_memory_and_joy_step(
+                    def transition_with_memory_and_candidate_audit_step(
                         carry: PrototypeAgentState,
                         inputs: tuple[
                             PrototypeTransition,
-                            PrototypeGradientJoyEvidence,
+                            PrototypeCandidateUpdateAuditEvidence,
                             PrototypeExperientialMemoryInput,
                         ],
                     ) -> tuple[
                         PrototypeAgentState,
                         tuple[Array, Array, Array, Array, Array, Array, Array],
                     ]:
-                        transition, joy, memory_input = inputs
+                        transition, audit_sidecar, memory_input = inputs
                         result = self.update_transition(
                             carry,
                             transition,
-                            joy,
+                            audit_sidecar,
                             experiential_memory_input=(
                                 memory_input if use_memory_input else None
                             ),
@@ -7268,7 +12994,7 @@ class PrototypeAgent:
                         return result.state, outputs_from_result(result)
 
                     final_state, outputs = jax.lax.scan(
-                        transition_with_memory_and_joy_step,
+                        transition_with_memory_and_candidate_audit_step,
                         state,
                         (
                             transitions,
@@ -7352,7 +13078,7 @@ class PrototypeAgent:
                         carry: PrototypeAgentState,
                         inputs: tuple[
                             PrototypeTransition,
-                            PrototypeGradientJoyEvidence,
+                            PrototypeCandidateUpdateAuditEvidence,
                             PrototypeExperientialMemoryInput,
                             PrototypePartnerPolicyFusionInput,
                             PrototypePartnerPolicyFusionFeedback,
@@ -7363,7 +13089,7 @@ class PrototypeAgent:
                     ]:
                         (
                             transition,
-                            joy,
+                            audit_sidecar,
                             memory_input,
                             fusion_input,
                             fusion_feedback,
@@ -7371,7 +13097,7 @@ class PrototypeAgent:
                         result = self.update_transition(
                             carry,
                             transition,
-                            joy,
+                            audit_sidecar,
                             experiential_memory_input=(
                                 memory_input if use_memory_input else None
                             ),
@@ -7401,8 +13127,8 @@ class PrototypeAgent:
             average_rewards,
             transition_valid,
             builder_learning_applied,
-            gradient_sparks_joy,
-            joyful_gradient_applied,
+            candidate_update_audit_passed,
+            audited_candidate_update_applied,
         ) = outputs
         return PrototypeArrayResult(
             state=final_state,
@@ -7411,8 +13137,8 @@ class PrototypeAgent:
             oak_average_rewards=average_rewards,
             transition_valid=transition_valid,
             state_builder_learning_applied=builder_learning_applied,
-            gradient_sparks_joy=gradient_sparks_joy,
-            joyful_gradient_applied=joyful_gradient_applied,
+            gradient_sparks_joy=candidate_update_audit_passed,
+            joyful_gradient_applied=audited_candidate_update_applied,
         )
 
     # -- Curation (Python-level) ----------------------------------------------
@@ -7471,6 +13197,9 @@ class PrototypeAgent:
             ia=self._config.ia,
             partner_policy_fusion=self._config.partner_policy_fusion,
             experiential_memory=self._config.experiential_memory,
+            experiential_memory_advantage_gate=(
+                self._config.experiential_memory_advantage_gate
+            ),
             gru_perception=self._config.gru_perception,
             state_builder=self._config.state_builder,
             learn_state_builder_from_world_model=(
@@ -7480,6 +13209,7 @@ class PrototypeAgent:
                 self._config.representation_gradient_mixer
             ),
             gradient_joy=self._config.gradient_joy,
+            learning_value_router=self._config.learning_value_router,
             auto_curate_every=self._config.auto_curate_every,
         )
         new_agent = PrototypeAgent(new_config)
@@ -7522,7 +13252,11 @@ class PrototypeAgent:
                 "prototype_feature_lifecycle owns the fixed feature bank"
             )
         n = self._config.auto_curate_every
-        if n <= 0 or int(state.step_count) % n != 0:
+        if n <= 0:
+            return self, state
+        if not bool(self._checkpoint_state_valid(state)):
+            return self, state
+        if not bool(_lifetime_words_multiple_of(state.step_words, n)):
             return self, state
         return self.curate(state, key, available_feature_indices)
 
@@ -7544,7 +13278,12 @@ class PrototypeAgent:
         Returns:
             Tuple of :class:`SubtaskSpec` instances ranked by importance.
         """
-        template = self._config.oak.stomp.subtask_specs[0]
+        configured_specs = self._config.oak.stomp.subtask_specs
+        template = (
+            configured_specs[0]
+            if configured_specs
+            else SubtaskSpec(feature_index=0)
+        )
         return feature_to_subtask_specs(
             self._oak_component_state(state.oak_state),
             n_subtasks=n_subtasks,
@@ -7554,16 +13293,40 @@ class PrototypeAgent:
         )
 
 
-def _prototype_config_digest(config: dict[str, Any]) -> str:
-    """Return a canonical SHA-256 digest for a serialized agent config."""
+def _prototype_config_bytes(config: dict[str, Any]) -> bytes:
+    """Return the exact canonical JSON encoding of an agent config.
 
-    payload = json.dumps(
+    Comparing this encoding, rather than Python containers, is load-bearing:
+    Python considers ``True == 1 == 1.0`` even though those JSON values have
+    different configuration semantics.
+    """
+
+    return json.dumps(
         config,
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
     ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+
+
+def _prototype_config_digest(config: dict[str, Any]) -> str:
+    """Return a canonical SHA-256 digest for a serialized agent config."""
+
+    return hashlib.sha256(_prototype_config_bytes(config)).hexdigest()
+
+
+def _unambiguous_legacy_int32_counter_words(value: Any, *, name: str) -> Array:
+    """Migrate non-negative, unsaturated int32 telemetry to exact words."""
+
+    counter = jnp.asarray(value)
+    if counter.dtype != jnp.dtype(jnp.int32):
+        raise TypeError(f"legacy {name} must have dtype int32")
+    if not bool(jnp.all(counter >= 0)):
+        raise ValueError(f"negative legacy {name} indicates wrap")
+    if not bool(jnp.all(counter < _INT32_MAX)):
+        raise ValueError(f"saturated legacy {name} is ambiguous")
+    low = counter.astype(jnp.uint32)
+    return jnp.stack((jnp.zeros_like(low), low), axis=-1)
 
 
 def save_prototype_checkpoint(
@@ -7582,14 +13345,49 @@ def save_prototype_checkpoint(
         raise ValueError("cannot save an inconsistent PrototypeAgent state")
 
     config = agent.to_config()
+    feature_memory = agent.prototype_feature_memory
+    atomic_feature_world_memory = (
+        agent.config.prototype_atomic_feature_world_memory is not None
+    )
+    feature_world_model = (
+        agent.config.prototype_feature_lifecycle is not None
+        and agent.config.world_model is not None
+        and not atomic_feature_world_memory
+    )
+    if agent.config.learning_value_router is not None:
+        schema = PROTOTYPE_LEARNING_VALUE_ROUTER_CHECKPOINT_SCHEMA
+    elif atomic_feature_world_memory:
+        schema = PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_CHECKPOINT_SCHEMA
+    elif feature_world_model:
+        schema = PROTOTYPE_FEATURE_WORLD_MODEL_CHECKPOINT_SCHEMA
+    elif feature_memory is not None:
+        schema = PROTOTYPE_FEATURE_MEMORY_CHECKPOINT_SCHEMA
+    elif agent.config.prototype_feature_utility_curation is not None:
+        schema = PROTOTYPE_FEATURE_UTILITY_CURATION_CHECKPOINT_SCHEMA
+    elif agent.config.prototype_feature_utility is not None:
+        schema = PROTOTYPE_FEATURE_UTILITY_CHECKPOINT_SCHEMA
+    else:
+        schema = PROTOTYPE_CHECKPOINT_SCHEMA
+    metadata: dict[str, Any] = {
+        "schema": schema,
+        "agent_config": config,
+        "config_sha256": _prototype_config_digest(config),
+    }
+    if feature_memory is not None:
+        metadata["feature_memory_schema_sha256"] = (
+            feature_memory.schema_digest_hex
+        )
+    if atomic_feature_world_memory:
+        atomic_digest = agent._prototype_atomic_feature_world_memory_digest
+        if atomic_digest is None:
+            raise RuntimeError("atomic checkpoint digest is unavailable")
+        metadata["atomic_feature_world_memory_schema_sha256"] = bytes(
+            int(value) for value in jax.device_get(atomic_digest).tolist()
+        ).hex()
     save_checkpoint(
         state,
         path,
-        metadata={
-            "schema": PROTOTYPE_CHECKPOINT_SCHEMA,
-            "agent_config": config,
-            "config_sha256": _prototype_config_digest(config),
-        },
+        metadata=metadata,
     )
 
 
@@ -7609,18 +13407,39 @@ def load_prototype_checkpoint(
     Version-1 checkpoints did not record whether ``start`` had run, so their
     action cache cannot be armed safely by inference. Pass
     ``trust_v1_started=True`` only when external provenance establishes that
-    the stored OaK decision was already selected for dispatch.
+    the stored OaK decision was already selected for dispatch. Exact outer
+    clocks make that migration narrower still: only a primed zero-transition
+    v1 state is unambiguous, because v1 did not record autoreset observation
+    events. Pre-v7 states that do not physically contain the new word clocks
+    fail structurally; saturated telemetry is never used to invent history.
     """
 
     metadata = load_checkpoint_metadata(path)
     schema = metadata.get("schema")
     if schema not in {
+        PROTOTYPE_LEARNING_VALUE_ROUTER_CHECKPOINT_SCHEMA,
+        PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_CHECKPOINT_SCHEMA,
+        PROTOTYPE_FEATURE_WORLD_MODEL_CHECKPOINT_SCHEMA,
+        PROTOTYPE_FEATURE_MEMORY_CHECKPOINT_SCHEMA,
+        PROTOTYPE_FEATURE_UTILITY_CURATION_CHECKPOINT_SCHEMA,
+        PROTOTYPE_FEATURE_UTILITY_CHECKPOINT_SCHEMA,
         PROTOTYPE_CHECKPOINT_SCHEMA,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V12,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V11,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V10,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V9,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V8,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V7,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V6,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V5,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V4,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V3,
         _PROTOTYPE_CHECKPOINT_SCHEMA_V2,
         _PROTOTYPE_CHECKPOINT_SCHEMA_V1,
     }:
         raise ValueError(
-            "checkpoint is not an Alberta PrototypeAgent v1/v2/v3 checkpoint"
+            "checkpoint is not an Alberta PrototypeAgent "
+            "v1 through v19 checkpoint"
         )
     config = metadata.get("agent_config")
     if not isinstance(config, dict):
@@ -7630,21 +13449,211 @@ def load_prototype_checkpoint(
         _prototype_config_digest(config)
     ):
         raise ValueError("prototype checkpoint config digest does not match")
+    if schema in {
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V12,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V11,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V10,
+    }:
+        raise ValueError(
+            "PrototypeAgent v10/v11/v12 checkpoints predate exact identity and "
+            "fixed-trace state-builder clocks; migrate each unambiguous builder "
+            "state with its standalone helper and resave under a current schema"
+        )
 
     agent = PrototypeAgent.from_config(config)
-    if agent.to_config() != config:
+    if _prototype_config_bytes(agent.to_config()) != _prototype_config_bytes(config):
         raise ValueError("prototype checkpoint agent_config is not canonical")
+    if agent.config.learning_value_router is not None:
+        if schema != PROTOTYPE_LEARNING_VALUE_ROUTER_CHECKPOINT_SCHEMA:
+            raise ValueError(
+                "learning_value_router requires a v19 PrototypeAgent checkpoint"
+            )
+    elif schema == PROTOTYPE_LEARNING_VALUE_ROUTER_CHECKPOINT_SCHEMA:
+        raise ValueError(
+            "v19 PrototypeAgent checkpoints require learning_value_router"
+        )
     if (
         agent.config.prototype_feature_lifecycle is not None
-        and schema != PROTOTYPE_CHECKPOINT_SCHEMA
+        and schema in {
+            _PROTOTYPE_CHECKPOINT_SCHEMA_V2,
+            _PROTOTYPE_CHECKPOINT_SCHEMA_V1,
+        }
     ):
         raise ValueError(
             "prototype_feature_lifecycle is unsupported by legacy v1/v2 "
             "PrototypeAgent checkpoints"
         )
+    feature_config = agent.config.prototype_feature_lifecycle
+    utility_config = agent.config.prototype_feature_utility
+    utility_curation_config = (
+        agent.config.prototype_feature_utility_curation
+    )
+    feature_memory = agent.prototype_feature_memory
+    feature_memory_digest = metadata.get("feature_memory_schema_sha256")
+    atomic_config = agent.config.prototype_atomic_feature_world_memory
+    atomic_digest = metadata.get(
+        "atomic_feature_world_memory_schema_sha256"
+    )
+    if atomic_config is not None:
+        expected_atomic_digest = (
+            agent._prototype_atomic_feature_world_memory_digest
+        )
+        if schema not in {
+            PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_CHECKPOINT_SCHEMA,
+            PROTOTYPE_LEARNING_VALUE_ROUTER_CHECKPOINT_SCHEMA,
+        }:
+            raise ValueError(
+                "atomic feature/world/memory composition requires a v18 "
+                "PrototypeAgent checkpoint"
+            )
+        if expected_atomic_digest is None:
+            raise RuntimeError("atomic checkpoint digest is unavailable")
+        expected_atomic_hex = bytes(
+            int(value)
+            for value in jax.device_get(expected_atomic_digest).tolist()
+        ).hex()
+        if not isinstance(atomic_digest, str) or atomic_digest != expected_atomic_hex:
+            raise ValueError(
+                "atomic feature/world/memory checkpoint schema digest does not match"
+            )
+    elif schema == PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_CHECKPOINT_SCHEMA:
+        raise ValueError(
+            "v18 PrototypeAgent checkpoints require the atomic composition"
+        )
+    elif atomic_digest is not None:
+        raise ValueError(
+            "PrototypeAgent checkpoint without the atomic composition contains "
+            "atomic schema metadata"
+        )
+    feature_world_model = (
+        feature_config is not None
+        and agent.config.world_model is not None
+        and atomic_config is None
+    )
+    if feature_world_model:
+        if schema not in {
+            PROTOTYPE_FEATURE_WORLD_MODEL_CHECKPOINT_SCHEMA,
+            PROTOTYPE_LEARNING_VALUE_ROUTER_CHECKPOINT_SCHEMA,
+        }:
+            raise ValueError(
+                "prototype feature/world-model composition requires a v17 "
+                "PrototypeAgent checkpoint"
+            )
+    elif schema == PROTOTYPE_FEATURE_WORLD_MODEL_CHECKPOINT_SCHEMA:
+        raise ValueError(
+            "v17 PrototypeAgent checkpoints require feature lifecycle and the "
+            "stable-base world model to be enabled"
+        )
+    if feature_memory is not None:
+        if schema not in {
+            PROTOTYPE_LEARNING_VALUE_ROUTER_CHECKPOINT_SCHEMA,
+            PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_CHECKPOINT_SCHEMA,
+            PROTOTYPE_FEATURE_WORLD_MODEL_CHECKPOINT_SCHEMA,
+            PROTOTYPE_FEATURE_MEMORY_CHECKPOINT_SCHEMA,
+        }:
+            raise ValueError(
+                "prototype feature memory requires a v16, v17, or v18 PrototypeAgent "
+                "checkpoint"
+            )
+        if (
+            not isinstance(feature_memory_digest, str)
+            or feature_memory_digest != feature_memory.schema_digest_hex
+        ):
+            raise ValueError(
+                "prototype feature-memory checkpoint schema digest does not match"
+            )
+    elif schema == PROTOTYPE_FEATURE_MEMORY_CHECKPOINT_SCHEMA:
+        raise ValueError(
+            "v16 PrototypeAgent checkpoints require feature memory to be enabled"
+        )
+    elif feature_memory_digest is not None:
+        raise ValueError(
+            "PrototypeAgent checkpoint without feature memory contains "
+            "feature-memory metadata"
+        )
+    if (
+        utility_curation_config is not None
+        and schema
+        not in {
+            PROTOTYPE_LEARNING_VALUE_ROUTER_CHECKPOINT_SCHEMA,
+            PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_CHECKPOINT_SCHEMA,
+            PROTOTYPE_FEATURE_WORLD_MODEL_CHECKPOINT_SCHEMA,
+            PROTOTYPE_FEATURE_MEMORY_CHECKPOINT_SCHEMA,
+            PROTOTYPE_FEATURE_UTILITY_CURATION_CHECKPOINT_SCHEMA,
+        }
+    ):
+        raise ValueError(
+            "prototype_feature_utility_curation requires a v15, v16, or v17 "
+            "PrototypeAgent checkpoint"
+        )
+    if utility_curation_config is None and schema == (
+        PROTOTYPE_FEATURE_UTILITY_CURATION_CHECKPOINT_SCHEMA
+    ):
+        raise ValueError(
+            "v15 PrototypeAgent checkpoints require feature utility curation "
+            "to be enabled"
+        )
+    if (
+        utility_config is not None
+        and utility_curation_config is None
+        and schema
+        not in {
+            PROTOTYPE_LEARNING_VALUE_ROUTER_CHECKPOINT_SCHEMA,
+            PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_CHECKPOINT_SCHEMA,
+            PROTOTYPE_FEATURE_WORLD_MODEL_CHECKPOINT_SCHEMA,
+            PROTOTYPE_FEATURE_MEMORY_CHECKPOINT_SCHEMA,
+            PROTOTYPE_FEATURE_UTILITY_CHECKPOINT_SCHEMA,
+        }
+    ):
+        raise ValueError(
+            "prototype_feature_utility requires a v14, v16, or v17 "
+            "PrototypeAgent checkpoint"
+        )
+    if utility_config is None and schema in {
+        PROTOTYPE_FEATURE_UTILITY_CHECKPOINT_SCHEMA,
+        PROTOTYPE_FEATURE_UTILITY_CURATION_CHECKPOINT_SCHEMA,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V8,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V9,
+    }:
+        raise ValueError(
+            "feature utility PrototypeAgent checkpoints require utility to be enabled"
+        )
+    if (
+        feature_config is not None
+        and feature_config.managed_horde_demons > 0
+        and schema
+        not in {
+            PROTOTYPE_LEARNING_VALUE_ROUTER_CHECKPOINT_SCHEMA,
+            PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_CHECKPOINT_SCHEMA,
+            PROTOTYPE_FEATURE_WORLD_MODEL_CHECKPOINT_SCHEMA,
+            PROTOTYPE_FEATURE_MEMORY_CHECKPOINT_SCHEMA,
+            PROTOTYPE_CHECKPOINT_SCHEMA,
+            PROTOTYPE_FEATURE_UTILITY_CHECKPOINT_SCHEMA,
+            PROTOTYPE_FEATURE_UTILITY_CURATION_CHECKPOINT_SCHEMA,
+        }
+    ):
+        raise ValueError(
+            "managed feature/Horde composition requires a current "
+            "PrototypeAgent checkpoint"
+        )
     key = jr.key(0) if template_key is None else template_key
     template = agent.init(key)
-    if schema == PROTOTYPE_CHECKPOINT_SCHEMA:
+    if schema in {
+        PROTOTYPE_LEARNING_VALUE_ROUTER_CHECKPOINT_SCHEMA,
+        PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_CHECKPOINT_SCHEMA,
+        PROTOTYPE_FEATURE_WORLD_MODEL_CHECKPOINT_SCHEMA,
+        PROTOTYPE_FEATURE_MEMORY_CHECKPOINT_SCHEMA,
+        PROTOTYPE_FEATURE_UTILITY_CURATION_CHECKPOINT_SCHEMA,
+        PROTOTYPE_FEATURE_UTILITY_CHECKPOINT_SCHEMA,
+        PROTOTYPE_CHECKPOINT_SCHEMA,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V9,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V8,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V7,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V6,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V5,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V4,
+        _PROTOTYPE_CHECKPOINT_SCHEMA_V3,
+    }:
         restored, restored_metadata = load_checkpoint(template, path)
         if restored_metadata != metadata:
             raise ValueError("prototype checkpoint metadata changed between reads")
@@ -7696,12 +13705,27 @@ def load_prototype_checkpoint(
                 dtype=jnp.bool_,
             ),
             member_update_counts=legacy_world.member_update_counts,
+            member_update_count_words=(
+                _unambiguous_legacy_int32_counter_words(
+                    legacy_world.member_update_counts,
+                    name="ensemble member_update_counts",
+                )
+            ),
             replay_member_update_counts=jnp.zeros_like(
                 legacy_world.member_update_counts,
                 dtype=jnp.int32,
             ),
+            replay_member_update_count_words=jnp.zeros(
+                (*legacy_world.member_update_counts.shape, 2),
+                dtype=jnp.uint32,
+            ),
             event_count=legacy_world.event_count,
+            event_count_words=_unambiguous_legacy_int32_counter_words(
+                legacy_world.event_count,
+                name="ensemble event_count",
+            ),
             replay_event_count=jnp.asarray(0, dtype=jnp.int32),
+            replay_event_count_words=jnp.zeros((2,), dtype=jnp.uint32),
         )
         migrated = restored_state.replace(world_model_state=migrated_world)
         if not bool(agent._checkpoint_state_valid(migrated)):
@@ -7728,6 +13752,11 @@ def load_prototype_checkpoint(
     if restored_metadata != metadata:
         raise ValueError("prototype checkpoint metadata changed between reads")
     old_state = cast(_PrototypeAgentStateV1, restored_v1)
+    if int(old_state.step_count) != 0:
+        raise ValueError(
+            "v1 prototype checkpoint observation-event history is ambiguous; "
+            "only a provenance-verified primed zero-transition state can migrate"
+        )
     representation = old_state.oak_state.stomp_state.base_last_obs
     raw_dim = agent._raw_observation_dim()
     raw_observation = representation[:raw_dim]
@@ -7744,10 +13773,10 @@ def load_prototype_checkpoint(
         current_action=old_state.oak_state.stomp_state.last_primitive_action,
         current_decision_id=template.current_decision_id,
         started=jnp.array(True),
-        observation_event_count=_saturating_int32_increment(
-            old_state.step_count,
-        ),
+        observation_event_count=jnp.asarray(1, dtype=jnp.int32),
+        observation_event_words=jnp.asarray((0, 1), dtype=jnp.uint32),
         step_count=old_state.step_count,
+        step_words=jnp.asarray((0, 0), dtype=jnp.uint32),
     )
     if not bool(agent._checkpoint_state_valid(migrated)):
         raise ValueError("trusted v1 prototype checkpoint cache state is inconsistent")
@@ -7755,34 +13784,65 @@ def load_prototype_checkpoint(
 
 
 __all__ = [
+    "PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_CHECKPOINT_SCHEMA",
+    "PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_CONFIG_SCHEMA",
+    "PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_MECHANISM_STATUS",
+    "PROTOTYPE_ATOMIC_FEATURE_WORLD_MEMORY_SCIENTIFIC_PROMOTION_ALLOWED",
     "PROTOTYPE_CHECKPOINT_SCHEMA",
+    "PROTOTYPE_FEATURE_MEMORY_CHECKPOINT_SCHEMA",
+    "PROTOTYPE_FEATURE_WORLD_MODEL_CHECKPOINT_SCHEMA",
+    "PROTOTYPE_FEATURE_WORLD_MODEL_SCHEMA_DIGEST_NBYTES",
+    "PROTOTYPE_FEATURE_UTILITY_CURATION_CHECKPOINT_SCHEMA",
+    "PROTOTYPE_FEATURE_UTILITY_CHECKPOINT_SCHEMA",
+    "PROTOTYPE_LEARNING_VALUE_ROUTER_CHECKPOINT_SCHEMA",
+    "PROTOTYPE_LIFETIME_COUNTER_DELTA_NBYTES",
+    "PROTOTYPE_LIFETIME_COUNTER_NBYTES",
     "GRUPerceptionConfig",
     "GRUPerceptionState",
     "PrototypeAgent",
     "PrototypeAgentConfig",
     "PrototypeAgentState",
+    "PrototypeAgentStateResourceMeasurement",
     "PrototypeArrayResult",
+    "PrototypeAtomicFeatureWorldMemoryConfig",
+    "PrototypeAtomicFeatureWorldMemoryDiagnostics",
+    "PrototypeAtomicFeatureWorldMemoryResourceBudget",
+    "PrototypeAtomicFeatureWorldMemoryState",
     "PrototypeBehaviorGradientDiagnostics",
     "PrototypeBehaviorGradientResult",
+    "PrototypeCachedPrimitiveActionReplacement",
     "PrototypeDecision",
     "PrototypeExperientialMemoryDiagnostics",
     "PrototypeExperientialMemoryInput",
     "PrototypeExperientialMemoryResourceDeclaration",
     "PrototypeFeatureLifecycleIntegrationDiagnostics",
+    "PrototypeFeatureMemoryIntegrationDiagnostics",
+    "PrototypeFeatureOaKHordeState",
+    "PrototypeFeatureOaKHordeUtilityCurationState",
+    "PrototypeFeatureOaKHordeUtilityState",
     "PrototypeFeatureOaKState",
     "PrototypeFeatureRepresentationState",
+    "PrototypeFeatureWorldModelState",
+    "PrototypeFeatureUtilityIntegrationDiagnostics",
+    "PrototypeFeatureUtilityCurationIntegrationDiagnostics",
+    "PrototypeCandidateUpdateAuditEvidence",
     "PrototypeGradientJoyEvidence",
     "PrototypeInteractionState",
+    "PrototypeLearningValueRouterState",
     "PrototypeMemoryInteractionState",
     "PrototypePartnerPolicyFusionDiagnostics",
     "PrototypePartnerPolicyFusionFeedback",
     "PrototypePartnerPolicyFusionInput",
     "PrototypeRecurrentLatentDiagnostics",
     "PrototypeRecurrentLatentWorldModelState",
+    "PrototypeRTUFinalizationReceipt",
+    "PrototypeRTUTransitionPreparation",
     "PrototypeTransition",
     "PrototypeTransitionDiagnostics",
     "PrototypeUpdateResult",
     "feature_to_subtask_specs",
     "load_prototype_checkpoint",
+    "measure_prototype_agent_state_resources",
+    "prototype_lifetime_counter_nbytes",
     "save_prototype_checkpoint",
 ]

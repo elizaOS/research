@@ -21,6 +21,9 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
+from collections.abc import Mapping
+from numbers import Real
 from typing import Any, Literal, Protocol, cast
 
 import chex
@@ -28,13 +31,18 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int, UInt
 
 from alberta_framework.core.behavior_model import (
     BehaviorModel,
     BehaviorModelState,
     floor_and_renormalize_probabilities,
     selected_action_probabilities,
+)
+from alberta_framework.core.normalizers import (
+    _checked_lifetime_words_increment,
+    _lifetime_counter_valid,
+    _saturating_int32_counter_increment,
 )
 from alberta_framework.core.world_model import (
     ActionConditionedWorldModel,
@@ -43,6 +51,15 @@ from alberta_framework.core.world_model import (
 from alberta_framework.core.world_model import (
     WorldModelPrediction as ActionWorldModelPrediction,
 )
+
+DREAM_ROLLOUT_CONFIG_SCHEMA = "alberta.dream-rollout.config.v2"
+DREAM_ROLLOUT_STATE_SCHEMA = "alberta.dream-rollout.state.v2"
+DREAM_ROLLOUT_RESULT_SCHEMA = "alberta.dream-rollout.result.v2"
+DREAM_ROLLOUT_RESOURCE_SCHEMA = "alberta.dream-rollout.resource-budget.v2"
+DREAM_ROLLOUT_CLOCK_NBYTES = 12
+DREAM_ROLLOUT_CLOCK_DELTA_NBYTES = 8
+
+_INT32_MAX = 2**31 - 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -494,27 +511,95 @@ class DreamRolloutConfig:
 
     def __post_init__(self) -> None:
         """Validate scalar configuration."""
-        if self.rollout_horizon < 1:
-            raise ValueError("rollout_horizon must be positive")
-        if self.confidence_threshold < 0.0:
-            raise ValueError("confidence_threshold must be non-negative")
-        if self.max_model_error < 0.0:
-            raise ValueError("max_model_error must be non-negative")
-        if self.discount_floor < 0.0:
-            raise ValueError("discount_floor must be non-negative")
+        if type(self.rollout_horizon) is not int or not 1 <= self.rollout_horizon <= _INT32_MAX:
+            raise ValueError(
+                f"rollout_horizon must be an exact integer in [1, {_INT32_MAX}]"
+            )
+        for name in (
+            "confidence_threshold",
+            "max_model_error",
+            "discount_floor",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, Real):
+                raise ValueError(f"{name} must be a finite non-negative real")
+            if not math.isfinite(float(value)) or float(value) < 0.0:
+                raise ValueError(f"{name} must be a finite non-negative real")
+        if type(self.stop_on_terminal) is not bool:
+            raise ValueError("stop_on_terminal must be an exact bool")
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dictionary."""
-        payload = dataclasses.asdict(self)
-        payload["type"] = "DreamRolloutConfig"
-        return payload
+        return {
+            "type": "DreamRolloutConfig",
+            "config_schema": DREAM_ROLLOUT_CONFIG_SCHEMA,
+            "state_schema": DREAM_ROLLOUT_STATE_SCHEMA,
+            "result_schema": DREAM_ROLLOUT_RESULT_SCHEMA,
+            **dataclasses.asdict(self),
+        }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> DreamRolloutConfig:
+    def from_config(cls, config: Mapping[str, Any]) -> DreamRolloutConfig:
         """Reconstruct from :meth:`to_config` output."""
+        if not isinstance(config, Mapping):
+            raise TypeError("dream-rollout config must be a mapping")
         payload = dict(config)
-        payload.pop("type", None)
+        expected = {
+            "type",
+            "config_schema",
+            "state_schema",
+            "result_schema",
+            "rollout_horizon",
+            "confidence_threshold",
+            "max_model_error",
+            "discount_floor",
+            "stop_on_terminal",
+        }
+        if set(payload) != expected:
+            missing = sorted(expected - set(payload))
+            extra = sorted(set(payload) - expected)
+            raise ValueError(
+                "dream-rollout config fields are invalid; "
+                f"missing={missing}, extra={extra}"
+            )
+        schemas = {
+            "type": "DreamRolloutConfig",
+            "config_schema": DREAM_ROLLOUT_CONFIG_SCHEMA,
+            "state_schema": DREAM_ROLLOUT_STATE_SCHEMA,
+            "result_schema": DREAM_ROLLOUT_RESULT_SCHEMA,
+        }
+        for name, expected_value in schemas.items():
+            if payload.pop(name) != expected_value:
+                raise ValueError(f"dream-rollout {name} schema value is unsupported")
         return cls(**payload)
+
+
+def migrate_legacy_dream_rollout_config(
+    config: Mapping[str, Any],
+) -> DreamRolloutConfig:
+    """Migrate the pre-schema rollout config through an explicit host path."""
+
+    if not isinstance(config, Mapping):
+        raise TypeError("legacy dream-rollout config must be a mapping")
+    payload = dict(config)
+    expected = {
+        "type",
+        "rollout_horizon",
+        "confidence_threshold",
+        "max_model_error",
+        "discount_floor",
+        "stop_on_terminal",
+    }
+    if set(payload) != expected:
+        missing = sorted(expected - set(payload))
+        extra = sorted(set(payload) - expected)
+        raise ValueError(
+            "legacy dream-rollout config fields are invalid; "
+            f"missing={missing}, extra={extra}"
+        )
+    if payload.pop("type") != "DreamRolloutConfig":
+        raise ValueError("legacy dream-rollout config type is unsupported")
+    return DreamRolloutConfig(**payload)
 
 
 @chex.dataclass(frozen=True)
@@ -551,6 +636,7 @@ class DreamRolloutState:
     active: Array
     cumulative_confidence: Float[Array, ""]
     step_count: Int[Array, ""]
+    step_words: UInt[Array, " 2"]
 
 
 @chex.dataclass(frozen=True)
@@ -568,6 +654,41 @@ class ImaginedTransition:
     behavior_probability: Float[Array, ""]
     valid: Array
     step_index: Int[Array, ""]
+    step_index_words: UInt[Array, " 2"]
+
+
+@chex.dataclass(frozen=True)
+class DreamRolloutStepResult:
+    """One staged dream transaction and explicit commit diagnostics."""
+
+    state: DreamRolloutState
+    transition: ImaginedTransition
+    pre_step_words: UInt[Array, " 2"]
+    post_step_words: UInt[Array, " 2"]
+    state_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    behavior_prediction_valid: Bool[Array, ""]
+    world_prediction_valid: Bool[Array, ""]
+    prediction_valid: Bool[Array, ""]
+    update_applied: Bool[Array, ""]
+
+
+@dataclasses.dataclass(frozen=True)
+class DreamRolloutResourceBudget:
+    """Fixed persistent-state and per-rollout work declaration."""
+
+    schema: str
+    state_schema: str
+    state_nbytes: int
+    observation_nbytes: int
+    rng_nbytes: int
+    exact_clock_nbytes: int
+    exact_clock_delta_nbytes: int
+    maximum_steps: int
+    maximum_behavior_calls: int
+    maximum_world_calls: int
+    maximum_key_splits: int
+    persistent_capacity_growth: int
 
 
 @chex.dataclass(frozen=True)
@@ -644,6 +765,147 @@ class ActionConditionedDreamWorld:
         )
 
 
+def _require_scalar_array(value: Any, *, name: str, dtype: Any) -> Array:
+    array = jnp.asarray(value)
+    if array.shape != ():
+        raise ValueError(f"{name} must be scalar, got shape {array.shape}")
+    if array.dtype != jnp.dtype(dtype):
+        raise TypeError(f"{name} must have dtype {jnp.dtype(dtype)}, got {array.dtype}")
+    return array
+
+
+def _require_dream_rollout_state_contract(state: DreamRolloutState) -> None:
+    if not isinstance(state, DreamRolloutState):
+        raise TypeError("rollout_state must be a DreamRolloutState")
+    observation = jnp.asarray(state.observation)
+    if observation.size < 1 or not jnp.issubdtype(observation.dtype, jnp.inexact):
+        raise TypeError("dream-rollout observation must be a non-empty floating array")
+    if not isinstance(state.rng_key, Array):
+        raise TypeError("dream-rollout rng_key must be a scalar JAX PRNG key")
+    try:
+        key_data = jnp.asarray(jr.key_data(state.rng_key))
+    except (TypeError, ValueError) as error:
+        raise TypeError("dream-rollout rng_key must be a scalar JAX PRNG key") from error
+    if key_data.shape != (2,) or key_data.dtype != jnp.dtype(jnp.uint32):
+        raise TypeError("dream-rollout rng_key must be a scalar JAX PRNG key")
+    _require_scalar_array(state.active, name="dream-rollout active", dtype=jnp.bool_)
+    _require_scalar_array(
+        state.cumulative_confidence,
+        name="dream-rollout cumulative_confidence",
+        dtype=jnp.float32,
+    )
+    _require_scalar_array(
+        state.step_count,
+        name="dream-rollout step_count",
+        dtype=jnp.int32,
+    )
+    words = jnp.asarray(state.step_words)
+    if words.shape != (2,):
+        raise ValueError(
+            f"dream-rollout step_words must have shape (2,), got {words.shape}"
+        )
+    if words.dtype != jnp.dtype(jnp.uint32):
+        raise TypeError(
+            "dream-rollout step_words must have dtype uint32, "
+            f"got {words.dtype}"
+        )
+
+
+def dream_rollout_state_is_valid(state: DreamRolloutState) -> Bool[Array, ""]:
+    """Return whether one rollout state satisfies its exact dynamic contract."""
+
+    _require_dream_rollout_state_contract(state)
+    return (
+        _lifetime_counter_valid(state.step_words, state.step_count)
+        & jnp.all(jnp.isfinite(state.observation))
+        & jnp.isfinite(state.cumulative_confidence)
+        & (state.cumulative_confidence >= jnp.asarray(0.0, dtype=jnp.float32))
+    )
+
+
+def migrate_legacy_dream_rollout_state(
+    state: Mapping[str, Any],
+) -> DreamRolloutState:
+    """Attach exact words only to an unambiguous pre-v2 rollout state."""
+
+    if not isinstance(state, Mapping):
+        raise TypeError("legacy dream-rollout state must be a mapping")
+    payload = dict(state)
+    expected = {
+        "observation",
+        "rng_key",
+        "active",
+        "cumulative_confidence",
+        "step_count",
+    }
+    if set(payload) != expected:
+        missing = sorted(expected - set(payload))
+        extra = sorted(set(payload) - expected)
+        raise ValueError(
+            "legacy dream-rollout state fields are invalid; "
+            f"missing={missing}, extra={extra}"
+        )
+    count = _require_scalar_array(
+        payload["step_count"],
+        name="legacy dream-rollout step_count",
+        dtype=jnp.int32,
+    )
+    count_value = int(count)
+    if not 0 <= count_value < _INT32_MAX:
+        raise ValueError(
+            "legacy dream-rollout step_count is ambiguous at the int32 boundary"
+        )
+    migrated = DreamRolloutState(
+        observation=jnp.asarray(payload["observation"]),
+        rng_key=payload["rng_key"],
+        active=jnp.asarray(payload["active"]),
+        cumulative_confidence=jnp.asarray(payload["cumulative_confidence"]),
+        step_count=count,
+        step_words=jnp.asarray((0, count_value), dtype=jnp.uint32),
+    )
+    if not bool(dream_rollout_state_is_valid(migrated)):
+        raise ValueError("legacy dream-rollout state is invalid")
+    return migrated
+
+
+def measure_dream_rollout_state_nbytes(state: DreamRolloutState) -> int:
+    """Measure every persistent JAX-array byte in a rollout state."""
+
+    _require_dream_rollout_state_contract(state)
+    return sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree.leaves(state)
+        if isinstance(leaf, Array)
+    )
+
+
+def dream_rollout_resource_budget(
+    state: DreamRolloutState,
+    config: DreamRolloutConfig,
+) -> DreamRolloutResourceBudget:
+    """Return fixed state bytes and maximum protocol calls for one rollout."""
+
+    _require_dream_rollout_state_contract(state)
+    if not isinstance(config, DreamRolloutConfig):
+        raise TypeError("config must be a DreamRolloutConfig")
+    observation = jnp.asarray(state.observation)
+    key_data = jnp.asarray(jr.key_data(state.rng_key))
+    return DreamRolloutResourceBudget(
+        schema=DREAM_ROLLOUT_RESOURCE_SCHEMA,
+        state_schema=DREAM_ROLLOUT_STATE_SCHEMA,
+        state_nbytes=measure_dream_rollout_state_nbytes(state),
+        observation_nbytes=int(observation.size) * int(observation.dtype.itemsize),
+        rng_nbytes=int(key_data.size) * int(key_data.dtype.itemsize),
+        exact_clock_nbytes=DREAM_ROLLOUT_CLOCK_NBYTES,
+        exact_clock_delta_nbytes=DREAM_ROLLOUT_CLOCK_DELTA_NBYTES,
+        maximum_steps=config.rollout_horizon,
+        maximum_behavior_calls=config.rollout_horizon,
+        maximum_world_calls=config.rollout_horizon,
+        maximum_key_splits=config.rollout_horizon,
+        persistent_capacity_growth=0,
+    )
+
+
 def init_dream_rollout_state(
     observation: Array,
     key: Array,
@@ -657,6 +919,192 @@ def init_dream_rollout_state(
         active=jnp.asarray(active, dtype=jnp.bool_),
         cumulative_confidence=jnp.array(1.0, dtype=jnp.float32),
         step_count=jnp.array(0, dtype=jnp.int32),
+        step_words=jnp.zeros((2,), dtype=jnp.uint32),
+    )
+
+
+def dream_one_step_result(
+    world_model: DreamWorldModel,
+    world_state: Any,
+    behavior_model: DreamBehaviorModel,
+    behavior_state: Any,
+    rollout_state: DreamRolloutState,
+    config: DreamRolloutConfig | None = None,
+) -> DreamRolloutStepResult:
+    """Stage and atomically commit one bounded imagined transition."""
+    cfg = config or DreamRolloutConfig()
+    _require_dream_rollout_state_contract(rollout_state)
+    state_valid = dream_rollout_state_is_valid(rollout_state)
+    proposed_words, lifetime_capacity_available = _checked_lifetime_words_increment(
+        rollout_state.step_words
+    )
+    key, action_key, model_key = jr.split(rollout_state.rng_key, 3)
+    behavior_prediction = behavior_model.sample_action(
+        behavior_state,
+        rollout_state.observation,
+        action_key,
+    )
+    action = jnp.asarray(behavior_prediction.action)
+    action_probability = jnp.asarray(
+        behavior_prediction.action_probability,
+        dtype=jnp.float32,
+    )
+    log_probability = jnp.asarray(
+        behavior_prediction.log_probability,
+        dtype=jnp.float32,
+    )
+    if action_probability.shape != () or log_probability.shape != ():
+        raise ValueError("dream behavior probabilities must be scalar")
+    behavior_prediction_valid = (
+        jnp.all(jnp.isfinite(action))
+        & jnp.isfinite(action_probability)
+        & jnp.isfinite(log_probability)
+        & (action_probability >= jnp.asarray(0.0, dtype=jnp.float32))
+        & (action_probability <= jnp.asarray(1.0, dtype=jnp.float32))
+    )
+    safe_action = jnp.where(behavior_prediction_valid, action, jnp.zeros_like(action))
+    world_prediction = world_model.predict(
+        world_state,
+        rollout_state.observation,
+        safe_action,
+        model_key,
+    )
+    next_prediction = jnp.asarray(
+        world_prediction.next_observation,
+        dtype=jnp.asarray(rollout_state.observation).dtype,
+    )
+    if next_prediction.shape != jnp.asarray(rollout_state.observation).shape:
+        raise ValueError(
+            "dream world-model next_observation must match the rollout observation shape"
+        )
+    reward = jnp.asarray(world_prediction.reward, dtype=jnp.float32)
+    discount = jnp.asarray(world_prediction.discount, dtype=jnp.float32)
+    terminated_prediction = jnp.asarray(world_prediction.terminated, dtype=jnp.bool_)
+    confidence = jnp.asarray(world_prediction.confidence, dtype=jnp.float32)
+    model_error = jnp.asarray(world_prediction.model_error, dtype=jnp.float32)
+    for name, value in (
+        ("reward", reward),
+        ("discount", discount),
+        ("terminated", terminated_prediction),
+        ("confidence", confidence),
+        ("model_error", model_error),
+    ):
+        if value.shape != ():
+            raise ValueError(f"dream world-model {name} must be scalar")
+    world_prediction_valid = (
+        jnp.all(jnp.isfinite(next_prediction))
+        & jnp.isfinite(reward)
+        & jnp.isfinite(discount)
+        & jnp.isfinite(confidence)
+        & jnp.isfinite(model_error)
+        & (confidence >= jnp.asarray(0.0, dtype=jnp.float32))
+        & (model_error >= jnp.asarray(0.0, dtype=jnp.float32))
+    )
+    prediction_valid = behavior_prediction_valid & world_prediction_valid
+    confidence_ok = confidence >= jnp.asarray(
+        cfg.confidence_threshold,
+        dtype=jnp.float32,
+    )
+    error_ok = model_error <= jnp.asarray(
+        cfg.max_model_error,
+        dtype=jnp.float32,
+    )
+    discount_terminal = discount <= jnp.asarray(
+        cfg.discount_floor,
+        dtype=jnp.float32,
+    )
+    terminated = jnp.logical_or(terminated_prediction, discount_terminal)
+    accepted = (
+        rollout_state.active
+        & confidence_ok
+        & error_ok
+        & prediction_valid
+    )
+    next_active = jnp.logical_and(accepted, jnp.logical_not(terminated))
+    if not cfg.stop_on_terminal:
+        next_active = accepted
+    next_observation = jnp.where(
+        accepted,
+        next_prediction,
+        rollout_state.observation,
+    )
+    candidate_state = DreamRolloutState(
+        observation=next_observation,
+        rng_key=key,
+        active=next_active,
+        cumulative_confidence=jnp.where(
+            accepted,
+            rollout_state.cumulative_confidence * confidence,
+            rollout_state.cumulative_confidence,
+        ),
+        step_count=_saturating_int32_counter_increment(rollout_state.step_count),
+        step_words=proposed_words,
+    )
+    candidate_state_valid = dream_rollout_state_is_valid(candidate_state)
+    update_applied = (
+        state_valid
+        & lifetime_capacity_available
+        & prediction_valid
+        & candidate_state_valid
+    )
+    next_state = jax.lax.cond(
+        update_applied,
+        lambda _: candidate_state,
+        lambda _: rollout_state,
+        operand=None,
+    )
+    safe_observation = jnp.where(
+        jnp.isfinite(rollout_state.observation),
+        rollout_state.observation,
+        jnp.zeros_like(rollout_state.observation),
+    )
+    committed_next_observation = jnp.where(
+        update_applied,
+        next_prediction,
+        safe_observation,
+    )
+    committed_action = jnp.where(update_applied, safe_action, jnp.zeros_like(safe_action))
+    transition = ImaginedTransition(
+        observation=jnp.where(update_applied, rollout_state.observation, safe_observation),
+        action=committed_action,
+        reward=jnp.where(update_applied, reward, jnp.asarray(0.0, dtype=jnp.float32)),
+        next_observation=committed_next_observation,
+        discount=jnp.where(
+            update_applied,
+            discount,
+            jnp.asarray(0.0, dtype=jnp.float32),
+        ),
+        terminated=jnp.where(update_applied, terminated, jnp.asarray(False)),
+        confidence=jnp.where(
+            update_applied,
+            confidence,
+            jnp.asarray(0.0, dtype=jnp.float32),
+        ),
+        model_error=jnp.where(
+            update_applied,
+            model_error,
+            jnp.asarray(0.0, dtype=jnp.float32),
+        ),
+        behavior_probability=jnp.where(
+            update_applied,
+            action_probability,
+            jnp.asarray(0.0, dtype=jnp.float32),
+        ),
+        valid=update_applied & accepted,
+        step_index=rollout_state.step_count,
+        step_index_words=rollout_state.step_words,
+    )
+    return DreamRolloutStepResult(
+        state=next_state,
+        transition=transition,
+        pre_step_words=rollout_state.step_words,
+        post_step_words=next_state.step_words,
+        state_valid=state_valid,
+        lifetime_capacity_available=lifetime_capacity_available,
+        behavior_prediction_valid=behavior_prediction_valid,
+        world_prediction_valid=world_prediction_valid,
+        prediction_valid=prediction_valid,
+        update_applied=update_applied,
     )
 
 
@@ -668,69 +1116,17 @@ def dream_one_step(
     rollout_state: DreamRolloutState,
     config: DreamRolloutConfig | None = None,
 ) -> tuple[DreamRolloutState, ImaginedTransition]:
-    """Generate one imagined transition without mutating real environment state."""
-    cfg = config or DreamRolloutConfig()
-    key, action_key, model_key = jr.split(rollout_state.rng_key, 3)
-    behavior_prediction = behavior_model.sample_action(
-        behavior_state,
-        rollout_state.observation,
-        action_key,
-    )
-    world_prediction = world_model.predict(
+    """Compatibility wrapper returning the committed state and transition."""
+
+    result = dream_one_step_result(
+        world_model,
         world_state,
-        rollout_state.observation,
-        behavior_prediction.action,
-        model_key,
+        behavior_model,
+        behavior_state,
+        rollout_state,
+        config,
     )
-    confidence_ok = world_prediction.confidence >= jnp.asarray(
-        cfg.confidence_threshold,
-        dtype=jnp.float32,
-    )
-    error_ok = world_prediction.model_error <= jnp.asarray(
-        cfg.max_model_error,
-        dtype=jnp.float32,
-    )
-    discount_terminal = world_prediction.discount <= jnp.asarray(
-        cfg.discount_floor,
-        dtype=jnp.float32,
-    )
-    terminated = jnp.logical_or(world_prediction.terminated, discount_terminal)
-    valid = jnp.logical_and(rollout_state.active, jnp.logical_and(confidence_ok, error_ok))
-    next_active = jnp.logical_and(valid, jnp.logical_not(terminated))
-    if not cfg.stop_on_terminal:
-        next_active = valid
-    next_observation = jnp.where(
-        valid,
-        world_prediction.next_observation,
-        rollout_state.observation,
-    )
-    next_state = DreamRolloutState(
-        observation=next_observation,
-        rng_key=key,
-        active=next_active,
-        cumulative_confidence=jnp.where(
-            valid,
-            rollout_state.cumulative_confidence * world_prediction.confidence,
-            rollout_state.cumulative_confidence,
-        ),
-        step_count=rollout_state.step_count + 1,
-    )
-    transition = ImaginedTransition(
-        observation=rollout_state.observation,
-        action=behavior_prediction.action,
-        reward=jnp.squeeze(jnp.asarray(world_prediction.reward, dtype=jnp.float32)),
-        next_observation=world_prediction.next_observation,
-        discount=jnp.squeeze(jnp.asarray(world_prediction.discount, dtype=jnp.float32)),
-        terminated=terminated,
-        confidence=jnp.squeeze(jnp.asarray(world_prediction.confidence, dtype=jnp.float32)),
-        model_error=jnp.squeeze(jnp.asarray(world_prediction.model_error, dtype=jnp.float32)),
-        behavior_probability=jnp.squeeze(
-            jnp.asarray(behavior_prediction.action_probability, dtype=jnp.float32)
-        ),
-        valid=valid,
-        step_index=rollout_state.step_count,
-    )
-    return next_state, transition
+    return result.state, result.transition
 
 
 def dream_rollout(
@@ -889,13 +1285,21 @@ __all__ = [
     "ActionConditionedDreamWorld",
     "BehaviorModelPrediction",
     "BehaviorModelDreamPolicy",
+    "DREAM_ROLLOUT_CLOCK_DELTA_NBYTES",
+    "DREAM_ROLLOUT_CLOCK_NBYTES",
+    "DREAM_ROLLOUT_CONFIG_SCHEMA",
+    "DREAM_ROLLOUT_RESOURCE_SCHEMA",
+    "DREAM_ROLLOUT_RESULT_SCHEMA",
+    "DREAM_ROLLOUT_STATE_SCHEMA",
     "DreamBehaviorModel",
     "DreamBehaviorModelPrediction",
     "DreamGVFTrainingItem",
     "DreamProposal",
     "DreamRolloutConfig",
+    "DreamRolloutResourceBudget",
     "DreamRolloutResult",
     "DreamRolloutState",
+    "DreamRolloutStepResult",
     "DreamSARSATrainingItem",
     "DreamSelectionConfig",
     "DreamSelectionResult",
@@ -911,12 +1315,18 @@ __all__ = [
     "WorldModelPrediction",
     "action_features",
     "dream_one_step",
+    "dream_one_step_result",
     "dream_rollout",
+    "dream_rollout_resource_budget",
+    "dream_rollout_state_is_valid",
     "imagined_rollout_to_gvf_items",
     "imagined_rollout_to_sarsa_items",
     "imagined_transition_to_gvf_item",
     "imagined_transition_to_supervised_item",
     "init_dream_rollout_state",
+    "measure_dream_rollout_state_nbytes",
+    "migrate_legacy_dream_rollout_config",
+    "migrate_legacy_dream_rollout_state",
     "score_dream_candidates",
     "slice_imagined_transition",
 ]

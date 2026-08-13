@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 from typing import Any
 
 import chex
@@ -12,8 +13,12 @@ import numpy as np
 import pytest
 
 from alberta_framework.core.joint_partner_world import (
+    JOINT_OUTCOME_STATE_SCHEMA,
     BoundedJointOutcomeConfig,
     BoundedJointOutcomeModel,
+    joint_outcome_lifetime_counter_nbytes,
+    measure_bounded_joint_outcome_state_nbytes,
+    migrate_legacy_bounded_joint_outcome_state,
 )
 
 
@@ -51,6 +56,7 @@ def test_config_and_model_roundtrip_are_strict() -> None:
     )
     restored = BoundedJointOutcomeModel.from_config(model.to_config())
     assert restored.to_config() == model.to_config()
+    assert restored.to_config()["state_schema"] == JOINT_OUTCOME_STATE_SCHEMA
 
     changed = copy.deepcopy(model.to_config())
     changed["unexpected"] = 1
@@ -72,9 +78,13 @@ def test_resource_budget_matches_state_arrays_exactly() -> None:
     assert budget.joint_cells == 9
     assert budget.allocated_float32_scalars == 9 * 3
     assert budget.allocated_int32_scalars == 10
+    assert budget.allocated_uint32_scalars == 2
     assert budget.state_nbytes == actual_nbytes
+    assert budget.state_nbytes == measure_bounded_joint_outcome_state_nbytes(state)
+    assert joint_outcome_lifetime_counter_nbytes() == 12
     assert budget.learned_float32_scalars_touched_per_update == 3
     assert budget.administrative_int32_scalars_touched_per_update == 2
+    assert budget.administrative_uint32_scalars_touched_per_update == 2
     assert budget.planner_cell_evaluations_per_decision == 9
     assert budget.replay_capacity == 0
 
@@ -119,6 +129,11 @@ def test_update_is_predict_before_update_and_touches_only_executed_cell() -> Non
     assert int(result.prediction.visit_count) == 0
     assert int(result.visit_count_after) == 1
     assert int(result.state.step_count) == 1
+    chex.assert_trees_all_equal(
+        result.state.step_words,
+        jnp.asarray((0, 1), dtype=jnp.uint32),
+    )
+    assert bool(result.update_applied)
 
     expected_reward = np.asarray(state.reward_predictions).copy()
     expected_reward[1, 0] = 0.6
@@ -266,3 +281,95 @@ def test_update_and_marginalization_are_jit_vmap_safe() -> None:
     assert decisions.expected_rewards.shape == (3, 2)
     assert bool(jnp.all(decisions.partner_probabilities_valid))
     chex.assert_tree_all_finite((states, decisions))
+
+
+def test_exact_lifetime_clock_carries_and_refuses_corruption_or_exhaustion() -> None:
+    model = BoundedJointOutcomeModel(BoundedJointOutcomeConfig())
+    initial = model.init()
+    args = (
+        jnp.asarray(1, dtype=jnp.int32),
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.asarray(0.75, dtype=jnp.float32),
+        jnp.asarray((1.0,), dtype=jnp.float32),
+    )
+    near_carry = initial.replace(
+        step_count=jnp.asarray(2**31 - 1, dtype=jnp.int32),
+        step_words=jnp.asarray((0, 2**32 - 1), dtype=jnp.uint32),
+        visit_counts=initial.visit_counts.at[1, 0].set(2**31 - 1),
+    )
+    carried = jax.jit(model.update)(near_carry, *args)
+    assert bool(carried.lifetime_counter_valid)
+    assert bool(carried.lifetime_capacity_available)
+    assert bool(carried.update_applied)
+    chex.assert_trees_all_equal(
+        carried.post_step_words,
+        jnp.asarray((1, 0), dtype=jnp.uint32),
+    )
+    assert int(carried.state.step_count) == 2**31 - 1
+    assert int(carried.state.visit_counts[1, 0]) == 2**31 - 1
+
+    def scan_step(state, _):
+        result = model.update(state, *args)
+        return result.state, (result.update_applied, result.post_step_words)
+
+    scanned, (applied, words) = jax.lax.scan(
+        scan_step,
+        near_carry,
+        jnp.arange(2, dtype=jnp.int32),
+    )
+    chex.assert_trees_all_equal(applied, jnp.asarray((True, True), dtype=jnp.bool_))
+    chex.assert_trees_all_equal(
+        words,
+        jnp.asarray(((1, 0), (1, 1)), dtype=jnp.uint32),
+    )
+    chex.assert_trees_all_equal(scanned.step_words, jnp.asarray((1, 1), dtype=jnp.uint32))
+
+    exhausted = carried.state.replace(
+        step_words=jnp.full((2,), 2**32 - 1, dtype=jnp.uint32),
+    )
+    stopped = model.update(exhausted, *args)
+    assert bool(stopped.lifetime_counter_valid)
+    assert not bool(stopped.lifetime_capacity_available)
+    assert not bool(stopped.update_applied)
+    chex.assert_trees_all_equal(stopped.state, exhausted)
+
+    misaligned = initial.replace(step_count=jnp.asarray(1, dtype=jnp.int32))
+    rejected = model.update(misaligned, *args)
+    assert not bool(rejected.lifetime_counter_valid)
+    assert not bool(rejected.update_applied)
+    chex.assert_trees_all_equal(rejected.state, misaligned)
+
+    negative_visit = initial.replace(
+        visit_counts=initial.visit_counts.at[0, 0].set(-1)
+    )
+    rejected_visit = model.update(negative_visit, *args)
+    assert not bool(rejected_visit.lifetime_counter_valid)
+    assert not bool(rejected_visit.update_applied)
+    chex.assert_trees_all_equal(rejected_visit.state, negative_visit)
+
+
+def test_legacy_joint_outcome_clock_migration_checks_counter_alignment() -> None:
+    model = BoundedJointOutcomeModel(BoundedJointOutcomeConfig())
+    state = model.init()
+    legacy = {
+        field.name: getattr(state, field.name)
+        for field in dataclasses.fields(type(state))
+        if field.name != "step_words"
+    }
+    legacy["step_count"] = jnp.asarray(3, dtype=jnp.int32)
+    legacy["visit_counts"] = jnp.asarray(((1, 0), (0, 2)), dtype=jnp.int32)
+    migrated = migrate_legacy_bounded_joint_outcome_state(legacy)
+    chex.assert_trees_all_equal(
+        migrated.step_words,
+        jnp.asarray((0, 3), dtype=jnp.uint32),
+    )
+
+    misaligned = dict(legacy)
+    misaligned["visit_counts"] = jnp.asarray(((1, 0), (0, 1)), dtype=jnp.int32)
+    with pytest.raises(ValueError, match="not aligned"):
+        migrate_legacy_bounded_joint_outcome_state(misaligned)
+
+    saturated = dict(legacy)
+    saturated["step_count"] = jnp.asarray(2**31 - 1, dtype=jnp.int32)
+    with pytest.raises(ValueError, match="ambiguous"):
+        migrate_legacy_bounded_joint_outcome_state(saturated)

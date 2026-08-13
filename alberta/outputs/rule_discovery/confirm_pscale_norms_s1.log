@@ -1,0 +1,24 @@
+An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-08-03 18:15:23,985 INFO loading MNIST from data_home=/home/shaw/milady/alberta/outputs/step2_published_mnist_openml_cache
+2026-08-03 18:15:26,909 INFO running disc_r1_pscale_norms seed=1 for 200 tasks x 5000 steps (noise_mode=step)
+2026-08-03 18:15:43,238 INFO disc_r1_pscale_norms seed=1 task 10/200 online_acc=0.8554 elapsed=14.5s
+2026-08-03 18:15:54,489 INFO disc_r1_pscale_norms seed=1 task 20/200 online_acc=0.8666 elapsed=25.8s
+2026-08-03 18:16:05,561 INFO disc_r1_pscale_norms seed=1 task 30/200 online_acc=0.8738 elapsed=36.9s
+2026-08-03 18:16:18,127 INFO disc_r1_pscale_norms seed=1 task 40/200 online_acc=0.8616 elapsed=49.4s
+2026-08-03 18:16:29,940 INFO disc_r1_pscale_norms seed=1 task 50/200 online_acc=0.8754 elapsed=61.2s
+2026-08-03 18:16:42,960 INFO disc_r1_pscale_norms seed=1 task 60/200 online_acc=0.8570 elapsed=74.3s
+2026-08-03 18:16:55,206 INFO disc_r1_pscale_norms seed=1 task 70/200 online_acc=0.8620 elapsed=86.5s
+2026-08-03 18:17:07,176 INFO disc_r1_pscale_norms seed=1 task 80/200 online_acc=0.8690 elapsed=98.5s
+2026-08-03 18:17:19,288 INFO disc_r1_pscale_norms seed=1 task 90/200 online_acc=0.8658 elapsed=110.6s
+2026-08-03 18:17:31,282 INFO disc_r1_pscale_norms seed=1 task 100/200 online_acc=0.8622 elapsed=122.6s
+2026-08-03 18:17:42,726 INFO disc_r1_pscale_norms seed=1 task 110/200 online_acc=0.8590 elapsed=134.0s
+2026-08-03 18:17:54,039 INFO disc_r1_pscale_norms seed=1 task 120/200 online_acc=0.8542 elapsed=145.3s
+2026-08-03 18:18:06,166 INFO disc_r1_pscale_norms seed=1 task 130/200 online_acc=0.8522 elapsed=157.5s
+2026-08-03 18:18:18,288 INFO disc_r1_pscale_norms seed=1 task 140/200 online_acc=0.8654 elapsed=169.6s
+2026-08-03 18:18:30,582 INFO disc_r1_pscale_norms seed=1 task 150/200 online_acc=0.8536 elapsed=181.9s
+2026-08-03 18:18:43,047 INFO disc_r1_pscale_norms seed=1 task 160/200 online_acc=0.8650 elapsed=194.3s
+2026-08-03 18:18:55,853 INFO disc_r1_pscale_norms seed=1 task 170/200 online_acc=0.8574 elapsed=207.1s
+2026-08-03 18:19:07,909 INFO disc_r1_pscale_norms seed=1 task 180/200 online_acc=0.8640 elapsed=219.2s
+2026-08-03 18:19:21,417 INFO disc_r1_pscale_norms seed=1 task 190/200 online_acc=0.8646 elapsed=232.7s
+2026-08-03 18:19:34,777 INFO disc_r1_pscale_norms seed=1 task 200/200 online_acc=0.8640 elapsed=246.1s
+2026-08-03 18:19:34,806 INFO disc_r1_pscale_norms seed=1 done: avg online acc 0.8654 (wall 246.1s) -> outputs/ipmnist_screening/confirm_full/disc_r1_pscale_norms_seed1.json

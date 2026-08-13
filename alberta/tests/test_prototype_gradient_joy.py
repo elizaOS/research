@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import chex
 import jax
@@ -21,6 +21,8 @@ from alberta_framework.core.prototype_agent import (
     PrototypeAgent,
     PrototypeAgentConfig,
     PrototypeAgentState,
+    PrototypeArrayResult,
+    PrototypeCandidateUpdateAuditEvidence,
     PrototypeGradientJoyEvidence,
     PrototypeTransition,
     load_prototype_checkpoint,
@@ -55,6 +57,31 @@ SAFETY_PROBE_GRADIENT = jnp.tile(
     jnp.asarray([1.25, 0.75], dtype=jnp.float32),
     PARAMETER_COUNT // 2,
 )
+
+
+def test_array_result_canonical_audit_names_are_exact_legacy_aliases() -> None:
+    candidate_audit = jnp.asarray((True, False, True), dtype=jnp.bool_)
+    update_applied = jnp.asarray((False, False, True), dtype=jnp.bool_)
+    result = PrototypeArrayResult(
+        state=cast(PrototypeAgentState, object()),
+        actions=jnp.zeros((3,), dtype=jnp.int32),
+        oak_td_errors=jnp.zeros((3,), dtype=jnp.float32),
+        oak_average_rewards=jnp.zeros((3,), dtype=jnp.float32),
+        transition_valid=jnp.ones((3,), dtype=jnp.bool_),
+        state_builder_learning_applied=update_applied,
+        gradient_sparks_joy=candidate_audit,
+        joyful_gradient_applied=update_applied,
+    )
+
+    assert result.candidate_update_audit_passed is result.gradient_sparks_joy
+    assert result.audited_candidate_update_applied is result.joyful_gradient_applied
+
+
+def test_prototype_candidate_audit_evidence_is_the_canonical_type() -> None:
+    assert PrototypeGradientJoyEvidence is PrototypeCandidateUpdateAuditEvidence
+    assert PrototypeCandidateUpdateAuditEvidence.__name__ == (
+        "PrototypeCandidateUpdateAuditEvidence"
+    )
 
 
 def _builder_config() -> OnlineGatedStateBuilderConfig:
@@ -100,7 +127,7 @@ def _ensemble_config(*, max_input_magnitude: float = 100.0) -> WorldModelEnsembl
 
 def _agent(
     *,
-    joy: bool,
+    candidate_audit: bool,
     learn: bool = True,
     max_input_magnitude: float = 100.0,
 ) -> PrototypeAgent:
@@ -127,7 +154,7 @@ def _agent(
                     norm_temperature=1.0,
                     diagnostics_epsilon=1.0e-12,
                 )
-                if joy
+                if candidate_audit
                 else None
             ),
         )
@@ -203,9 +230,9 @@ def _candidate_for_transition(
 
 def _complete_sidecar(
     state: PrototypeAgentState,
-) -> PrototypeGradientJoyEvidence:
+) -> PrototypeCandidateUpdateAuditEvidence:
     available = jnp.asarray(True, dtype=jnp.bool_)
-    return PrototypeGradientJoyEvidence(
+    return PrototypeCandidateUpdateAuditEvidence(
         decision_id=state.current_decision_id,
         objective_probe_gradient=OBJECTIVE_PROBE_GRADIENT,
         retention_probe_gradient=RETENTION_PROBE_GRADIENT,
@@ -223,8 +250,8 @@ def _complete_sidecar(
     )
 
 
-def test_learning_and_joy_configuration_is_strict_and_round_trips() -> None:
-    agent = _agent(joy=True)
+def test_learning_and_candidate_audit_configuration_is_strict_and_round_trips() -> None:
+    agent = _agent(candidate_audit=True)
     assert PrototypeAgent.from_config(agent.to_config()).to_config() == agent.to_config()
 
     with pytest.raises(ValueError, match="world_model_ensemble"):
@@ -266,7 +293,7 @@ def test_corrupt_online_builder_state_cannot_be_checkpointed(
     field: str,
     value: jax.Array,
 ) -> None:
-    agent = _agent(joy=True)
+    agent = _agent(candidate_audit=True)
     state = agent.start(agent.init(jr.key(31)), jnp.asarray([0.2], dtype=jnp.float32))
     corrupt_builder = state.state_builder_state.replace(**{field: value})
     corrupt = state.replace(state_builder_state=corrupt_builder)
@@ -277,7 +304,7 @@ def test_corrupt_online_builder_state_cannot_be_checkpointed(
 
 
 def test_ungated_builder_update_matches_source_proposal_destination_commit() -> None:
-    agent = _agent(joy=False)
+    agent = _agent(candidate_audit=False)
     state = agent.start(agent.init(jr.key(1)), jnp.asarray([0.2], dtype=jnp.float32))
     transition = _transition(state, -0.7)
     destination, ensemble_result, proposal = _candidate_for_transition(
@@ -314,11 +341,11 @@ def test_ungated_builder_update_matches_source_proposal_destination_commit() -> 
         result.state.state_builder_state.parameter_sensitivity,
         destination.parameter_sensitivity,
     )
-    assert result.gradient_joy_application is None
+    assert result.candidate_update_audit_application is None
 
 
 def test_rejected_ensemble_vetoes_parameters_but_preserves_recurrent_advance() -> None:
-    agent = _agent(joy=False, max_input_magnitude=0.5)
+    agent = _agent(candidate_audit=False, max_input_magnitude=0.5)
     state = agent.start(agent.init(jr.key(2)), jnp.asarray([0.1], dtype=jnp.float32))
     transition = _transition(state, 0.2)
     destination, _, _ = _candidate_for_transition(agent, state, transition)
@@ -340,7 +367,7 @@ def test_rejected_ensemble_vetoes_parameters_but_preserves_recurrent_advance() -
 
 
 def test_terminal_commit_preserves_reset_destination_recurrence_and_cache() -> None:
-    agent = _agent(joy=False)
+    agent = _agent(candidate_audit=False)
     state = agent.start(agent.init(jr.key(22)), jnp.asarray([0.15], dtype=jnp.float32))
     final_observation = jnp.asarray([0.8], dtype=jnp.float32)
     reset_observation = jnp.asarray([-0.6], dtype=jnp.float32)
@@ -413,19 +440,21 @@ def test_terminal_commit_preserves_reset_destination_recurrence_and_cache() -> N
     )
 
 
-def test_missing_joy_evidence_answers_no_without_blocking_real_learning() -> None:
-    agent = _agent(joy=True)
+def test_missing_candidate_audit_evidence_does_not_block_real_learning() -> None:
+    agent = _agent(candidate_audit=True)
     state = agent.start(agent.init(jr.key(3)), jnp.asarray([0.1], dtype=jnp.float32))
     result = agent.update_transition(state, _transition(state, 0.6))
 
     assert bool(result.transition_diagnostics.valid)
     assert bool(result.world_model_ensemble_diagnostics.applied)
-    assert result.gradient_joy_application is not None
-    assert not bool(result.gradient_joy_evidence_supplied)
-    assert not bool(result.sparks_joy)
-    assert not bool(result.joyful_gradient_applied)
-    assert not bool(result.gradient_joy_application.assessment.sparks_joy)
-    assert not bool(result.gradient_joy_application.applied)
+    assert result.candidate_update_audit_application is not None
+    assert not bool(result.candidate_update_audit_evidence_supplied)
+    assert not bool(result.candidate_update_audit_passed)
+    assert not bool(result.audited_candidate_update_applied)
+    assert not bool(
+        result.candidate_update_audit_application.assessment.candidate_update_audit_passed
+    )
+    assert not bool(result.candidate_update_audit_application.applied)
     assert not bool(result.state_builder_learning_diagnostics.applied)
     assert int(result.state.step_count) == int(state.step_count) + 1
     assert int(result.state.world_model_state.event_count) == (
@@ -433,12 +462,28 @@ def test_missing_joy_evidence_answers_no_without_blocking_real_learning() -> Non
     )
 
 
-def test_builder_learning_counter_saturates_without_wrapping_control() -> None:
-    agent = _agent(joy=False)
+def test_dual_canonical_and_legacy_candidate_audit_keywords_fail_before_control() -> None:
+    agent = _agent(candidate_audit=True)
+    state = agent.start(agent.init(jr.key(31)), jnp.asarray([0.1], dtype=jnp.float32))
+    transition = _transition(state, 0.6)
+    sidecar = _complete_sidecar(state)
+
+    with pytest.raises(ValueError, match="cannot both be supplied"):
+        agent.update_transition(
+            state,
+            transition,
+            candidate_update_audit_evidence=sidecar,
+            gradient_joy_evidence=sidecar,
+        )
+
+
+def test_builder_learning_telemetry_saturates_while_exact_clock_continues() -> None:
+    agent = _agent(candidate_audit=False)
     state = agent.start(agent.init(jr.key(32)), jnp.asarray([0.2], dtype=jnp.float32))
     maximum = 2**31 - 1
     near_capacity_builder = state.state_builder_state.replace(
-        update_count=jnp.asarray(maximum - 1, dtype=jnp.int32)
+        update_count=jnp.asarray(maximum - 1, dtype=jnp.int32),
+        update_words=jnp.asarray((0, maximum - 1), dtype=jnp.uint32),
     )
     state = state.replace(state_builder_state=near_capacity_builder)
 
@@ -447,17 +492,27 @@ def test_builder_learning_counter_saturates_without_wrapping_control() -> None:
     assert bool(final_update.transition_diagnostics.valid)
     assert bool(final_update.state_builder_learning_diagnostics.applied)
     assert int(final_update.state.state_builder_state.update_count) == maximum
-
-    exhausted_state = final_update.state
-    exhausted = agent.update_transition(
-        exhausted_state,
-        _transition(exhausted_state, 0.6),
+    chex.assert_trees_all_equal(
+        final_update.state.state_builder_state.update_words,
+        jnp.asarray((0, maximum), dtype=jnp.uint32),
     )
-    assert bool(exhausted.transition_diagnostics.valid)
-    assert not bool(exhausted.state_builder_learning_diagnostics.applied)
-    assert bool(exhausted.state_builder_learning_diagnostics.rejected)
-    assert int(exhausted.state.state_builder_state.update_count) == maximum
-    assert int(exhausted.state.step_count) == int(exhausted_state.step_count) + 1
+
+    saturated_telemetry_state = final_update.state
+    continued = agent.update_transition(
+        saturated_telemetry_state,
+        _transition(saturated_telemetry_state, 0.6),
+    )
+    assert bool(continued.transition_diagnostics.valid)
+    assert bool(continued.state_builder_learning_diagnostics.applied)
+    assert not bool(continued.state_builder_learning_diagnostics.rejected)
+    assert int(continued.state.state_builder_state.update_count) == maximum
+    chex.assert_trees_all_equal(
+        continued.state.state_builder_state.update_words,
+        jnp.asarray((0, maximum + 1), dtype=jnp.uint32),
+    )
+    assert int(continued.state.step_count) == (
+        int(saturated_telemetry_state.step_count) + 1
+    )
 
 
 def _warm_signals(
@@ -472,10 +527,10 @@ def _warm_signals(
     return state
 
 
-def test_complete_matching_evidence_sparks_joy_and_applies_eager_jit_checkpoint(
+def test_complete_matching_evidence_passes_candidate_audit_and_applies_eager_jit_checkpoint(
     tmp_path: Path,
 ) -> None:
-    agent = _agent(joy=True)
+    agent = _agent(candidate_audit=True)
     state = agent.start(agent.init(jr.key(4)), jnp.asarray([0.25], dtype=jnp.float32))
     state = _warm_signals(agent, state)
     transition = _transition(state, 0.9)
@@ -488,24 +543,30 @@ def test_complete_matching_evidence_sparks_joy_and_applies_eager_jit_checkpoint(
     assert bool(jnp.any(proposal.candidate_parameter_update != 0.0))
     sidecar = _complete_sidecar(state)
 
-    eager = agent.update_transition(state, transition, sidecar)
+    eager = agent.update_transition(
+        state,
+        transition,
+        candidate_update_audit_evidence=sidecar,
+    )
     compiled_update = jax.jit(agent.update_transition)
     compiled = compiled_update(state, transition, sidecar)
 
-    assert eager.gradient_joy_application is not None
-    assert bool(eager.gradient_joy_evidence_supplied)
-    assert bool(eager.gradient_joy_decision_id_matches)
-    assert bool(eager.sparks_joy)
-    assert bool(eager.joyful_gradient_applied)
+    assert eager.candidate_update_audit_application is not None
+    assert bool(eager.candidate_update_audit_evidence_supplied)
+    assert bool(eager.candidate_update_audit_decision_id_matches)
     assert bool(eager.candidate_update_audit_passed)
     assert bool(eager.audited_candidate_update_applied)
-    assert bool(eager.gradient_joy_application.assessment.sparks_joy)
-    assert bool(eager.gradient_joy_application.effective_assessment.sparks_joy)
-    assert bool(eager.gradient_joy_application.applied)
+    assert bool(
+        eager.candidate_update_audit_application.assessment.candidate_update_audit_passed
+    )
+    assert bool(
+        eager.candidate_update_audit_application.effective_assessment.candidate_update_audit_passed
+    )
+    assert bool(eager.candidate_update_audit_application.applied)
     assert bool(eager.state_builder_learning_diagnostics.applied)
     chex.assert_trees_all_equal(
         eager.state.state_builder_state.parameters,
-        eager.gradient_joy_application.parameters,
+        eager.candidate_update_audit_application.parameters,
     )
     assert not bool(
         jnp.array_equal(
@@ -521,8 +582,8 @@ def test_complete_matching_evidence_sparks_joy_and_applies_eager_jit_checkpoint(
     invalid_eager = agent.update_transition(state, invalid_transition, sidecar)
     invalid_compiled = compiled_update(state, invalid_transition, sidecar)
     assert not bool(invalid_eager.transition_diagnostics.valid)
-    assert not bool(invalid_eager.sparks_joy)
-    assert not bool(invalid_eager.joyful_gradient_applied)
+    assert not bool(invalid_eager.candidate_update_audit_passed)
+    assert not bool(invalid_eager.audited_candidate_update_applied)
     _assert_tree_equal(invalid_eager.state, state)
     _assert_tree_equal(invalid_eager, invalid_compiled)
 
@@ -532,10 +593,10 @@ def test_complete_matching_evidence_sparks_joy_and_applies_eager_jit_checkpoint(
     nonfinite_eager = agent.update_transition(state, transition, nonfinite_sidecar)
     nonfinite_compiled = compiled_update(state, transition, nonfinite_sidecar)
     assert bool(nonfinite_eager.transition_diagnostics.valid)
-    assert bool(nonfinite_eager.gradient_joy_evidence_supplied)
-    assert bool(nonfinite_eager.gradient_joy_decision_id_matches)
-    assert not bool(nonfinite_eager.sparks_joy)
-    assert not bool(nonfinite_eager.joyful_gradient_applied)
+    assert bool(nonfinite_eager.candidate_update_audit_evidence_supplied)
+    assert bool(nonfinite_eager.candidate_update_audit_decision_id_matches)
+    assert not bool(nonfinite_eager.candidate_update_audit_passed)
+    assert not bool(nonfinite_eager.audited_candidate_update_applied)
     chex.assert_trees_all_equal(
         nonfinite_eager.state.state_builder_state.parameters,
         state.state_builder_state.parameters,
@@ -572,13 +633,14 @@ def test_complete_matching_evidence_sparks_joy_and_applies_eager_jit_checkpoint(
     _assert_tree_equal(eager, resumed)
 
 
-def test_candidate_sparks_joy_when_builder_capacity_vetoes_the_commit() -> None:
-    agent = _agent(joy=True)
+def test_candidate_audit_passes_when_builder_capacity_vetoes_the_commit() -> None:
+    agent = _agent(candidate_audit=True)
     state = agent.start(agent.init(jr.key(41)), jnp.asarray([0.25], dtype=jnp.float32))
     state = _warm_signals(agent, state)
     maximum = 2**31 - 1
     saturated_builder = state.state_builder_state.replace(
-        update_count=jnp.asarray(maximum, dtype=jnp.int32)
+        update_count=jnp.asarray(maximum, dtype=jnp.int32),
+        update_words=jnp.full((2,), 2**32 - 1, dtype=jnp.uint32),
     )
     state = state.replace(state_builder_state=saturated_builder)
     transition = _transition(state, 0.9)
@@ -588,14 +650,18 @@ def test_candidate_sparks_joy_when_builder_capacity_vetoes_the_commit() -> None:
     compiled = jax.jit(agent.update_transition)(state, transition, sidecar)
 
     assert bool(eager.transition_diagnostics.valid)
-    assert eager.gradient_joy_application is not None
-    assert bool(eager.gradient_joy_application.assessment.sparks_joy)
-    assert bool(eager.gradient_joy_application.effective_assessment.sparks_joy)
-    assert bool(eager.gradient_joy_application.applied)
-    assert bool(eager.sparks_joy)
+    assert eager.candidate_update_audit_application is not None
+    assert bool(
+        eager.candidate_update_audit_application.assessment.candidate_update_audit_passed
+    )
+    assert bool(
+        eager.candidate_update_audit_application.effective_assessment.candidate_update_audit_passed
+    )
+    assert bool(eager.candidate_update_audit_application.applied)
+    assert bool(eager.candidate_update_audit_passed)
     assert not bool(eager.state_builder_learning_diagnostics.applied)
     assert bool(eager.state_builder_learning_diagnostics.rejected)
-    assert not bool(eager.joyful_gradient_applied)
+    assert not bool(eager.audited_candidate_update_applied)
     chex.assert_trees_all_equal(
         eager.state.state_builder_state.parameters,
         state.state_builder_state.parameters,
@@ -604,8 +670,8 @@ def test_candidate_sparks_joy_when_builder_capacity_vetoes_the_commit() -> None:
     _assert_tree_equal(eager, compiled)
 
 
-def test_stale_joy_sidecar_vetoes_only_the_builder_update() -> None:
-    agent = _agent(joy=True)
+def test_stale_candidate_audit_sidecar_vetoes_only_the_builder_update() -> None:
+    agent = _agent(candidate_audit=True)
     state = agent.start(agent.init(jr.key(5)), jnp.asarray([0.25], dtype=jnp.float32))
     state = _warm_signals(agent, state)
     transition = _transition(state, -0.9)
@@ -618,13 +684,15 @@ def test_stale_joy_sidecar_vetoes_only_the_builder_update() -> None:
     result = agent.update_transition(state, transition, sidecar)
 
     assert bool(result.transition_diagnostics.valid)
-    assert bool(result.gradient_joy_evidence_supplied)
-    assert not bool(result.gradient_joy_decision_id_matches)
-    assert not bool(result.sparks_joy)
-    assert not bool(result.joyful_gradient_applied)
-    assert result.gradient_joy_application is not None
-    assert not bool(result.gradient_joy_application.assessment.sparks_joy)
-    assert not bool(result.gradient_joy_application.applied)
+    assert bool(result.candidate_update_audit_evidence_supplied)
+    assert not bool(result.candidate_update_audit_decision_id_matches)
+    assert not bool(result.candidate_update_audit_passed)
+    assert not bool(result.audited_candidate_update_applied)
+    assert result.candidate_update_audit_application is not None
+    assert not bool(
+        result.candidate_update_audit_application.assessment.candidate_update_audit_passed
+    )
+    assert not bool(result.candidate_update_audit_application.applied)
     assert not bool(result.state_builder_learning_diagnostics.applied)
     chex.assert_trees_all_equal(
         result.state.state_builder_state.parameters,
@@ -633,8 +701,8 @@ def test_stale_joy_sidecar_vetoes_only_the_builder_update() -> None:
     assert int(result.state.step_count) == int(state.step_count) + 1
 
 
-def test_joy_scan_matches_loop_and_reports_the_storage_implication() -> None:
-    agent = _agent(joy=True)
+def test_candidate_audit_scan_matches_loop_and_reports_storage_implication() -> None:
+    agent = _agent(candidate_audit=True)
     initial = agent.start(
         agent.init(jr.key(4)),
         jnp.asarray([0.25], dtype=jnp.float32),
@@ -673,20 +741,43 @@ def test_joy_scan_matches_loop_and_reports_the_storage_implication() -> None:
         ),
     )
     chex.assert_trees_all_equal(
-        scanned.gradient_sparks_joy,
-        jnp.stack((first.sparks_joy, second.sparks_joy)),
-    )
-    chex.assert_trees_all_equal(
-        scanned.joyful_gradient_applied,
+        scanned.candidate_update_audit_passed,
         jnp.stack(
             (
-                first.joyful_gradient_applied,
-                second.joyful_gradient_applied,
+                first.candidate_update_audit_passed,
+                second.candidate_update_audit_passed,
             )
         ),
     )
+    chex.assert_trees_all_equal(
+        scanned.audited_candidate_update_applied,
+        jnp.stack(
+            (
+                first.audited_candidate_update_applied,
+                second.audited_candidate_update_applied,
+            )
+        ),
+    )
+    # Frozen serialized names remain exact compatibility aliases.
+    chex.assert_trees_all_equal(
+        scanned.candidate_update_audit_passed,
+        scanned.gradient_sparks_joy,
+    )
+    chex.assert_trees_all_equal(
+        scanned.audited_candidate_update_applied,
+        scanned.joyful_gradient_applied,
+    )
+    chex.assert_trees_all_equal(
+        compiled.candidate_update_audit_passed,
+        scanned.candidate_update_audit_passed,
+    )
+    chex.assert_trees_all_equal(
+        compiled.audited_candidate_update_applied,
+        scanned.audited_candidate_update_applied,
+    )
     assert bool(jnp.any(scanned.state_builder_learning_applied))
     implication = (~scanned.state_builder_learning_applied) | (
-        scanned.gradient_sparks_joy & scanned.joyful_gradient_applied
+        scanned.candidate_update_audit_passed
+        & scanned.audited_candidate_update_applied
     )
     assert bool(jnp.all(implication))

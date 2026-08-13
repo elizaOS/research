@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -34,9 +35,124 @@ from alberta_framework.core.experiential_memory import (
 )
 
 EXPERIENTIAL_MEMORY_POLICY_SCHEMA = "alberta.experiential-memory-policy.v1"
+EXPERIENTIAL_MEMORY_ADVANTAGE_GATE_CONFIG_SCHEMA = (
+    "alberta.experiential-memory-advantage-gate.config.v1"
+)
 _POLICY_TYPE = "ExperientialMemoryPolicy"
 _ACTION_SEMANTICS = "categorical-score-mass-not-action-identifiers"
 _SELECTION_SEMANTICS = "lowest-index-argmax-over-safe-positive-mass"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ExperientialMemoryAdvantageGateConfig:
+    """Opt-in conservative authority over a base action.
+
+    The gate interprets only exact one-hot neighbor actions as
+    action-conditioned reward evidence.  A memory proposal may replace a
+    different base action only when both actions have at least
+    ``min_action_support`` selected neighbors and the proposal's local
+    similarity-weighted mean reward exceeds the base mean by strictly more
+    than ``min_reward_advantage``. Both actions must also own at least
+    ``min_action_weight_mass`` of the normalized selected-neighbor mass.
+    Missing, fractional, malformed, or non-finite evidence abstains.
+
+    ``min_action_support`` is a raw selected-neighbor count, not an effective
+    sample size. The v1 gate has no uncertainty interval, delayed-return
+    credit, causal attribution, context inference, or nonstationarity model.
+    It is only a conservative authority boundary over local immediate-reward
+    evidence and cannot make aliased contexts identifiable.
+
+    This configuration is deliberately separate from the memory and policy
+    v1 schemas.  Callers that do not construct the gate retain their exact
+    historical proposal semantics.
+    """
+
+    min_action_support: int = 1
+    min_action_weight_mass: float = 0.1
+    min_reward_advantage: float = 0.0
+
+    def __post_init__(self) -> None:
+        if type(self.min_action_support) is not int or not (
+            1 <= self.min_action_support <= 2**31 - 1
+        ):
+            raise ValueError("min_action_support must be a positive exact int32")
+        for name, value in (
+            ("min_action_weight_mass", self.min_action_weight_mass),
+            ("min_reward_advantage", self.min_reward_advantage),
+        ):
+            if type(value) is not float or not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite exact float")
+        represented_mass = float(
+            jnp.asarray(self.min_action_weight_mass, dtype=jnp.float32)
+        )
+        if not math.isfinite(represented_mass) or not 0.0 < represented_mass <= 1.0:
+            raise ValueError(
+                "min_action_weight_mass must remain in (0, 1] in float32"
+            )
+        represented_advantage = float(
+            jnp.asarray(self.min_reward_advantage, dtype=jnp.float32)
+        )
+        if not math.isfinite(represented_advantage) or represented_advantage < 0.0:
+            raise ValueError(
+                "min_reward_advantage must remain finite and non-negative in float32"
+            )
+
+    def to_config(self) -> dict[str, object]:
+        """Return the exact standalone v1 gate configuration."""
+
+        return {
+            "schema": EXPERIENTIAL_MEMORY_ADVANTAGE_GATE_CONFIG_SCHEMA,
+            "type": type(self).__name__,
+            "mechanism_status": "development-l0",
+            "scientific_promotion_allowed": False,
+            "min_action_support": self.min_action_support,
+            "min_action_weight_mass": self.min_action_weight_mass,
+            "min_reward_advantage": self.min_reward_advantage,
+        }
+
+    @classmethod
+    def from_config(
+        cls,
+        config: Mapping[str, object],
+    ) -> ExperientialMemoryAdvantageGateConfig:
+        """Strictly reconstruct one standalone v1 gate configuration."""
+
+        expected = {
+            "schema",
+            "type",
+            "mechanism_status",
+            "scientific_promotion_allowed",
+            "min_action_support",
+            "min_action_weight_mass",
+            "min_reward_advantage",
+        }
+        if set(config) != expected:
+            raise ValueError("experiential-memory advantage gate fields do not match v1")
+        fixed = {
+            "schema": EXPERIENTIAL_MEMORY_ADVANTAGE_GATE_CONFIG_SCHEMA,
+            "type": cls.__name__,
+            "mechanism_status": "development-l0",
+            "scientific_promotion_allowed": False,
+        }
+        if any(
+            type(config.get(name)) is not type(value)
+            or config.get(name) != value
+            for name, value in fixed.items()
+        ):
+            raise ValueError("experiential-memory advantage gate fixed fields are invalid")
+        if type(config.get("min_action_support")) is not int:
+            raise ValueError("min_action_support must be a JSON integer")
+        for name in ("min_action_weight_mass", "min_reward_advantage"):
+            if type(config.get(name)) is not float:
+                raise ValueError(f"{name} must be a JSON float")
+        result = cls(
+            min_action_support=cast(int, config["min_action_support"]),
+            min_action_weight_mass=cast(float, config["min_action_weight_mass"]),
+            min_reward_advantage=cast(float, config["min_reward_advantage"]),
+        )
+        if result.to_config() != dict(config):
+            raise ValueError("experiential-memory advantage gate config is noncanonical")
+        return result
 
 
 def _require_array(
@@ -98,6 +214,54 @@ class ExperientialMemoryPolicyProposal:
     action_mass_valid: Bool[Array, ""]
     safe_positive_mass_available: Bool[Array, ""]
     retrieval: ExperientialMemoryRetrieval
+
+
+@chex.dataclass(frozen=True)
+class ExperientialMemoryAdvantageGateDiagnostics:
+    """Exact local evidence and authority decision for one proposed override."""
+
+    evidence_valid: Bool[Array, ""]
+    neighbor_action_one_hot: Bool[Array, " top_k"]
+    neighbor_reward_finite: Bool[Array, " top_k"]
+    neighbor_weight_contract_valid: Bool[Array, ""]
+    action_support_counts: Int[Array, " n_actions"]
+    action_weight_mass: Float[Array, " n_actions"]
+    action_reward_means: Float[Array, " n_actions"]
+    base_action: Int[Array, ""]
+    proposed_action: Int[Array, ""]
+    actions_differ: Bool[Array, ""]
+    base_support_count: Int[Array, ""]
+    proposed_support_count: Int[Array, ""]
+    min_action_support: Int[Array, ""]
+    base_action_weight_mass: Float[Array, ""]
+    proposed_action_weight_mass: Float[Array, ""]
+    min_action_weight_mass: Float[Array, ""]
+    weight_mass_ready: Bool[Array, ""]
+    support_ready: Bool[Array, ""]
+    base_reward_mean: Float[Array, ""]
+    proposed_reward_mean: Float[Array, ""]
+    reward_advantage: Float[Array, ""]
+    min_reward_advantage: Float[Array, ""]
+    advantage_ready: Bool[Array, ""]
+    replacement_allowed: Bool[Array, ""]
+
+
+@dataclasses.dataclass(frozen=True)
+class ExperientialMemoryAdvantageGateResourceDeclaration:
+    """Fixed logical work and zero persistent state for one assessment."""
+
+    n_actions: int
+    top_k: int
+    neighbor_action_values_interpreted: int
+    neighbor_reward_values_interpreted: int
+    neighbor_weight_values_interpreted: int
+    owned_persistent_state_bytes: int
+    random_draws_per_assessment: int
+
+    def to_config(self) -> dict[str, int]:
+        """Return the exact JSON-compatible resource declaration."""
+
+        return dataclasses.asdict(self)
 
 
 class ExperientialMemoryPolicy:
@@ -285,8 +449,295 @@ class ExperientialMemoryPolicy:
         )
 
 
+class ExperientialMemoryAdvantageGate:
+    """Stateless, fail-closed local reward-advantage authority gate.
+
+    The gate consumes a genuine policy proposal together with the exact
+    pre-write memory state that produced it.  It neither queries nor mutates
+    memory.  Only selected neighbors with exact one-hot stored actions are
+    accepted as action-conditioned reward evidence.  This keeps arbitrary
+    categorical score vectors from being misrepresented as executed actions.
+
+    Selected-row counts are raw counts; similarity weights are checked through
+    a separate minimum-mass floor. Neither is an effective sample size or an
+    uncertainty interval. Immediate observed reward is associational evidence,
+    not causal intervention credit, so this gate deliberately makes no claim
+    to solve state aliasing or changing latent contexts.
+    """
+
+    def __init__(
+        self,
+        memory: ExperientialMemory,
+        config: ExperientialMemoryAdvantageGateConfig,
+    ) -> None:
+        if not isinstance(memory, ExperientialMemory):
+            raise TypeError("memory must be ExperientialMemory")
+        if type(config) is not ExperientialMemoryAdvantageGateConfig:
+            raise TypeError(
+                "config must be an exact ExperientialMemoryAdvantageGateConfig"
+            )
+        if config.min_action_support > memory.config.top_k:
+            raise ValueError("min_action_support must not exceed memory top_k")
+        self._memory = memory
+        self._config = config
+
+    @property
+    def memory(self) -> ExperientialMemory:
+        """The exact bounded memory whose pre-write state is assessed."""
+
+        return self._memory
+
+    @property
+    def config(self) -> ExperientialMemoryAdvantageGateConfig:
+        """The exact static authority thresholds."""
+
+        return self._config
+
+    def to_config(self) -> dict[str, object]:
+        """Serialize only the standalone gate construction."""
+
+        return self._config.to_config()
+
+    @classmethod
+    def from_config(
+        cls,
+        memory: ExperientialMemory,
+        config: Mapping[str, object],
+    ) -> ExperientialMemoryAdvantageGate:
+        """Reconstruct a gate bound to an already-constructed memory."""
+
+        return cls(
+            memory,
+            ExperientialMemoryAdvantageGateConfig.from_config(config),
+        )
+
+    def resource_declaration(
+        self,
+    ) -> ExperientialMemoryAdvantageGateResourceDeclaration:
+        """Declare exact bounded logical reads and zero owned state."""
+
+        n_actions = self._memory.config.action_dim
+        top_k = self._memory.config.top_k
+        return ExperientialMemoryAdvantageGateResourceDeclaration(
+            n_actions=n_actions,
+            top_k=top_k,
+            neighbor_action_values_interpreted=top_k * n_actions,
+            neighbor_reward_values_interpreted=top_k,
+            neighbor_weight_values_interpreted=top_k,
+            owned_persistent_state_bytes=0,
+            random_draws_per_assessment=0,
+        )
+
+    def assess(
+        self,
+        state: ExperientialMemoryState,
+        proposal: ExperientialMemoryPolicyProposal,
+        base_action: Int[Array, ""],
+    ) -> ExperientialMemoryAdvantageGateDiagnostics:
+        """Return whether local evidence authorizes changing ``base_action``."""
+
+        self._memory._validate_state_static_contract(state)
+        if not isinstance(proposal, ExperientialMemoryPolicyProposal):
+            raise TypeError("proposal must be ExperientialMemoryPolicyProposal")
+        _require_array(
+            base_action,
+            name="base_action",
+            shape=(),
+            dtype=jnp.int32,
+        )
+        retrieval = proposal.retrieval
+        top_k = self._memory.config.top_k
+        n_actions = self._memory.config.action_dim
+        for name, shape, dtype in (
+            ("proposal.available", (), jnp.bool_),
+            ("proposal.action", (), jnp.int32),
+            ("retrieval.neighbor_indices", (top_k,), jnp.int32),
+            ("retrieval.neighbor_mask", (top_k,), jnp.bool_),
+            ("retrieval.neighbor_weights", (top_k,), jnp.float32),
+            ("retrieval.accepted", (), jnp.bool_),
+            ("retrieval.state_valid", (), jnp.bool_),
+        ):
+            owner, field = name.split(".", maxsplit=1)
+            value = getattr(proposal if owner == "proposal" else retrieval, field)
+            _require_array(value, name=name, shape=shape, dtype=dtype)
+        _require_array(
+            proposal.action_mass,
+            name="proposal.action_mass",
+            shape=(n_actions,),
+            dtype=jnp.float32,
+        )
+        return cast(
+            ExperientialMemoryAdvantageGateDiagnostics,
+            self._assess_jit(state, proposal, base_action),
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _assess_jit(
+        self,
+        state: ExperientialMemoryState,
+        proposal: ExperientialMemoryPolicyProposal,
+        base_action: Array,
+    ) -> ExperientialMemoryAdvantageGateDiagnostics:
+        cfg = self._config
+        n_actions = self._memory.config.action_dim
+        capacity = self._memory.config.capacity
+        retrieval = proposal.retrieval
+        indices = retrieval.neighbor_indices
+        neighbor_mask = retrieval.neighbor_mask
+        indices_valid = jnp.all((indices >= 0) & (indices < capacity))
+        safe_indices = jnp.clip(indices, 0, capacity - 1)
+        actions = state.entries.actions[safe_indices]
+        rewards = state.entries.rewards[safe_indices]
+        rows_valid = state.entries.valid[safe_indices]
+
+        action_finite = jnp.all(jnp.isfinite(actions), axis=1)
+        action_binary = jnp.all((actions == 0.0) | (actions == 1.0), axis=1)
+        action_one_hot = (
+            action_finite
+            & action_binary
+            & (jnp.sum(actions, axis=1) == 1.0)
+        )
+        reward_finite = jnp.isfinite(rewards)
+        weights = retrieval.neighbor_weights
+        weights_finite_nonnegative = jnp.all(jnp.isfinite(weights)) & jnp.all(
+            weights >= 0.0
+        )
+        masked_weights_zero = jnp.all(jnp.where(neighbor_mask, True, weights == 0.0))
+        positive_normalized_weight = jnp.isclose(
+            jnp.sum(weights),
+            jnp.asarray(1.0, dtype=jnp.float32),
+            rtol=1.0e-5,
+            atol=1.0e-6,
+        )
+        weight_contract_valid = (
+            weights_finite_nonnegative
+            & masked_weights_zero
+            & positive_normalized_weight
+        )
+        selected_rows_valid = jnp.all(
+            (~neighbor_mask) | (rows_valid & action_one_hot & reward_finite)
+        )
+        proposal_action_valid = (
+            proposal.available
+            & (proposal.action >= 0)
+            & (proposal.action < n_actions)
+        )
+        base_action_valid = (base_action >= 0) & (base_action < n_actions)
+        evidence_valid = (
+            proposal_action_valid
+            & base_action_valid
+            & retrieval.accepted
+            & retrieval.state_valid
+            & indices_valid
+            & weight_contract_valid
+            & selected_rows_valid
+        )
+
+        safe_actions = jnp.where(
+            action_one_hot,
+            jnp.argmax(actions, axis=1).astype(jnp.int32),
+            jnp.asarray(0, dtype=jnp.int32),
+        )
+        evidence_mask = neighbor_mask & rows_valid & action_one_hot & reward_finite
+        support_counts = (
+            jnp.zeros((n_actions,), dtype=jnp.int32)
+            .at[safe_actions]
+            .add(evidence_mask.astype(jnp.int32))
+        )
+        evidence_weights = jnp.where(evidence_mask, weights, 0.0)
+        weight_mass = (
+            jnp.zeros((n_actions,), dtype=jnp.float32)
+            .at[safe_actions]
+            .add(evidence_weights)
+        )
+        weighted_reward_sum = (
+            jnp.zeros((n_actions,), dtype=jnp.float32)
+            .at[safe_actions]
+            .add(evidence_weights * jnp.where(reward_finite, rewards, 0.0))
+        )
+        reward_means = jnp.where(
+            weight_mass > 0.0,
+            weighted_reward_sum / jnp.where(weight_mass > 0.0, weight_mass, 1.0),
+            jnp.zeros_like(weight_mass),
+        )
+
+        safe_base = jnp.clip(base_action, 0, n_actions - 1)
+        safe_proposed = jnp.clip(proposal.action, 0, n_actions - 1)
+        base_support = support_counts[safe_base]
+        proposed_support = support_counts[safe_proposed]
+        minimum_support = jnp.asarray(cfg.min_action_support, dtype=jnp.int32)
+        base_weight_mass = weight_mass[safe_base]
+        proposed_weight_mass = weight_mass[safe_proposed]
+        minimum_weight_mass = jnp.asarray(
+            cfg.min_action_weight_mass,
+            dtype=jnp.float32,
+        )
+        weight_mass_ready = (
+            evidence_valid
+            & (base_weight_mass >= minimum_weight_mass)
+            & (proposed_weight_mass >= minimum_weight_mass)
+        )
+        support_ready = (
+            evidence_valid
+            & (base_support >= minimum_support)
+            & (proposed_support >= minimum_support)
+            & weight_mass_ready
+        )
+        base_mean = jnp.where(evidence_valid, reward_means[safe_base], 0.0)
+        proposed_mean = jnp.where(evidence_valid, reward_means[safe_proposed], 0.0)
+        advantage = jnp.where(
+            evidence_valid,
+            proposed_mean - base_mean,
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        minimum_advantage = jnp.asarray(
+            cfg.min_reward_advantage,
+            dtype=jnp.float32,
+        )
+        advantage_ready = (
+            support_ready
+            & jnp.isfinite(advantage)
+            & (advantage > minimum_advantage)
+        )
+        actions_differ = proposal_action_valid & base_action_valid & (
+            proposal.action != base_action
+        )
+        replacement_allowed = actions_differ & advantage_ready
+        return ExperientialMemoryAdvantageGateDiagnostics(
+            evidence_valid=evidence_valid,
+            neighbor_action_one_hot=action_one_hot,
+            neighbor_reward_finite=reward_finite,
+            neighbor_weight_contract_valid=weight_contract_valid,
+            action_support_counts=support_counts,
+            action_weight_mass=weight_mass,
+            action_reward_means=reward_means,
+            base_action=base_action,
+            proposed_action=proposal.action,
+            actions_differ=actions_differ,
+            base_support_count=base_support,
+            proposed_support_count=proposed_support,
+            min_action_support=minimum_support,
+            base_action_weight_mass=base_weight_mass,
+            proposed_action_weight_mass=proposed_weight_mass,
+            min_action_weight_mass=minimum_weight_mass,
+            weight_mass_ready=weight_mass_ready,
+            support_ready=support_ready,
+            base_reward_mean=base_mean,
+            proposed_reward_mean=proposed_mean,
+            reward_advantage=advantage,
+            min_reward_advantage=minimum_advantage,
+            advantage_ready=advantage_ready,
+            replacement_allowed=replacement_allowed,
+        )
+
+
 __all__ = [
+    "EXPERIENTIAL_MEMORY_ADVANTAGE_GATE_CONFIG_SCHEMA",
     "EXPERIENTIAL_MEMORY_POLICY_SCHEMA",
+    "ExperientialMemoryAdvantageGate",
+    "ExperientialMemoryAdvantageGateConfig",
+    "ExperientialMemoryAdvantageGateDiagnostics",
+    "ExperientialMemoryAdvantageGateResourceDeclaration",
     "ExperientialMemoryPolicy",
     "ExperientialMemoryPolicyProposal",
     "ExperientialMemoryPolicyResourceDeclaration",

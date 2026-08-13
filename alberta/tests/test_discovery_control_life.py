@@ -109,6 +109,8 @@ from alberta_framework.streams.closed_loop import (
     SwitchingTwoStateMDP,
 )
 
+pytestmark = [pytest.mark.development, pytest.mark.slow]
+
 N_SEEDS = 8
 PHASE_LEN = 300
 NUM_PHASES = 12

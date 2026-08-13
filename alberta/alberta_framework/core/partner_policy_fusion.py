@@ -14,6 +14,10 @@ action, partner, and model features used at decision time.  Stale, duplicate,
 or misattributed feedback returns the byte-for-byte same state.  Mere policy
 agreement is neither accepted nor represented as a learning target.
 
+Decision and event authority is represented by exact big-endian ``uint32[2]``
+words.  Same-named signed-int32 identifiers are saturating compatibility
+telemetry and are authenticated against those words before any transaction.
+
 The caller supplies the hard discrete-action safety mask.  No route can emit
 an action outside that mask.  Invalid, expired, missing, non-finite, or unsafe
 partner messages fall back to the caller's counterfactual base action.  If the
@@ -37,10 +41,15 @@ import jax.numpy as jnp
 import numpy as np
 import numpy.typing as npt
 from jax import Array
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Bool, Float, Int, UInt
 
-PARTNER_POLICY_FUSION_CONFIG_SCHEMA = "alberta.partner-policy-fusion.config.v1"
-PARTNER_POLICY_FUSION_CHECKPOINT_SCHEMA = "alberta.partner-policy-fusion.checkpoint.v1"
+PARTNER_POLICY_FUSION_CONFIG_SCHEMA = "alberta.partner-policy-fusion.config.v2"
+PARTNER_POLICY_FUSION_CHECKPOINT_SCHEMA = "alberta.partner-policy-fusion.checkpoint.v2"
+PARTNER_POLICY_FUSION_STATE_SCHEMA = "alberta.partner-policy-fusion.state.v2"
+_LEGACY_PARTNER_POLICY_FUSION_CONFIG_SCHEMA = "alberta.partner-policy-fusion.config.v1"
+_LEGACY_PARTNER_POLICY_FUSION_CHECKPOINT_SCHEMA = (
+    "alberta.partner-policy-fusion.checkpoint.v1"
+)
 MECHANISM_STATUS = "development_l0_mechanism_only"
 SCIENTIFIC_PROMOTION_ALLOWED = False
 
@@ -61,8 +70,13 @@ RELIABILITY_HISTORY_DEVELOPMENT_ONLINE = 1
 _CONFIG_TYPE = "PartnerPolicyFusionConfig"
 _FUSION_TYPE = "PartnerPolicyFusion"
 _INT32_MAX = 2_147_483_647
+_UINT32_MAX = 4_294_967_295
+_UINT64_MAX = 18_446_744_073_709_551_615
 _FLOAT32_MAX = float(np.finfo(np.float32).max)
 _FLOAT32_TINY = float(np.finfo(np.float32).tiny)
+
+PARTNER_POLICY_FUSION_EXACT_IDENTITY_NBYTES = 8
+PARTNER_POLICY_FUSION_EXACT_IDENTITY_DELTA_NBYTES = 4
 
 
 def _strict_positive_int(value: object, *, name: str, maximum: int = _INT32_MAX) -> int:
@@ -71,6 +85,65 @@ def _strict_positive_int(value: object, *, name: str, maximum: int = _INT32_MAX)
     if type(value) is not int or not 1 <= value <= maximum:
         raise ValueError(f"{name} must be a strict integer in [1, {maximum}]")
     return value
+
+
+def partner_policy_fusion_identity_words(value: int) -> UInt[Array, " 2"]:
+    """Encode one exact non-negative uint64 identity as ``[high, low]`` words."""
+
+    if type(value) is not int or not 0 <= value <= _UINT64_MAX:
+        raise ValueError(f"identity must be a strict integer in [0, {_UINT64_MAX}]")
+    return jnp.asarray(
+        ((value >> 32) & _UINT32_MAX, value & _UINT32_MAX),
+        dtype=jnp.uint32,
+    )
+
+
+def _words_to_int32_telemetry(words: Array) -> Int[Array, ...]:
+    """Project exact identities onto saturating non-negative int32 telemetry."""
+
+    fits = (words[..., 0] == jnp.asarray(0, dtype=jnp.uint32)) & (
+        words[..., 1] <= jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+    )
+    return jnp.where(
+        fits,
+        words[..., 1].astype(jnp.int32),
+        jnp.asarray(_INT32_MAX, dtype=jnp.int32),
+    )
+
+
+def _words_eq(left: Array, right: Array) -> Bool[Array, ...]:
+    """Compare exact identities along their final two-word axis."""
+
+    return jnp.all(left == right, axis=-1)
+
+
+def _words_le(left: Array, right: Array) -> Bool[Array, ...]:
+    """Compare big-endian uint32-word identities without enabling x64."""
+
+    return (left[..., 0] < right[..., 0]) | (
+        (left[..., 0] == right[..., 0]) & (left[..., 1] <= right[..., 1])
+    )
+
+
+def _words_lt(left: Array, right: Array) -> Bool[Array, ...]:
+    """Return the strict ordering of exact big-endian identities."""
+
+    return _words_le(left, right) & (~_words_eq(left, right))
+
+
+def _ordered_words_difference(left: Array, right: Array) -> UInt[Array, "... 2"]:
+    """Return ``right - left``; callers authenticate ``left <= right``."""
+
+    borrow = (right[..., 1] < left[..., 1]).astype(jnp.uint32)
+    low = right[..., 1] - left[..., 1]
+    high = right[..., 0] - left[..., 0] - borrow
+    return jnp.stack((high, low), axis=-1).astype(jnp.uint32)
+
+
+def _words_at_most_python_uint64(words: Array, upper: int) -> Bool[Array, ...]:
+    """Compare exact identities with an already-validated Python uint64."""
+
+    return _words_le(words, partner_policy_fusion_identity_words(upper))
 
 
 def _strict_float32(
@@ -204,7 +277,7 @@ class PartnerPolicyFusionConfig:
         _strict_positive_int(
             self.max_message_horizon,
             name="max_message_horizon",
-            maximum=_INT32_MAX,
+            maximum=_UINT64_MAX,
         )
         _strict_positive_int(
             self.min_feedback_for_learned_routing,
@@ -335,7 +408,7 @@ class PartnerPolicyFusionConfig:
             "scientific_promotion_allowed",
         }
         if set(payload) != expected:
-            raise ValueError("config fields do not match the partner-fusion v1 schema")
+            raise ValueError("config fields do not match the partner-fusion v2 schema")
         if payload.pop("schema") != PARTNER_POLICY_FUSION_CONFIG_SCHEMA:
             raise ValueError("unexpected partner-fusion config schema")
         if payload.pop("type") != _CONFIG_TYPE:
@@ -381,6 +454,7 @@ class PartnerPolicyFusionResourceBudget:
     trainable_float32_scalars: int
     persistent_float32_scalars: int
     persistent_int32_scalars: int
+    persistent_uint32_scalars: int
     persistent_bool_scalars: int
     persistent_state_scalars: int
     persistent_state_bytes: int
@@ -390,11 +464,18 @@ class PartnerPolicyFusionResourceBudget:
     max_trainable_scalars_touched_per_feedback: int
     decision_input_float32_scalars: int
     decision_input_int32_scalars: int
+    decision_input_uint32_scalars: int
     decision_input_bool_scalars: int
     feedback_input_float32_scalars: int
     feedback_input_int32_scalars: int
+    feedback_input_uint32_scalars: int
     feedback_input_bool_scalars: int
     max_parameter_updates_per_feedback: int
+    cancellation_input_int32_scalars: int
+    cancellation_input_uint32_scalars: int
+    cancellation_input_bool_scalars: int
+    max_parameter_updates_per_cancellation: int
+    max_counter_updates_per_cancellation: int
     rng_state_bytes: int
     replay_capacity: int
     dynamic_partner_capacity: int
@@ -409,11 +490,11 @@ class PartnerPolicyFusionResourceBudget:
 class PartnerMessageBatch:
     """Fixed-capacity partner messages for one action decision.
 
-    All integer references are caller-owned opaque non-negative identities.
-    There is intentionally no task or regime identifier.  An available
-    message is valid only when observation, context, decision, and event
-    bindings match the current call exactly and its finite validity horizon
-    has not expired.
+    Observation, context, and provenance references are caller-owned opaque
+    non-negative int32 identities.  Decision/event bindings and validity
+    horizons use exact word arrays; the corresponding ``*_id`` leaves are
+    authenticated saturating telemetry only.  There is intentionally no task
+    or regime identifier.
     """
 
     available: Bool[Array, " partners"]
@@ -428,6 +509,9 @@ class PartnerMessageBatch:
     issued_decision_id: Int[Array, " partners"]
     issued_event_id: Int[Array, " partners"]
     valid_through_event_id: Int[Array, " partners"]
+    issued_decision_words: UInt[Array, "partners 2"]
+    issued_event_words: UInt[Array, "partners 2"]
+    valid_through_event_words: UInt[Array, "partners 2"]
 
 
 @chex.dataclass(frozen=True)
@@ -443,13 +527,17 @@ class OptionKeyboardProposal:
 class PartnerPolicyFusionFeedback:
     """Realized outcome bound to one executed partner-influenced decision.
 
-    There is no agreement field.  Both realized assistance value and observed
-    safety outcome must be available for any model update.
+    Exact word identities are authoritative and the signed IDs are
+    authenticated telemetry.  There is no agreement field.  Both realized
+    assistance value and observed safety outcome must be available for any
+    model update.
     """
 
     available: Bool[Array, ""]
     decision_id: Int[Array, ""]
     executed_event_id: Int[Array, ""]
+    decision_words: UInt[Array, " 2"]
+    executed_event_words: UInt[Array, " 2"]
     executed_action: Int[Array, ""]
     partner_id: Int[Array, ""]
     assistance_value_available: Bool[Array, ""]
@@ -460,7 +548,7 @@ class PartnerPolicyFusionFeedback:
 
 @chex.dataclass(frozen=True)
 class PartnerPolicyFusionState:
-    """Fixed-size contextual model, saturating counters, and armed record."""
+    """Fixed model, exact identities, saturating telemetry, and armed record."""
 
     reliability_weights: Float[Array, "partners model_features"]
     feedback_counts: Int[Array, " partners"]
@@ -470,9 +558,13 @@ class PartnerPolicyFusionState:
     has_last_decision: Bool[Array, ""]
     last_decision_id: Int[Array, ""]
     last_event_id: Int[Array, ""]
+    last_decision_words: UInt[Array, " 2"]
+    last_event_words: UInt[Array, " 2"]
     feedback_armed: Bool[Array, ""]
     armed_decision_id: Int[Array, ""]
     armed_event_id: Int[Array, ""]
+    armed_decision_words: UInt[Array, " 2"]
+    armed_event_words: UInt[Array, " 2"]
     armed_action: Int[Array, ""]
     armed_partner_id: Int[Array, ""]
     armed_route: Int[Array, ""]
@@ -485,6 +577,8 @@ class PartnerFusionAvailability:
     """Explicit availability and validity surface for one decision."""
 
     state_valid: Bool[Array, ""]
+    decision_identity_telemetry_valid: Bool[Array, ""]
+    decision_identity_order_valid: Bool[Array, ""]
     decision_identity_valid: Bool[Array, ""]
     base_action_available: Bool[Array, ""]
     base_declared_score_valid: Bool[Array, ""]
@@ -492,6 +586,7 @@ class PartnerFusionAvailability:
     option_declared: Bool[Array, ""]
     option_valid: Bool[Array, ""]
     messages_declared: Bool[Array, " partners"]
+    messages_identity_telemetry_valid: Bool[Array, " partners"]
     messages_binding_valid: Bool[Array, " partners"]
     messages_horizon_valid: Bool[Array, " partners"]
     messages_numeric_valid: Bool[Array, " partners"]
@@ -534,10 +629,12 @@ class PartnerFusionShieldResult:
 
 @chex.dataclass(frozen=True)
 class PartnerFusionDecision:
-    """Complete bounded audit record for one fusion attempt."""
+    """Complete bounded audit record with authoritative exact identities."""
 
     decision_id: Int[Array, ""]
     event_id: Int[Array, ""]
+    decision_words: UInt[Array, " 2"]
+    event_words: UInt[Array, " 2"]
     observation_id: Int[Array, ""]
     context_id: Int[Array, ""]
     counterfactual_base_action: Int[Array, ""]
@@ -576,6 +673,7 @@ class PartnerFusionFeedbackResult:
     state: PartnerPolicyFusionState
     feedback_available: Bool[Array, ""]
     armed_record_available: Bool[Array, ""]
+    identity_telemetry_valid: Bool[Array, ""]
     identity_match: Bool[Array, ""]
     action_match: Bool[Array, ""]
     partner_match: Bool[Array, ""]
@@ -586,6 +684,27 @@ class PartnerFusionFeedbackResult:
     predicted_reliability_before: Float[Array, ""]
     realized_training_target: Float[Array, ""]
     parameter_update_l2_norm: Float[Array, ""]
+
+
+@chex.dataclass(frozen=True)
+class PartnerFusionFeedbackCancellationResult:
+    """Exact non-learning cancellation of one recommendation feedback owner."""
+
+    state: PartnerPolicyFusionState
+    state_valid_before: Bool[Array, ""]
+    cancellation_requested: Bool[Array, ""]
+    armed_record_available: Bool[Array, ""]
+    decision_identity_matches: Bool[Array, ""]
+    event_identity_matches: Bool[Array, ""]
+    action_matches: Bool[Array, ""]
+    partner_matches: Bool[Array, ""]
+    cancellation_required: Bool[Array, ""]
+    candidate_state_valid: Bool[Array, ""]
+    cancellation_applied: Bool[Array, ""]
+    transaction_satisfied: Bool[Array, ""]
+    reliability_unchanged: Bool[Array, ""]
+    counters_unchanged: Bool[Array, ""]
+    learning_applied: Bool[Array, ""]
 
 
 class PartnerPolicyFusion:
@@ -609,8 +728,11 @@ class PartnerPolicyFusion:
         features = cfg.model_feature_dim
         persistent_f32 = partners * features + features + 1
         persistent_i32 = 2 * partners + 9
+        persistent_u32 = 8
         persistent_bool = 2
-        persistent_scalars = persistent_f32 + persistent_i32 + persistent_bool
+        persistent_scalars = (
+            persistent_f32 + persistent_i32 + persistent_u32 + persistent_bool
+        )
         return PartnerPolicyFusionResourceBudget(
             max_partners=partners,
             context_dim=cfg.context_dim,
@@ -619,20 +741,31 @@ class PartnerPolicyFusion:
             trainable_float32_scalars=partners * features,
             persistent_float32_scalars=persistent_f32,
             persistent_int32_scalars=persistent_i32,
+            persistent_uint32_scalars=persistent_u32,
             persistent_bool_scalars=persistent_bool,
             persistent_state_scalars=persistent_scalars,
-            persistent_state_bytes=4 * (persistent_f32 + persistent_i32) + persistent_bool,
+            persistent_state_bytes=(
+                4 * (persistent_f32 + persistent_i32 + persistent_u32)
+                + persistent_bool
+            ),
             max_messages_per_decision=partners,
             max_model_scores_per_decision=partners,
             partner_id_pairwise_equality_comparisons_per_decision=partners * partners,
             max_trainable_scalars_touched_per_feedback=features,
             decision_input_float32_scalars=cfg.context_dim + 2 + 2 * partners,
             decision_input_int32_scalars=6 + 9 * partners,
+            decision_input_uint32_scalars=4 + 6 * partners,
             decision_input_bool_scalars=cfg.n_actions + 1 + partners,
             feedback_input_float32_scalars=1,
             feedback_input_int32_scalars=4,
+            feedback_input_uint32_scalars=4,
             feedback_input_bool_scalars=4,
             max_parameter_updates_per_feedback=1,
+            cancellation_input_int32_scalars=2,
+            cancellation_input_uint32_scalars=4,
+            cancellation_input_bool_scalars=1,
+            max_parameter_updates_per_cancellation=0,
+            max_counter_updates_per_cancellation=0,
             rng_state_bytes=0,
             replay_capacity=0,
             dynamic_partner_capacity=0,
@@ -641,17 +774,23 @@ class PartnerPolicyFusion:
     def to_config(self) -> dict[str, object]:
         """Serialize the complete fusion construction."""
 
-        return {"type": _FUSION_TYPE, "config": self._config.to_config()}
+        return {
+            "type": _FUSION_TYPE,
+            "state_schema": PARTNER_POLICY_FUSION_STATE_SCHEMA,
+            "config": self._config.to_config(),
+        }
 
     @classmethod
     def from_config(cls, config: Mapping[str, object]) -> PartnerPolicyFusion:
         """Strictly restore :class:`PartnerPolicyFusion` construction."""
 
         payload = dict(config)
-        if set(payload) != {"type", "config"}:
-            raise ValueError("fusion construction fields do not match the v1 schema")
+        if set(payload) != {"type", "state_schema", "config"}:
+            raise ValueError("fusion construction fields do not match the v2 schema")
         if payload.get("type") != _FUSION_TYPE:
             raise ValueError("unexpected partner-fusion construction type")
+        if payload.get("state_schema") != PARTNER_POLICY_FUSION_STATE_SCHEMA:
+            raise ValueError("unexpected partner-fusion state schema")
         nested = payload.get("config")
         if not isinstance(nested, Mapping):
             raise ValueError("fusion construction config must be a mapping")
@@ -663,6 +802,7 @@ class PartnerPolicyFusion:
         cfg = self._config
         zero_i = jnp.asarray(0, dtype=jnp.int32)
         missing_i = jnp.asarray(-1, dtype=jnp.int32)
+        zero_words = jnp.zeros((2,), dtype=jnp.uint32)
         return PartnerPolicyFusionState(
             reliability_weights=jnp.zeros(
                 (cfg.max_partners, cfg.model_feature_dim), dtype=jnp.float32
@@ -674,9 +814,13 @@ class PartnerPolicyFusion:
             has_last_decision=jnp.asarray(False, dtype=jnp.bool_),
             last_decision_id=missing_i,
             last_event_id=missing_i,
+            last_decision_words=zero_words,
+            last_event_words=zero_words,
             feedback_armed=jnp.asarray(False, dtype=jnp.bool_),
             armed_decision_id=missing_i,
             armed_event_id=missing_i,
+            armed_decision_words=zero_words,
+            armed_event_words=zero_words,
             armed_action=missing_i,
             armed_partner_id=missing_i,
             armed_route=missing_i,
@@ -689,6 +833,7 @@ class PartnerPolicyFusion:
 
         partners = self._config.max_partners
         missing = jnp.full((partners,), -1, dtype=jnp.int32)
+        zero_words = jnp.zeros((partners, 2), dtype=jnp.uint32)
         return PartnerMessageBatch(
             available=jnp.zeros((partners,), dtype=jnp.bool_),
             partner_id=missing,
@@ -702,6 +847,9 @@ class PartnerPolicyFusion:
             issued_decision_id=missing,
             issued_event_id=missing,
             valid_through_event_id=missing,
+            issued_decision_words=zero_words,
+            issued_event_words=zero_words,
+            valid_through_event_words=zero_words,
         )
 
     @staticmethod
@@ -727,9 +875,13 @@ class PartnerPolicyFusion:
             (state.has_last_decision, (), jnp.bool_),
             (state.last_decision_id, (), jnp.int32),
             (state.last_event_id, (), jnp.int32),
+            (state.last_decision_words, (2,), jnp.uint32),
+            (state.last_event_words, (2,), jnp.uint32),
             (state.feedback_armed, (), jnp.bool_),
             (state.armed_decision_id, (), jnp.int32),
             (state.armed_event_id, (), jnp.int32),
+            (state.armed_decision_words, (2,), jnp.uint32),
+            (state.armed_event_words, (2,), jnp.uint32),
             (state.armed_action, (), jnp.int32),
             (state.armed_partner_id, (), jnp.int32),
             (state.armed_route, (), jnp.int32),
@@ -770,12 +922,17 @@ class PartnerPolicyFusion:
             (~state.has_last_decision)
             & (state.last_decision_id == -1)
             & (state.last_event_id == -1)
+            & jnp.all(state.last_decision_words == 0)
+            & jnp.all(state.last_event_words == 0)
             & (state.decision_count == 0)
         )
         last_present = (
             state.has_last_decision
-            & (state.last_decision_id >= 0)
-            & (state.last_event_id >= 0)
+            & (
+                state.last_decision_id
+                == _words_to_int32_telemetry(state.last_decision_words)
+            )
+            & (state.last_event_id == _words_to_int32_telemetry(state.last_event_words))
             & (state.decision_count > 0)
         )
         last_valid = last_absent | last_present
@@ -784,6 +941,8 @@ class PartnerPolicyFusion:
             (~state.feedback_armed)
             & (state.armed_decision_id == -1)
             & (state.armed_event_id == -1)
+            & jnp.all(state.armed_decision_words == 0)
+            & jnp.all(state.armed_event_words == 0)
             & (state.armed_action == -1)
             & (state.armed_partner_id == -1)
             & (state.armed_route == -1)
@@ -793,10 +952,16 @@ class PartnerPolicyFusion:
         armed_present = (
             state.feedback_armed
             & state.has_last_decision
-            & (state.armed_decision_id >= 0)
-            & (state.armed_decision_id <= state.last_decision_id)
-            & (state.armed_event_id >= 0)
-            & (state.armed_event_id <= state.last_event_id)
+            & (
+                state.armed_decision_id
+                == _words_to_int32_telemetry(state.armed_decision_words)
+            )
+            & (
+                state.armed_event_id
+                == _words_to_int32_telemetry(state.armed_event_words)
+            )
+            & _words_le(state.armed_decision_words, state.last_decision_words)
+            & _words_le(state.armed_event_words, state.last_event_words)
             & (state.armed_action >= 0)
             & (state.armed_action < cfg.n_actions)
             & (state.armed_partner_id >= 0)
@@ -822,6 +987,8 @@ class PartnerPolicyFusion:
         *,
         decision_id: Array,
         event_id: Array,
+        decision_words: Array,
+        event_words: Array,
         observation_id: Array,
         context_id: Array,
         context_features: Array,
@@ -838,6 +1005,9 @@ class PartnerPolicyFusion:
         for value in scalar_ints:
             if value.shape != () or value.dtype != jnp.int32:
                 raise ValueError("decision identities and actions must be scalar int32")
+        for value in (decision_words, event_words):
+            if value.shape != (2,) or value.dtype != jnp.uint32:
+                raise ValueError("exact decision identities must be uint32 arrays of shape (2,)")
         if context_features.shape != (cfg.context_dim,) or context_features.dtype != jnp.float32:
             raise ValueError("context_features has the wrong shape or dtype")
         if base_declared_score.shape != () or base_declared_score.dtype != jnp.float32:
@@ -867,6 +1037,14 @@ class PartnerPolicyFusion:
         for value in message_ints:
             if value.shape != (cfg.max_partners,) or value.dtype != jnp.int32:
                 raise ValueError("message integer fields have the wrong shape or dtype")
+        message_words = (
+            messages.issued_decision_words,
+            messages.issued_event_words,
+            messages.valid_through_event_words,
+        )
+        for value in message_words:
+            if value.shape != (cfg.max_partners, 2) or value.dtype != jnp.uint32:
+                raise ValueError("message exact identities have the wrong shape or dtype")
         message_floats = (messages.declared_confidence, messages.communication_cost)
         for value in message_floats:
             if value.shape != (cfg.max_partners,) or value.dtype != jnp.float32:
@@ -896,6 +1074,8 @@ class PartnerPolicyFusion:
         *,
         decision_id: Array,
         event_id: Array,
+        decision_words: Array,
+        event_words: Array,
         observation_id: Array,
         context_id: Array,
         context_features: Array,
@@ -922,6 +1102,8 @@ class PartnerPolicyFusion:
         self._validate_decision_static_contract(
             decision_id=decision_id,
             event_id=event_id,
+            decision_words=decision_words,
+            event_words=event_words,
             observation_id=observation_id,
             context_id=context_id,
             context_features=context_features,
@@ -933,15 +1115,19 @@ class PartnerPolicyFusion:
         )
         cfg = self._config
         state_valid = self._state_valid_predicate(state)
+        identity_telemetry_valid = (
+            (decision_id == _words_to_int32_telemetry(decision_words))
+            & (event_id == _words_to_int32_telemetry(event_words))
+        )
+        identity_order_valid = (~state.has_last_decision) | (
+            _words_lt(state.last_decision_words, decision_words)
+            & _words_lt(state.last_event_words, event_words)
+        )
         ids_valid = (
-            (decision_id >= 0)
-            & (event_id >= 0)
+            identity_telemetry_valid
+            & identity_order_valid
             & (observation_id >= 0)
             & (context_id >= 0)
-            & (
-                (~state.has_last_decision)
-                | ((decision_id > state.last_decision_id) & (event_id > state.last_event_id))
-            )
         )
         base_allowed = _safe_action_lookup(safety_action_mask, base_action, cfg.n_actions)
         base_score_valid = jnp.isfinite(base_declared_score) & (
@@ -976,28 +1162,43 @@ class PartnerPolicyFusion:
         message_binding_valid = (
             (messages.observation_id == observation_id)
             & (messages.context_id == context_id)
-            & (messages.issued_decision_id == decision_id)
+            & _words_eq(messages.issued_decision_words, decision_words)
         )
-        nonnegative_events = (
-            (messages.issued_event_id >= 0) & (messages.valid_through_event_id >= 0)
+        message_identity_telemetry_valid = (
+            (messages.issued_decision_id >= 0)
+            & (messages.issued_event_id >= 0)
+            & (messages.valid_through_event_id >= 0)
+            & (
+                messages.issued_decision_id
+                == _words_to_int32_telemetry(messages.issued_decision_words)
+            )
+            & (
+                messages.issued_event_id
+                == _words_to_int32_telemetry(messages.issued_event_words)
+            )
+            & (
+                messages.valid_through_event_id
+                == _words_to_int32_telemetry(messages.valid_through_event_words)
+            )
         )
-        ordered_horizon = nonnegative_events & (
-            messages.valid_through_event_id >= messages.issued_event_id
+        ordered_horizon = _words_le(
+            messages.issued_event_words,
+            messages.valid_through_event_words,
         )
-        # Select equal operands on unordered/sentinel rows before subtraction.
-        # On ordered non-negative int32 rows, the mathematical difference is
-        # in [0, INT32_MAX], including issued=INT32_MAX-1 and through=INT32_MAX.
         safe_horizon_start = jnp.where(
-            ordered_horizon,
-            messages.issued_event_id,
-            messages.valid_through_event_id,
+            ordered_horizon[:, None],
+            messages.issued_event_words,
+            messages.valid_through_event_words,
         )
-        horizon_width = messages.valid_through_event_id - safe_horizon_start
+        horizon_width = _ordered_words_difference(
+            safe_horizon_start,
+            messages.valid_through_event_words,
+        )
         horizon_valid = (
             ordered_horizon
-            & (messages.issued_event_id <= event_id)
-            & (event_id <= messages.valid_through_event_id)
-            & (horizon_width <= cfg.max_message_horizon)
+            & _words_le(messages.issued_event_words, event_words)
+            & _words_le(event_words, messages.valid_through_event_words)
+            & _words_at_most_python_uint64(horizon_width, cfg.max_message_horizon)
         )
         numeric_valid = (
             context_valid
@@ -1016,6 +1217,7 @@ class PartnerPolicyFusion:
         messages_valid = (
             messages.available
             & unique_partner
+            & message_identity_telemetry_valid
             & message_binding_valid
             & horizon_valid
             & numeric_valid
@@ -1206,9 +1408,17 @@ class PartnerPolicyFusion:
             has_last_decision=jnp.asarray(True, dtype=jnp.bool_),
             last_decision_id=decision_id,
             last_event_id=event_id,
+            last_decision_words=decision_words,
+            last_event_words=event_words,
             feedback_armed=state.feedback_armed | feedback_armed,
             armed_decision_id=jnp.where(feedback_armed, decision_id, state.armed_decision_id),
             armed_event_id=jnp.where(feedback_armed, event_id, state.armed_event_id),
+            armed_decision_words=jnp.where(
+                feedback_armed, decision_words, state.armed_decision_words
+            ),
+            armed_event_words=jnp.where(
+                feedback_armed, event_words, state.armed_event_words
+            ),
             armed_action=jnp.where(feedback_armed, effective_action, state.armed_action),
             armed_partner_id=jnp.where(
                 feedback_armed, selected_partner_id, state.armed_partner_id
@@ -1241,6 +1451,8 @@ class PartnerPolicyFusion:
         )
         availability = PartnerFusionAvailability(
             state_valid=state_valid,
+            decision_identity_telemetry_valid=identity_telemetry_valid,
+            decision_identity_order_valid=identity_order_valid,
             decision_identity_valid=ids_valid,
             base_action_available=base_allowed,
             base_declared_score_valid=base_score_valid,
@@ -1248,6 +1460,7 @@ class PartnerPolicyFusion:
             option_declared=option_proposal.available,
             option_valid=option_valid,
             messages_declared=messages.available,
+            messages_identity_telemetry_valid=message_identity_telemetry_valid,
             messages_binding_valid=message_binding_valid,
             messages_horizon_valid=horizon_valid,
             messages_numeric_valid=numeric_valid,
@@ -1285,6 +1498,8 @@ class PartnerPolicyFusion:
         decision = PartnerFusionDecision(
             decision_id=decision_id,
             event_id=event_id,
+            decision_words=decision_words,
+            event_words=event_words,
             observation_id=observation_id,
             context_id=context_id,
             counterfactual_base_action=base_action,
@@ -1314,6 +1529,108 @@ class PartnerPolicyFusion:
         )
         return PartnerFusionDecisionResult(state=next_state, decision=decision)
 
+    def _clear_feedback_owner(
+        self,
+        state: PartnerPolicyFusionState,
+    ) -> PartnerPolicyFusionState:
+        """Return ``state`` with only its armed recommendation made canonical."""
+
+        missing_i = jnp.asarray(-1, dtype=jnp.int32)
+        zero_words = jnp.zeros((2,), dtype=jnp.uint32)
+        return dataclasses.replace(  # type: ignore[type-var]
+            state,
+            feedback_armed=jnp.asarray(False, dtype=jnp.bool_),
+            armed_decision_id=missing_i,
+            armed_event_id=missing_i,
+            armed_decision_words=zero_words,
+            armed_event_words=zero_words,
+            armed_action=missing_i,
+            armed_partner_id=missing_i,
+            armed_route=missing_i,
+            armed_model_features=jnp.zeros(
+                (self._config.model_feature_dim,), dtype=jnp.float32
+            ),
+            armed_predicted_reliability=jnp.asarray(0.0, dtype=jnp.float32),
+        )
+
+    def cancel_pending_feedback(
+        self,
+        state: PartnerPolicyFusionState,
+        *,
+        cancellation_requested: bool | Array,
+        decision_words: Array,
+        event_words: Array,
+        effective_action: int | Array,
+        partner_id: int | Array,
+    ) -> PartnerFusionFeedbackCancellationResult:
+        """Cancel a recommendation that was not the action actually executed.
+
+        Cancellation is exact-owner cleanup, not realized feedback. It changes
+        no reliability parameter or counter. A stale/misattributed request or
+        invalid candidate is an exact whole-state no-op.
+        """
+
+        self._validate_state_static_contract(state)
+        requested = jnp.asarray(cancellation_requested)
+        if requested.shape != () or requested.dtype != jnp.bool_:
+            raise ValueError("cancellation_requested must be scalar bool")
+        expected_decision = jnp.asarray(decision_words)
+        expected_event = jnp.asarray(event_words)
+        for value in (expected_decision, expected_event):
+            if value.shape != (2,) or value.dtype != jnp.uint32:
+                raise ValueError(
+                    "cancellation identities must be uint32 shape-(2,) arrays"
+                )
+        expected_action = jnp.asarray(effective_action)
+        expected_partner = jnp.asarray(partner_id)
+        for value in (expected_action, expected_partner):
+            if value.shape != () or value.dtype != jnp.int32:
+                raise ValueError(
+                    "cancellation action and partner must be scalar int32"
+                )
+
+        state_valid = self._state_valid_predicate(state)
+        decision_matches = _words_eq(
+            expected_decision,
+            state.armed_decision_words,
+        )
+        event_matches = _words_eq(expected_event, state.armed_event_words)
+        action_matches = expected_action == state.armed_action
+        partner_matches = expected_partner == state.armed_partner_id
+        required = requested & state.feedback_armed
+        candidate = self._clear_feedback_owner(state)
+        candidate_valid = self._state_valid_predicate(candidate)
+        applied = (
+            state_valid
+            & required
+            & decision_matches
+            & event_matches
+            & action_matches
+            & partner_matches
+            & candidate_valid
+        )
+        final_state = cast(
+            PartnerPolicyFusionState,
+            jax.lax.cond(applied, lambda _: candidate, lambda _: state, operand=None),
+        )
+        return PartnerFusionFeedbackCancellationResult(
+            state=final_state,
+            state_valid_before=state_valid,
+            cancellation_requested=requested,
+            armed_record_available=state.feedback_armed,
+            decision_identity_matches=decision_matches,
+            event_identity_matches=event_matches,
+            action_matches=action_matches,
+            partner_matches=partner_matches,
+            cancellation_required=required,
+            candidate_state_valid=candidate_valid,
+            cancellation_applied=applied,
+            transaction_satisfied=state_valid & ((~required) | applied),
+            reliability_unchanged=jnp.asarray(True, dtype=jnp.bool_),
+            counters_unchanged=jnp.asarray(True, dtype=jnp.bool_),
+            learning_applied=jnp.asarray(False, dtype=jnp.bool_),
+        )
+
     def apply_feedback(
         self,
         state: PartnerPolicyFusionState,
@@ -1336,12 +1653,22 @@ class PartnerPolicyFusion:
         for value, dtype in scalar_contracts:
             if value.shape != () or value.dtype != dtype:
                 raise ValueError("feedback fields must be scalar with their declared dtype")
+        for value in (feedback.decision_words, feedback.executed_event_words):
+            if value.shape != (2,) or value.dtype != jnp.uint32:
+                raise ValueError("feedback exact identities must be uint32 shape-(2,) arrays")
 
         cfg = self._config
         state_valid = self._state_valid_predicate(state)
+        identity_telemetry_valid = (
+            (feedback.decision_id == _words_to_int32_telemetry(feedback.decision_words))
+            & (
+                feedback.executed_event_id
+                == _words_to_int32_telemetry(feedback.executed_event_words)
+            )
+        )
         identity_match = (
-            (feedback.decision_id == state.armed_decision_id)
-            & (feedback.executed_event_id == state.armed_event_id)
+            _words_eq(feedback.decision_words, state.armed_decision_words)
+            & _words_eq(feedback.executed_event_words, state.armed_event_words)
         )
         action_match = feedback.executed_action == state.armed_action
         partner_match = feedback.partner_id == state.armed_partner_id
@@ -1355,6 +1682,7 @@ class PartnerPolicyFusion:
             feedback.available
             & state_valid
             & state.feedback_armed
+            & identity_telemetry_valid
             & identity_match
             & action_match
             & partner_match
@@ -1403,28 +1731,16 @@ class PartnerPolicyFusion:
                 state.safe_feedback_counts[safe_partner],
             )
         )
-        missing_i = jnp.asarray(-1, dtype=jnp.int32)
-        proposed = PartnerPolicyFusionState(
-            reliability_weights=next_weights,
-            feedback_counts=next_feedback_counts,
-            safe_feedback_counts=next_safe_counts,
-            decision_count=state.decision_count,
-            feedback_applied_count=_saturating_increment(
-                state.feedback_applied_count, cfg.counter_cap
-            ),
-            has_last_decision=state.has_last_decision,
-            last_decision_id=state.last_decision_id,
-            last_event_id=state.last_event_id,
-            feedback_armed=jnp.asarray(False, dtype=jnp.bool_),
-            armed_decision_id=missing_i,
-            armed_event_id=missing_i,
-            armed_action=missing_i,
-            armed_partner_id=missing_i,
-            armed_route=missing_i,
-            armed_model_features=jnp.zeros(
-                (cfg.model_feature_dim,), dtype=jnp.float32
-            ),
-            armed_predicted_reliability=jnp.asarray(0.0, dtype=jnp.float32),
+        proposed = self._clear_feedback_owner(
+            dataclasses.replace(  # type: ignore[type-var]
+                state,
+                reliability_weights=next_weights,
+                feedback_counts=next_feedback_counts,
+                safe_feedback_counts=next_safe_counts,
+                feedback_applied_count=_saturating_increment(
+                    state.feedback_applied_count, cfg.counter_cap
+                ),
+            )
         )
         next_state = jax.tree_util.tree_map(
             lambda new, old: jnp.where(input_valid, new, old), proposed, state
@@ -1442,6 +1758,7 @@ class PartnerPolicyFusion:
             state=next_state,
             feedback_available=feedback.available,
             armed_record_available=state.feedback_armed,
+            identity_telemetry_valid=identity_telemetry_valid,
             identity_match=identity_match,
             action_match=action_match,
             partner_match=partner_match,
@@ -1460,6 +1777,8 @@ class PartnerPolicyFusion:
         *,
         decision_ids: Array,
         event_ids: Array,
+        decision_words: Array,
+        event_words: Array,
         observation_ids: Array,
         context_ids: Array,
         context_features: Array,
@@ -1478,6 +1797,10 @@ class PartnerPolicyFusion:
             decision_ids.dtype != jnp.int32
             or event_ids.shape != (length,)
             or event_ids.dtype != jnp.int32
+            or decision_words.shape != (length, 2)
+            or decision_words.dtype != jnp.uint32
+            or event_words.shape != (length, 2)
+            or event_words.dtype != jnp.uint32
             or observation_ids.shape != (length,)
             or observation_ids.dtype != jnp.int32
             or context_ids.shape != (length,)
@@ -1504,6 +1827,8 @@ class PartnerPolicyFusion:
                 Array,
                 Array,
                 Array,
+                Array,
+                Array,
                 OptionKeyboardProposal,
                 PartnerMessageBatch,
             ],
@@ -1512,14 +1837,16 @@ class PartnerPolicyFusion:
                 carry,
                 decision_id=inputs[0],
                 event_id=inputs[1],
-                observation_id=inputs[2],
-                context_id=inputs[3],
-                context_features=inputs[4],
-                base_action=inputs[5],
-                base_declared_score=inputs[6],
-                safety_action_mask=inputs[7],
-                option_proposal=inputs[8],
-                messages=inputs[9],
+                decision_words=inputs[2],
+                event_words=inputs[3],
+                observation_id=inputs[4],
+                context_id=inputs[5],
+                context_features=inputs[6],
+                base_action=inputs[7],
+                base_declared_score=inputs[8],
+                safety_action_mask=inputs[9],
+                option_proposal=inputs[10],
+                messages=inputs[11],
             )
             return result.state, result.decision
 
@@ -1529,6 +1856,8 @@ class PartnerPolicyFusion:
             (
                 decision_ids,
                 event_ids,
+                decision_words,
+                event_words,
                 observation_ids,
                 context_ids,
                 context_features,
@@ -1563,6 +1892,10 @@ class PartnerPolicyFusion:
         """Return a strict digest-bound JSON-compatible checkpoint."""
 
         self.validate_state(state)
+        if measure_partner_policy_fusion_state_nbytes(
+            state
+        ) != self.resource_budget.persistent_state_bytes:
+            raise ValueError("partner-fusion state violates its exact resource contract")
         construction = self.to_config()
         state_payload: dict[str, object] = {
             "reliability_weights": np.asarray(
@@ -1579,9 +1912,21 @@ class PartnerPolicyFusion:
             "has_last_decision": bool(jax.device_get(state.has_last_decision)),
             "last_decision_id": int(jax.device_get(state.last_decision_id)),
             "last_event_id": int(jax.device_get(state.last_event_id)),
+            "last_decision_words": np.asarray(
+                jax.device_get(state.last_decision_words), dtype=np.uint32
+            ).tolist(),
+            "last_event_words": np.asarray(
+                jax.device_get(state.last_event_words), dtype=np.uint32
+            ).tolist(),
             "feedback_armed": bool(jax.device_get(state.feedback_armed)),
             "armed_decision_id": int(jax.device_get(state.armed_decision_id)),
             "armed_event_id": int(jax.device_get(state.armed_event_id)),
+            "armed_decision_words": np.asarray(
+                jax.device_get(state.armed_decision_words), dtype=np.uint32
+            ).tolist(),
+            "armed_event_words": np.asarray(
+                jax.device_get(state.armed_event_words), dtype=np.uint32
+            ).tolist(),
             "armed_action": int(jax.device_get(state.armed_action)),
             "armed_partner_id": int(jax.device_get(state.armed_partner_id)),
             "armed_route": int(jax.device_get(state.armed_route)),
@@ -1594,6 +1939,7 @@ class PartnerPolicyFusion:
         }
         return {
             "schema": PARTNER_POLICY_FUSION_CHECKPOINT_SCHEMA,
+            "state_schema": PARTNER_POLICY_FUSION_STATE_SCHEMA,
             "mechanism_status": MECHANISM_STATUS,
             "scientific_promotion_allowed": SCIENTIFIC_PROMOTION_ALLOWED,
             "fusion": construction,
@@ -1618,6 +1964,20 @@ class PartnerPolicyFusion:
         return jnp.asarray(value, dtype=jnp.int32)
 
     @staticmethod
+    def _checkpoint_identity_words(value: object, *, name: str) -> Array:
+        """Parse one exact JSON uint32-word identity."""
+
+        try:
+            untyped = np.asarray(value, dtype=object)
+        except ValueError as error:
+            raise ValueError(f"{name} must be a two-word vector") from error
+        if untyped.shape != (2,) or any(type(item) is not int for item in untyped.flat):
+            raise ValueError(f"{name} must contain exactly two JSON integers")
+        if any(item < 0 or item > _UINT32_MAX for item in untyped.flat):
+            raise ValueError(f"{name} contains an out-of-range uint32 word")
+        return jnp.asarray(value, dtype=jnp.uint32)
+
+    @staticmethod
     def _checkpoint_float_array(value: object, *, shape: tuple[int, ...], name: str) -> Array:
         """Parse an exact finite JSON float32 array."""
 
@@ -1638,10 +1998,17 @@ class PartnerPolicyFusion:
         cls,
         checkpoint: Mapping[str, object],
     ) -> tuple[PartnerPolicyFusion, PartnerPolicyFusionState]:
-        """Strictly restore an exact v1 construction and state."""
+        """Strictly restore an exact-word v2 construction and state."""
+
+        if checkpoint.get("schema") == _LEGACY_PARTNER_POLICY_FUSION_CHECKPOINT_SCHEMA:
+            raise ValueError(
+                "legacy partner-fusion checkpoint v1 lacks exact identities; migrate "
+                "it with migrate_legacy_partner_policy_fusion_checkpoint"
+            )
 
         expected = {
             "schema",
+            "state_schema",
             "mechanism_status",
             "scientific_promotion_allowed",
             "fusion",
@@ -1651,9 +2018,12 @@ class PartnerPolicyFusion:
             "state_digest",
         }
         if set(checkpoint) != expected:
-            raise ValueError("checkpoint fields do not match partner-fusion v1")
-        if checkpoint.get("schema") != PARTNER_POLICY_FUSION_CHECKPOINT_SCHEMA:
+            raise ValueError("checkpoint fields do not match partner-fusion v2")
+        schema = checkpoint.get("schema")
+        if schema != PARTNER_POLICY_FUSION_CHECKPOINT_SCHEMA:
             raise ValueError("unexpected partner-fusion checkpoint schema")
+        if checkpoint.get("state_schema") != PARTNER_POLICY_FUSION_STATE_SCHEMA:
+            raise ValueError("unexpected partner-fusion checkpoint state schema")
         if checkpoint.get("mechanism_status") != MECHANISM_STATUS:
             raise ValueError("partner-fusion checkpoint must remain development L0")
         if checkpoint.get("scientific_promotion_allowed") is not False:
@@ -1678,9 +2048,13 @@ class PartnerPolicyFusion:
             "has_last_decision",
             "last_decision_id",
             "last_event_id",
+            "last_decision_words",
+            "last_event_words",
             "feedback_armed",
             "armed_decision_id",
             "armed_event_id",
+            "armed_decision_words",
+            "armed_event_words",
             "armed_action",
             "armed_partner_id",
             "armed_route",
@@ -1688,7 +2062,7 @@ class PartnerPolicyFusion:
             "armed_predicted_reliability",
         }
         if set(state_payload) != expected_state:
-            raise ValueError("checkpoint state fields do not match partner-fusion v1")
+            raise ValueError("checkpoint state fields do not match partner-fusion v2")
         cfg = fusion.config
 
         def scalar_int(name: str, *, allow_missing: bool) -> Array:
@@ -1733,9 +2107,25 @@ class PartnerPolicyFusion:
             has_last_decision=scalar_bool("has_last_decision"),
             last_decision_id=scalar_int("last_decision_id", allow_missing=True),
             last_event_id=scalar_int("last_event_id", allow_missing=True),
+            last_decision_words=cls._checkpoint_identity_words(
+                state_payload.get("last_decision_words"),
+                name="checkpoint state.last_decision_words",
+            ),
+            last_event_words=cls._checkpoint_identity_words(
+                state_payload.get("last_event_words"),
+                name="checkpoint state.last_event_words",
+            ),
             feedback_armed=scalar_bool("feedback_armed"),
             armed_decision_id=scalar_int("armed_decision_id", allow_missing=True),
             armed_event_id=scalar_int("armed_event_id", allow_missing=True),
+            armed_decision_words=cls._checkpoint_identity_words(
+                state_payload.get("armed_decision_words"),
+                name="checkpoint state.armed_decision_words",
+            ),
+            armed_event_words=cls._checkpoint_identity_words(
+                state_payload.get("armed_event_words"),
+                name="checkpoint state.armed_event_words",
+            ),
             armed_action=scalar_int("armed_action", allow_missing=True),
             armed_partner_id=scalar_int("armed_partner_id", allow_missing=True),
             armed_route=scalar_int("armed_route", allow_missing=True),
@@ -1750,14 +2140,211 @@ class PartnerPolicyFusion:
         return fusion, state
 
 
+def measure_partner_policy_fusion_state_nbytes(state: PartnerPolicyFusionState) -> int:
+    """Measure persistent JAX-array bytes in one partner-fusion state."""
+
+    return sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree.leaves(state)
+        if isinstance(leaf, Array)
+    )
+
+
+def _legacy_partner_policy_fusion_config(
+    payload: Mapping[str, object],
+) -> PartnerPolicyFusionConfig:
+    """Authenticate and reconstruct the exact legacy v1 config surface."""
+
+    converted = dict(payload)
+    if converted.get("schema") != _LEGACY_PARTNER_POLICY_FUSION_CONFIG_SCHEMA:
+        raise ValueError("legacy partner-fusion config schema is unsupported")
+    converted["schema"] = PARTNER_POLICY_FUSION_CONFIG_SCHEMA
+    config = PartnerPolicyFusionConfig.from_config(converted)
+    if config.max_message_horizon > _INT32_MAX:
+        raise ValueError("legacy max_message_horizon exceeds the historical int32 bound")
+    return config
+
+
+def _legacy_partner_policy_fusion_resource_budget(
+    fusion: PartnerPolicyFusion,
+) -> dict[str, int]:
+    """Reconstruct the exact v1 accounting record for migration authentication."""
+
+    budget = fusion.resource_budget.to_config()
+    exact_scalars = budget.pop("persistent_uint32_scalars")
+    budget.pop("decision_input_uint32_scalars")
+    budget.pop("feedback_input_uint32_scalars")
+    budget.pop("cancellation_input_int32_scalars")
+    budget.pop("cancellation_input_uint32_scalars")
+    budget.pop("cancellation_input_bool_scalars")
+    budget.pop("max_parameter_updates_per_cancellation")
+    budget.pop("max_counter_updates_per_cancellation")
+    budget["persistent_state_scalars"] -= exact_scalars
+    budget["persistent_state_bytes"] -= 4 * exact_scalars
+    return budget
+
+
+def migrate_legacy_partner_policy_fusion_checkpoint(
+    checkpoint: Mapping[str, object],
+) -> dict[str, object]:
+    """Migrate one authenticated, unsaturated v1 checkpoint to exact-word v2.
+
+    A v1 identity equal to signed-int32 saturation is ambiguous: it could be
+    the genuine identity ``INT32_MAX`` or any later identity hidden by
+    saturation.  Such checkpoints are rejected and must restart in a fresh
+    exact-identity namespace.
+    """
+
+    expected = {
+        "schema",
+        "mechanism_status",
+        "scientific_promotion_allowed",
+        "fusion",
+        "config_digest",
+        "resource_budget",
+        "state",
+        "state_digest",
+    }
+    if set(checkpoint) != expected:
+        raise ValueError("legacy partner-fusion checkpoint field manifest is not exact")
+    if checkpoint.get("schema") != _LEGACY_PARTNER_POLICY_FUSION_CHECKPOINT_SCHEMA:
+        raise ValueError("legacy partner-fusion checkpoint schema is unsupported")
+    if checkpoint.get("mechanism_status") != MECHANISM_STATUS:
+        raise ValueError("legacy partner-fusion checkpoint has invalid mechanism status")
+    if checkpoint.get("scientific_promotion_allowed") is not False:
+        raise ValueError("legacy partner-fusion checkpoint cannot claim promotion")
+    construction = checkpoint.get("fusion")
+    state_payload = checkpoint.get("state")
+    if not isinstance(construction, Mapping) or not isinstance(state_payload, Mapping):
+        raise ValueError("legacy checkpoint fusion and state must be mappings")
+    if checkpoint.get("config_digest") != _payload_digest(construction):
+        raise ValueError("legacy partner-fusion config digest mismatch")
+    if checkpoint.get("state_digest") != _payload_digest(state_payload):
+        raise ValueError("legacy partner-fusion state digest mismatch")
+    if set(construction) != {"type", "config"} or construction.get("type") != _FUSION_TYPE:
+        raise ValueError("legacy partner-fusion construction manifest is not exact")
+    config_payload = construction.get("config")
+    if not isinstance(config_payload, Mapping):
+        raise ValueError("legacy partner-fusion config must be a mapping")
+    fusion = PartnerPolicyFusion(_legacy_partner_policy_fusion_config(config_payload))
+    if checkpoint.get("resource_budget") != _legacy_partner_policy_fusion_resource_budget(
+        fusion
+    ):
+        raise ValueError("legacy partner-fusion resource budget is not exact")
+
+    expected_state = {
+        "reliability_weights",
+        "feedback_counts",
+        "safe_feedback_counts",
+        "decision_count",
+        "feedback_applied_count",
+        "has_last_decision",
+        "last_decision_id",
+        "last_event_id",
+        "feedback_armed",
+        "armed_decision_id",
+        "armed_event_id",
+        "armed_action",
+        "armed_partner_id",
+        "armed_route",
+        "armed_model_features",
+        "armed_predicted_reliability",
+    }
+    if set(state_payload) != expected_state:
+        raise ValueError("legacy partner-fusion state field manifest is not exact")
+    cfg = fusion.config
+
+    def scalar_int(name: str, *, allow_missing: bool, identity: bool = False) -> Array:
+        raw = state_payload.get(name)
+        lower = -1 if allow_missing else 0
+        upper = _INT32_MAX - 1 if identity else _INT32_MAX
+        if type(raw) is not int or not lower <= raw <= upper:
+            suffix = " or is saturated and ambiguous" if identity else ""
+            raise ValueError(f"legacy state.{name} is invalid{suffix}")
+        return jnp.asarray(raw, dtype=jnp.int32)
+
+    def scalar_bool(name: str) -> Array:
+        raw = state_payload.get(name)
+        if type(raw) is not bool:
+            raise ValueError(f"legacy state.{name} must be a JSON boolean")
+        return jnp.asarray(raw, dtype=jnp.bool_)
+
+    def identity_words(name: str) -> Array:
+        raw = state_payload.get(name)
+        if type(raw) is not int or not -1 <= raw < _INT32_MAX:
+            raise ValueError(f"legacy state.{name} is saturated or invalid")
+        return (
+            jnp.zeros((2,), dtype=jnp.uint32)
+            if raw == -1
+            else partner_policy_fusion_identity_words(raw)
+        )
+
+    predicted = state_payload.get("armed_predicted_reliability")
+    if type(predicted) is not float:
+        raise ValueError("legacy armed_predicted_reliability must be a JSON float")
+    parsed_predicted = np.float32(predicted)
+    if not np.isfinite(parsed_predicted):
+        raise ValueError("legacy armed_predicted_reliability must be finite float32")
+    migrated_state = PartnerPolicyFusionState(
+        reliability_weights=PartnerPolicyFusion._checkpoint_float_array(
+            state_payload.get("reliability_weights"),
+            shape=(cfg.max_partners, cfg.model_feature_dim),
+            name="legacy state.reliability_weights",
+        ),
+        feedback_counts=PartnerPolicyFusion._checkpoint_int_vector(
+            state_payload.get("feedback_counts"),
+            length=cfg.max_partners,
+            name="legacy state.feedback_counts",
+        ),
+        safe_feedback_counts=PartnerPolicyFusion._checkpoint_int_vector(
+            state_payload.get("safe_feedback_counts"),
+            length=cfg.max_partners,
+            name="legacy state.safe_feedback_counts",
+        ),
+        decision_count=scalar_int("decision_count", allow_missing=False),
+        feedback_applied_count=scalar_int(
+            "feedback_applied_count", allow_missing=False
+        ),
+        has_last_decision=scalar_bool("has_last_decision"),
+        last_decision_id=scalar_int(
+            "last_decision_id", allow_missing=True, identity=True
+        ),
+        last_event_id=scalar_int("last_event_id", allow_missing=True, identity=True),
+        last_decision_words=identity_words("last_decision_id"),
+        last_event_words=identity_words("last_event_id"),
+        feedback_armed=scalar_bool("feedback_armed"),
+        armed_decision_id=scalar_int(
+            "armed_decision_id", allow_missing=True, identity=True
+        ),
+        armed_event_id=scalar_int("armed_event_id", allow_missing=True, identity=True),
+        armed_decision_words=identity_words("armed_decision_id"),
+        armed_event_words=identity_words("armed_event_id"),
+        armed_action=scalar_int("armed_action", allow_missing=True),
+        armed_partner_id=scalar_int("armed_partner_id", allow_missing=True),
+        armed_route=scalar_int("armed_route", allow_missing=True),
+        armed_model_features=PartnerPolicyFusion._checkpoint_float_array(
+            state_payload.get("armed_model_features"),
+            shape=(cfg.model_feature_dim,),
+            name="legacy state.armed_model_features",
+        ),
+        armed_predicted_reliability=jnp.asarray(parsed_predicted, dtype=jnp.float32),
+    )
+    fusion.validate_state(migrated_state)
+    return fusion.checkpoint_payload(migrated_state)
+
+
 __all__ = [
     "MECHANISM_STATUS",
     "PARTNER_POLICY_FUSION_CHECKPOINT_SCHEMA",
     "PARTNER_POLICY_FUSION_CONFIG_SCHEMA",
+    "PARTNER_POLICY_FUSION_EXACT_IDENTITY_DELTA_NBYTES",
+    "PARTNER_POLICY_FUSION_EXACT_IDENTITY_NBYTES",
+    "PARTNER_POLICY_FUSION_STATE_SCHEMA",
     "PartnerFusionAvailability",
     "PartnerFusionDecision",
     "PartnerFusionDecisionResult",
     "PartnerFusionFeedbackResult",
+    "PartnerFusionFeedbackCancellationResult",
     "PartnerFusionScoreAudit",
     "PartnerFusionShieldResult",
     "PartnerMessageBatch",
@@ -1779,4 +2366,7 @@ __all__ = [
     "SOURCE_OPTION_KEYBOARD",
     "SOURCE_PARTNER",
     "OptionKeyboardProposal",
+    "measure_partner_policy_fusion_state_nbytes",
+    "migrate_legacy_partner_policy_fusion_checkpoint",
+    "partner_policy_fusion_identity_words",
 ]

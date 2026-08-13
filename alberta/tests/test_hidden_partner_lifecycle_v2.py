@@ -171,7 +171,11 @@ def test_manual_v5_trace_fail_closes_on_current_conditional_probe_source() -> No
     assert not audit.candidate_reacquisition_contract_valid
     assert audit.durable_memory_contract_valid
     assert not audit.lifecycle_contract_valid
-    assert audit.resource_contract_valid
+    assert result.summary.initial_state_nbytes == 6_833
+    assert result.summary.final_state_nbytes == 6_833
+    assert result.initial_resource.total_state_nbytes == 6_833
+    assert result.final_resource.total_state_nbytes == 6_833
+    assert not audit.resource_contract_valid
     assert not audit.all_contracts_valid
     assert np.any(audit.feature_violation_bits)
     assert np.any(audit.candidate_violation_bits)

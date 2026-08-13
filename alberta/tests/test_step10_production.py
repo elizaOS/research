@@ -273,6 +273,8 @@ def test_step10_off_policy_intra_option_importance_ratio_is_clipped() -> None:
     q_weights = state.option_policies.q_weights.at[0, 1, 0].set(1.0)
     state = state.replace(
         base_last_obs=jnp.array([1.0, 0.0], dtype=jnp.float32),
+        base_last_action=jnp.array(2, dtype=jnp.int32),
+        last_primitive_action=jnp.array(1, dtype=jnp.int32),
         executing_option=jnp.array(0, dtype=jnp.int32),
         option_last_intra_action=jnp.array(1, dtype=jnp.int32),
         option_policies=state.option_policies.replace(q_weights=q_weights),
@@ -308,8 +310,10 @@ def test_option_terminates_when_threshold_exceeded() -> None:
 
     # Force option execution by injecting executing_option=0 into state
     state_with_option = state.replace(
+        base_last_action=jnp.array(2, dtype=jnp.int32),
         executing_option=jnp.array(0, dtype=jnp.int32),
         option_start_obs=jnp.zeros(2, dtype=jnp.float32),
+        option_last_intra_action=state.last_primitive_action,
         option_steps=jnp.array(0, dtype=jnp.int32),
         option_cumreward=jnp.array(0.0, dtype=jnp.float32),
         option_discount=jnp.array(1.0, dtype=jnp.float32),

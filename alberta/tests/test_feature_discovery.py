@@ -535,6 +535,67 @@ def test_curation_priority_override_changes_only_forced_transaction_selection() 
     )
 
 
+@pytest.mark.parametrize("unready_cohort", ["active", "candidate"])
+def test_curation_priority_override_reserved_ranks_are_ineligible(
+    unready_cohort: str,
+) -> None:
+    learner = FixedBudgetInteractionLearner(
+        n_features=2,
+        n_tasks=1,
+        step_size_output=0.0,
+        utility_decay=0.999,
+        replacement_interval=1,
+        min_feature_age=0,
+        candidate_count=2,
+        candidate_min_age=0,
+        promotion_margin=1.0,
+        refresh_candidates=False,
+        refresh_promoted_candidate=False,
+        use_obgd=False,
+    )
+    state = learner.init(feature_dim=4, key=jr.key(706)).replace(
+        feature_left=jnp.asarray((0, 0), dtype=jnp.int32),
+        feature_right=jnp.asarray((1, 2), dtype=jnp.int32),
+        utilities=jnp.asarray((0.0, 0.1), dtype=jnp.float32),
+        ages=jnp.asarray((5, 5), dtype=jnp.int32),
+        candidate_left=jnp.asarray((1, 0), dtype=jnp.int32),
+        candidate_right=jnp.asarray((2, 3), dtype=jnp.int32),
+        candidate_utilities=jnp.asarray((100.0, 20.0), dtype=jnp.float32),
+        candidate_ages=jnp.asarray((5, 5), dtype=jnp.int32),
+    )
+    maximum = jnp.asarray(jnp.finfo(jnp.float32).max, dtype=jnp.float32)
+    override = InteractionCurationPriorityOverride(
+        enabled=jnp.asarray(True, dtype=jnp.bool_),
+        active_ranks=(
+            jnp.full((2,), maximum, dtype=jnp.float32)
+            if unready_cohort == "active"
+            else jnp.asarray((0.0, 0.1), dtype=jnp.float32)
+        ),
+        candidate_ranks=(
+            jnp.full((2,), -maximum, dtype=jnp.float32)
+            if unready_cohort == "candidate"
+            else jnp.asarray((1.0, 0.5), dtype=jnp.float32)
+        ),
+    )
+
+    result = learner.update(
+        state,
+        jnp.ones((4,), dtype=jnp.float32),
+        jnp.zeros((1,), dtype=jnp.float32),
+        curation_priority_override=override,
+    )
+
+    assert bool(result.curation_attempted)
+    assert bool(result.curation_priority_override_applied)
+    assert int(result.replaced_slot) == -1
+    assert int(result.promoted_candidate) == -1
+    if unready_cohort == "active":
+        assert int(result.curation_selected_active_worst_slot) == -1
+    else:
+        assert int(result.curation_selected_promotion_candidate) == -1
+    chex.assert_trees_all_equal(result.state, result.pre_curation_state)
+
+
 def test_curation_priority_override_controls_candidate_refresh_argmin() -> None:
     learner = FixedBudgetInteractionLearner(
         n_features=1,
@@ -972,6 +1033,7 @@ def test_interaction_age_and_step_counters_saturate_without_replacement() -> Non
             maximum,
         ),
         step_count=maximum,
+        step_words=jnp.asarray((0, 2**31 - 1), dtype=jnp.uint32),
     )
 
     result = learner.update(
@@ -2242,33 +2304,38 @@ class TestFixedBudgetInteractionLearner:
 
         positive = jitted_update(interrupted.state, observation, positive_target)
         assert int(positive.state.candidate_promotion_evidence_streak[0]) == 1
+        corrupt_candidate = positive.state.replace(
+            candidate_output_weights=jnp.array([[jnp.nan]], dtype=jnp.float32)
+        )
         nonfinite = jitted_update(
-            positive.state.replace(
-                candidate_output_weights=jnp.array([[jnp.nan]], dtype=jnp.float32)
-            ),
+            corrupt_candidate,
             observation,
             positive_target,
         )
         assert float(nonfinite.candidate_promotion_signal[0]) == 0.0
         assert not bool(nonfinite.candidate_promotion_raw_evidence[0])
-        assert int(nonfinite.state.candidate_promotion_evidence_streak[0]) == 0
+        assert not bool(nonfinite.state_valid)
+        assert not bool(nonfinite.update_applied)
+        assert bool(nonfinite.update_rejected)
+        chex.assert_trees_all_equal(nonfinite.state, corrupt_candidate)
+        assert int(nonfinite.state.candidate_promotion_evidence_streak[0]) == 1
         assert bool(nonfinite.state.candidate_reacquisition_required[0])
 
         state = nonfinite.state.replace(
             candidate_output_weights=jnp.array([[0.5]], dtype=jnp.float32)
         )
         final_results = []
-        for _ in range(4):
+        for _ in range(3):
             result = jitted_update(state, observation, positive_target)
             final_results.append(result)
             state = result.state
 
-        assert int(final_results[2].promoted_candidate) == -1
-        assert not bool(final_results[2].candidate_reacquisition_confirmed[0])
-        assert int(final_results[3].candidate_promotion_evidence_streak_updated[0]) == 4
-        assert bool(final_results[3].candidate_reacquisition_confirmed[0])
-        assert int(final_results[3].promoted_candidate) == 0
-        assert not bool(final_results[3].state.candidate_reacquisition_required[0])
+        assert int(final_results[1].promoted_candidate) == -1
+        assert not bool(final_results[1].candidate_reacquisition_confirmed[0])
+        assert int(final_results[2].candidate_promotion_evidence_streak_updated[0]) == 4
+        assert bool(final_results[2].candidate_reacquisition_confirmed[0])
+        assert int(final_results[2].promoted_candidate) == 0
+        assert not bool(final_results[2].state.candidate_reacquisition_required[0])
 
     def test_unrelated_lower_utility_candidate_can_win_during_reacquisition(self) -> None:
         learner = FixedBudgetInteractionLearner(
@@ -2495,12 +2562,22 @@ class TestFixedBudgetInteractionLearner:
         assert int(saturated.promoted_candidate) == 0
         assert int(saturated.state.candidate_promotion_evidence_streak[0]) == 0
 
-        for adversarial_value in (
-            jnp.asarray(-0.0, dtype=jnp.float32),
-            jnp.nan,
-            jnp.inf,
-            -jnp.inf,
-        ):
+        adversarial = base.replace(
+            candidate_output_weights=base.candidate_output_weights.at[0, 0].set(
+                jnp.asarray(-0.0, dtype=jnp.float32)
+            )
+        )
+        result = jitted_update(adversarial, observation, target)
+        assert float(result.candidate_promotion_signal[0]) == 0.0
+        assert bool(jnp.isfinite(result.candidate_promotion_signal[0]))
+        assert not bool(result.candidate_promotion_raw_evidence[0])
+        assert int(result.candidate_promotion_evidence_streak_updated[0]) == 0
+        assert int(result.state.candidate_promotion_evidence_streak[0]) == 0
+        assert int(
+            np.asarray(result.state.candidate_output_weights[0, 0]).view(np.uint32)
+        ) == 0
+
+        for adversarial_value in (jnp.nan, jnp.inf, -jnp.inf):
             adversarial = base.replace(
                 candidate_output_weights=base.candidate_output_weights.at[0, 0].set(
                     adversarial_value
@@ -2510,13 +2587,12 @@ class TestFixedBudgetInteractionLearner:
             assert float(result.candidate_promotion_signal[0]) == 0.0
             assert bool(jnp.isfinite(result.candidate_promotion_signal[0]))
             assert not bool(result.candidate_promotion_raw_evidence[0])
-            assert int(result.candidate_promotion_evidence_streak_updated[0]) == 0
-            assert int(result.state.candidate_promotion_evidence_streak[0]) == 0
-            assert int(
-                np.asarray(result.state.candidate_output_weights[0, 0]).view(
-                    np.uint32
-                )
-            ) == 0
+            assert not bool(result.state_valid)
+            assert not bool(result.update_applied)
+            assert bool(result.update_rejected)
+            assert int(result.candidate_promotion_evidence_streak_updated[0]) == 2
+            assert int(result.state.candidate_promotion_evidence_streak[0]) == 2
+            chex.assert_trees_all_equal(result.state, adversarial)
 
         invalid = jitted_update(
             base.replace(
@@ -2726,7 +2802,7 @@ class TestFixedBudgetInteractionLearner:
         reference_prediction = learner.predict(base, observation, closed)
         reference = learner.update(base, observation, target, closed)
         max_float = jnp.asarray(jnp.finfo(jnp.float32).max, dtype=jnp.float32)
-        for closed_value in (jnp.nan, jnp.inf, -jnp.inf, max_float):
+        for closed_value in (jnp.nan, jnp.inf, -jnp.inf):
             adversarial = base.replace(
                 output_weights=base.output_weights.at[0, 0].set(closed_value)
             )
@@ -2738,29 +2814,35 @@ class TestFixedBudgetInteractionLearner:
                 closed,
             )
             chex.assert_trees_all_equal(reference_prediction, adversarial_prediction)
-            chex.assert_trees_all_equal(
-                reference.predictions,
-                adversarial_result.predictions,
-            )
-            chex.assert_trees_all_equal(reference.errors, adversarial_result.errors)
-            chex.assert_trees_all_equal(
-                reference.relevance_probe_errors,
-                adversarial_result.relevance_probe_errors,
-            )
-            chex.assert_trees_all_equal(
-                reference.relevance_probe_scores,
-                adversarial_result.relevance_probe_scores,
-            )
-            chex.assert_trees_all_equal(
-                reference.state.relevance_probe_weights,
-                adversarial_result.state.relevance_probe_weights,
-            )
-            chex.assert_trees_all_equal(
-                reference.state.relevance_probe_biases,
-                adversarial_result.state.relevance_probe_biases,
-            )
-            assert bool(jnp.all(jnp.isfinite(adversarial_result.relevance_probe_errors)))
-            assert bool(jnp.all(jnp.isfinite(adversarial_result.relevance_probe_scores)))
+            assert not bool(adversarial_result.state_valid)
+            assert not bool(adversarial_result.update_applied)
+            assert bool(adversarial_result.update_rejected)
+            assert bool(jnp.isnan(adversarial_result.predictions[0]))
+            chex.assert_trees_all_equal(adversarial_result.state, adversarial)
+
+        finite_closed = base.replace(
+            output_weights=base.output_weights.at[0, 0].set(max_float)
+        )
+        finite_closed_prediction = learner.predict(finite_closed, observation, closed)
+        finite_closed_result = learner.update(
+            finite_closed,
+            observation,
+            target,
+            closed,
+        )
+        chex.assert_trees_all_equal(reference_prediction, finite_closed_prediction)
+        chex.assert_trees_all_equal(reference.predictions, finite_closed_result.predictions)
+        chex.assert_trees_all_equal(reference.errors, finite_closed_result.errors)
+        chex.assert_trees_all_equal(
+            reference.relevance_probe_errors,
+            finite_closed_result.relevance_probe_errors,
+        )
+        chex.assert_trees_all_equal(
+            reference.relevance_probe_scores,
+            finite_closed_result.relevance_probe_scores,
+        )
+        assert bool(finite_closed_result.state_valid)
+        assert bool(finite_closed_result.update_applied)
 
         for open_value in (max_float, jnp.inf):
             overflowing = base.replace(

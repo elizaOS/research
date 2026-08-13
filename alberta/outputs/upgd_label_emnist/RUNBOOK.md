@@ -72,6 +72,38 @@ overwrite): after interruption, relaunch only missing shards. An interim
 artifact over a shard subset uses `--allow-incomplete` and a *new* output name;
 never overwrite a published artifact.
 
+## v2 — EMA input-conditioning transfer arms (2026-08-02)
+
+Plan (immutable, seeds 100,101,102 — deliberately the v1 seeds so per-seed
+paired deltas against the v1 `upgd_w` arm are meaningful):
+`outputs/upgd_label_emnist/plan.v2.json`
+plan_sha256 `8fe978266c7638bf84e907d026df0bf1acef8c252c3ce7a51534d2f6606baa7d`
+
+Arms (factories are the pinned IPMNIST screening-lane implementations,
+`ipmnist_screening._make_upgd_ema_norm_learner` / `_make_sgd_ema_norm_learner`;
+norm_decay=0.999, norm_epsilon=1e-8):
+
+- **upgd_ema_norm** — published EMNIST UPGD-W (lr=0.01, beta_utility=0.9,
+  sigma=0.001, wd=0.0) behind the EMA input normalizer.
+- **upgd_ema_norm_sigma0** — same, noise_std=0.
+- **sgd_ema_norm** — bare-conditioning control: plain SGD (lr=0.01, wd=0.0 —
+  matched to the published EMNIST UPGD-W decay; the IPMNIST screening arm used
+  0.01 to match that protocol) behind the same normalizer.
+
+**Pre-registered prediction** (recorded in the immutable plan notes BEFORE any
+v2 shard ran): L/P EMNIST inputs are STATIONARY (labels permute, pixels never
+do), so conditioning should transfer only weakly — `upgd_ema_norm` within
+~±0.02 of v1 `upgd_w` (0.6715), far below the +0.061 IPMNIST effect;
+`upgd_ema_norm_sigma0` ≈ `upgd_ema_norm`; `sgd_ema_norm` collapses toward the
+plain-optimizer band (~0.2–0.4) because the utility gate/consolidation does
+the heavy lifting under label recurrence. A near-null conditioning effect
+CONFIRMS the mechanism reading: conditioning fixes input non-stationarity,
+not label non-stationarity.
+
+Shards: `partials_v2/<learner>_seed<seed>.json` (9 total), same shard CLI as
+v1 with `--plan outputs/upgd_label_emnist/plan.v2.json`. Merge writes
+`results.v2.json` (v1 artifact untouched).
+
 ## Evidence policy
 
 Permanently nonpromoting development replication diagnostic: self-recorded

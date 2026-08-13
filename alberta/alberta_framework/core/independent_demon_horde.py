@@ -34,20 +34,28 @@ Reference: Sutton et al. 2011, "Horde: A Scalable Real-time Architecture
 for Learning Knowledge from Unsupervised Sensorimotor Interaction"
 """
 
+import dataclasses
 import functools
 import time
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float, UInt
 
 from alberta_framework.core.horde import HordeUpdateResult
 from alberta_framework.core.initializers import sparse_init
 from alberta_framework.core.learners import AnyOptimizer
-from alberta_framework.core.normalizers import Normalizer
+from alberta_framework.core.normalizers import (
+    Normalizer,
+    _checked_lifetime_words_increment,
+    _lifetime_counter_valid,
+    _saturating_int32_counter_increment,
+    migrate_legacy_normalizer_state,
+)
 from alberta_framework.core.optimizers import LMS, Bounder
 from alberta_framework.core.types import (
     AutostepParamState,
@@ -59,6 +67,36 @@ from alberta_framework.core.types import (
     MLPParams,
     TraceMode,
 )
+
+INDEPENDENT_DEMON_HORDE_STATE_SCHEMA = "alberta.independent-demon-horde-state.v2"
+INDEPENDENT_DEMON_HORDE_LIFETIME_COUNTER_NBYTES = 12
+INDEPENDENT_DEMON_HORDE_LIFETIME_COUNTER_DELTA_NBYTES = 8
+
+_INT32_MAX = 2**31 - 1
+
+
+def _tree_arrays_finite(tree: Any) -> Bool[Array, ""]:
+    """Return whether every persistent floating/complex array is finite."""
+
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for leaf in jax.tree.leaves(tree):
+        if isinstance(leaf, Array) and jnp.issubdtype(leaf.dtype, jnp.inexact):
+            valid = valid & jnp.all(jnp.isfinite(leaf))
+    return valid
+
+
+def _source_valid(
+    observation: Array,
+    cumulants: Array,
+    next_observation: Array,
+) -> Bool[Array, ""]:
+    """Validate inputs while preserving NaN as the inactive-demon sentinel."""
+
+    return (
+        jnp.all(jnp.isfinite(observation))
+        & jnp.all(jnp.isfinite(next_observation))
+        & jnp.all(jnp.isfinite(cumulants) | jnp.isnan(cumulants))
+    )
 
 # =============================================================================
 # Types
@@ -77,13 +115,17 @@ class IndependentDemonHordeState:
     Attributes:
         demon_states: Per-demon ``MLPLearnerState`` (one entry per
             demon). Length equals ``n_demons``.
-        step_count: Scalar step counter shared by all demons.
+        step_count: Saturating int32 compatibility telemetry.
+        step_words: Exact big-endian ``[high, low]`` uint32 event identity.
+            The legacy per-demon MLP states do not yet own exact clocks; their
+            int32 counters remain per-active-update telemetry.
         birth_timestamp: Wall-clock seconds at construction.
         uptime_s: Cumulative wall-clock seconds spent in scan loops.
     """
 
     demon_states: tuple[MLPLearnerState, ...]
     step_count: Array = None  # type: ignore[assignment]
+    step_words: UInt[Array, " 2"] = None  # type: ignore[assignment]
     birth_timestamp: float = 0.0
     uptime_s: float = 0.0
 
@@ -263,6 +305,7 @@ class IndependentDemonHorde:
         """
         return {
             "type": "IndependentDemonHorde",
+            "state_schema": INDEPENDENT_DEMON_HORDE_STATE_SCHEMA,
             "horde_spec": self._horde_spec.to_config(),
             "hidden_sizes": list(self._hidden_sizes),
             "optimizer": self._optimizer.to_config(),
@@ -301,6 +344,14 @@ class IndependentDemonHorde:
 
         config = dict(config)
         config.pop("type", None)
+        state_schema = config.pop(
+            "state_schema",
+            INDEPENDENT_DEMON_HORDE_STATE_SCHEMA,
+        )
+        if state_schema != INDEPENDENT_DEMON_HORDE_STATE_SCHEMA:
+            raise ValueError(
+                f"Unsupported independent Horde state schema: {state_schema!r}"
+            )
 
         horde_spec = HordeSpec.from_config(config.pop("horde_spec"))
         optimizer = optimizer_from_config(config.pop("optimizer"))
@@ -415,6 +466,7 @@ class IndependentDemonHorde:
         return IndependentDemonHordeState(
             demon_states=demon_states,
             step_count=jnp.array(0, dtype=jnp.int32),
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
             birth_timestamp=time.time(),
             uptime_s=0.0,
         )
@@ -616,7 +668,11 @@ class IndependentDemonHorde:
             optimizer_states=masked_opt_states,
             traces=masked_traces,
             normalizer_state=masked_normalizer_state,
-            step_count=demon_state.step_count + jnp.where(active, 1, 0),
+            step_count=jnp.where(
+                active,
+                _saturating_int32_counter_increment(demon_state.step_count),
+                demon_state.step_count,
+            ),
             birth_timestamp=demon_state.birth_timestamp,
             uptime_s=demon_state.uptime_s,
         )
@@ -629,6 +685,70 @@ class IndependentDemonHorde:
         reported_error = jnp.where(active, target - prediction_val, jnp.nan)
         reported_mean_ss = jnp.where(active, mean_ss, jnp.nan)
         return new_state, prediction_val, reported_error, reported_mean_ss
+
+    def _child_clock_status(
+        self,
+        demon_states: tuple[MLPLearnerState, ...],
+        active_mask: Array,
+    ) -> tuple[
+        Bool[Array, ""],
+        Bool[Array, ""],
+        Bool[Array, ""],
+        Bool[Array, ""],
+    ]:
+        """Validate legacy child telemetry and every exact normalizer clock.
+
+        ``MLPLearnerState`` itself still lacks an exact lifetime identity.  Its
+        scalar counter is therefore compatibility telemetry only.  A configured
+        normalizer does own an exact per-active-update clock, which must agree
+        with that telemetry and have capacity for every active demon.
+        """
+
+        child_valid = jnp.asarray(True, dtype=jnp.bool_)
+        normalizer_aligned = jnp.asarray(True, dtype=jnp.bool_)
+        lifetime_capacity = jnp.asarray(True, dtype=jnp.bool_)
+        estimator_capacity = jnp.asarray(True, dtype=jnp.bool_)
+        for index, demon_state in enumerate(demon_states):
+            if getattr(demon_state.step_count, "shape", None) != ():
+                raise ValueError("independent demon step_count must be scalar")
+            if getattr(demon_state.step_count, "dtype", None) != jnp.dtype(jnp.int32):
+                raise TypeError("independent demon step_count must have dtype int32")
+            child_valid = child_valid & (demon_state.step_count >= 0)
+            active = active_mask[index]
+            if self._normalizer is None:
+                child_valid = child_valid & jnp.asarray(
+                    demon_state.normalizer_state is None,
+                    dtype=jnp.bool_,
+                )
+                continue
+            if demon_state.normalizer_state is None:
+                child_valid = child_valid & jnp.asarray(False, dtype=jnp.bool_)
+                normalizer_aligned = normalizer_aligned & jnp.asarray(
+                    False,
+                    dtype=jnp.bool_,
+                )
+                lifetime_capacity = lifetime_capacity & ~active
+                estimator_capacity = estimator_capacity & ~active
+                continue
+            status = self._normalizer.counter_status(demon_state.normalizer_state)
+            aligned = status.counter_valid & _lifetime_counter_valid(
+                demon_state.normalizer_state.sample_count_words,
+                demon_state.step_count,
+            )
+            normalizer_aligned = normalizer_aligned & aligned
+            child_valid = child_valid & aligned
+            lifetime_capacity = lifetime_capacity & (
+                (~active) | status.lifetime_capacity_available
+            )
+            estimator_capacity = estimator_capacity & (
+                (~active) | status.estimator_capacity_available
+            )
+        return (
+            child_valid,
+            normalizer_aligned,
+            lifetime_capacity,
+            estimator_capacity,
+        )
 
     # -------------------------------------------------------------------------
     # Public predict / update
@@ -683,8 +803,29 @@ class IndependentDemonHorde:
             ``IndependentDemonHordeState``.
         """
         n_demons = self.n_demons
+        if len(state.demon_states) != n_demons:
+            raise ValueError(
+                "independent Horde demon-state count does not match its specification"
+            )
+        if getattr(observation, "shape", None) != getattr(
+            next_observation, "shape", None
+        ):
+            raise ValueError("observation and next_observation shapes must match")
+        if getattr(cumulants, "shape", None) != (n_demons,):
+            raise ValueError(f"cumulants must have shape ({n_demons},)")
+
         gammas = self._horde_spec.gammas
         lamdas = self._horde_spec.lamdas
+        outer_valid = _lifetime_counter_valid(state.step_words, state.step_count)
+        proposed_words, outer_capacity = _checked_lifetime_words_increment(
+            state.step_words
+        )
+        transition_source_valid = _source_valid(
+            observation,
+            cumulants,
+            next_observation,
+        )
+        state_valid = _tree_arrays_finite(state)
 
         # 1. Per-demon V(s') for bootstrapping (each demon uses its OWN net)
         next_preds = jnp.stack(
@@ -702,6 +843,12 @@ class IndependentDemonHorde:
         # 3. Active mask (NaN cumulant -> inactive)
         active_mask = ~jnp.isnan(cumulants)
         safe_targets = jnp.where(active_mask, targets, 0.0)
+        (
+            children_pre_valid,
+            normalizer_pre_aligned,
+            child_lifetime_capacity,
+            estimator_capacity,
+        ) = self._child_clock_status(state.demon_states, active_mask)
 
         # 4. Per-demon update
         new_demon_states: list[MLPLearnerState] = []
@@ -735,12 +882,50 @@ class IndependentDemonHorde:
 
         # NaN-out td_targets for inactive demons to match HordeLearner.
         reported_targets = jnp.where(active_mask, targets, jnp.nan)
+        reported_values_valid = (
+            jnp.all(jnp.isfinite(predictions))
+            & jnp.all((~active_mask) | jnp.isfinite(td_errors))
+            & jnp.all((~active_mask) | jnp.isfinite(reported_targets))
+            & jnp.all(
+                (~active_mask[:, None]) | jnp.isfinite(per_demon_metrics)
+            )
+        )
 
-        new_state = IndependentDemonHordeState(
+        candidate_state = IndependentDemonHordeState(
             demon_states=tuple(new_demon_states),
-            step_count=state.step_count + 1,
+            step_count=_saturating_int32_counter_increment(state.step_count),
+            step_words=proposed_words,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
+        )
+        (
+            children_post_valid,
+            normalizer_post_aligned,
+            ignored_post_lifetime_capacity,
+            ignored_post_estimator_capacity,
+        ) = self._child_clock_status(candidate_state.demon_states, active_mask)
+        del ignored_post_lifetime_capacity, ignored_post_estimator_capacity
+        candidate_valid = (
+            _tree_arrays_finite(candidate_state)
+            & children_post_valid
+            & normalizer_post_aligned
+            & reported_values_valid
+        )
+        lifetime_capacity_available = outer_capacity & child_lifetime_capacity
+        update_applied = (
+            outer_valid
+            & lifetime_capacity_available
+            & transition_source_valid
+            & state_valid
+            & normalizer_pre_aligned
+            & estimator_capacity
+            & candidate_valid
+        )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda _: candidate_state,
+            lambda _: state,
+            operand=None,
         )
 
         return HordeUpdateResult(
@@ -751,7 +936,172 @@ class IndependentDemonHorde:
             per_demon_metrics=per_demon_metrics,
             # No shared trunk -> no scalar trunk bounding metric.
             trunk_bounding_metric=jnp.array(1.0, dtype=jnp.float32),
+            pre_step_words=state.step_words,
+            post_step_words=new_state.step_words,
+            lifetime_counter_valid=outer_valid & children_pre_valid,
+            lifetime_capacity_available=lifetime_capacity_available,
+            normalizer_counter_aligned=normalizer_pre_aligned,
+            normalizer_estimator_capacity_available=estimator_capacity,
+            child_counters_aligned=normalizer_pre_aligned,
+            source_valid=transition_source_valid,
+            candidate_valid=candidate_valid,
+            state_valid=state_valid,
+            update_applied=update_applied,
         )
+
+
+def measure_independent_demon_horde_state_nbytes(
+    state: IndependentDemonHordeState,
+) -> int:
+    """Measure all persistent JAX-array bytes in one concrete wrapper state."""
+
+    def measure(value: Any) -> int:
+        if isinstance(value, Array):
+            return int(value.size) * int(value.dtype.itemsize)
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return sum(
+                measure(getattr(value, field.name))
+                for field in dataclasses.fields(value)
+                if field.name not in {"birth_timestamp", "uptime_s"}
+            )
+        if isinstance(value, Mapping):
+            return sum(measure(item) for item in value.values())
+        if isinstance(value, (tuple, list)):
+            return sum(measure(item) for item in value)
+        return 0
+
+    return measure(state)
+
+
+def independent_demon_horde_lifetime_counter_nbytes() -> int:
+    """Return bytes owned by the wrapper's exact lifetime identity."""
+
+    return INDEPENDENT_DEMON_HORDE_LIFETIME_COUNTER_NBYTES
+
+
+def _host_state_mapping(state: Any, *, label: str) -> dict[str, Any]:
+    if isinstance(state, Mapping):
+        return dict(state)
+    if dataclasses.is_dataclass(state) and not isinstance(state, type):
+        return {
+            field.name: getattr(state, field.name)
+            for field in dataclasses.fields(state)
+        }
+    raise TypeError(f"legacy {label} state must be a mapping or dataclass")
+
+
+def _legacy_normalizer_type(normalizer_state: Any) -> str:
+    names = set(_host_state_mapping(normalizer_state, label="normalizer"))
+    if "p" in names:
+        return "WelfordNormalizer"
+    if "decay" in names:
+        return "EMANormalizer"
+    if "momentum" in names:
+        return "StreamingBatchNormalizer"
+    raise ValueError("legacy normalizer field manifest does not identify its type")
+
+
+def _migrate_legacy_demon_state(
+    demon_state: Any,
+    *,
+    outer_step: int,
+) -> MLPLearnerState:
+    fields = _host_state_mapping(demon_state, label="independent demon")
+    expected_names = {
+        field.name for field in dataclasses.fields(cast(Any, MLPLearnerState))
+    }
+    if set(fields) != expected_names:
+        missing = sorted(expected_names - set(fields))
+        extra = sorted(set(fields) - expected_names)
+        raise ValueError(
+            "legacy independent demon field manifest is not exact; "
+            f"missing={missing}, extra={extra}"
+        )
+    child_step_array = jnp.asarray(fields["step_count"])
+    if (
+        child_step_array.shape != ()
+        or child_step_array.dtype != jnp.dtype(jnp.int32)
+    ):
+        raise TypeError("legacy independent demon step_count must be scalar int32")
+    child_step = int(child_step_array)
+    if child_step < 0:
+        raise ValueError("negative legacy independent demon step_count indicates wrap")
+    if child_step > outer_step:
+        raise ValueError("legacy demon update count exceeds wrapper event count")
+
+    normalizer_state = fields["normalizer_state"]
+    if normalizer_state is not None:
+        normalizer_fields = _host_state_mapping(
+            normalizer_state,
+            label="normalizer",
+        )
+        if "sample_count_words" not in normalizer_fields:
+            normalizer_state = migrate_legacy_normalizer_state(
+                normalizer_fields,
+                normalizer_type=_legacy_normalizer_type(normalizer_fields),
+            )
+            fields["normalizer_state"] = normalizer_state
+        sample_count = jnp.asarray(normalizer_state.sample_count)
+        if (
+            sample_count.shape != ()
+            or sample_count.dtype != jnp.dtype(jnp.int32)
+        ):
+            raise TypeError("normalizer sample_count must be scalar int32")
+        if int(sample_count) != child_step:
+            raise ValueError("legacy demon and normalizer counters are not aligned")
+        if not bool(
+            _lifetime_counter_valid(
+                normalizer_state.sample_count_words,
+                normalizer_state.sample_count,
+            )
+        ):
+            raise ValueError("migrated normalizer lifetime counter is invalid")
+    return MLPLearnerState(**fields)
+
+
+def migrate_legacy_independent_demon_horde_state(
+    legacy_state: Any,
+) -> IndependentDemonHordeState:
+    """Migrate one exact pre-v2 wrapper state on the host.
+
+    Saturated or negative wrapper counters are rejected: the legacy int32
+    identity may have wrapped and cannot be authenticated.  Per-demon MLP
+    counters remain bounded compatibility telemetry, while any nested exact
+    normalizer state is migrated and required to match its demon update count.
+    """
+
+    fields = _host_state_mapping(legacy_state, label="independent Horde")
+    current_names = {
+        field.name
+        for field in dataclasses.fields(cast(Any, IndependentDemonHordeState))
+    }
+    legacy_names = current_names - {"step_words"}
+    supplied_names = set(fields)
+    if supplied_names != legacy_names:
+        missing = sorted(legacy_names - supplied_names)
+        extra = sorted(supplied_names - legacy_names)
+        raise ValueError(
+            "legacy independent Horde field manifest is not exact; "
+            f"missing={missing}, extra={extra}"
+        )
+    step_array = jnp.asarray(fields["step_count"])
+    if step_array.shape != () or step_array.dtype != jnp.dtype(jnp.int32):
+        raise TypeError("legacy independent Horde step_count must be scalar int32")
+    step = int(step_array)
+    if step < 0:
+        raise ValueError("negative legacy independent Horde step_count indicates wrap")
+    if step >= _INT32_MAX:
+        raise ValueError("saturated legacy independent Horde step_count is ambiguous")
+
+    raw_demon_states = fields["demon_states"]
+    if not isinstance(raw_demon_states, tuple) or not raw_demon_states:
+        raise TypeError("legacy independent Horde demon_states must be a non-empty tuple")
+    fields["demon_states"] = tuple(
+        _migrate_legacy_demon_state(demon_state, outer_step=step)
+        for demon_state in raw_demon_states
+    )
+    fields["step_words"] = jnp.asarray((0, step), dtype=jnp.uint32)
+    return IndependentDemonHordeState(**fields)
 
 
 # =============================================================================

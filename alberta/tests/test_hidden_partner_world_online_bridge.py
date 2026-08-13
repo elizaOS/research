@@ -120,10 +120,28 @@ def _agent_result_for_state(
 
 
 def _force_next_interaction_promotion(
+    bridge: HiddenPartnerWorldOnlineBridge,
     state: HiddenPartnerWorldOnlineState,
     pair: tuple[int, int] = (4, 5),
 ) -> HiddenPartnerWorldOnlineState:
-    interaction = state.agent.interaction
+    clock_63 = jnp.asarray((0, 63), dtype=jnp.uint32)
+    clock_64 = jnp.asarray((0, 64), dtype=jnp.uint32)
+    # Build one valid non-birth world observation, then restart the otherwise
+    # untrained agent on exactly that ordinary observation.  This keeps the
+    # decision cache causal while the test moves every clock owner to the
+    # synthetic pre-step-64 curation boundary.
+    world_state = state.world.replace(
+        step_count=jnp.asarray(63, dtype=jnp.int32),
+        step_words=clock_63,
+        previous_outcome=jnp.asarray(1.0, dtype=jnp.float32),
+        previous_partner_action=jnp.asarray(1, dtype=jnp.int32),
+        has_partner_history=jnp.asarray(True, dtype=jnp.bool_),
+    )
+    restarted = bridge.agent.start(
+        bridge.world.observe(world_state),
+        state.agent.current_selection.rng_key_before,
+    )
+    interaction = restarted.state.interaction
     matching = (interaction.candidate_left == pair[0]) & (
         interaction.candidate_right == pair[1]
     )
@@ -131,6 +149,8 @@ def _force_next_interaction_promotion(
     candidate_index = int(jnp.argmax(matching))
     interaction = interaction.replace(
         step_count=jnp.asarray(63, dtype=jnp.int32),
+        step_words=clock_63,
+        replacement_phase=jnp.asarray(63, dtype=jnp.int32),
         ages=jnp.full((ACTIVE_PAIR_SLOTS,), 256, dtype=jnp.int32),
         utilities=jnp.zeros((ACTIVE_PAIR_SLOTS,), dtype=jnp.float32),
         candidate_ages=jnp.full(
@@ -144,7 +164,46 @@ def _force_next_interaction_promotion(
             .set(10.0)
         ),
     )
-    return state.replace(agent=state.agent.replace(interaction=interaction))
+    agent_state = restarted.state.replace(
+        interaction=interaction,
+        state_builder=restarted.state.state_builder.replace(
+            step_count=jnp.asarray(64, dtype=jnp.int32),
+            step_words=clock_64,
+            update_count=jnp.asarray(63, dtype=jnp.int32),
+            update_words=clock_63,
+        ),
+        behavior=restarted.state.behavior.replace(
+            step_count=jnp.asarray(63, dtype=jnp.int32),
+            step_words=clock_63,
+        ),
+        joint_world=restarted.state.joint_world.replace(
+            step_count=jnp.asarray(63, dtype=jnp.int32),
+            step_words=clock_63,
+        ),
+        control=restarted.state.control.replace(
+            step_count=jnp.asarray(63, dtype=jnp.int32),
+            step_words=clock_63,
+        ),
+        router=dataclasses.replace(
+            restarted.state.router,
+            route_count=jnp.asarray(63, dtype=jnp.int32),
+            route_words=clock_63,
+        ),
+        step_count=jnp.asarray(63, dtype=jnp.int32),
+        step_words=clock_63,
+    )
+    # The bridge authenticates one shared transition identity.  Move every
+    # owner to the same synthetic pre-step-64 point; changing only the child
+    # lifecycle clock would correctly fail the global transaction.
+    return state.replace(
+        world=world_state,
+        agent=agent_state,
+        world_filter=state.world_filter.replace(
+            step_count=jnp.asarray(63, dtype=jnp.int32)
+        ),
+        action=restarted.action,
+        step_count=jnp.asarray(63, dtype=jnp.int32),
+    )
 
 
 def _assert_grounded_mechanism_neutral(mechanism: object) -> None:
@@ -500,7 +559,7 @@ def test_v6_full_agent_cache_contract_survives_fused_probability_reduction() -> 
             )
             if not valid
         ]
-        assert checks.shape == (23,)
+        assert checks.shape == (len(INTEGRATED_DECISION_CACHE_CHECK_ORDER),)
         assert not failed, f"step {step_index} cache failures: {failed}"
         assert bool(update.diagnostics.transition_semantics_valid)
         agent_state = update.state
@@ -693,7 +752,10 @@ def test_balanced_initialization_preserves_ordinary_policy_rng_and_state_budget(
 
     ordinary_budget = ordinary.resource_budget(ordinary_state)
     balanced_budget = balanced.resource_budget(balanced_state)
-    assert ordinary_budget.total_state_nbytes == 6_956
+    # Exact stream/agent lifetime words intentionally raised the fixed v2
+    # footprint; keep the measured golden explicit so later hidden growth is
+    # still caught.
+    assert ordinary_budget.total_state_nbytes == 7_040
     assert balanced_budget.total_state_nbytes == ordinary_budget.total_state_nbytes
     assert balanced_budget.bridge_metadata_nbytes == 41
     assert _tree_signature(balanced_state) == _tree_signature(ordinary_state)
@@ -1462,7 +1524,7 @@ def test_mechanism_trace_projects_native_lifecycle_transaction_and_router_identi
 ) -> None:
     bridge = _shared_bridge()
     initial = bridge.initialize(jr.key(310), jr.key(311))
-    prepared = _force_next_interaction_promotion(initial, pair)
+    prepared = _force_next_interaction_promotion(bridge, initial, pair)
     expected = _agent_result_for_state(bridge, prepared)
     step = bridge.step(prepared)
     mechanism = step.trace.mechanism
@@ -1906,9 +1968,11 @@ def test_random_curation_trace_proves_selection_only_matched_compute() -> None:
     world_key = jr.key(324)
     agent_key = jr.key(325)
     random_state = _force_next_interaction_promotion(
+        random_bridge,
         random_bridge.initialize(world_key, agent_key)
     )
     learned_state = _force_next_interaction_promotion(
+        learned_bridge,
         learned_bridge.initialize(world_key, agent_key)
     )
     random_expected = _agent_result_for_state(random_bridge, random_state)

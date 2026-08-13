@@ -4,6 +4,15 @@ Status: development research synthesis (2026-08-02). Nothing in this document
 is promoted evidence; all campaign numbers referenced are development-grade
 and nonpromoting under the repository's evidence rules.
 
+Provenance audit: the stored IPMNIST curves reconstruct the numbers cited
+below, but they do not constitute a completed current-source campaign. The
+checked-in proxy receipt rejects the UPGD prefix comparisons, the summary is
+missing 12 current shards, the round-2 driver cannot consume the shard schema,
+and v1 shards bind no source, command, or dataset bytes. “Best,” “champion,”
+and mechanism language below therefore means only highest stored development
+mean or research hypothesis. It is not a SOTA, causal, or cross-horizon
+claim; a fresh source-bound lifecycle must attempt to reproduce it.
+
 This report answers, in order: (1) is our result actually SOTA and what is
 everyone else doing; (2) what optimizer/mechanism improvements are still on
 the table; (3) what completely different approaches deserve arms; (4) what
@@ -21,9 +30,9 @@ accuracy):
 |---|---:|---|
 | Published SOTA (UPGD-W, our 10-seed repro) | 0.7791 | best in print |
 | Best protocol-pure improvement (`adamw_cbp_r3e4`) | 0.80126 | no input-encoding change |
-| **Our champion (`sigma0_ndecay099`)** | **0.86245** | EMA input norm (decay 0.99) + utility-gated SGD, no noise |
+| **Highest stored mean (`sigma0_ndecay099`)** | **0.86245** | EMA input norm (decay 0.99) + utility-gated SGD, no noise |
 
-The mechanism decomposition is complete and stable across horizons:
+The stored means motivate, but do not authenticate, this mechanism hypothesis:
 input-statistics conditioning +0.061 (dominant), utility gate +0.011,
 perturbation noise: load-bearing on raw inputs (−0.035 to remove), neutral
 under slow conditioning, **harmful under fast conditioning** (−0.002). The

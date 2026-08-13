@@ -198,6 +198,7 @@ def test_primitive_base_target_ignores_option_reward_state() -> None:
         executing_option=jnp.array(-1, dtype=jnp.int32),
         base_last_obs=observations[0],
         base_last_action=primitive_action,
+        last_primitive_action=primitive_action,
         base_average_reward=average_reward,
         # Poison all option statistics: none may enter the primitive target.
         option_cumreward=jnp.array(-456.0, dtype=jnp.float32),
@@ -205,6 +206,8 @@ def test_primitive_base_target_ignores_option_reward_state() -> None:
         option_baseline_mass=jnp.array(321.0, dtype=jnp.float32),
         option_discount=jnp.array(0.01, dtype=jnp.float32),
         option_steps=jnp.array(9, dtype=jnp.int32),
+        step_count=jnp.array(9, dtype=jnp.int32),
+        step_words=jnp.array([0, 9], dtype=jnp.uint32),
     )
     q_last = learner.predict(state.base_learner_state, state.base_last_obs)[primitive_action]
     max_next_q = jnp.max(learner.predict(state.base_learner_state, observations[1]))

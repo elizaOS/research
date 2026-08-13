@@ -258,6 +258,7 @@ def test_prototype_explicit_transition_routes_discount_to_ia(
     state = agent.start(agent.init(jr.key(2)), OBS)
     main_stomp = state.oak_state.stomp_state.replace(
         base_last_obs=OBS,
+        base_last_action=jnp.array(EXECUTED_ACTION, dtype=jnp.int32),
         last_primitive_action=jnp.array(EXECUTED_ACTION, dtype=jnp.int32),
     )
     state = state.replace(
@@ -303,6 +304,7 @@ def test_prototype_legacy_update_keeps_ia_legacy_bootstrap() -> None:
         oak_state=state.oak_state.replace(
             stomp_state=state.oak_state.stomp_state.replace(
                 base_last_obs=OBS,
+                base_last_action=jnp.array(EXECUTED_ACTION, dtype=jnp.int32),
                 last_primitive_action=jnp.array(EXECUTED_ACTION, dtype=jnp.int32),
             )
         ),

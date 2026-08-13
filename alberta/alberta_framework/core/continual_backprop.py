@@ -76,6 +76,7 @@ from jaxtyping import Float, Int
 
 from alberta_framework.core.initializers import sparse_init
 from alberta_framework.core.multi_head_learner import (
+    MULTI_HEAD_MLP_STATE_SCHEMA,
     AnyOptimizer,
     MultiHeadMLPLearner,
     MultiHeadMLPState,
@@ -721,6 +722,11 @@ class CBPMultiHeadMLPLearner:
 
         config = dict(config)
         config.pop("type", None)
+        state_schema = config.pop("state_schema", MULTI_HEAD_MLP_STATE_SCHEMA)
+        if state_schema != MULTI_HEAD_MLP_STATE_SCHEMA:
+            raise ValueError(
+                f"Unsupported MultiHeadMLP state schema: {state_schema!r}"
+            )
         cbp_cfg_dict = config.pop("cbp_config")
         cbp_config = ContinualBackpropConfig.from_config(cbp_cfg_dict)
 

@@ -74,7 +74,9 @@ def test_protocol_roundtrip_is_strict_nonpromoting_and_plan_ordered() -> None:
     assert payload["regime_schedule"] == [0, 1, 0]
     assert payload["actor_trace_lambda"] == 0.0
     assert "sparks_joy" not in cast(str, payload["claim_scope"])
-    assert any("sparks_joy" in claim for claim in cast(list[str], payload["excluded_claims"]))
+    assert "Prototype candidate-update audit validity" in cast(
+        list[str], payload["excluded_claims"]
+    )
 
     promoted = copy.deepcopy(payload)
     promoted["scientific_promotion_allowed"] = True

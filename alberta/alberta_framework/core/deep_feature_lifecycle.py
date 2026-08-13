@@ -29,7 +29,9 @@ References:
 from __future__ import annotations
 
 import functools
+import math
 import time
+from numbers import Real
 from typing import Any, cast
 
 import chex
@@ -37,10 +39,11 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int, UInt
 
 from alberta_framework.core.initializers import sparse_init
 from alberta_framework.core.multi_head_learner import (
+    MULTI_HEAD_MLP_STATE_SCHEMA,
     AnyOptimizer,
     MultiHeadMLPLearner,
     MultiHeadMLPState,
@@ -49,6 +52,76 @@ from alberta_framework.core.multi_head_learner import (
 from alberta_framework.core.normalizers import Normalizer
 from alberta_framework.core.optimizers import Bounder
 from alberta_framework.core.types import TraceMode
+
+_INT32_MAX = 2**31 - 1
+
+DEEP_FEATURE_LIFECYCLE_CONFIG_SCHEMA = "alberta.deep-feature-lifecycle-config.v2"
+DEEP_FEATURE_LIFECYCLE_STATE_SCHEMA = "alberta.deep-feature-lifecycle-state.v2"
+
+
+def _lifetime_words_mod(words: Array, divisor: int) -> UInt[Array, ""]:
+    """Return exact uint64-word remainder using portable uint32 operations."""
+
+    if type(divisor) is not int or not 1 <= divisor <= _INT32_MAX:
+        raise ValueError("deep-feature schedule divisor must be positive int32")
+    array = jnp.asarray(words)
+    if array.shape != (2,):
+        raise ValueError("deep-feature MLP step_words must have shape (2,)")
+    if array.dtype != jnp.dtype(jnp.uint32):
+        raise TypeError("deep-feature MLP step_words must have dtype uint32")
+    divisor_u = jnp.asarray(divisor, dtype=jnp.uint32)
+    one = jnp.asarray(1, dtype=jnp.uint32)
+
+    def reduce_bit(index: int, remainder: Array) -> Array:
+        bit_index = jnp.asarray(63 - index, dtype=jnp.int32)
+        from_high = bit_index >= 32
+        shift = jnp.where(from_high, bit_index - 32, bit_index)
+        source = jnp.where(from_high, array[0], array[1])
+        bit = (source >> shift.astype(jnp.uint32)) & one
+        doubled = remainder + remainder + bit
+        return jnp.where(doubled >= divisor_u, doubled - divisor_u, doubled)
+
+    return cast(
+        UInt[Array, ""],
+        jax.lax.fori_loop(
+            0,
+            64,
+            reduce_bit,
+            jnp.asarray(0, dtype=jnp.uint32),
+        ).astype(jnp.uint32),
+    )
+
+
+def _lifetime_words_at_least(words: Array, threshold: int) -> Bool[Array, ""]:
+    """Compare exact words with a non-negative signed-int32 threshold."""
+
+    if type(threshold) is not int or not 0 <= threshold <= _INT32_MAX:
+        raise ValueError("deep-feature schedule threshold must be non-negative int32")
+    array = jnp.asarray(words)
+    if array.shape != (2,):
+        raise ValueError("deep-feature MLP step_words must have shape (2,)")
+    if array.dtype != jnp.dtype(jnp.uint32):
+        raise TypeError("deep-feature MLP step_words must have dtype uint32")
+    return (array[0] > jnp.asarray(0, dtype=jnp.uint32)) | (
+        array[1] >= jnp.asarray(threshold, dtype=jnp.uint32)
+    )
+
+
+def _saturating_age_increment(values: Array) -> Array:
+    """Increment non-negative int32 ages without lifetime wrap."""
+
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    return jnp.minimum(jnp.maximum(values, 0), maximum - 1) + 1
+
+
+def _floating_tree_is_finite(tree: object) -> Bool[Array, ""]:
+    """Require every floating/complex JAX state leaf to remain finite."""
+
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for leaf in jax.tree.leaves(tree):
+        if isinstance(leaf, Array) and jnp.issubdtype(leaf.dtype, jnp.inexact):
+            valid = valid & jnp.all(jnp.isfinite(leaf))
+    return valid
 
 
 @chex.dataclass(frozen=True)
@@ -183,6 +256,74 @@ class DeepFeatureLifecycleConfig:
     enabled: bool = True
 
     def __post_init__(self) -> None:
+        integer_fields = (
+            ("candidate_count", self.candidate_count),
+            ("promotion_interval", self.promotion_interval),
+            ("min_unit_age", self.min_unit_age),
+            ("candidate_min_age", self.candidate_min_age),
+            ("replacement_warmup_steps", self.replacement_warmup_steps),
+            ("layer_promotion_budget", self.layer_promotion_budget),
+            (
+                "active_perturbation_warmup_steps",
+                self.active_perturbation_warmup_steps,
+            ),
+            ("active_perturbation_ramp_steps", self.active_perturbation_ramp_steps),
+            ("active_perturbation_interval", self.active_perturbation_interval),
+        )
+        for integer_name, integer_value in integer_fields:
+            if type(integer_value) is not int:
+                raise TypeError(f"{integer_name} must be an exact integer")
+        boolean_fields = (
+            ("candidate_normalized_updates", self.candidate_normalized_updates),
+            ("function_preserving_promotion", self.function_preserving_promotion),
+            (
+                "candidate_perturbation_utility_scaled",
+                self.candidate_perturbation_utility_scaled,
+            ),
+            ("soft_gated_candidates", self.soft_gated_candidates),
+            ("refresh_on_failed_promotion", self.refresh_on_failed_promotion),
+            ("enabled", self.enabled),
+        )
+        for boolean_name, boolean_value in boolean_fields:
+            if type(boolean_value) is not bool:
+                raise TypeError(f"{boolean_name} must be an exact boolean")
+        finite_fields = (
+            ("candidate_step_size", self.candidate_step_size),
+            ("candidate_utility_decay", self.candidate_utility_decay),
+            ("candidate_weight_step_size", self.candidate_weight_step_size),
+            ("candidate_perturbation_std", self.candidate_perturbation_std),
+            ("candidate_update_epsilon", self.candidate_update_epsilon),
+            ("active_utility_decay", self.active_utility_decay),
+            ("promotion_margin", self.promotion_margin),
+            ("promotion_ratio", self.promotion_ratio),
+            ("replacement_utility_quantile", self.replacement_utility_quantile),
+            (
+                "active_candidate_perturbation_std",
+                self.active_candidate_perturbation_std,
+            ),
+            ("active_perturbation_std", self.active_perturbation_std),
+            ("active_perturbation_beta", self.active_perturbation_beta),
+            ("candidate_gate_init", self.candidate_gate_init),
+            ("candidate_gate_step_size", self.candidate_gate_step_size),
+            ("candidate_gate_l1", self.candidate_gate_l1),
+            ("candidate_gate_max_abs", self.candidate_gate_max_abs),
+        )
+        for finite_name, finite_value in finite_fields:
+            if (
+                not isinstance(finite_value, Real)
+                or isinstance(finite_value, bool)
+                or not math.isfinite(float(finite_value))
+            ):
+                raise ValueError(f"{finite_name} must be a finite real scalar")
+        threshold = self.promotion_output_change_threshold
+        if (
+            not isinstance(threshold, Real)
+            or isinstance(threshold, bool)
+            or math.isnan(float(threshold))
+        ):
+            raise ValueError(
+                "promotion_output_change_threshold must be a non-negative real scalar"
+            )
         if self.candidate_count < 1:
             raise ValueError("candidate_count must be >= 1")
         if self.candidate_step_size < 0.0:
@@ -197,24 +338,26 @@ class DeepFeatureLifecycleConfig:
             raise ValueError("candidate_update_epsilon must be > 0")
         if not 0.0 <= self.active_utility_decay < 1.0:
             raise ValueError("active_utility_decay must be in [0, 1)")
-        if self.promotion_interval < 1:
-            raise ValueError("promotion_interval must be >= 1")
-        if self.min_unit_age < 0:
-            raise ValueError("min_unit_age must be >= 0")
-        if self.candidate_min_age < 0:
-            raise ValueError("candidate_min_age must be >= 0")
+        if not 1 <= self.promotion_interval <= _INT32_MAX:
+            raise ValueError("promotion_interval must be in [1, INT32_MAX]")
+        if not 0 <= self.min_unit_age <= _INT32_MAX:
+            raise ValueError("min_unit_age must be in [0, INT32_MAX]")
+        if not 0 <= self.candidate_min_age <= _INT32_MAX:
+            raise ValueError("candidate_min_age must be in [0, INT32_MAX]")
+        if self.promotion_margin < 0.0:
+            raise ValueError("promotion_margin must be >= 0")
         if self.promotion_ratio < 0.0:
             raise ValueError("promotion_ratio must be >= 0")
         if self.promotion_layer_mode not in {"all", "first", "final"}:
             raise ValueError("promotion_layer_mode must be 'all', 'first', or 'final'")
         if self.promotion_utility_mode not in {"raw", "mean_normalized"}:
             raise ValueError("promotion_utility_mode must be 'raw' or 'mean_normalized'")
-        if self.replacement_warmup_steps < 0:
-            raise ValueError("replacement_warmup_steps must be >= 0")
+        if not 0 <= self.replacement_warmup_steps <= _INT32_MAX:
+            raise ValueError("replacement_warmup_steps must be in [0, INT32_MAX]")
         if not 0.0 <= self.replacement_utility_quantile <= 1.0:
             raise ValueError("replacement_utility_quantile must be in [0, 1]")
-        if self.layer_promotion_budget < 0:
-            raise ValueError("layer_promotion_budget must be >= 0")
+        if not 0 <= self.layer_promotion_budget <= _INT32_MAX:
+            raise ValueError("layer_promotion_budget must be in [0, INT32_MAX]")
         if self.early_promotion_outgoing_mode not in {"zero", "preserve"}:
             raise ValueError(
                 "early_promotion_outgoing_mode must be 'zero' or 'preserve'"
@@ -236,24 +379,36 @@ class DeepFeatureLifecycleConfig:
             raise ValueError("active_perturbation_std must be >= 0")
         if self.active_perturbation_beta < 0.0:
             raise ValueError("active_perturbation_beta must be >= 0")
-        if self.active_perturbation_warmup_steps < 0:
-            raise ValueError("active_perturbation_warmup_steps must be >= 0")
-        if self.active_perturbation_ramp_steps < 0:
-            raise ValueError("active_perturbation_ramp_steps must be >= 0")
-        if self.active_perturbation_interval < 1:
-            raise ValueError("active_perturbation_interval must be >= 1")
+        if not 0 <= self.active_perturbation_warmup_steps <= _INT32_MAX:
+            raise ValueError(
+                "active_perturbation_warmup_steps must be in [0, INT32_MAX]"
+            )
+        if not 0 <= self.active_perturbation_ramp_steps <= _INT32_MAX:
+            raise ValueError(
+                "active_perturbation_ramp_steps must be in [0, INT32_MAX]"
+            )
+        if not 1 <= self.active_perturbation_interval <= _INT32_MAX:
+            raise ValueError(
+                "active_perturbation_interval must be in [1, INT32_MAX]"
+            )
         if self.candidate_gate_step_size < 0.0:
             raise ValueError("candidate_gate_step_size must be >= 0")
         if self.candidate_gate_l1 < 0.0:
             raise ValueError("candidate_gate_l1 must be >= 0")
         if self.candidate_gate_max_abs < 0.0:
             raise ValueError("candidate_gate_max_abs must be >= 0")
+        if abs(self.candidate_gate_init) > self.candidate_gate_max_abs:
+            raise ValueError(
+                "abs(candidate_gate_init) must not exceed candidate_gate_max_abs"
+            )
         if self.soft_gate_layer_mode not in {"final", "all"}:
             raise ValueError("soft_gate_layer_mode must be 'final' or 'all'")
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dict."""
         return {
+            "config_schema": DEEP_FEATURE_LIFECYCLE_CONFIG_SCHEMA,
+            "state_schema": DEEP_FEATURE_LIFECYCLE_STATE_SCHEMA,
             "candidate_count": self.candidate_count,
             "candidate_step_size": self.candidate_step_size,
             "candidate_utility_decay": self.candidate_utility_decay,
@@ -303,8 +458,13 @@ class DeepFeatureLifecycleConfig:
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> DeepFeatureLifecycleConfig:
-        """Reconstruct from :meth:`to_config` output."""
-        return cls(**config)
+        """Strictly reconstruct current-schema :meth:`to_config` output."""
+        payload = dict(config)
+        if payload.pop("config_schema", None) != DEEP_FEATURE_LIFECYCLE_CONFIG_SCHEMA:
+            raise ValueError("deep-feature lifecycle config schema is unsupported")
+        if payload.pop("state_schema", None) != DEEP_FEATURE_LIFECYCLE_STATE_SCHEMA:
+            raise ValueError("deep-feature lifecycle state schema is unsupported")
+        return cls(**payload)
 
 
 @chex.dataclass(frozen=True)
@@ -339,6 +499,14 @@ class DeepFeatureLifecycleUpdateResult:
     per_head_metrics: Float[Array, "n_heads 3"]
     lifecycle_metrics: Float[Array, " 4"]
     promotions_made: Int[Array, " n_layers"]
+    pre_step_words: UInt[Array, " 2"]
+    post_step_words: UInt[Array, " 2"]
+    source_state_valid: Bool[Array, ""]
+    inputs_valid: Bool[Array, ""]
+    base_update_applied: Bool[Array, ""]
+    candidate_state_finite: Bool[Array, ""]
+    update_applied: Bool[Array, ""]
+    update_rejected: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -353,6 +521,7 @@ class DeepFeatureLifecycleLearningResult:
     per_head_metrics: Float[Array, "num_steps n_heads 3"]
     lifecycle_metrics: Float[Array, "num_steps 4"]
     promotions_made: Int[Array, "num_steps n_layers"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 def _layer_inputs_and_activations(
@@ -647,6 +816,8 @@ class DeepFeatureGeneratingMultiHeadMLPLearner:
 
         config = dict(config)
         config.pop("type", None)
+        if config.pop("state_schema", None) != MULTI_HEAD_MLP_STATE_SCHEMA:
+            raise ValueError("deep-feature base MLP state schema is unsupported")
         lifecycle_config = DeepFeatureLifecycleConfig.from_config(
             config.pop("lifecycle_config")
         )
@@ -771,6 +942,90 @@ class DeepFeatureGeneratingMultiHeadMLPLearner:
         if self._config.soft_gate_layer_mode == "all":
             return True
         return layer_idx == n_layers - 1
+
+    def _auxiliary_state_valid(
+        self,
+        state: DeepFeatureLifecycleState,
+    ) -> Bool[Array, ""]:
+        """Validate the lifecycle-owned portion of a source state.
+
+        Static shape/dtype mismatches are schema errors and raise before any
+        compiled computation.  Dynamic corruption (non-finite values,
+        negative ages, or out-of-range candidate targets) produces a false
+        transaction verdict so the complete wrapper state is preserved.
+        """
+
+        collections = (
+            state.unit_ages,
+            state.active_utilities,
+            state.candidate_weights,
+            state.candidate_biases,
+            state.candidate_output_weights,
+            state.candidate_gates,
+            state.candidate_target_units,
+            state.candidate_utilities,
+            state.candidate_ages,
+        )
+        if any(len(values) != len(self._hidden_sizes) for values in collections):
+            raise ValueError(
+                "deep-feature lifecycle state tuple count does not match hidden layers"
+            )
+
+        valid = _floating_tree_is_finite(state)
+        for layer_idx, hidden_size in enumerate(self._hidden_sizes):
+            fan_in = state.mlp_state.trunk_params.weights[layer_idx].shape[1]
+            expected_shapes = (
+                (state.unit_ages[layer_idx], (hidden_size,), jnp.dtype(jnp.int32)),
+                (state.active_utilities[layer_idx], (hidden_size,), jnp.dtype(jnp.float32)),
+                (
+                    state.candidate_weights[layer_idx],
+                    (self._config.candidate_count, fan_in),
+                    jnp.dtype(jnp.float32),
+                ),
+                (
+                    state.candidate_biases[layer_idx],
+                    (self._config.candidate_count,),
+                    jnp.dtype(jnp.float32),
+                ),
+                (
+                    state.candidate_output_weights[layer_idx],
+                    (self._n_heads, self._config.candidate_count),
+                    jnp.dtype(jnp.float32),
+                ),
+                (
+                    state.candidate_gates[layer_idx],
+                    (self._config.candidate_count,),
+                    jnp.dtype(jnp.float32),
+                ),
+                (
+                    state.candidate_target_units[layer_idx],
+                    (self._config.candidate_count,),
+                    jnp.dtype(jnp.int32),
+                ),
+                (
+                    state.candidate_utilities[layer_idx],
+                    (self._config.candidate_count,),
+                    jnp.dtype(jnp.float32),
+                ),
+                (
+                    state.candidate_ages[layer_idx],
+                    (self._config.candidate_count,),
+                    jnp.dtype(jnp.int32),
+                ),
+            )
+            for value, shape, dtype in expected_shapes:
+                if value.shape != shape or value.dtype != dtype:
+                    raise ValueError(
+                        "deep-feature lifecycle state shape/dtype schema mismatch"
+                    )
+            valid = (
+                valid
+                & jnp.all(state.unit_ages[layer_idx] >= 0)
+                & jnp.all(state.candidate_ages[layer_idx] >= 0)
+                & jnp.all(state.candidate_target_units[layer_idx] >= 0)
+                & jnp.all(state.candidate_target_units[layer_idx] < hidden_size)
+            )
+        return valid
 
     def _predict_with_soft_candidates(
         self,
@@ -920,35 +1175,38 @@ class DeepFeatureGeneratingMultiHeadMLPLearner:
         """Perturb low-utility active trunk rows using layer-local utility."""
         std = jnp.asarray(self._config.active_perturbation_std, dtype=jnp.float32)
         beta = jnp.asarray(self._config.active_perturbation_beta, dtype=jnp.float32)
-        warmup_steps = jnp.asarray(
-            self._config.active_perturbation_warmup_steps,
-            dtype=mlp_state.step_count.dtype,
-        )
-        ramp_steps = jnp.asarray(
-            self._config.active_perturbation_ramp_steps,
-            dtype=jnp.float32,
-        )
-        interval = jnp.asarray(
+        warmup = self._config.active_perturbation_warmup_steps
+        ramp = self._config.active_perturbation_ramp_steps
+        warmup_reached = _lifetime_words_at_least(mlp_state.step_words, warmup)
+        interval_due = _lifetime_words_mod(
+            mlp_state.step_words,
             self._config.active_perturbation_interval,
-            dtype=mlp_state.step_count.dtype,
-        )
+        ) == jnp.asarray(0, dtype=jnp.uint32)
         do_perturb = jnp.logical_and(
             std > 0.0,
-            jnp.logical_and(
-                mlp_state.step_count >= warmup_steps,
-                (mlp_state.step_count % interval) == 0,
-            ),
+            warmup_reached & interval_due,
         )
-        ramp_progress = jnp.where(
-            ramp_steps > 0.0,
-            (
-                mlp_state.step_count.astype(jnp.float32)
-                - warmup_steps.astype(jnp.float32)
-                + 1.0
+        if ramp > 0:
+            low = mlp_state.step_words[1]
+            beyond_low_word = mlp_state.step_words[0] > 0
+            warmup_u = jnp.asarray(warmup, dtype=jnp.uint32)
+            difference = jnp.where(low >= warmup_u, low - warmup_u, 0)
+            capped_difference = jnp.where(
+                beyond_low_word,
+                jnp.asarray(ramp - 1, dtype=jnp.uint32),
+                jnp.minimum(
+                    difference,
+                    jnp.asarray(ramp - 1, dtype=jnp.uint32),
+                ),
             )
-            / jnp.maximum(ramp_steps, 1.0),
-            1.0,
-        )
+            elapsed = capped_difference.astype(jnp.float32) + 1.0
+            ramp_progress = jnp.where(
+                warmup_reached,
+                elapsed / jnp.asarray(ramp, dtype=jnp.float32),
+                jnp.asarray(0.0, dtype=jnp.float32),
+            )
+        else:
+            ramp_progress = jnp.asarray(1.0, dtype=jnp.float32)
         schedule_scale = jnp.clip(ramp_progress, 0.0, 1.0)
 
         new_weights: list[Array] = []
@@ -1321,6 +1579,10 @@ class DeepFeatureGeneratingMultiHeadMLPLearner:
         targets: Array,
     ) -> DeepFeatureLifecycleUpdateResult:
         """Update MLP, test candidates, and possibly promote candidates."""
+        source_state_valid = self._auxiliary_state_valid(state)
+        inputs_valid = jnp.all(jnp.isfinite(observation)) & jnp.all(
+            jnp.isfinite(targets) | jnp.isnan(targets)
+        )
         active_mask = ~jnp.isnan(targets)
         safe_targets = jnp.where(active_mask, targets, 0.0)
         live_predictions = self._learner.predict(state.mlp_state, observation)
@@ -1337,20 +1599,51 @@ class DeepFeatureGeneratingMultiHeadMLPLearner:
         post_state = mlp_result.state
         n_layers = len(self._hidden_sizes)
         rng_key = state.rng_key
-        post_state, rng_key = self._apply_active_perturbations(post_state, rng_key)
+        if self._config.enabled:
+            post_state, rng_key = self._apply_active_perturbations(
+                post_state,
+                rng_key,
+            )
 
         if not self._config.enabled or n_layers == 0:
             passthrough_state = state.replace(  # type: ignore[attr-defined]
                 mlp_state=post_state,
                 rng_key=rng_key,
             )
+            candidate_state_finite = _floating_tree_is_finite(passthrough_state)
+            update_applied = (
+                mlp_result.update_applied
+                & source_state_valid
+                & inputs_valid
+                & candidate_state_finite
+                & jnp.all(
+                    passthrough_state.mlp_state.step_words
+                    == mlp_result.post_step_words
+                )
+            )
+            committed_state = cast(
+                DeepFeatureLifecycleState,
+                jax.lax.cond(
+                    update_applied,
+                    lambda: passthrough_state,
+                    lambda: state,
+                ),
+            )
             return DeepFeatureLifecycleUpdateResult(  # type: ignore[call-arg]
-                state=passthrough_state,
+                state=committed_state,
                 predictions=live_predictions,
                 errors=mlp_result.errors,
                 per_head_metrics=mlp_result.per_head_metrics,
                 lifecycle_metrics=jnp.zeros(4, dtype=jnp.float32),
                 promotions_made=jnp.zeros((max(n_layers, 1),), dtype=jnp.int32),
+                pre_step_words=state.mlp_state.step_words,
+                post_step_words=committed_state.mlp_state.step_words,
+                source_state_valid=source_state_valid,
+                inputs_valid=inputs_valid,
+                base_update_applied=mlp_result.update_applied,
+                candidate_state_finite=candidate_state_finite,
+                update_applied=update_applied,
+                update_rejected=~update_applied,
             )
 
         obs = observation
@@ -1579,7 +1872,9 @@ class DeepFeatureGeneratingMultiHeadMLPLearner:
                 candidate_ages=_replace_tuple_item(
                     new_state.candidate_ages,
                     layer_idx,
-                    new_state.candidate_ages[layer_idx] + 1,
+                    _saturating_age_increment(
+                        new_state.candidate_ages[layer_idx]
+                    ),
                 ),
                 active_utilities=_replace_tuple_item(
                     new_state.active_utilities, layer_idx, new_active_util
@@ -1587,20 +1882,22 @@ class DeepFeatureGeneratingMultiHeadMLPLearner:
                 unit_ages=_replace_tuple_item(
                     new_state.unit_ages,
                     layer_idx,
-                    new_state.unit_ages[layer_idx] + 1,
+                    _saturating_age_increment(new_state.unit_ages[layer_idx]),
                 ),
             )
             mean_candidate_utilities.append(jnp.mean(new_cand_util))
             max_candidate_utilities.append(jnp.max(new_cand_util))
             mean_active_utilities.append(jnp.mean(new_active_util))
 
-        scheduled = jnp.logical_and(
-            (post_state.step_count % self._config.promotion_interval) == 0,
-            post_state.step_count
-            >= jnp.asarray(
-                self._config.replacement_warmup_steps,
-                dtype=post_state.step_count.dtype,
-            ),
+        scheduled = (
+            _lifetime_words_mod(
+                post_state.step_words,
+                self._config.promotion_interval,
+            )
+            == jnp.asarray(0, dtype=jnp.uint32)
+        ) & _lifetime_words_at_least(
+            post_state.step_words,
+            self._config.replacement_warmup_steps,
         )
         promotions: list[Array] = []
         promotion_count = jnp.array(0, dtype=jnp.int32)
@@ -1643,13 +1940,45 @@ class DeepFeatureGeneratingMultiHeadMLPLearner:
             dtype=jnp.float32,
         )
 
+        candidate_state_finite = _floating_tree_is_finite(new_state)
+        update_applied = (
+            mlp_result.update_applied
+            & source_state_valid
+            & inputs_valid
+            & candidate_state_finite
+            & jnp.all(new_state.mlp_state.step_words == mlp_result.post_step_words)
+        )
+        committed_state = cast(
+            DeepFeatureLifecycleState,
+            jax.lax.cond(
+                update_applied,
+                lambda: new_state,
+                lambda: state,
+            ),
+        )
         return DeepFeatureLifecycleUpdateResult(  # type: ignore[call-arg]
-            state=new_state,
+            state=committed_state,
             predictions=live_predictions,
             errors=mlp_result.errors,
             per_head_metrics=mlp_result.per_head_metrics,
-            lifecycle_metrics=lifecycle_metrics,
-            promotions_made=promotions_arr,
+            lifecycle_metrics=jnp.where(
+                update_applied,
+                lifecycle_metrics,
+                jnp.zeros_like(lifecycle_metrics),
+            ),
+            promotions_made=jnp.where(
+                update_applied,
+                promotions_arr,
+                jnp.zeros_like(promotions_arr),
+            ),
+            pre_step_words=state.mlp_state.step_words,
+            post_step_words=committed_state.mlp_state.step_words,
+            source_state_valid=source_state_valid,
+            inputs_valid=inputs_valid,
+            base_update_applied=mlp_result.update_applied,
+            candidate_state_finite=candidate_state_finite,
+            update_applied=update_applied,
+            update_rejected=~update_applied,
         )
 
 
@@ -1664,21 +1993,23 @@ def run_deep_feature_lifecycle_arrays(
     def step_fn(
         carry: DeepFeatureLifecycleState,
         inputs: tuple[Array, Array],
-    ) -> tuple[DeepFeatureLifecycleState, tuple[Array, Array, Array]]:
+    ) -> tuple[DeepFeatureLifecycleState, tuple[Array, Array, Array, Array]]:
         obs, tgt = inputs
         result = learner.update(carry, obs, tgt)
         return result.state, (
             result.per_head_metrics,
             result.lifecycle_metrics,
             result.promotions_made,
+            result.update_applied,
         )
 
     t0 = time.time()
-    final_state, (per_head_metrics, lifecycle_metrics, promotions_made) = jax.lax.scan(
-        step_fn,
-        state,
-        (observations, targets),
-    )
+    final_state, (
+        per_head_metrics,
+        lifecycle_metrics,
+        promotions_made,
+        updates_applied,
+    ) = jax.lax.scan(step_fn, state, (observations, targets))
     elapsed = time.time() - t0
     final_mlp = final_state.mlp_state.replace(  # type: ignore[attr-defined]
         uptime_s=final_state.mlp_state.uptime_s + elapsed
@@ -1689,4 +2020,5 @@ def run_deep_feature_lifecycle_arrays(
         per_head_metrics=per_head_metrics,
         lifecycle_metrics=lifecycle_metrics,
         promotions_made=promotions_made,
+        updates_applied=updates_applied,
     )

@@ -120,7 +120,7 @@ def _agent(
     *,
     builder: StateBuilderConfig | None = None,
     learn_builder: bool = False,
-    joy: bool = False,
+    candidate_audit: bool = False,
     max_input_magnitude: float = 100.0,
 ) -> PrototypeAgent:
     resolved_builder = _identity_builder() if builder is None else builder
@@ -151,7 +151,7 @@ def _agent(
                     norm_temperature=1.0,
                     diagnostics_epsilon=1.0e-12,
                 )
-                if joy
+                if candidate_audit
                 else None
             ),
         )
@@ -356,11 +356,15 @@ def test_rehearsal_rejection_is_accounted_without_rolling_back_control() -> None
     assert int(composer_state.replay_state.accepted_transition_count) == 0
 
 
-@pytest.mark.parametrize("joy", [False, True])
-def test_only_real_gradient_can_reach_builder_and_joy_still_fails_closed(
-    joy: bool,
+@pytest.mark.parametrize("candidate_audit_enabled", [False, True])
+def test_only_real_gradient_can_reach_builder_and_candidate_audit_fails_closed(
+    candidate_audit_enabled: bool,
 ) -> None:
-    agent = _agent(builder=_online_builder(), learn_builder=True, joy=joy)
+    agent = _agent(
+        builder=_online_builder(),
+        learn_builder=True,
+        candidate_audit=candidate_audit_enabled,
+    )
     state = agent.start(
         agent.init(jr.key(4)),
         jnp.asarray([0.25], dtype=jnp.float32),
@@ -372,12 +376,14 @@ def test_only_real_gradient_can_reach_builder_and_joy_still_fails_closed(
 
     assert bool(result.model_replay_transaction_applied)
     assert int(result.model_replay_updates_applied) == 2
-    expected_builder_updates = 0 if joy else 1
+    expected_builder_updates = 0 if candidate_audit_enabled else 1
     assert int(result.state.state_builder_state.update_count) == expected_builder_updates
-    assert bool(result.state_builder_learning_diagnostics.applied) is (not joy)
-    if joy:
-        assert not bool(result.sparks_joy)
-        assert not bool(result.joyful_gradient_applied)
+    assert bool(result.state_builder_learning_diagnostics.applied) is (
+        not candidate_audit_enabled
+    )
+    if candidate_audit_enabled:
+        assert not bool(result.candidate_update_audit_passed)
+        assert not bool(result.audited_candidate_update_applied)
     assert int(result.state.world_model_state.ensemble_state.replay_event_count) == 2
 
 

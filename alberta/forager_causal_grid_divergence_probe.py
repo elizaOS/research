@@ -1014,6 +1014,35 @@ def _require_manifest_source_root(
         )
 
 
+def _require_private_extracted_source_root(
+    qualification_root: Path,
+    source_root: Path,
+) -> None:
+    """Require a canonical source snapshot outside the read-only input mount."""
+    qualification_resolved = _canonical_qualification_root(qualification_root)
+    if not source_root.is_absolute():
+        raise CausalGridDivergenceProbeError(
+            "private extracted source root must be an absolute canonical directory"
+        )
+    try:
+        metadata = source_root.lstat()
+        resolved = source_root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise CausalGridDivergenceProbeError(
+            "cannot resolve the private extracted source root"
+        ) from exc
+    if (
+        source_root != resolved
+        or stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or source_root.is_relative_to(qualification_resolved)
+    ):
+        raise CausalGridDivergenceProbeError(
+            "private extracted source root must be a canonical non-symlink directory "
+            "outside the qualification mount"
+        )
+
+
 def _validate_capability_receipt(
     *,
     candidate_id: str,
@@ -1082,8 +1111,15 @@ def _validate_capability_receipt(
 def _load_bound_inputs(
     qualification_root: Path,
     source_root: Path,
+    *,
+    private_extracted_source: bool = False,
 ) -> tuple[tuple[dict[str, Any], ...], dict[str, Any]]:
-    _require_manifest_source_root(qualification_root, source_root)
+    if type(private_extracted_source) is not bool:
+        raise TypeError("private_extracted_source must be a bool")
+    if private_extracted_source:
+        _require_private_extracted_source_root(qualification_root, source_root)
+    else:
+        _require_manifest_source_root(qualification_root, source_root)
     manifest_path = _qualification_input_path(
         qualification_root,
         _QUALIFICATION_MANIFEST_PATH,
@@ -3375,6 +3411,7 @@ def _child_main(argv: Sequence[str]) -> int:
     configurations, _manifest = _load_bound_inputs(
         args.qualification_root,
         args.source_root,
+        private_extracted_source=True,
     )
     payload = _child_runtime_payload(
         args.source_root,

@@ -37,6 +37,12 @@ lane's code is deleted before its conclusion is ledgered).
 | EMNIST `.npy` cache (deferred until live shards finish) | 338 MB | reparse retained ARFF; digests pinned in `plan.v*.json` |
 
 Not executed, deliberately:
+- The pruned causal-grid probe's first-party Alberta recovery bundle
+  (`sources/alberta/{source.tar,inventory.json,snapshot-descriptor.json}`,
+  about 9.7 MB) is explicitly unignored and must remain tracked byte-for-byte;
+  clean-checkout tests reconstruct its 205-file tree only in a temporary
+  directory. The two much larger upstream mirrors remain externally
+  provisioned and ignored.
 - The two `rtu_schema23_*_failed_source_drift_*` dirs are chmod-frozen
   (deliberate read-only negative records) — kept, 13.5 MB.
 - Tier-2 option: `sources/upstream_rng_isolated/source.tar` (301 MB) is

@@ -7,15 +7,16 @@ channel independently, updates a fixed-size per-channel normalization state,
 and emits consumer-specific routes whose inactive fields are exact zero with
 false availability.
 
-Terminology is strict.  The historical ``LearningValue.delight`` field is the
-actor-sample quantity ``advantage * action_surprisal`` defined by the
-Delightful Policy Gradient (DG) paper, *Does This Gradient Spark Joy?*
-(arXiv:2603.20526), where a sample ``sparks joy`` when the Kondo gate selects
-it for a backward pass.  The separate
-multi-objective candidate-update safety audit in
-:mod:`alberta_framework.core.delight` retains older ``gradient_joy`` API names
-only for compatibility.  This router computes neither Kondo selection nor an
-update-quality verdict; it prepares typed routes for both consumers.
+Terminology is strict.  The exact ``LearningValue.delight`` field is the
+actor-sample quantity ``advantage * action_surprisal`` introduced by
+*Delightful Policy Gradient* (arXiv:2603.14608). *Does This Gradient Spark
+Joy?* (arXiv:2603.20526) then uses it to form Kondo forward admission intent;
+a sample ``sparks joy`` only when its gradient contribution enters an actor
+backward that executes. The separate multi-objective candidate-update safety
+audit in :mod:`alberta_framework.core.delight` retains older ``gradient_joy``
+API names only for compatibility.  This router computes neither Kondo
+selection nor an update-quality verdict; it prepares typed routes for both
+consumers.
 
 Normalization is causal.  A value at time ``t`` is standardized only from the
 count, mean, and Welford ``M2`` stored before time ``t``.  The current value is
@@ -78,7 +79,7 @@ _EXPLORATION_MASK = (False, False, False, True, True, True, False, False)
 _MODEL_MEMORY_REPLAY_MASK = (False, False, False, True, True, True, False, False)
 _ADAPTATION_CHANGE_MASK = (False, False, False, False, False, True, True, False)
 _SAFETY_MASK = (False, False, False, False, False, False, False, True)
-_LITERAL_GRADIENT_JOY_EVIDENCE_MASK = (True,) * _CHANNEL_COUNT
+_CANDIDATE_UPDATE_AUDIT_EVIDENCE_MASK = (True,) * _CHANNEL_COUNT
 
 
 def _strict_positive_float32(value: object, *, name: str) -> float:
@@ -444,7 +445,7 @@ class SafetyLearningValueRoute:
 
 
 @chex.dataclass(frozen=True)
-class LiteralGradientJoyEvidenceRoute:
+class CandidateUpdateAuditEvidenceRoute:
     """All-eight-channel evidence route for the candidate-update audit.
 
     ``ready`` requires all eight independently valid raw channels.  The
@@ -493,13 +494,13 @@ class LearningValueRouterResult:
     model_memory_replay: ModelMemoryReplayLearningValueRoute
     adaptation_change: AdaptationChangeLearningValueRoute
     safety: SafetyLearningValueRoute
-    literal_gradient_joy_evidence: LiteralGradientJoyEvidenceRoute
+    candidate_update_audit_evidence: CandidateUpdateAuditEvidenceRoute
     diagnostics: LearningValueRouterDiagnostics
 
     @property
-    def candidate_update_audit_evidence(self) -> LiteralGradientJoyEvidenceRoute:
-        """Canonical name for the historical audit-evidence route."""
-        return self.literal_gradient_joy_evidence
+    def literal_gradient_joy_evidence(self) -> CandidateUpdateAuditEvidenceRoute:
+        """Historical compatibility alias for the candidate-audit route."""
+        return self.candidate_update_audit_evidence
 
 
 @chex.dataclass(frozen=True)
@@ -839,6 +840,134 @@ class LearningValueRouter:
             normalization_ready,
         )
 
+    def unavailable_result(
+        self,
+        state: LearningValueRouterState,
+    ) -> LearningValueRouterResult:
+        """Return an explicit no-event result without advancing ``state``.
+
+        This is the transactional rollback companion to :meth:`route`. It is
+        useful to an outer owner that must preserve a fixed result PyTree when
+        the enclosing event is rejected before typed producers run. No channel
+        is declared, accepted, normalized, or counted, and
+        ``normalization_state_updated`` is exact false.
+        """
+
+        self._validate_state_static_contract(state)
+        cfg = self._config
+        state_valid = self._state_is_valid(state)
+        capacity_available = state_valid & (state.step_count < cfg.max_steps)
+        zero_float = jnp.zeros((_CHANNEL_COUNT,), dtype=jnp.float32)
+        zero_bool = jnp.zeros((_CHANNEL_COUNT,), dtype=jnp.bool_)
+        zero_int = jnp.zeros((_CHANNEL_COUNT,), dtype=jnp.int32)
+        safe_count = jnp.where(
+            state_valid,
+            state.channel_valid_counts,
+            zero_int,
+        )
+        safe_mean = jnp.where(state_valid, state.channel_means, zero_float)
+        safe_m2 = jnp.where(state_valid, state.channel_m2, zero_float)
+        denominator = jnp.maximum(safe_count - 1, 1).astype(jnp.float32)
+        variance = jnp.where(
+            safe_count >= 2,
+            safe_m2 / denominator,
+            zero_float,
+        )
+        scale = jnp.maximum(
+            jnp.sqrt(jnp.maximum(variance, 0.0)),
+            jnp.asarray(cfg.channel_scale_floors(), dtype=jnp.float32),
+        )
+
+        def payload(mask: tuple[bool, ...]) -> tuple[
+            LearningValue,
+            LearningValue,
+            LearningValueAvailability,
+            LearningValueAvailability,
+            Array,
+            Array,
+        ]:
+            return self._masked_route(
+                zero_float,
+                zero_float,
+                zero_bool,
+                zero_bool,
+                mask,
+            )
+
+        def route_kwargs(
+            route_payload: tuple[
+                LearningValue,
+                LearningValue,
+                LearningValueAvailability,
+                LearningValueAvailability,
+                Array,
+                Array,
+            ],
+        ) -> dict[str, object]:
+            return {
+                "values": route_payload[0],
+                "normalized_values": route_payload[1],
+                "availability": route_payload[2],
+                "normalized_availability": route_payload[3],
+                "ready": route_payload[4],
+                "normalization_ready": route_payload[5],
+            }
+
+        result = LearningValueRouterResult(
+            paper_dg_actor=PaperDGActorRoute(
+                **route_kwargs(payload(_PAPER_DG_ACTOR_MASK))
+            ),
+            exploration=ExplorationLearningValueRoute(
+                **route_kwargs(payload(_EXPLORATION_MASK))
+            ),
+            model_memory_replay=ModelMemoryReplayLearningValueRoute(
+                **route_kwargs(payload(_MODEL_MEMORY_REPLAY_MASK))
+            ),
+            adaptation_change=AdaptationChangeLearningValueRoute(
+                **route_kwargs(payload(_ADAPTATION_CHANGE_MASK))
+            ),
+            safety=SafetyLearningValueRoute(
+                **route_kwargs(payload(_SAFETY_MASK))
+            ),
+            candidate_update_audit_evidence=CandidateUpdateAuditEvidenceRoute(
+                **route_kwargs(payload(_CANDIDATE_UPDATE_AUDIT_EVIDENCE_MASK))
+            ),
+            diagnostics=LearningValueRouterDiagnostics(
+                declared_availability=_vector_to_availability(zero_bool),
+                finite=_vector_to_availability(zero_bool),
+                domain_valid=_vector_to_availability(zero_bool),
+                accepted=_vector_to_availability(zero_bool),
+                normalization_available=_vector_to_availability(zero_bool),
+                pre_update_count=safe_count,
+                pre_update_mean=_vector_to_learning_value(safe_mean),
+                pre_update_m2=_vector_to_learning_value(safe_m2),
+                pre_update_scale=_vector_to_learning_value(
+                    jnp.where(state_valid, scale, zero_float)
+                ),
+                state_valid=state_valid,
+                counter_capacity_available=capacity_available,
+                normalization_state_updated=jnp.asarray(False, dtype=jnp.bool_),
+                paper_dg_delight_prerequisites_valid=jnp.asarray(
+                    False,
+                    dtype=jnp.bool_,
+                ),
+                paper_dg_delight_identity_valid=jnp.asarray(
+                    False,
+                    dtype=jnp.bool_,
+                ),
+                current_valid_channel_count=jnp.asarray(0, dtype=jnp.int32),
+                current_unavailable_channel_count=jnp.asarray(
+                    0,
+                    dtype=jnp.int32,
+                ),
+                current_invalid_channel_count=jnp.asarray(0, dtype=jnp.int32),
+            ),
+        )
+        return cast(
+            LearningValueRouterResult,
+            jax.tree_util.tree_map(jax.lax.stop_gradient, result),
+        )
+
     def route(
         self,
         state: LearningValueRouterState,
@@ -1028,12 +1157,12 @@ class LearningValueRouter:
             normalization_available,
             _SAFETY_MASK,
         )
-        joy_payload = self._masked_route(
+        candidate_audit_payload = self._masked_route(
             routed_raw,
             normalized,
             accepted,
             normalization_available,
-            _LITERAL_GRADIENT_JOY_EVIDENCE_MASK,
+            _CANDIDATE_UPDATE_AUDIT_EVIDENCE_MASK,
         )
 
         def route_kwargs(
@@ -1067,8 +1196,8 @@ class LearningValueRouter:
                 **route_kwargs(adaptation_payload)
             ),
             safety=SafetyLearningValueRoute(**route_kwargs(safety_payload)),
-            literal_gradient_joy_evidence=LiteralGradientJoyEvidenceRoute(
-                **route_kwargs(joy_payload)
+            candidate_update_audit_evidence=CandidateUpdateAuditEvidenceRoute(
+                **route_kwargs(candidate_audit_payload)
             ),
             diagnostics=LearningValueRouterDiagnostics(
                 declared_availability=_vector_to_availability(declared),
@@ -1327,8 +1456,13 @@ class LearningValueRouter:
         return router, state
 
 
+# Historical public spelling is an identity alias, never a separate route.
+LiteralGradientJoyEvidenceRoute = CandidateUpdateAuditEvidenceRoute
+
+
 __all__ = [
     "AdaptationChangeLearningValueRoute",
+    "CandidateUpdateAuditEvidenceRoute",
     "ExplorationLearningValueRoute",
     "LEARNING_VALUE_ROUTER_CHECKPOINT_SCHEMA",
     "LEARNING_VALUE_ROUTER_CONFIG_SCHEMA",

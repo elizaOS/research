@@ -1,7 +1,7 @@
 # Forager Matched v3 Development Runbook
 
-Status: **component design and implementation only; campaign unissued, runtime-unqualified,
-and no full-horizon benchmark executed**.
+Status: **component implementation plus non-authorizing dependency artifacts; campaign
+unissued, runtime-unqualified, and no full-horizon benchmark executed**.
 
 This document describes the next separately versioned Forager comparison lane. It is not a
 preregistration receipt, an authority grant, or a performance claim. No v3 development,
@@ -23,11 +23,18 @@ validated.
   `55680786cf5a76aa2a51de35205a9bb543420c7f27aa41846d40a94dcf965fc7`.
   It binds implemented components but keeps execution readiness and authority false.
 - The pre-observation qualification-plan descriptor has SHA-256
-  `508b2167854d39b8a99c180708d93fcda0b3ea9cad66a1097c318b74e0440f26`.
+  `258b9e376b82127f912bf2828a6d4e5c7a257ed2a990cd15bf4c9cbd81c17788`.
   It is a score-blind, content-only contract with no default production plan. A caller must
   separately provide the exact two source closures, one complete runtime identity, 28
   permanently consumed public qualification cases, 28 resource ceilings, and 28
-  result-publisher bindings. It neither executes qualification nor grants authority.
+  result-publisher bindings. It neither executes qualification nor grants authority. Its
+  external-source requirement retains the historical materializer-v1 identity; it is not
+  silently upgraded to materializer v2.
+- The additive compiled-PPO qualification descriptor has SHA-256
+  `b5f7df77cd3f6e35126ed7c9f4b7acacdaa8237e8242241f658a95d21e9e3b06`.
+  It reuses exactly the base plan's one `adapted_ppo_gru` public case and ceilings while
+  selecting the compiled runner and six-file publisher only inside the addendum. It does not
+  amend or supersede the base plan, execute qualification, or grant authority.
 - Adding v3 Python files changes the full Alberta source snapshot used by any later
   qualification. That expected source drift does not change historical artifacts or the v2
   candidate-universe digest.
@@ -159,20 +166,123 @@ for the continuing path because resume can restore historical RNG state.
 
 The external source materializer is now implemented and independently audited. Its pinned
 identity schema digest is
-`5932626998b1fe75a3bf172d03d832b6c2e98b2d29e7d85507fa17665869b90a` and its
+`74cf45b9d09b06c17dd38c8713940f32a04e887259bb027c75bfa680e7b43192` and its
 implementation-source SHA-256 is
-`5a7b0d41de86952cd393bb53c4ee3eec8006ab3edc2b42a85f688cbf74dbd041`.
-It accepts only the pinned direct-`.git` checkout, validates the complete regular-file Git
-tree, applies the four frozen transforms, strips Git metadata, and atomically publishes a
-manifested derived tree. Git inspection is hermetic and wall/output bounded. No production
-checkout or manifest has been accepted, the archive bytes remain provenance rather than
-independently verified input, and no manifest grants runtime or execution authority.
+`3ff59a9f88d79b122fa66a1cdca009a68ff524806a7a7c58e5d565cd30ecaafe`.
+Materializer v2 accepts only the pinned direct-`.git` checkout, validates the complete
+regular-file Git tree plus its one exact excluded gitlink and exact portable alias exception,
+applies the four frozen transforms, strips Git metadata, and atomically publishes a
+manifested derived tree while retaining a process-bound directory capability. Git inspection
+is hermetic and wall/output bounded. A disposable, nonpromoting engineering replay covered
+all 10,945 tracked entries and replayed the published manifest, but no production checkout or
+manifest has been accepted. The archive bytes remain provenance rather than independently
+verified input, and no manifest grants runtime or execution authority.
+
+The external sealed-staging contract has descriptor SHA-256
+`ceea86b38822f3add0465788003d349dd221a49fba5f3fa069bfec985537caea`,
+implementation-source SHA-256
+`675d54edcf2f87c1847712e7a480e2e5134312d040a68a1102c10c4829f8fba0`, and
+test-source SHA-256
+`d469fc2892bd756d017097f1baecf4be46792bfa5f365c174ca7456b8f483c1c`.
+It accepts only a live retained materializer-v2 capability, replaces the 12 exact candidate
+configuration paths with their frozen derived bytes, relocates the exact materializer
+manifest, and streams a canonical USTAR into a sealed, unlinked, read-only descriptor. The
+isolated worker imports an exact sealed snapshot of its own verified implementation source.
+A disposable engineering replay reverified all 10,944 materialized regular files and all
+10,946 archive members; every one of the 18 authority claims remained false and no workload
+was executed. No replay archive, digest, production bundle, or execution receipt was retained.
+
+The downstream durable external-source publisher now binds that staging closure under
+descriptor SHA-256
+`d76657b2f0d65adae377e21fa391628aa5749acb476c69aa64ce542a716f146d`; its
+implementation-source SHA-256 is
+`0b3a31f4a8117a51477b1f0c49925d2c77a6ae4311e77bcdb367cb4cc24566e9`.
+No archive has been republished under this revised closure. Earlier one-shot build receipts
+remain historical, nonauthorizing records of their older source closure and cannot qualify a
+future run. Specifically, the retained context
+`ccacc85f9adf6d81368050be37c67cbd38bb2423cc147deea580a152acf2b330`, execution
+`38cab52b6d247bf045405bd9de9d63b36f00d4e2f79bbb7a154d663ee24b8e9d`, publication
+`28892dd3be5c29df122a94a4feb35045fd17f95475e5e7237c0a04b4b15cbd88`, and image
+`sha256:a1f491fc786a788b2629e0670ee52ad84138057e58dd795703a830ea2e42c269` are
+classified `pre_v3_source_closure_drift`. They are excluded from every active fresh-build
+binding; no automatic rebuild or reuse is permitted.
+
+The descriptor-only external execution contract has SHA-256
+`9e1a8d73ec14de554b3fdb3e5457f0448ca91adc46bf9f53988e7538bbc0eca4`; its
+implementation-source SHA-256 is
+`7b806ffe70eb38f7db182c9ef4a56c5b800f499f8ee9973ad8ac156529506671`.
+It binds the exact order, derived configuration path, entrypoint, arguments, result directory,
+reward archive, sibling database, and PPO video path for all 12 external candidates. It treats
+configuration-plan v1 as historical and selects materializer v2 only as a separate overlay.
+It exposes no executor, filesystem mutation, seed issuer, result loader, or acceptance API.
+
+The strict external-result bridge has descriptor SHA-256
+`19c784eeb709b44f2729ba4a6cf9af35a563995f51d1af91b1674af8523a90dd`; its
+implementation-source SHA-256 is
+`c1859f0cfb7862e22c470f89ad9d3298a76b1fb419bf1431069f286f593e22f7`.
+It maps the 12 exact external reward-array layouts into the frozen 499,712-step raw-reward
+trace through a bounded ZIP/NPY parser and the strict scorer, then independently reconstructs
+the ordered score, framed trace digest, canonical scorer NPZ, and complete scorer receipt.
+Every public conversion and receipt exposes reward and score content, is permanently
+nonqualifying, and is forbidden as input to a score-blind controller or publisher. No external
+result has been accepted and no execution, publication, or ingestion authority exists.
+
+The score-opaque external in-container worker has descriptor SHA-256
+`2375d8c796b82b9317135a4bb2e48779e37c8a3a91bebfe7c238fbdd9efa6e94`; its
+implementation-source SHA-256 is
+`8e8f1ed88519dbda6276c1fd9756172eb1e37e244088f51caf2924bd6fe8484a`.
+It binds and launches exactly one frozen external candidate, inventories only opaque result
+bytes, and retains them behind PID-bound single-use capabilities. The worker remains
+unexecuted here and is not a host OCI executor. A future host must prove a fresh isolated
+worker, networkless/read-only runtime closure, resource observations, all-descendant cleanup,
+and an empty cgroup or container before any content can enter a qualification path.
 
 The 14 local worker-envelope configurations now have an implemented, content-checking,
 non-authorizing builder. Its builder descriptor SHA-256 is
 `1368d3a0c96acd83e82cef75c9d014533dd783d0e6af27714ac47e2f1907840b`.
-This closes configuration construction only; the local execution source snapshot remains
-unbound and every local candidate remains execution-unready.
+The local runner descriptor SHA-256 is
+`2237914749f353d2700bbb0f33a66d8789268a5e156f2961be2e626f42efd2a1`; its
+implementation-source SHA-256 is
+`aa2eb0fd642dec7ef62a4cb0fc555f6aaede6570a55c49adfa8425a264be91aa`.
+The local source-snapshot contract has descriptor SHA-256
+`6f24c9e6fa740780856783c2e3f42f01758e10ba2e2084c40c42aa72a895090e`; its
+implementation-source SHA-256 is
+`c66d148b1f16574ac03d9e64bf87d4716caa1ce985a9258c3c5e36cb44cd6fda`.
+The standalone local bootstrap has descriptor SHA-256
+`9b2e51ab5e9bdfbb2373e411120a6b1030c66c6a105b57ea6be6215c97a87a17`; its
+implementation-source SHA-256 is
+`1240aff1329ee4322ef7087801213aa125497a5110da2c477bcecb8a4fea905e`.
+It verifies the full snapshot before and after a fresh `-I -S -B` child, uses exact
+descriptor transports and a private bytecode/cache boundary, forces CPU JAX, and requires
+separate process-bound execution and outcome capabilities. A transient engineering snapshot
+was measured and immediately replayed without being persisted or accepted. No production
+snapshot, local workload, or completion receipt exists, and every local candidate remains
+execution-unready.
+
+The local result-to-publication path is now an exact one-way trust pair. The private reward
+bundle has descriptor SHA-256
+`c4fc32c0194677af5c94849a0e457eb967b45eb28df0eed80cd68f0cc8fda315` and
+implementation-source SHA-256
+`e966cd7885df30ad9753992a213c537c9f2fff98dda9c93e98e563b6653bc0d8`.
+The direct atomic publisher has descriptor SHA-256
+`a7c13b79fb35e6248b45f2997b0b406fddb7db5b7eeb9681b226fcb122a418d6` and
+implementation-source SHA-256
+`2e840406f58253c1f02969aae2cf679a5383d93bbacd3239950f0f5054b806d2`.
+The bundle statically pins the publisher; the publisher dynamically replays the bundle source
+and canonical descriptor, avoiding a mutual source-hash cycle. Public inspection and direct
+publication are mutually exclusive single-use choices. Publication commits exactly nine flat
+files once under the full SHA-256 of `publication.json`; publish and reload return immutable
+metadata only, and the metadata has a canonical full-file receipt plus a strict caller-pinned
+parser. Reload reconciles the publication manifest's eight records and the local manifest's
+seven leaf records against the bytes actually reloaded, so caller-supplied records cannot
+replace either committed inventory.
+
+This boundary does not claim information-theoretic score opacity: exact content digests and
+sizes remain visible metadata and a qualification controller must be independently prevented
+from branching, retrying, or selecting on them. Same-process hostile Python and same-UID
+filesystem confidentiality are also outside the claim. No local qualification worker, fresh
+source snapshot, production publication, accepted observation, or authority exists, and the
+older OCI image cannot contain this source closure.
 
 The two local adapters now share one implemented, non-authorizing Foragax environment
 bridge. Its descriptor SHA-256 is
@@ -185,27 +295,169 @@ Adapter cores own only their candidate-private agent chains. The bridge binds JA
 JAXlib 0.11.0, the enabled partitionable Threefry behavior, x64-disabled mode, and exact
 Foragax 0.55.0 install-tree bytes. It remains an unqualified, per-step host API: no real
 Foragax parity qualification, backend qualification, full-horizon memory profile, or
-compiled chunk kernel has been accepted. On 2026-08-02 an unpersisted, nonpromoting
+compiled full-horizon execution has been accepted. On 2026-08-02 an unpersisted, nonpromoting
 engineering probe opened the exact installed CPU runtime, validated a `(9, 9, 3)` float32
 observation, completed three transitions with exact reset-plus-step key accounting, and
 replayed the same seed/actions with byte-exact observations and rewards. That tiny probe is
 not a qualification receipt and does not change any false readiness flag.
 
-The current OCI image is
+The earlier upstream-derived comparator OCI image is
 `sha256:5ecaabefce6439a8731c19e7a55fedb666788242baf035e6ffca86eb31299768`.
 Its dependency-lock label exactly matches upstream `uv.lock` SHA-256
 `46c2990caf152b84bcb3ac39de5173304cdbf5edd61a68f3d0000b843dabbacd`
-and includes JAX 0.9.0.1, Flax 0.12.3, Optax, Distrax, and Flashbax. Reuse is conditional on
-a fresh v3 capability/import probe; a missing dependency requires a newly pinned image
-before protocol freeze. In particular, the adapter bridge requires JAX/JAXlib 0.11.0, so
-this image is not currently a qualified adapter runtime image.
+and includes JAX/JAXlib 0.9.0.1, Flax 0.12.3, Optax, Distrax, and Flashbax. It is a negative
+control only: it cannot be reused or relabeled as the v3 runtime because the adapter bridge
+requires JAX/JAXlib 0.11.0 and the image does not satisfy the frozen CPU/cache contract.
 
 The qualification-plan v1 contract deliberately requires one unified, networkless CPU OCI
 runtime using JAX/JAXlib 0.11.0 for all 28 public qualification cases. The current JAX
 0.9.0.1 image cannot satisfy that contract. A future production plan therefore requires a
 newly pinned unified image whose external, local, and adapter candidate imports and exact
 seed/trace behavior all pass the predeclared score-blind probes; separate family runtimes
-would require a separately versioned qualification-plan contract.
+would require a separately versioned qualification-plan contract. The current retained r5
+engineering solve preserves JAX/JAXlib 0.11.0, Optax 0.2.8, dm-haiku 0.0.17, and Flax
+0.12.8 from r4. Its sole registry-package delta is exact released
+`distrax 0.1.7 -> 0.1.9`; the other 103 registry selections are unchanged. The resulting
+CPython 3.12 Linux x86_64 closure contains exactly 104 wheels and no CUDA or development
+packages. Its resolution `uv.lock` is SHA-256
+`6f6127c1b4d970c432bf29f6c7e8e65230b966cbf6197cf4e462822e84ef725d`
+(106,980 bytes). Its exact 11-file, non-authorizing solver-content manifest is SHA-256
+`325f91ad66fe26d36d46ad2588621fbb010f2a879ac6c56ab0922db3d9d4d1a5`
+(2,331 bytes), with publication-body SHA-256
+`402bb9e4a706d8c854a58889bbb54ef2989d2d753ca6e4a7a8ffe972604879ac`.
+The retained resolution report is 5,541 bytes with SHA-256
+`75eebf630d80271ce3d08dfb4adcfeb33c805222cf3320f95174dd9a3ee1f17e`.
+The live index snapshot and solver cache are not retained, so this content is provenance for
+the disconnected result rather than an independently authoritative solve.
+
+The pure CPU runtime-lock schema has descriptor SHA-256
+`31d4c5a101f441bc082bdaf9250050f7950440271e6360854d5faa9fcd7ff34a`,
+implementation-source SHA-256
+`08c232c50714891a86f5332df84c531252ff956d50e6eccfe39a30842a02fa2a`, and
+test-source SHA-256
+`c19fe578b9ebd13e2111ccfc7812a8e3bb72ddd25952afa468a389ab34e0b19a`.
+Its separate production gate requires exactly 104 registry-wheel distributions for
+CPython 3.12.3 on CPU-only Linux x86_64 with glibc at least 2.28. The schema binds the exact
+upstream source inputs, overlay operations, solver provenance, complete marker environment,
+wheel and core-metadata identities, PEP 440 requirement syntax, selected extras, active-edge
+reachability, and a content-addressed wheelhouse identity. It performs no filesystem, wheel,
+network, solver, installation, import, or execution operation, and every authority or
+readiness claim remains false.
+
+The pure-content issuer implementation SHA-256 is
+`b009fcd22741268ce55188bd4b468f3de6cf3a0e83b5d0ad8e5924368b8ebc04`; its
+test-source SHA-256 is
+`1533f8ae64107b540fa50db5a5459c3513ebe16b5ccd347d8a9ec93b9d076084`.
+It reconstructs the lock and wheel CAS mapping from the exact retained capture, receipt, and
+four-operation provenance envelope. The separate production reissuance gate accepted the
+caller-pinned 36-root and 104-wheel identities and produced these read-only, ignored
+non-evidence artifacts:
+
+- issuance envelope SHA-256
+  `30ee57e9df1e1805d7a338d250daf99849170a765fe66613466664af38421eae`
+  (49,145 bytes), body SHA-256
+  `01a51a461afe0ca8ec03fcf7dd14d2f5aa38036d7d19bf13c1b8617e09fedd24`;
+- CPU runtime-lock SHA-256
+  `f4089e4631bc1a8817827a27ab58943968c634f2a3c54ea4f54385c2163a8641`
+  (356,996 bytes), body SHA-256
+  `09cccab7af4e717daf0a6a3c8664fd8b7d875e51f8721e3d2abad8f7f77ec565`;
+- wheel CAS-manifest SHA-256
+  `e9ea3ee9faaecf09ba4367db47ab8fe7d281505b96099d3963743fbe9fc1cc46`
+  (72,679 bytes), body SHA-256
+  `234e6f1718e475a659571e0f8bc6d0fed91ccc6c3242e9f2c6695b55b442de3f`.
+
+The three files are published new-only under
+`.tools/forager-matched-v3-cpu-v1/runtime-lock-publications/sha256/f4089e4631bc1a8817827a27ab58943968c634f2a3c54ea4f54385c2163a8641/`.
+The gate bound 36 exact roots under inventory SHA-256
+`2f175de86b18b7d72772dd093902f801f423bd37393fde9133377528e4a12d47`
+and 104 selected wheels under inventory SHA-256
+`8cbe5daa6a66e87672fce419cf40f2b6769fbceea8eca3ded7e33401b3a618e6`;
+the derived CAS wheel inventory is
+`991834df9ddfc8ce2e6a71c7ed321a1cef5b21f2563b704b8168ed838ec5dfad`.
+New-only publication, immutable readback, the production gate, and a second pure-content
+issuance all reproduced the three files byte-for-byte.
+
+The lock is a content-issued runtime candidate, not an installed or qualified runtime. It
+does not establish source installation, imports, CPU-only execution, OCI identity, or
+qualification success.
+
+Four earlier immutable dependency publications are rejected engineering lineages, not
+fallback runtimes:
+
+- r1 (`17a89408...` wheelhouse, `f26a4767...` issued lock) failed because Optax 0.2.7
+  imports a JAX API removed in 0.11;
+- r2 (`e99c8bc9...` wheelhouse; no issued lock) fixed Optax but dm-haiku 0.0.16 failed on
+  removed `jax.core.DropVar`;
+- r3 (`2788d7aa...` wheelhouse; no issued lock) fixed Haiku but Flax 0.12.3 failed during
+  `linen.Dense.init` on removed `jax.core.get_opaque_trace_state`.
+- r4 (`f22a96b7...` wheelhouse, `beee7c13...` issued lock) passed the broad dependency
+  smoke probe but was rejected when exact-source PPO gradients reached removed
+  `jax.core.get_aval` through Distrax 0.1.7.
+
+The r5 fresh offline engineering probe installed exactly the published 104 wheels with the
+index, cache, configuration, dependency resolution, and source builds disabled. Completed
+CPU operations covered JAX JIT/gradient, Optax update, Haiku transform/init/apply/JIT, Flax
+Dense init/apply/JIT, Distrax categorical log-probability JIT/gradient, Gymnax reset/step,
+and Foragax reset/step. A separate network-disabled, read-only exact-source probe then
+completed both differentiated-loss routes: `isolated_ppo_generic` and
+`isolated_rtu_paper_scale`, each with a finite gradient tree. These probes are compatibility
+checks, not OCI or qualification receipts, and change no readiness or authority flag.
+
+The disconnected CPU wheelhouse contract has descriptor SHA-256
+`b74224c7bb0523b87458cb4a08aaf9967b5fd11574927d9635cf9a93bc417331`,
+host implementation-source SHA-256
+`22c2c03ef4a6dbffc018d2426eaebeefc92ce7fc6f1508d65609b89e9468e176`,
+isolated-helper source SHA-256
+`ea80e1860a0af0d376ed1be0b1c09ef74a34db2d7acd983db53ef4ffa09e99f9`, and
+test-source SHA-256
+`e6bee490079b85df9c7ecb4442ccc5e91b5f72af135974390852f938950a13df`.
+It copies caller-enumerated candidate wheels before inspection, then executes exact sealed
+snapshots of CPython 3.12.3, its frozen helper, and a separately hash-bound `packaging` wheel.
+The helper validates ZIP structure, RECORD coverage and hashes, METADATA/WHEEL identities,
+target tags, PEP 508 closure and extras, critical versions, accelerator exclusions, and graph
+reachability. Exact original wheel filenames up to 255 bytes remain in the receipt while the
+canonical USTAR uses deterministic `<wheel-sha256>.whl` member names. The archive is retained
+through a PID-bound read-only unlinked descriptor, and optional publication is explicit,
+caller-rooted, content-addressed, new-only, and rollback-checked. The Python loader, shared
+libraries, standard library, runtime prefix, kernel, verifier provenance, and verifier side
+effects remain outside this content contract.
+
+The separately authorized capture contract has descriptor SHA-256
+`8ebdec1eb47401b6c0fec4508f4649c575f22dc54c48810e28f8b5b5f2d0d0b0`,
+implementation-source SHA-256
+`716c9ffd996412cc88fde3fcc44f50280948f457fca2aba7e241815b83bc74ee`,
+and test-source SHA-256
+`c4e01a1f9549fd8fe42502735438a4276ff40087528683e1f702aa8dbac64593`.
+It accepted only exact lowercase `files.pythonhosted.org` wheel paths. The retained base
+capture held 109 wheels; targeted captures added exact replacement wheels. The r5 Distrax
+delta manifest is SHA-256
+`6389585ef9ba70c6d0ca441a8dc33fe4ba44c16da70c360cc417745f2a5fdeaa`
+(26,859 bytes), with body SHA-256
+`63c30934ac382e7dd0d01a760e44769344ea13bbca43c1c3ad16f26765548fef`.
+It commits only `distrax-0.1.9-py3-none-any.whl`, 313,467 bytes with SHA-256
+`11c93bd4dd913803f2539847cf3a688804fae5f9da224dc44e340846753f75f4`.
+The final combined 104-wheel manifest is SHA-256
+`f4d674e88f2a29047a0296ca84432cb08d05b631f96c9e75653c31df25c7275d`
+(61,762 bytes), with body SHA-256
+`1f8d7a75786ebf84a40e78dbcfcf73ac650f9fa2eb017b75cd5a92de05aac626`.
+The disconnected verifier then published canonical USTAR SHA-256
+`f396944111366df1e243214547d17c5ed35d517f0508ecff7b4a2edec1e881a7`
+(573,061,120 bytes, 104 members), archive-inventory SHA-256
+`14f99cb2b3daf8e4c121b4ed6641db792c04b10e58217f883d96d5d90eaad0c0`,
+and receipt SHA-256
+`51dc757abc25f07347c0b7b1416a61e149e72707485e3a54fdfd31765a53a1c6`
+(460,516 bytes), with body SHA-256
+`9ad8aeb755879a6624e3414ac438418e4d6ce58d40ea30ce4b5c12e64089df84`.
+These are untrusted network input followed by disconnected content validation; they do not
+authenticate PyPI, establish package safety, create an OCI image, or grant execution or
+qualification authority. The separate fresh offline probe above is the only installation
+reproduction described here.
+
+The one-image requirement applies to the final source-qualified image, not merely a shared
+dependency base. Both exact source closures must be baked into that image from retained,
+verified descriptor streams. Docker resolves bind sources in the daemon's namespace, so a
+client `/proc/self/fd` path or mutable host source mount cannot preserve the verifier's inode
+capability and is not an acceptable production boundary.
 
 ## Adapter conformance
 
@@ -294,6 +546,24 @@ cover both real structural runner-receipt parsers and a fresh-process reload; th
 agent executions. No production publication has been emitted or accepted. Campaign
 ingestion, seed-provenance authority, qualification, evidence, and every
 performance/promotion claim remain false.
+
+The compiled PPO-GRU path is separately implemented but unexecuted. Its runner descriptor
+SHA-256 is
+`3d95ed7f550cdbd946934e02f452f072bf2a0397a39dfb712be9782d2d6e2565`; its
+implementation-source SHA-256 is
+`08dc9c8d36fb98661ec4a8922973dc25df78d881807651f873843e7ddf64a27f`.
+The compiled reward-bundle descriptor SHA-256 is
+`cc9e2ad605496682ff2870bb6db312f56ad4926f4805a4a90fbacac4f648cf08`; its
+implementation-source SHA-256 is
+`e50466c185d66334f629915944407d72cb4aff4aa611dffbbe20de8aa8146f6e`.
+The six-file atomic publisher descriptor SHA-256 is
+`a7827fd32b526c1ad3f9d22549a66fa054c3785c75891560356db82791a3f500`; its
+implementation-source SHA-256 is
+`42ea4bbf5f01818b1f1f44c9410eeaa0a1fe51326a29399c175e1e859e6b8a71`.
+These components bind the exact 976 compiled chunks, runtime identity, complete reward trace,
+strict scoring, and publication replay. Their tests use synthetic content and structural
+receipts; no compiled candidate, full-horizon workload, production bundle, or publication
+has run.
 
 Separately, the isolated paper-scale RTU-PPO comparator uses 2,048-step rollouts and binds
 exactly 244 rollouts because `499712 / 2048 = 244`. It may not inherit a rounding convention
@@ -416,12 +686,13 @@ Planned roots are new and digest-named, for example:
 - `outputs/forager/matched_v3_confirmatory_<digest>_v1`
 
 All writes use new exclusive-create paths. Component-level strict schemas, cross-version
-tests, configuration replay, full adapter runners, external materialization, scoring, and
-in-memory adapter conversion now exist. A non-authorizing atomic publication implementation
-also exists, but no production adapter publication is accepted. The lane remains unissued
-until accepted production source/runtime qualification, production-result publication,
-campaign ingestion, resource receipts, campaign/seal closure, and final-analysis validators
-exist.
+tests, configuration replay, full adapter runners, external materialization and result
+conversion, local source measurement and execution plumbing, scoring, and in-memory adapter
+conversion now exist. Non-authorizing atomic publication implementations also exist for the
+base and compiled adapter paths, but no production publication is accepted. The lane remains
+unissued until accepted production source/runtime qualification, production-result
+publication, campaign ingestion, resource receipts, campaign/seal closure, and final-analysis
+validators exist.
 
 Live OCI or scientific work remains gated on all of:
 

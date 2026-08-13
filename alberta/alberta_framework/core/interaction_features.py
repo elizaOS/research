@@ -16,9 +16,12 @@ References:
         Finally Works."  (ObGD update bounding.)
 """
 
+import dataclasses
 import functools
 import math
+import struct
 import time
+from collections.abc import Mapping
 from numbers import Real
 from pathlib import Path
 from typing import Any, cast
@@ -28,7 +31,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Bool, Float, Int, PRNGKeyArray
+from jaxtyping import Bool, Float, Int, PRNGKeyArray, UInt
 
 from alberta_framework.core.checkpoints import (
     load_checkpoint,
@@ -43,6 +46,16 @@ from alberta_framework.core.feature_discovery import (
 from alberta_framework.core.future_utility import one_step_output_loss_reduction
 
 _INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
+
+CURATION_ACTIVE_INELIGIBLE_RANK = float.fromhex("0x1.fffffep+127")
+CURATION_CANDIDATE_INELIGIBLE_RANK = -CURATION_ACTIVE_INELIGIBLE_RANK
+"""Reserved finite ranks for an enabled curation-priority override.
+
+These sentinels exclude a slot from the corresponding active-deletion or
+candidate-promotion cohort.  They are finite so a valid but evidence-unready
+policy can preserve ordinary learning without falling back to legacy ranks.
+"""
 
 RELEVANCE_PROBE_MODE_CONDITIONAL_V1 = "conditional_v1"
 RELEVANCE_PROBE_MODE_TARGET_ONLY_V1 = "target_only_v1"
@@ -54,7 +67,15 @@ RELEVANCE_PROBE_MODES = frozenset(
 )
 """Versioned semantics supported by the fixed-shape relevance-probe state."""
 
-INTERACTION_FEATURE_CHECKPOINT_SCHEMA = "alberta.interaction-feature-checkpoint.v1"
+INTERACTION_FEATURE_STATE_SCHEMA = "alberta.interaction-feature-state.v2"
+INTERACTION_FEATURE_CHECKPOINT_SCHEMA = "alberta.interaction-feature-checkpoint.v2"
+INTERACTION_FEATURE_LIFETIME_COUNTER_NBYTES = 12
+INTERACTION_FEATURE_LIFETIME_COUNTER_DELTA_NBYTES = 8
+INTERACTION_FEATURE_TRANSACTION_CLOCK_NBYTES = 16
+INTERACTION_FEATURE_TRANSACTION_CLOCK_DELTA_NBYTES = 12
+_LEGACY_INTERACTION_FEATURE_CHECKPOINT_SCHEMA = (
+    "alberta.interaction-feature-checkpoint.v1"
+)
 
 
 def _require_array_contract(
@@ -83,6 +104,92 @@ def _saturating_int32_increment(value: Array) -> Array:
     maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
     counter = jnp.asarray(value, dtype=jnp.int32)
     return jnp.minimum(jnp.maximum(counter, 0), maximum - 1) + 1
+
+
+def _checked_lifetime_words_increment(
+    words: Array,
+) -> tuple[UInt[Array, " 2"], Bool[Array, ""]]:
+    """Propose one exact transaction increment without all-ones wraparound."""
+
+    if getattr(words, "shape", None) != (2,):
+        raise ValueError("interaction-feature lifetime words must have shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("interaction-feature lifetime words must have dtype uint32")
+    maximum = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+    capacity_available = ~jnp.all(words == maximum)
+    one = jnp.asarray(1, dtype=jnp.uint32)
+    low = words[1] + one
+    carry = (low == jnp.asarray(0, dtype=jnp.uint32)).astype(jnp.uint32)
+    proposed = jnp.stack((words[0] + carry, low))
+    return (
+        jnp.where(capacity_available, proposed, words).astype(jnp.uint32),
+        capacity_available,
+    )
+
+
+def _lifetime_counter_valid(words: Array, telemetry: Array) -> Bool[Array, ""]:
+    """Validate exact transaction identity against saturating telemetry."""
+
+    if getattr(words, "shape", None) != (2,):
+        raise ValueError("interaction-feature lifetime words must have shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("interaction-feature lifetime words must have dtype uint32")
+    if getattr(telemetry, "shape", None) != ():
+        raise ValueError("interaction-feature step_count must be scalar")
+    if getattr(telemetry, "dtype", None) != jnp.dtype(jnp.int32):
+        raise TypeError("interaction-feature step_count must have dtype int32")
+    maximum_i32 = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    below_saturation = (words[0] == jnp.asarray(0, dtype=jnp.uint32)) & (
+        words[1] < jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+    )
+    return (telemetry >= 0) & jnp.where(
+        below_saturation,
+        telemetry == words[1].astype(jnp.int32),
+        telemetry == maximum_i32,
+    )
+
+
+def _exact_words_modulo(words: Array, divisor_value: int) -> UInt[Array, ""]:
+    """Reduce one exact two-word identity modulo an int32-safe divisor.
+
+    The reduction consumes all 64 persisted bits. It never reconstructs the
+    identity in a scalar JAX integer, so it remains exact when x64 is disabled
+    and across low-word rollover.
+    """
+
+    if getattr(words, "shape", None) != (2,):
+        raise ValueError("interaction-feature lifetime words must have shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("interaction-feature lifetime words must have dtype uint32")
+    if (
+        isinstance(divisor_value, bool)
+        or not isinstance(divisor_value, int)
+        or not 1 <= divisor_value <= _INT32_MAX
+    ):
+        raise ValueError("exact-word modulo divisor must be a positive int32-safe integer")
+    divisor = jnp.asarray(divisor_value, dtype=jnp.uint32)
+
+    def fold_word(remainder: Array, word: Array) -> Array:
+        def fold_bit(bit_index: Array, current: Array) -> Array:
+            shift = jnp.asarray(31, dtype=jnp.int32) - bit_index
+            bit = (word >> shift.astype(jnp.uint32)) & jnp.asarray(
+                1,
+                dtype=jnp.uint32,
+            )
+            doubled = current + current + bit
+            return jnp.where(doubled >= divisor, doubled - divisor, doubled)
+
+        return jax.lax.fori_loop(
+            0,
+            32,
+            fold_bit,
+            remainder,
+        )
+
+    return fold_word(
+        fold_word(jnp.asarray(0, dtype=jnp.uint32), words[0]),
+        words[1],
+    )
 
 
 @chex.dataclass(frozen=True)
@@ -119,6 +226,8 @@ class InteractionFeatureState:
     candidate_parent_b: Int[Array, " n_candidates"]
     candidate_generator: Int[Array, " n_candidates"]
     step_count: Int[Array, ""]
+    step_words: UInt[Array, " 2"]
+    replacement_phase: Int[Array, ""]
     birth_timestamp: Float[Array, ""]
     uptime_s: Float[Array, ""]
 
@@ -180,6 +289,13 @@ class InteractionFeatureUpdateResult:
     curation_selected_active_worst_slot: Int[Array, ""]
     curation_selected_promotion_candidate: Int[Array, ""]
     curation_selected_refresh_candidate: Int[Array, ""]
+    pre_step_words: UInt[Array, " 2"]
+    post_step_words: UInt[Array, " 2"]
+    lifetime_counter_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    state_valid: Bool[Array, ""]
+    candidate_state_valid: Bool[Array, ""]
+    update_applied: Bool[Array, ""]
     update_rejected: Bool[Array, ""]
 
 
@@ -227,6 +343,25 @@ class FixedBudgetInteractionLearner:
     linear compute. Public updates enforce trace-time array contracts;
     nonfinite dynamic input is an explicit atomic no-op reported by
     ``update_rejected``.
+
+    ``task_utility_weights`` is an optional L0 mechanism for assigning fixed
+    relative utility mass across task heads.  It affects feature utility only,
+    never prediction loss or output learning.  The default ``None`` follows
+    the historical aggregation branches exactly.  A configured weighted mean
+    divides by the active base-weight mass; active and inverse-frequency task
+    balancing remain multiplicative factors in the numerator.  Weighted max
+    and top-k exclude zero-weight or inactive heads, rank by weighted signal,
+    and normalize the selected signal by selected base-weight mass.
+
+    ``stale_retirement_interval=None`` preserves the historical transaction:
+    retirement is due only at ``replacement_interval`` and leaves one vacancy
+    for a later ordinary curation. An explicit positive interval binds a
+    separate retirement cadence directly to the exact two-word transaction
+    identity. Each due update retires at most one slot and may atomically fill
+    only that new vacancy with a separately confirmed nonmatching candidate;
+    the retired identity's reset archive entry is ineligible in the same
+    transaction. If no candidate qualifies, the one vacancy blocks subsequent
+    retirement until ordinary curation fills it, preventing bank collapse.
     """
 
     def __init__(
@@ -256,6 +391,7 @@ class FixedBudgetInteractionLearner:
         independent_relevance_probe: bool = False,
         relevance_probe_mode: str = RELEVANCE_PROBE_MODE_CONDITIONAL_V1,
         retire_stale_features: bool = False,
+        stale_retirement_interval: int | None = None,
         candidate_promotion_floor: float = 0.0,
         candidate_promotion_confirmation_steps: int = 1,
         candidate_reacquisition_confirmation_steps: int = 1,
@@ -268,6 +404,7 @@ class FixedBudgetInteractionLearner:
         scale_robust: bool = False,
         scale_normalizer_decay: float = 0.99,
         scale_normalizer_epsilon: float = 1e-6,
+        task_utility_weights: tuple[float, ...] | None = None,
     ):
         if n_features < 1:
             raise ValueError("n_features must be positive")
@@ -277,8 +414,14 @@ class FixedBudgetInteractionLearner:
             raise ValueError("candidate_count must be non-negative")
         if not 0.0 <= utility_decay < 1.0:
             raise ValueError("utility_decay must be in [0, 1)")
-        if replacement_interval < 0:
-            raise ValueError("replacement_interval must be non-negative")
+        if (
+            isinstance(replacement_interval, bool)
+            or not isinstance(replacement_interval, int)
+            or not 0 <= replacement_interval <= _INT32_MAX
+        ):
+            raise ValueError(
+                "replacement_interval must be an int32-safe non-negative integer"
+            )
         if (
             isinstance(promotion_margin, bool)
             or not isinstance(cast(object, promotion_margin), Real)
@@ -298,6 +441,48 @@ class FixedBudgetInteractionLearner:
             raise ValueError(
                 "utility_task_balancing must be 'none', 'active', or 'active_inverse_frequency'"
             )
+        if task_utility_weights is not None:
+            if type(task_utility_weights) is not tuple:
+                raise TypeError("task_utility_weights must be None or an exact tuple")
+            if len(task_utility_weights) != n_tasks:
+                raise ValueError("task_utility_weights must have one entry per task")
+            if any(type(weight) is not float for weight in task_utility_weights):
+                raise TypeError("task_utility_weights entries must be built-in floats")
+            if any(not math.isfinite(weight) for weight in task_utility_weights):
+                raise ValueError("task_utility_weights must be finite")
+            if any(weight < 0.0 for weight in task_utility_weights):
+                raise ValueError("task_utility_weights must be nonnegative")
+            float32_weights: list[float] = []
+            for weight in task_utility_weights:
+                try:
+                    float32_weight = struct.unpack("!f", struct.pack("!f", weight))[0]
+                except OverflowError as exc:
+                    raise ValueError(
+                        "task_utility_weights must be float32 representable"
+                    ) from exc
+                if not math.isfinite(float32_weight) or (
+                    weight > 0.0 and float32_weight == 0.0
+                ):
+                    raise ValueError(
+                        "task_utility_weights must be float32 representable"
+                    )
+                float32_weights.append(float32_weight)
+            float32_total = sum(float32_weights)
+            try:
+                float32_total = struct.unpack(
+                    "!f",
+                    struct.pack("!f", float32_total),
+                )[0]
+            except OverflowError as exc:
+                raise ValueError(
+                    "task_utility_weights total must be float32 representable"
+                ) from exc
+            if not math.isfinite(float32_total):
+                raise ValueError(
+                    "task_utility_weights total must be float32 representable"
+                )
+            if float32_total <= 0.0:
+                raise ValueError("task_utility_weights must contain positive mass")
         if not 0.0 <= task_activity_decay < 1.0:
             raise ValueError("task_activity_decay must be in [0, 1)")
         if not 0.0 <= future_utility_mix <= 1.0:
@@ -369,6 +554,15 @@ class FixedBudgetInteractionLearner:
             raise ValueError("retire_stale_features must be boolean")
         if retire_stale_features and utility_retention_grace_steps is None:
             raise ValueError("retire_stale_features requires utility_retention_grace_steps")
+        if stale_retirement_interval is not None and (
+            isinstance(stale_retirement_interval, bool)
+            or not isinstance(stale_retirement_interval, int)
+            or not 1 <= stale_retirement_interval <= _INT32_MAX
+        ):
+            raise ValueError(
+                "stale_retirement_interval must be None or a positive "
+                "int32-safe integer"
+            )
         if (
             isinstance(candidate_promotion_floor, bool)
             or not isinstance(cast(object, candidate_promotion_floor), Real)
@@ -376,8 +570,15 @@ class FixedBudgetInteractionLearner:
             or candidate_promotion_floor < 0.0
         ):
             raise ValueError("candidate_promotion_floor must be finite and non-negative")
-        if retire_stale_features and replacement_interval <= 0:
-            raise ValueError("retire_stale_features requires a positive replacement_interval")
+        if (
+            retire_stale_features
+            and stale_retirement_interval is None
+            and replacement_interval <= 0
+        ):
+            raise ValueError(
+                "retire_stale_features requires a positive retirement cadence: "
+                "set replacement_interval or stale_retirement_interval"
+            )
         if retire_stale_features and candidate_promotion_floor <= 0.0:
             raise ValueError("retire_stale_features requires a positive candidate_promotion_floor")
         if (
@@ -444,6 +645,7 @@ class FixedBudgetInteractionLearner:
         self._utility_aggregation = utility_aggregation
         self._utility_top_k = utility_top_k
         self._utility_task_balancing = utility_task_balancing
+        self._task_utility_weights = task_utility_weights
         self._task_activity_decay = task_activity_decay
         self._future_utility_mix = future_utility_mix
         self._utility_retention_decay = utility_retention_decay
@@ -454,6 +656,7 @@ class FixedBudgetInteractionLearner:
         self._independent_relevance_probe = independent_relevance_probe
         self._relevance_probe_mode = relevance_probe_mode
         self._retire_stale_features = retire_stale_features
+        self._stale_retirement_interval = stale_retirement_interval
         self._candidate_promotion_floor = candidate_promotion_floor
         self._candidate_promotion_confirmation_steps = (
             candidate_promotion_confirmation_steps
@@ -480,6 +683,264 @@ class FixedBudgetInteractionLearner:
     def n_tasks(self) -> int:
         """Number of output tasks."""
         return self._n_tasks
+
+    def _require_state_contract(
+        self,
+        state: InteractionFeatureState,
+        *,
+        feature_dim: int,
+    ) -> None:
+        """Validate the fixed state schema before traced update arithmetic."""
+
+        if not isinstance(state, InteractionFeatureState):
+            raise TypeError("state must be an InteractionFeatureState")
+        if feature_dim < 1:
+            raise ValueError("feature_dim must be positive")
+        key = jnp.asarray(state.key)
+        if key.shape != () or not jnp.issubdtype(
+            key.dtype,
+            jax.dtypes.prng_key,
+        ):
+            raise TypeError("interaction-feature key must be a scalar PRNG key")
+
+        float_contracts = (
+            ("output_weights", state.output_weights, (self._n_tasks, self._n_features)),
+            (
+                "relevance_probe_weights",
+                state.relevance_probe_weights,
+                (self._n_tasks, self._n_features),
+            ),
+            ("relevance_probe_biases", state.relevance_probe_biases, (self._n_tasks,)),
+            ("output_biases", state.output_biases, (self._n_tasks,)),
+            ("utilities", state.utilities, (self._n_features,)),
+            ("task_activity_ema", state.task_activity_ema, (self._n_tasks,)),
+            (
+                "candidate_output_weights",
+                state.candidate_output_weights,
+                (self._n_tasks, self._candidate_count),
+            ),
+            ("candidate_utilities", state.candidate_utilities, (self._candidate_count,)),
+            (
+                "feature_second_moments",
+                state.feature_second_moments,
+                (self._n_features if self._scale_robust else 0,),
+            ),
+            (
+                "candidate_second_moments",
+                state.candidate_second_moments,
+                (self._candidate_count if self._scale_robust else 0,),
+            ),
+            (
+                "target_second_moments",
+                state.target_second_moments,
+                (self._n_tasks if self._scale_robust else 0,),
+            ),
+            ("birth_timestamp", state.birth_timestamp, ()),
+            ("uptime_s", state.uptime_s, ()),
+        )
+        for name, value, shape in float_contracts:
+            _require_array_contract(
+                value,
+                name=f"state.{name}",
+                shape=shape,
+                dtype=jnp.dtype(jnp.float32),
+            )
+
+        int_contracts = (
+            ("feature_left", state.feature_left, (self._n_features,)),
+            ("feature_right", state.feature_right, (self._n_features,)),
+            ("evidence_idle_steps", state.evidence_idle_steps, (self._n_features,)),
+            (
+                "utility_evidence_streak",
+                state.utility_evidence_streak,
+                (self._n_features,),
+            ),
+            ("ages", state.ages, (self._n_features,)),
+            ("candidate_left", state.candidate_left, (self._candidate_count,)),
+            ("candidate_right", state.candidate_right, (self._candidate_count,)),
+            ("candidate_ages", state.candidate_ages, (self._candidate_count,)),
+            (
+                "candidate_promotion_evidence_streak",
+                state.candidate_promotion_evidence_streak,
+                (self._candidate_count,),
+            ),
+            ("feature_parent_a", state.feature_parent_a, (self._n_features,)),
+            ("feature_parent_b", state.feature_parent_b, (self._n_features,)),
+            ("feature_generator", state.feature_generator, (self._n_features,)),
+            (
+                "candidate_parent_a",
+                state.candidate_parent_a,
+                (self._candidate_count,),
+            ),
+            (
+                "candidate_parent_b",
+                state.candidate_parent_b,
+                (self._candidate_count,),
+            ),
+            (
+                "candidate_generator",
+                state.candidate_generator,
+                (self._candidate_count,),
+            ),
+            ("step_count", state.step_count, ()),
+            ("replacement_phase", state.replacement_phase, ()),
+        )
+        for name, value, shape in int_contracts:
+            _require_array_contract(
+                value,
+                name=f"state.{name}",
+                shape=shape,
+                dtype=jnp.dtype(jnp.int32),
+            )
+
+        bool_contracts = (
+            (
+                "active_output_memory_committed",
+                state.active_output_memory_committed,
+                (self._n_features,),
+            ),
+            (
+                "candidate_reacquisition_required",
+                state.candidate_reacquisition_required,
+                (self._candidate_count,),
+            ),
+        )
+        for name, value, shape in bool_contracts:
+            _require_array_contract(
+                value,
+                name=f"state.{name}",
+                shape=shape,
+                dtype=jnp.dtype(jnp.bool_),
+            )
+        _checked_lifetime_words_increment(state.step_words)
+
+    def _replacement_phase_valid(
+        self,
+        step_words: Array,
+        replacement_phase: Array,
+    ) -> Bool[Array, ""]:
+        """Bind the persisted scheduling phase to the exact 64-bit identity."""
+
+        if self._replacement_interval == 0:
+            return replacement_phase == jnp.asarray(0, dtype=jnp.int32)
+        exact_phase = _exact_words_modulo(step_words, self._replacement_interval)
+        phase_in_range = (replacement_phase >= 0) & (
+            replacement_phase
+            < jnp.asarray(self._replacement_interval, dtype=jnp.int32)
+        )
+        return phase_in_range & (replacement_phase.astype(jnp.uint32) == exact_phase)
+
+    def _next_replacement_phase(self, replacement_phase: Array) -> Int[Array, ""]:
+        """Advance the exact modulo phase without saturating or wrapping."""
+
+        if self._replacement_interval == 0:
+            return jnp.asarray(0, dtype=jnp.int32)
+        final_phase = jnp.asarray(self._replacement_interval - 1, dtype=jnp.int32)
+        return jnp.where(
+            replacement_phase == final_phase,
+            jnp.asarray(0, dtype=jnp.int32),
+            replacement_phase + jnp.asarray(1, dtype=jnp.int32),
+        )
+
+    def _state_values_valid(
+        self,
+        state: InteractionFeatureState,
+        *,
+        feature_dim: int,
+    ) -> Bool[Array, ""]:
+        """Validate every dynamic state value outside the exact clock fields."""
+
+        active_live = self._live_descriptor_mask(
+            state.feature_left,
+            state.feature_right,
+            feature_dim,
+        )
+        candidate_live = self._live_descriptor_mask(
+            state.candidate_left,
+            state.candidate_right,
+            feature_dim,
+        )
+        active_vacancy = (state.feature_left == -1) & (state.feature_right == -1)
+        candidate_vacancy = (state.candidate_left == -1) & (
+            state.candidate_right == -1
+        )
+        lineage_values_valid = jnp.asarray(True, dtype=jnp.bool_)
+        for lineage in (
+            state.feature_parent_a,
+            state.feature_parent_b,
+            state.candidate_parent_a,
+            state.candidate_parent_b,
+        ):
+            lineage_values_valid = lineage_values_valid & jnp.all(
+                (lineage >= -1) & (lineage < self._n_features)
+            )
+        generator_values_valid = jnp.all(
+            (state.feature_generator >= -1)
+            & (state.feature_generator <= GENERATOR_IMPRINT)
+        ) & jnp.all(
+            (state.candidate_generator >= -1)
+            & (state.candidate_generator <= GENERATOR_IMPRINT)
+        )
+        counters_valid = (
+            jnp.all(state.evidence_idle_steps >= 0)
+            & jnp.all(state.utility_evidence_streak >= 0)
+            & jnp.all(state.ages >= 0)
+            & jnp.all(state.candidate_ages >= 0)
+            & jnp.all(state.candidate_promotion_evidence_streak >= 0)
+        )
+        finite_values = (
+            jnp.all(jnp.isfinite(state.output_weights))
+            & jnp.all(jnp.isfinite(state.relevance_probe_weights))
+            & jnp.all(jnp.isfinite(state.relevance_probe_biases))
+            & jnp.all(jnp.isfinite(state.output_biases))
+            & jnp.all(jnp.isfinite(state.utilities))
+            & jnp.all(jnp.isfinite(state.task_activity_ema))
+            & jnp.all(jnp.isfinite(state.candidate_output_weights))
+            & jnp.all(jnp.isfinite(state.candidate_utilities))
+            & jnp.all(jnp.isfinite(state.feature_second_moments))
+            & jnp.all(jnp.isfinite(state.candidate_second_moments))
+            & jnp.all(jnp.isfinite(state.target_second_moments))
+            & jnp.isfinite(state.birth_timestamp)
+            & jnp.isfinite(state.uptime_s)
+        )
+        bounded_values = (
+            jnp.all(state.utilities >= 0.0)
+            & jnp.all(state.candidate_utilities >= 0.0)
+            & jnp.all(state.task_activity_ema >= 0.0)
+            & jnp.all(state.task_activity_ema <= 1.0)
+            & jnp.all(state.feature_second_moments >= 0.0)
+            & jnp.all(state.candidate_second_moments >= 0.0)
+            & jnp.all(state.target_second_moments >= 0.0)
+            & (state.birth_timestamp >= 0.0)
+            & (state.uptime_s >= 0.0)
+        )
+        return (
+            finite_values
+            & bounded_values
+            & counters_valid
+            & jnp.all(active_live | active_vacancy)
+            & jnp.all(candidate_live | candidate_vacancy)
+            & jnp.all(~state.active_output_memory_committed | active_live)
+            & lineage_values_valid
+            & generator_values_valid
+        )
+
+    def _transaction_state_valid(
+        self,
+        state: InteractionFeatureState,
+        *,
+        feature_dim: int,
+    ) -> Bool[Array, ""]:
+        """Validate one complete dynamic state including its exact clock."""
+
+        return (
+            _lifetime_counter_valid(state.step_words, state.step_count)
+            & self._replacement_phase_valid(
+                state.step_words,
+                state.replacement_phase,
+            )
+            & self._state_values_valid(state, feature_dim=feature_dim)
+        )
 
     def memory_accounting(self, state: InteractionFeatureState) -> dict[str, int | bool]:
         """Return exact persistent-array accounting for an initialized state.
@@ -546,6 +1007,9 @@ class FixedBudgetInteractionLearner:
             ),
             "normalizer_scalars": int(normalizer_scalars),
             "normalizer_bytes": int(normalizer_scalars) * 4,
+            "lifetime_counter_bytes": INTERACTION_FEATURE_LIFETIME_COUNTER_NBYTES,
+            "replacement_phase_bytes": int(state.replacement_phase.nbytes),
+            "transaction_clock_bytes": INTERACTION_FEATURE_TRANSACTION_CLOCK_NBYTES,
             "persistent_array_bytes": array_bytes,
         }
 
@@ -553,6 +1017,7 @@ class FixedBudgetInteractionLearner:
         """Serialize learner configuration."""
         return {
             "type": "FixedBudgetInteractionLearner",
+            "state_schema": INTERACTION_FEATURE_STATE_SCHEMA,
             "n_features": self._n_features,
             "n_tasks": self._n_tasks,
             "step_size_output": self._step_size_output,
@@ -568,6 +1033,11 @@ class FixedBudgetInteractionLearner:
             "utility_aggregation": self._utility_aggregation,
             "utility_top_k": self._utility_top_k,
             "utility_task_balancing": self._utility_task_balancing,
+            "task_utility_weights": (
+                None
+                if self._task_utility_weights is None
+                else list(self._task_utility_weights)
+            ),
             "task_activity_decay": self._task_activity_decay,
             "future_utility_mix": self._future_utility_mix,
             "utility_retention_decay": self._utility_retention_decay,
@@ -582,6 +1052,7 @@ class FixedBudgetInteractionLearner:
             "independent_relevance_probe": self._independent_relevance_probe,
             "relevance_probe_mode": self._relevance_probe_mode,
             "retire_stale_features": self._retire_stale_features,
+            "stale_retirement_interval": self._stale_retirement_interval,
             "candidate_promotion_floor": self._candidate_promotion_floor,
             "candidate_promotion_confirmation_steps": (
                 self._candidate_promotion_confirmation_steps
@@ -613,6 +1084,8 @@ class FixedBudgetInteractionLearner:
         """
         config = dict(config)
         config.pop("type", None)
+        if config.pop("state_schema", None) != INTERACTION_FEATURE_STATE_SCHEMA:
+            raise ValueError("interaction-feature state schema is unsupported")
         if "relevance_probe_mode" not in config:
             if config.get("independent_relevance_probe", False):
                 raise ValueError(
@@ -621,7 +1094,20 @@ class FixedBudgetInteractionLearner:
                 )
             config["relevance_probe_mode"] = RELEVANCE_PROBE_MODE_CONDITIONAL_V1
         generator_mix = config.pop("generator_mix", (1.0, 0.0, 0.0))
-        return cls(generator_mix=tuple(generator_mix), **config)
+        raw_task_utility_weights = config.pop("task_utility_weights", None)
+        if raw_task_utility_weights is None:
+            task_utility_weights = None
+        else:
+            if type(raw_task_utility_weights) is not list:
+                raise TypeError(
+                    "serialized task_utility_weights must be None or an exact JSON list"
+                )
+            task_utility_weights = tuple(raw_task_utility_weights)
+        return cls(
+            generator_mix=tuple(generator_mix),
+            task_utility_weights=task_utility_weights,
+            **config,
+        )
 
     def init(self, feature_dim: int, key: Array) -> InteractionFeatureState:
         """Initialize active and candidate pair banks."""
@@ -687,6 +1173,8 @@ class FixedBudgetInteractionLearner:
             candidate_parent_b=jnp.full(self._candidate_count, -1, dtype=jnp.int32),
             candidate_generator=jnp.full(self._candidate_count, GENERATOR_RANDOM, dtype=jnp.int32),
             step_count=jnp.array(0, dtype=jnp.int32),
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
+            replacement_phase=jnp.array(0, dtype=jnp.int32),
             birth_timestamp=jnp.asarray(time.time(), dtype=jnp.float32),
             uptime_s=jnp.asarray(0.0, dtype=jnp.float32),
         )
@@ -772,6 +1260,99 @@ class FixedBudgetInteractionLearner:
             1.0 - self._task_activity_decay
         ) * active_mask.astype(jnp.float32)
 
+    def _weighted_task_factors(
+        self,
+        active_mask: Array,
+        task_activity_ema: Array,
+    ) -> tuple[Array, Array, Array]:
+        """Return normalized base mass, numerator factors, and eligibility.
+
+        The configured base weights are normalized by their eligible mass
+        before they enter arithmetic.  This makes their scale irrelevant and
+        avoids overflowing an otherwise finite weighted sum.  Inverse task
+        frequency is deliberately a numerator multiplier, matching the legacy
+        active-inverse-frequency reduction rather than cancelling the rarity
+        correction in the denominator.
+        """
+
+        if self._task_utility_weights is None:
+            raise RuntimeError("weighted task factors require task_utility_weights")
+        base_weights = jnp.asarray(
+            self._task_utility_weights,
+            dtype=jnp.float32,
+        )
+        if self._utility_task_balancing == "none":
+            eligible = base_weights > 0.0
+        else:
+            eligible = (base_weights > 0.0) & active_mask
+        eligible_base_weights = jnp.where(eligible, base_weights, 0.0)
+        active_weight_mass = jnp.sum(eligible_base_weights, dtype=jnp.float32)
+        safe_active_weight_mass = jnp.where(
+            active_weight_mass > 0.0,
+            active_weight_mass,
+            jnp.asarray(1.0, dtype=jnp.float32),
+        )
+        normalized_base_weights = eligible_base_weights / safe_active_weight_mass
+        numerator_factors = normalized_base_weights
+        if self._utility_task_balancing == "active_inverse_frequency":
+            frequency_floor = jnp.asarray(
+                1.0 - self._task_activity_decay,
+                dtype=jnp.float32,
+            )
+            numerator_factors = numerator_factors / jnp.maximum(
+                task_activity_ema,
+                frequency_floor,
+            )
+        return normalized_base_weights, numerator_factors, eligible
+
+    def _weighted_task_feature_reduction(
+        self,
+        task_feature_signal: Array,
+        active_mask: Array,
+        task_activity_ema: Array,
+    ) -> Array:
+        """Apply configured task weights with safe mean/max/top-k semantics."""
+
+        (
+            normalized_base_weights,
+            numerator_factors,
+            eligible,
+        ) = self._weighted_task_factors(active_mask, task_activity_ema)
+        weighted_signal = task_feature_signal * numerator_factors[:, None]
+        if self._utility_aggregation == "mean":
+            return jnp.sum(weighted_signal, axis=0)
+
+        k = 1
+        if self._utility_aggregation == "topk":
+            k = min(self._utility_top_k, self._n_tasks)
+        scores = jnp.where(
+            eligible[:, None],
+            weighted_signal,
+            -jnp.inf,
+        )
+        _, selected_indices = jax.lax.top_k(jnp.swapaxes(scores, 0, 1), k)
+        selected_signal = jnp.take_along_axis(
+            jnp.swapaxes(weighted_signal, 0, 1),
+            selected_indices,
+            axis=1,
+        )
+        selected_base_mass = jnp.take_along_axis(
+            jnp.broadcast_to(
+                normalized_base_weights[None, :],
+                (task_feature_signal.shape[1], self._n_tasks),
+            ),
+            selected_indices,
+            axis=1,
+        )
+        selected_mass = jnp.sum(selected_base_mass, axis=1)
+        safe_selected_mass = jnp.where(
+            selected_mass > 0.0,
+            selected_mass,
+            jnp.asarray(1.0, dtype=jnp.float32),
+        )
+        selected_mean = jnp.sum(selected_signal, axis=1) / safe_selected_mass
+        return jnp.where(selected_mass > 0.0, selected_mean, 0.0)
+
     def _utility_signal(
         self,
         output_weights: Array,
@@ -781,6 +1362,12 @@ class FixedBudgetInteractionLearner:
     ) -> Array:
         """Score feature usefulness from current outgoing weights and activity."""
         weighted_activity = jnp.abs(output_weights) * jnp.abs(features)[None, :]
+        if self._task_utility_weights is not None:
+            return self._weighted_task_feature_reduction(
+                weighted_activity,
+                active_mask,
+                task_activity_ema,
+            )
         if self._utility_task_balancing != "none":
             active = active_mask.astype(jnp.float32)
             if self._utility_task_balancing == "active_inverse_frequency":
@@ -862,6 +1449,12 @@ class FixedBudgetInteractionLearner:
         task_activity_ema: Array,
     ) -> Array:
         weighted_signal = task_feature_signal
+        if self._task_utility_weights is not None:
+            return self._weighted_task_feature_reduction(
+                weighted_signal,
+                active_mask,
+                task_activity_ema,
+            )
         if self._utility_task_balancing != "none":
             active = active_mask.astype(jnp.float32)
             if self._utility_task_balancing == "active_inverse_frequency":
@@ -1434,6 +2027,27 @@ class FixedBudgetInteractionLearner:
             shape=(self._n_tasks,),
             dtype=jnp.dtype(jnp.float32),
         )
+        feature_dim = raw_observation.shape[0]
+        self._require_state_contract(state, feature_dim=feature_dim)
+        proposed_step_words, lifetime_capacity_available = (
+            _checked_lifetime_words_increment(state.step_words)
+        )
+        lifetime_counter_valid = _lifetime_counter_valid(
+            state.step_words,
+            state.step_count,
+        )
+        replacement_phase_valid = self._replacement_phase_valid(
+            state.step_words,
+            state.replacement_phase
+        )
+        state_valid = (
+            lifetime_counter_valid
+            & replacement_phase_valid
+            & self._state_values_valid(state, feature_dim=feature_dim)
+        )
+        proposed_replacement_phase = self._next_replacement_phase(
+            state.replacement_phase
+        )
         external = (
             jnp.ones((self._n_features,), dtype=jnp.bool_)
             if external_read_mask is None
@@ -1495,7 +2109,9 @@ class FixedBudgetInteractionLearner:
             0.0,
         )
         input_valid = (
-            jnp.all(jnp.isfinite(raw_observation))
+            state_valid
+            & lifetime_capacity_available
+            & jnp.all(jnp.isfinite(raw_observation))
             & jnp.all(jnp.isfinite(raw_targets) | jnp.isnan(raw_targets))
             & priority_override_valid
         )
@@ -1505,7 +2121,6 @@ class FixedBudgetInteractionLearner:
         active_count = jnp.maximum(jnp.sum(active_mask.astype(jnp.float32)), 1.0)
         task_activity_ema = self._task_activity_update(state.task_activity_ema, active_mask)
 
-        feature_dim = observation.shape[0]
         live_features = self._live_descriptor_mask(
             state.feature_left,
             state.feature_right,
@@ -1981,6 +2596,8 @@ class FixedBudgetInteractionLearner:
             candidate_parent_b=state.candidate_parent_b,
             candidate_generator=state.candidate_generator,
             step_count=step_count,
+            step_words=proposed_step_words,
+            replacement_phase=proposed_replacement_phase,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
@@ -1993,7 +2610,19 @@ class FixedBudgetInteractionLearner:
         retired_right = jnp.array(-1, dtype=jnp.int32)
 
         should_try_replace = (self._replacement_interval > 0) & (
-            step_count % jnp.array(max(self._replacement_interval, 1)) == 0
+            proposed_replacement_phase == jnp.asarray(0, dtype=jnp.int32)
+        )
+        retirement_interval = (
+            self._replacement_interval
+            if self._stale_retirement_interval is None
+            else self._stale_retirement_interval
+        )
+        should_try_retire = (
+            retirement_interval > 0
+            and self._retire_stale_features
+        ) & (
+            _exact_words_modulo(proposed_step_words, max(retirement_interval, 1))
+            == jnp.asarray(0, dtype=jnp.uint32)
         )
         stale_scores = jnp.where(
             live_features
@@ -2013,7 +2642,7 @@ class FixedBudgetInteractionLearner:
         has_stale_slot = jnp.any(stale_scores >= 0)
         has_vacancy_before = jnp.any(~live_features)
         should_retire = (
-            should_try_replace & self._retire_stale_features & has_stale_slot & ~has_vacancy_before
+            should_try_retire & has_stale_slot & ~has_vacancy_before
         )
         retired_slot = jnp.where(should_retire, stale_slot, retired_slot)
         retired_left = jnp.where(
@@ -2136,6 +2765,16 @@ class FixedBudgetInteractionLearner:
         first_inactive = jnp.argmax(inactive_slots).astype(jnp.int32)
         has_inactive_slot = jnp.any(inactive_slots)
         eligible_active = live_after_retirement & (ages >= self._min_feature_age)
+        eligible_active = eligible_active & (
+            ~priority_override_enabled
+            | (
+                active_priority_ranks
+                != jnp.asarray(
+                    CURATION_ACTIVE_INELIGIBLE_RANK,
+                    dtype=jnp.float32,
+                )
+            )
+        )
         active_selection_scores = jnp.where(
             priority_override_enabled,
             active_priority_ranks,
@@ -2182,6 +2821,21 @@ class FixedBudgetInteractionLearner:
             eligible_candidates = (
                 candidate_ages >= self._candidate_min_age
             ) & ~candidate_matches_active & candidate_promotion_confirmed
+            # Retirement resets every archive entry with the retired identity.
+            # The confirmation booleans above describe pre-reset evidence, so
+            # this explicit post-reset exclusion prevents same-transaction
+            # reacquisition even when that entry had the highest old utility.
+            eligible_candidates = eligible_candidates & ~retired_candidate_mask
+            eligible_candidates = eligible_candidates & (
+                ~priority_override_enabled
+                | (
+                    candidate_priority_ranks
+                    != jnp.asarray(
+                        CURATION_CANDIDATE_INELIGIBLE_RANK,
+                        dtype=jnp.float32,
+                    )
+                )
+            )
             candidate_selection_scores = jnp.where(
                 priority_override_enabled,
                 candidate_priority_ranks,
@@ -2202,8 +2856,13 @@ class FixedBudgetInteractionLearner:
             )
             curation_selected_refresh_candidate = worst_candidate
             should_promote = (
-                should_try_replace
-                & ~should_retire
+                (
+                    (should_try_replace & ~should_retire)
+                    | (
+                        should_retire
+                        & (self._stale_retirement_interval is not None)
+                    )
+                )
                 & has_destination
                 & has_candidate
                 & (
@@ -2614,6 +3273,8 @@ class FixedBudgetInteractionLearner:
             candidate_parent_b=candidate_parent_b,
             candidate_generator=candidate_generator,
             step_count=step_count,
+            step_words=proposed_step_words,
+            replacement_phase=proposed_replacement_phase,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
@@ -2638,6 +3299,15 @@ class FixedBudgetInteractionLearner:
             ],
             dtype=jnp.float32,
         )
+
+        candidate_state_valid = self._transaction_state_valid(
+            new_state,
+            feature_dim=feature_dim,
+        ) & self._transaction_state_valid(
+            pre_curation_state,
+            feature_dim=feature_dim,
+        )
+        input_valid = input_valid & candidate_state_valid
 
         committed_state = jax.lax.cond(
             input_valid,
@@ -2794,27 +3464,34 @@ class FixedBudgetInteractionLearner:
                 False,
             ),
             curation_priority_override_enabled=priority_override_enabled,
-            curation_attempted=input_valid & should_try_replace,
+            curation_attempted=input_valid & (should_try_replace | should_retire),
             curation_priority_override_applied=(
                 input_valid
-                & should_try_replace
+                & (should_try_replace | should_retire)
                 & priority_override_enabled
             ),
             curation_selected_active_worst_slot=jnp.where(
-                input_valid & should_try_replace,
+                input_valid & (should_try_replace | should_retire),
                 curation_selected_active_worst_slot,
                 rejected_index,
             ),
             curation_selected_promotion_candidate=jnp.where(
-                input_valid & should_try_replace,
+                input_valid & (should_try_replace | should_retire),
                 curation_selected_promotion_candidate,
                 rejected_index,
             ),
             curation_selected_refresh_candidate=jnp.where(
-                input_valid & should_try_replace,
+                input_valid & (should_try_replace | should_retire),
                 curation_selected_refresh_candidate,
                 rejected_index,
             ),
+            pre_step_words=state.step_words,
+            post_step_words=committed_state.step_words,
+            lifetime_counter_valid=lifetime_counter_valid,
+            lifetime_capacity_available=lifetime_capacity_available,
+            state_valid=state_valid,
+            candidate_state_valid=candidate_state_valid,
+            update_applied=input_valid,
             update_rejected=~input_valid,
         )
 
@@ -2842,6 +3519,81 @@ def run_interaction_feature_arrays(
     return InteractionFeatureLearningResult(state=final_state, metrics=metrics)
 
 
+def interaction_feature_lifetime_counter_nbytes() -> int:
+    """Return bytes occupied by compatibility telemetry and exact identity."""
+
+    return INTERACTION_FEATURE_LIFETIME_COUNTER_NBYTES
+
+
+def interaction_feature_transaction_clock_nbytes() -> int:
+    """Return bytes occupied by telemetry, exact identity, and cadence phase."""
+
+    return INTERACTION_FEATURE_TRANSACTION_CLOCK_NBYTES
+
+
+def measure_interaction_feature_state_nbytes(state: InteractionFeatureState) -> int:
+    """Measure persistent JAX-array bytes in one interaction-feature state."""
+
+    return sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree.leaves(state)
+        if isinstance(leaf, Array)
+    )
+
+
+def migrate_legacy_interaction_feature_state(
+    legacy_state: Any,
+    *,
+    replacement_interval: int,
+) -> InteractionFeatureState:
+    """Migrate a pre-v2 state only when its saturated clock is unambiguous."""
+
+    if (
+        isinstance(replacement_interval, bool)
+        or not isinstance(replacement_interval, int)
+        or not 0 <= replacement_interval <= _INT32_MAX
+    ):
+        raise ValueError(
+            "replacement_interval must be an int32-safe non-negative integer"
+        )
+    if isinstance(legacy_state, Mapping):
+        fields = dict(legacy_state)
+    elif dataclasses.is_dataclass(legacy_state) and not isinstance(legacy_state, type):
+        fields = {
+            field.name: getattr(legacy_state, field.name)
+            for field in dataclasses.fields(legacy_state)
+        }
+    else:
+        raise TypeError("legacy interaction-feature state must be a mapping or dataclass")
+    current_names = {
+        field.name
+        for field in dataclasses.fields(InteractionFeatureState)  # type: ignore[arg-type]
+    }
+    legacy_names = current_names - {"step_words", "replacement_phase"}
+    supplied_names = set(fields)
+    if supplied_names != legacy_names:
+        missing = sorted(legacy_names - supplied_names)
+        extra = sorted(supplied_names - legacy_names)
+        raise ValueError(
+            "legacy interaction-feature field manifest is not exact; "
+            f"missing={missing}, extra={extra}"
+        )
+    step_count = jnp.asarray(fields["step_count"])
+    if step_count.shape != () or step_count.dtype != jnp.dtype(jnp.int32):
+        raise TypeError("legacy interaction-feature step_count must be scalar int32")
+    step = int(step_count)
+    if step < 0:
+        raise ValueError("negative legacy interaction-feature step_count indicates wrap")
+    if step >= _INT32_MAX:
+        raise ValueError("saturated legacy interaction-feature step_count is ambiguous")
+    fields["step_words"] = jnp.asarray((0, step), dtype=jnp.uint32)
+    fields["replacement_phase"] = jnp.asarray(
+        0 if replacement_interval == 0 else step % replacement_interval,
+        dtype=jnp.int32,
+    )
+    return InteractionFeatureState(**fields)
+
+
 def save_interaction_feature_checkpoint(
     learner: FixedBudgetInteractionLearner,
     state: InteractionFeatureState,
@@ -2852,6 +3604,15 @@ def save_interaction_feature_checkpoint(
     """Persist state with its explicit probe semantics and resource contract."""
     if isinstance(feature_dim, bool) or not isinstance(feature_dim, int) or feature_dim < 1:
         raise ValueError("feature_dim must be a positive integer")
+    learner._require_state_contract(state, feature_dim=feature_dim)
+    if not bool(_lifetime_counter_valid(state.step_words, state.step_count)):
+        raise ValueError("interaction-feature checkpoint lifetime counter is invalid")
+    if not bool(
+        learner._replacement_phase_valid(state.step_words, state.replacement_phase)
+    ):
+        raise ValueError("interaction-feature checkpoint replacement phase is invalid")
+    if not bool(learner._state_values_valid(state, feature_dim=feature_dim)):
+        raise ValueError("interaction-feature checkpoint state values are invalid")
     save_checkpoint(
         state,
         path,
@@ -2877,7 +3638,14 @@ def load_interaction_feature_checkpoint(
     }
     if set(metadata) != expected_fields:
         raise ValueError("interaction-feature checkpoint metadata fields are invalid")
-    if metadata.get("schema") != INTERACTION_FEATURE_CHECKPOINT_SCHEMA:
+    checkpoint_schema = metadata.get("schema")
+    if checkpoint_schema == _LEGACY_INTERACTION_FEATURE_CHECKPOINT_SCHEMA:
+        raise ValueError(
+            "legacy interaction-feature checkpoint v1 lacks exact step_words and "
+            "replacement_phase; migrate its state with "
+            "migrate_legacy_interaction_feature_state and resave it"
+        )
+    if checkpoint_schema != INTERACTION_FEATURE_CHECKPOINT_SCHEMA:
         raise ValueError("interaction-feature checkpoint schema is unsupported")
     config = metadata.get("learner_config")
     if not isinstance(config, dict):
@@ -2890,6 +3658,18 @@ def load_interaction_feature_checkpoint(
     restored, restored_metadata = load_checkpoint(template, path)
     if restored_metadata != metadata:
         raise ValueError("interaction-feature checkpoint metadata changed between reads")
+    learner._require_state_contract(restored, feature_dim=feature_dim)
+    if not bool(_lifetime_counter_valid(restored.step_words, restored.step_count)):
+        raise ValueError("interaction-feature checkpoint lifetime counter is invalid")
+    if not bool(
+        learner._replacement_phase_valid(
+            restored.step_words,
+            restored.replacement_phase,
+        )
+    ):
+        raise ValueError("interaction-feature checkpoint replacement phase is invalid")
+    if not bool(learner._state_values_valid(restored, feature_dim=feature_dim)):
+        raise ValueError("interaction-feature checkpoint state values are invalid")
     if learner.memory_accounting(restored) != metadata.get("memory_accounting"):
         raise ValueError("interaction-feature checkpoint resource contract does not match")
     return learner, cast(InteractionFeatureState, restored)

@@ -12,22 +12,71 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int, UInt
 
+BEHAVIOR_MODEL_STATE_SCHEMA = "alberta.behavior-model-state.v2"
+BEHAVIOR_MODEL_LIFETIME_COUNTER_NBYTES = 12
+BEHAVIOR_MODEL_LIFETIME_COUNTER_DELTA_NBYTES = 8
 _INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
 
 
 def _saturating_int32_increment(value: Array) -> Array:
     maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
     counter = jnp.asarray(value, dtype=jnp.int32)
     return jnp.minimum(jnp.maximum(counter, 0), maximum - 1) + 1
+
+
+def _checked_lifetime_words_increment(
+    words: Array,
+) -> tuple[UInt[Array, " 2"], Bool[Array, ""]]:
+    """Propose the next exact word identity without wrapping all-ones."""
+
+    if getattr(words, "shape", None) != (2,):
+        raise ValueError("behavior lifetime words must have shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("behavior lifetime words must have dtype uint32")
+    maximum = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+    capacity_available = ~jnp.all(words == maximum)
+    one = jnp.asarray(1, dtype=jnp.uint32)
+    low = words[1] + one
+    carry = (low == jnp.asarray(0, dtype=jnp.uint32)).astype(jnp.uint32)
+    proposed = jnp.stack((words[0] + carry, low))
+    return (
+        jnp.where(capacity_available, proposed, words).astype(jnp.uint32),
+        capacity_available,
+    )
+
+
+def _lifetime_counter_valid(words: Array, telemetry: Array) -> Bool[Array, ""]:
+    """Validate exact identity against saturating int32 compatibility telemetry."""
+
+    if getattr(words, "shape", None) != (2,):
+        raise ValueError("behavior lifetime words must have shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("behavior lifetime words must have dtype uint32")
+    if getattr(telemetry, "shape", None) != ():
+        raise ValueError("behavior step_count must be scalar")
+    if getattr(telemetry, "dtype", None) != jnp.dtype(jnp.int32):
+        raise TypeError("behavior step_count must have dtype int32")
+    maximum_i32 = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    below_saturation = (words[0] == jnp.asarray(0, dtype=jnp.uint32)) & (
+        words[1] < jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+    )
+    expected = words[1].astype(jnp.int32)
+    return (telemetry >= 0) & jnp.where(
+        below_saturation,
+        telemetry == expected,
+        telemetry == maximum_i32,
+    )
 
 
 def floor_and_renormalize_probabilities(
@@ -215,6 +264,7 @@ class BehaviorModelState:
     bias: Float[Array, " n_actions"]
     rng_key: Array
     step_count: Int[Array, ""]
+    step_words: UInt[Array, " 2"]
     nll_ema: Float[Array, ""]
     accuracy_ema: Float[Array, ""]
     confidence_ema: Float[Array, ""]
@@ -235,6 +285,7 @@ class BehaviorModelResourceBudget:
     trainable_float32_scalars: int
     diagnostic_float32_scalars: int
     administrative_int32_scalars: int
+    lifetime_counter_uint32_scalars: int
     rng_uint32_scalars: int
     state_nbytes: int
     learned_float32_scalars_touched_per_update: int
@@ -276,6 +327,11 @@ class BehaviorModelUpdateResult:
     confidence: Float[Array, ""]
     predicted_action: Int[Array, ""]
     correct: Float[Array, ""]
+    pre_step_words: UInt[Array, " 2"]
+    post_step_words: UInt[Array, " 2"]
+    lifetime_counter_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -325,6 +381,7 @@ class BehaviorModel:
         """Serialize model configuration."""
         return {
             "type": "BehaviorModel",
+            "state_schema": BEHAVIOR_MODEL_STATE_SCHEMA,
             "config": self._config.to_config(),
         }
 
@@ -333,6 +390,9 @@ class BehaviorModel:
         """Reconstruct a behavior model from :meth:`to_config` output."""
         config = dict(config)
         config.pop("type", None)
+        state_schema = config.pop("state_schema", BEHAVIOR_MODEL_STATE_SCHEMA)
+        if state_schema != BEHAVIOR_MODEL_STATE_SCHEMA:
+            raise ValueError(f"Unsupported behavior-model state schema: {state_schema!r}")
         return cls(BehaviorModelConfig.from_config(config["config"]))
 
     def init(self, feature_dim: int, key: Array) -> BehaviorModelState:
@@ -347,6 +407,7 @@ class BehaviorModel:
             bias=jnp.zeros((self._config.n_actions,), dtype=jnp.float32),
             rng_key=key,
             step_count=jnp.array(0, dtype=jnp.int32),
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
             nll_ema=jnp.array(0.0, dtype=jnp.float32),
             accuracy_ema=jnp.array(0.0, dtype=jnp.float32),
             confidence_ema=jnp.array(0.0, dtype=jnp.float32),
@@ -364,14 +425,18 @@ class BehaviorModel:
         trainable = self._config.n_actions * feature_dim + self._config.n_actions
         diagnostics = 3
         administrative = 1
+        lifetime_words = 2
         rng_words = 2
-        state_nbytes = 4 * (trainable + diagnostics + administrative + rng_words)
+        state_nbytes = 4 * (
+            trainable + diagnostics + administrative + lifetime_words + rng_words
+        )
         return BehaviorModelResourceBudget(
             feature_dim=feature_dim,
             n_actions=self._config.n_actions,
             trainable_float32_scalars=trainable,
             diagnostic_float32_scalars=diagnostics,
             administrative_int32_scalars=administrative,
+            lifetime_counter_uint32_scalars=lifetime_words,
             rng_uint32_scalars=rng_words,
             state_nbytes=state_nbytes,
             learned_float32_scalars_touched_per_update=trainable + diagnostics,
@@ -465,6 +530,14 @@ class BehaviorModel:
     ) -> BehaviorModelUpdateResult:
         """Update the behavior model from one observed action."""
         cfg = self._config
+        proposed_step_words, lifetime_capacity_available = (
+            _checked_lifetime_words_increment(state.step_words)
+        )
+        lifetime_counter_valid = _lifetime_counter_valid(
+            state.step_words,
+            state.step_count,
+        )
+        update_available = lifetime_counter_valid & lifetime_capacity_available
         obs = jnp.asarray(observation, dtype=jnp.float32)
         action_id = jnp.asarray(action, dtype=jnp.int32)
         logits = state.weights @ obs + state.bias
@@ -503,7 +576,7 @@ class BehaviorModel:
         correct = (predicted_action == action_id).astype(jnp.float32)
 
         decay = jnp.asarray(cfg.diagnostic_decay, dtype=jnp.float32)
-        first = state.step_count == 0
+        first = jnp.all(state.step_words == jnp.asarray(0, dtype=jnp.uint32))
         nll_ema = jnp.where(
             first,
             loss,
@@ -520,13 +593,20 @@ class BehaviorModel:
             decay * state.confidence_ema + (1.0 - decay) * confidence,
         )
 
-        new_state = state.replace(  # type: ignore[attr-defined]
+        proposed_state = state.replace(  # type: ignore[attr-defined]
             weights=state.weights + cfg.step_size * weight_gradient,
             bias=state.bias + cfg.step_size * bias_gradient,
             step_count=_saturating_int32_increment(state.step_count),
+            step_words=proposed_step_words,
             nll_ema=nll_ema,
             accuracy_ema=accuracy_ema,
             confidence_ema=confidence_ema,
+        )
+        new_state = jax.lax.cond(
+            update_available,
+            lambda _: proposed_state,
+            lambda _: state,
+            operand=None,
         )
         return BehaviorModelUpdateResult(
             state=new_state,
@@ -539,6 +619,11 @@ class BehaviorModel:
             confidence=confidence,
             predicted_action=predicted_action,
             correct=correct,
+            pre_step_words=state.step_words,
+            post_step_words=new_state.step_words,
+            lifetime_counter_valid=lifetime_counter_valid,
+            lifetime_capacity_available=lifetime_capacity_available,
+            update_applied=update_available,
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -590,6 +675,59 @@ class BehaviorModel:
         return ratio
 
 
+def behavior_model_lifetime_counter_nbytes() -> int:
+    """Return bytes occupied by compatibility telemetry plus exact identity."""
+
+    return BEHAVIOR_MODEL_LIFETIME_COUNTER_NBYTES
+
+
+def measure_behavior_model_state_nbytes(state: BehaviorModelState) -> int:
+    """Measure persistent JAX-array bytes in one behavior-model state."""
+
+    return sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree.leaves(state)
+        if isinstance(leaf, Array)
+    )
+
+
+def migrate_legacy_behavior_model_state(legacy_state: Any) -> BehaviorModelState:
+    """Migrate an exact pre-v2 state whose int32 clock is still unambiguous."""
+
+    if isinstance(legacy_state, Mapping):
+        fields = dict(legacy_state)
+    elif dataclasses.is_dataclass(legacy_state) and not isinstance(legacy_state, type):
+        fields = {
+            field.name: getattr(legacy_state, field.name)
+            for field in dataclasses.fields(legacy_state)
+        }
+    else:
+        raise TypeError("legacy behavior-model state must be a mapping or dataclass")
+    current_names = {
+        field.name
+        for field in dataclasses.fields(cast(Any, BehaviorModelState))
+    }
+    legacy_names = current_names - {"step_words"}
+    supplied_names = set(fields)
+    if supplied_names != legacy_names:
+        missing = sorted(legacy_names - supplied_names)
+        extra = sorted(supplied_names - legacy_names)
+        raise ValueError(
+            "legacy behavior-model field manifest is not exact; "
+            f"missing={missing}, extra={extra}"
+        )
+    step_count = jnp.asarray(fields["step_count"])
+    if step_count.shape != () or step_count.dtype != jnp.dtype(jnp.int32):
+        raise TypeError("legacy behavior-model step_count must be scalar int32")
+    step = int(step_count)
+    if step < 0:
+        raise ValueError("negative legacy behavior-model step_count indicates wrap")
+    if step >= _INT32_MAX:
+        raise ValueError("saturated legacy behavior-model step_count is ambiguous")
+    fields["step_words"] = jnp.asarray((0, step), dtype=jnp.uint32)
+    return BehaviorModelState(**fields)
+
+
 def run_behavior_model_from_arrays(
     model: BehaviorModel,
     state: BehaviorModelState,
@@ -639,6 +777,9 @@ def run_behavior_model_from_arrays(
 
 
 __all__ = [
+    "BEHAVIOR_MODEL_LIFETIME_COUNTER_DELTA_NBYTES",
+    "BEHAVIOR_MODEL_LIFETIME_COUNTER_NBYTES",
+    "BEHAVIOR_MODEL_STATE_SCHEMA",
     "BehaviorModel",
     "BehaviorModelArrayResult",
     "BehaviorModelConfig",
@@ -648,9 +789,12 @@ __all__ = [
     "BehaviorModelState",
     "BehaviorModelUpdateResult",
     "action_log_likelihoods",
+    "behavior_model_lifetime_counter_nbytes",
     "clipped_importance_ratios",
     "epsilon_greedy_probabilities",
     "floor_and_renormalize_probabilities",
+    "measure_behavior_model_state_nbytes",
+    "migrate_legacy_behavior_model_state",
     "run_behavior_model_from_arrays",
     "selected_action_probabilities",
 ]

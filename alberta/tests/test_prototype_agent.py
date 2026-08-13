@@ -22,11 +22,17 @@ from alberta_framework.core.prototype_agent import (
     PrototypeAgentConfig,
     PrototypeAgentState,
     PrototypeArrayResult,
+    PrototypeTransition,
     PrototypeUpdateResult,
     feature_to_subtask_specs,
     load_prototype_checkpoint,
+    measure_prototype_agent_state_resources,
     save_prototype_checkpoint,
 )
+from alberta_framework.core.prototype_feature_lifecycle import (
+    PrototypeFeatureLifecycleConfig,
+)
+from alberta_framework.core.state_builder import IdentityStateBuilderConfig
 from alberta_framework.core.types import DemonType, GVFSpec, create_horde_spec
 from alberta_framework.core.world_model import ActionConditionedWorldModelConfig
 
@@ -95,6 +101,10 @@ def _wm_cfg(
 def _minimal_config() -> PrototypeAgentConfig:
     """OaK-only, no world model, no horde, no IA."""
     return PrototypeAgentConfig(oak=_oak_cfg())
+
+
+def _primitive_only_config() -> PrototypeAgentConfig:
+    return PrototypeAgentConfig(oak=_oak_cfg(specs=()))
 
 
 def _full_config(n_dreams: int = 2) -> PrototypeAgentConfig:
@@ -307,6 +317,49 @@ class TestPrototypeAgentInit:
         assert state.horde_state is not None
         assert state.ia_state is not None
 
+    def test_state_resource_measurement_exactly_partitions_minimal_state(self) -> None:
+        state = PrototypeAgent(_minimal_config()).init(jr.key(0))
+        measured = measure_prototype_agent_state_resources(state)
+        actual = sum(
+            int(leaf.size) * int(leaf.dtype.itemsize)
+            for leaf in jax.tree.leaves(state)
+            if isinstance(leaf, jax.Array)
+        )
+
+        assert measured.total_nbytes == actual
+        assert measured.total_nbytes == sum(
+            (
+                measured.oak_bundle_nbytes,
+                measured.world_model_bundle_nbytes,
+                measured.buffer_nbytes,
+                measured.standalone_horde_nbytes,
+                measured.interaction_memory_bundle_nbytes,
+                measured.gru_nbytes,
+                measured.state_builder_feature_bundle_nbytes,
+                measured.outer_nbytes,
+            )
+        )
+        assert measured.outer_nbytes == 77
+        assert measured.world_model_bundle_nbytes == 0
+        assert measured.buffer_nbytes == 0
+        assert measured.standalone_horde_nbytes == 0
+        assert measured.interaction_memory_bundle_nbytes == 0
+        assert measured.to_config()["total_nbytes"] == actual
+
+    def test_state_resource_measurement_exposes_enabled_top_level_bundles(self) -> None:
+        state = PrototypeAgent(_full_config()).init(jr.key(1))
+        measured = measure_prototype_agent_state_resources(state)
+
+        assert measured.oak_bundle_nbytes > 0
+        assert measured.world_model_bundle_nbytes > 0
+        assert measured.buffer_nbytes > 0
+        assert measured.standalone_horde_nbytes > 0
+        assert measured.interaction_memory_bundle_nbytes > 0
+        assert measured.gru_nbytes == 0
+        assert measured.state_builder_feature_bundle_nbytes == 0
+        assert measured.total_array_elements > 0
+        assert measured.total_array_leaves > 0
+
     def test_start_primes_oak(self) -> None:
         agent = PrototypeAgent(_minimal_config())
         state = agent.init(jr.key(0))
@@ -323,6 +376,105 @@ class TestPrototypeAgentInit:
         chex.assert_trees_all_close(
             primed.ia_state.cortex_state.stomp_state.base_last_obs, obs, atol=1e-6
         )
+
+    def test_primitive_only_agent_uses_base_control_without_empty_option_indexing(
+        self,
+    ) -> None:
+        config = _primitive_only_config()
+        restored = PrototypeAgentConfig.from_config(config.to_config())
+        assert restored.oak.n_options == 0
+        agent = PrototypeAgent(config)
+        observation = jnp.asarray((0.1, -0.2, 0.3, 0.4), dtype=jnp.float32)
+        state = agent.start(agent.init(jr.key(91)), observation)
+        stomp = state.oak_state.stomp_state
+        assert stomp.option_policies.q_weights.shape == (0, N_PRIM, OBS_DIM)
+        assert int(stomp.executing_option) == -1
+        assert int(agent.act(state, observation)) == int(stomp.base_last_action)
+
+        gradient = agent._behavior_representation_gradient(
+            state,
+            jnp.asarray(0.5, dtype=jnp.float32),
+            observation.at[0].add(0.1),
+            jnp.asarray(1.0, dtype=jnp.float32),
+        )
+        assert bool(gradient.valid)
+        assert bool(gradient.diagnostics.idle_base_source)
+        score = agent._oak_counterfactual_dispatch_score(
+            state.oak_state,
+            state.current_representation,
+        )
+        assert bool(jnp.isfinite(score))
+
+        generated = agent.auto_subtask_specs(state, n_subtasks=2)
+        assert len(generated) == 2
+        assert all(0 <= spec.feature_index < OBS_DIM for spec in generated)
+
+        curated_agent, curated_state = agent.curate(state, jr.key(92))
+        assert curated_agent is agent
+        assert curated_state is state
+
+        result = agent.update(
+            state,
+            jnp.asarray(0.5, dtype=jnp.float32),
+            observation.at[0].add(0.1),
+        )
+        assert bool(result.transition_diagnostics.valid)
+        assert int(result.state.oak_state.stomp_state.executing_option) == -1
+
+    def test_primitive_only_agent_composes_with_live_pair_feature_lifecycle(
+        self,
+    ) -> None:
+        lifecycle = PrototypeFeatureLifecycleConfig(
+            base_feature_dim=3,
+            active_pair_slots=1,
+            candidate_pair_slots=3,
+            n_tasks=1,
+            n_options=0,
+            n_primitive_actions=N_PRIM,
+            option_subtask_feature_indices=(),
+            step_size_output=0.05,
+            utility_decay=0.9,
+            replacement_interval=0,
+            min_feature_age=0,
+            candidate_min_age=0,
+            promotion_margin=1.0,
+            scale_normalizer_decay=0.9,
+            scale_normalizer_epsilon=1.0e-6,
+            carry_survivors=True,
+            max_observations=16,
+        )
+        config = PrototypeAgentConfig(
+            oak=_oak_cfg(specs=(), obs_dim=lifecycle.total_feature_dim),
+            state_builder=IdentityStateBuilderConfig(
+                observation_dim=lifecycle.base_feature_dim
+            ),
+            prototype_feature_lifecycle=lifecycle,
+        )
+        agent = PrototypeAgent(config)
+        observation = jnp.asarray((0.2, -0.1, 0.4), dtype=jnp.float32)
+        state = agent.start(agent.init(jr.key(93)), observation)
+        decision = agent.decision(state)
+        next_observation = observation.at[1].add(0.2)
+        result = agent.update_transition(
+            state,
+            PrototypeTransition(
+                observation=decision.observation,
+                action=decision.action,
+                decision_id=decision.decision_id,
+                reward=jnp.asarray(0.25, dtype=jnp.float32),
+                discount=jnp.asarray(1.0, dtype=jnp.float32),
+                terminated=jnp.asarray(False, dtype=jnp.bool_),
+                truncated=jnp.asarray(False, dtype=jnp.bool_),
+                next_observation=next_observation,
+                next_decision_observation=next_observation,
+            ),
+        )
+        assert bool(result.transition_diagnostics.valid)
+        assert result.prototype_feature_lifecycle_diagnostics is not None
+        assert bool(
+            result.prototype_feature_lifecycle_diagnostics.lifecycle.transaction_applied
+        )
+        assert int(result.state.oak_state.oak_state.stomp_state.executing_option) == -1
 
 
 # ---------------------------------------------------------------------------
@@ -836,6 +988,23 @@ class TestPrototypeAgentSerializationRoundtrip:
         with pytest.raises(ValueError, match="not canonical"):
             load_prototype_checkpoint(tmp_path / "not-read")
 
+        numeric_bool = dict(config)
+        assert type(numeric_bool["horde_step_size"]) is float
+        numeric_bool["horde_step_size"] = True
+        monkeypatch.setattr(
+            prototype_module,
+            "load_checkpoint_metadata",
+            lambda _path: {
+                "schema": PROTOTYPE_CHECKPOINT_SCHEMA,
+                "agent_config": numeric_bool,
+                "config_sha256": prototype_module._prototype_config_digest(
+                    numeric_bool
+                ),
+            },
+        )
+        with pytest.raises(ValueError, match="not canonical"):
+            load_prototype_checkpoint(tmp_path / "not-read")
+
 
 # ---------------------------------------------------------------------------
 # Dreaming mechanics
@@ -885,6 +1054,7 @@ class TestPrototypeAgentDreaming:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 class TestPrototypeAgentSmoke:
     def test_200_step_minimal(self) -> None:
         agent = PrototypeAgent(_minimal_config())

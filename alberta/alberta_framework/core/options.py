@@ -32,10 +32,26 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Bool, Float, Int, UInt
 
-from alberta_framework.core.multi_head_learner import MultiHeadMLPLearner, MultiHeadMLPState
+from alberta_framework.core.multi_head_learner import (
+    MultiHeadMLPLearner,
+    MultiHeadMLPState,
+    migrate_legacy_multi_head_mlp_state,
+)
+from alberta_framework.core.normalizers import (
+    _checked_lifetime_words_increment,
+    _lifetime_counter_valid,
+    _saturating_int32_counter_increment,
+)
 from alberta_framework.core.types import LMSState
+
+STOMP_STATE_SCHEMA = "alberta.stomp-state.v2"
+STOMP_LIFETIME_COUNTER_NBYTES = 12
+STOMP_LIFETIME_COUNTER_DELTA_NBYTES = 8
+
+_INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
 
 # ---------------------------------------------------------------------------
 # Subtask specification (Python-level; JAX arrays extracted for scan use)
@@ -88,8 +104,6 @@ class STOMPSpecArrays:
     @staticmethod
     def from_specs(specs: list[SubtaskSpec]) -> STOMPSpecArrays:
         """Build JAX arrays from a list of :class:`SubtaskSpec`."""
-        if not specs:
-            raise ValueError("at least one SubtaskSpec required")
         return STOMPSpecArrays(
             feature_indices=jnp.array([s.feature_index for s in specs], dtype=jnp.int32),
             thresholds=jnp.array([s.threshold for s in specs], dtype=jnp.float32),
@@ -227,7 +241,9 @@ class STOMPState:
             ``Σ_{k=0}^{T-1} γ^k`` accumulated in the current option.
         option_discount: Accumulated discount ``∏ γ`` in current option.
         option_steps: Number of primitive steps taken inside current option.
-        step_count: Total primitive steps taken by the agent.
+        step_count: Saturating int32 primitive-step telemetry.
+        step_words: Exact big-endian ``[high, low]`` uint32 primitive-step
+            identity. This is the scheduling and lifetime authority.
     """
 
     base_learner_state: MultiHeadMLPState
@@ -247,6 +263,7 @@ class STOMPState:
     option_discount: Float[Array, ""]
     option_steps: Int[Array, ""]
     step_count: Int[Array, ""]
+    step_words: UInt[Array, " 2"]
 
 
 DISPATCH_OWNER_INVALID = -1
@@ -317,6 +334,85 @@ def _all_integer_leaves_nonnegative(tree: Any) -> Array:
     return valid
 
 
+def _checked_lifetime_words_advance(
+    words: Array,
+    delta: Array,
+) -> tuple[UInt[Array, " 2"], Bool[Array, ""]]:
+    """Advance one uint64 word clock by a non-negative uint32 delta."""
+
+    if getattr(words, "shape", None) != (2,):
+        raise ValueError("lifetime counter words must have shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("lifetime counter words must have dtype uint32")
+    increment = jnp.asarray(delta, dtype=jnp.uint32).reshape(())
+    low = words[1] + increment
+    carry = (low < words[1]).astype(jnp.uint32)
+    high = words[0] + carry
+    overflow = (carry != 0) & (high == jnp.asarray(0, dtype=jnp.uint32))
+    candidate = jnp.stack((high, low)).astype(jnp.uint32)
+    return jnp.where(overflow, words, candidate), ~overflow
+
+
+def _lifetime_words_mod(words: Array, divisor: Array) -> UInt[Array, ""]:
+    """Return an exact uint64 word-pair remainder without enabling JAX x64."""
+
+    modulus = jnp.asarray(divisor, dtype=jnp.uint32).reshape(())
+
+    def fold_word(remainder: Array, word: Array) -> Array:
+        def fold_bit(bit_index: int, current: Array) -> Array:
+            shift = jnp.asarray(31 - bit_index, dtype=jnp.uint32)
+            bit = (word >> shift) & jnp.asarray(1, dtype=jnp.uint32)
+            doubled = current + current + bit
+            return jnp.where(doubled >= modulus, doubled - modulus, doubled)
+
+        return jax.lax.fori_loop(0, 32, fold_bit, remainder)
+
+    return fold_word(
+        fold_word(jnp.asarray(0, dtype=jnp.uint32), words[0]),
+        words[1],
+    )
+
+
+def _lifetime_words_at_least(words: Array, threshold: int) -> Bool[Array, ""]:
+    """Compare a word clock with one validated host uint64 threshold."""
+
+    threshold_high = jnp.asarray(threshold >> 32, dtype=jnp.uint32)
+    threshold_low = jnp.asarray(threshold & _UINT32_MAX, dtype=jnp.uint32)
+    return (words[0] > threshold_high) | (
+        (words[0] == threshold_high) & (words[1] >= threshold_low)
+    )
+
+
+def _stomp_action_ownership_valid(
+    state: STOMPState,
+    *,
+    n_options: int,
+    n_primitive_actions: int,
+) -> Bool[Array, ""]:
+    """Authenticate the extended-action owner of the dispatched primitive."""
+
+    primitive_valid = (state.last_primitive_action >= 0) & (
+        state.last_primitive_action < n_primitive_actions
+    )
+    idle = state.executing_option == -1
+    active = (state.executing_option >= 0) & (state.executing_option < n_options)
+    idle_valid = (
+        idle
+        & (state.base_last_action == state.last_primitive_action)
+        & (state.base_last_action >= 0)
+        & (state.base_last_action < n_primitive_actions)
+    )
+    active_valid = (
+        active
+        & (
+            state.base_last_action
+            == n_primitive_actions + state.executing_option
+        )
+        & (state.option_last_intra_action == state.last_primitive_action)
+    )
+    return primitive_valid & (idle_valid | active_valid)
+
+
 def _stomp_static_dispatch_contract(
     state: STOMPState,
     *,
@@ -371,6 +467,12 @@ def _stomp_static_dispatch_contract(
     static_valid = static_valid and (
         state.option_models.n_completions.shape == (n_options,)
         and state.option_models.n_completions.dtype == jnp.int32
+    )
+    static_valid = static_valid and (
+        state.step_words.shape == (2,)
+        and state.step_words.dtype == jnp.uint32
+        and state.base_learner_state.step_words.shape == (2,)
+        and state.base_learner_state.step_words.dtype == jnp.uint32
     )
     n_total_actions = n_primitive_actions + n_options
     learner = state.base_learner_state
@@ -481,8 +583,11 @@ def replace_dispatched_primitive_action(
     n_options = state.option_policies.q_weights.shape[0]
     n_primitive_actions = state.option_policies.q_weights.shape[1]
     observation_dim = state.option_policies.q_weights.shape[2]
-    if n_options < 1 or n_primitive_actions < 1 or observation_dim < 1:
-        raise TypeError("STOMP dispatch dimensions must all be positive")
+    if n_options < 0 or n_primitive_actions < 1 or observation_dim < 1:
+        raise TypeError(
+            "STOMP dispatch requires nonnegative option count and positive "
+            "primitive/observation dimensions"
+        )
 
     raw_observation = jnp.asarray(decision_observation)
     observation_static_contract_valid = (
@@ -559,6 +664,11 @@ def replace_dispatched_primitive_action(
     state_values_finite = _all_floating_leaves_finite(state)
     state_counters_valid = (
         _all_integer_leaves_nonnegative(state.base_learner_state)
+        & _lifetime_counter_valid(state.step_words, state.step_count)
+        & _lifetime_counter_valid(
+            state.base_learner_state.step_words,
+            state.base_learner_state.step_count,
+        )
         & jnp.all(state.option_models.n_completions >= 0)
         & (state.option_steps >= 0)
         & (state.step_count >= 0)
@@ -701,6 +811,17 @@ class STOMPUpdateResult:
     option_importance_ratio: Float[Array, ""]
     planning_backups: Int[Array, ""]
     planning_td_error: Float[Array, ""]
+    pre_step_words: UInt[Array, " 2"]
+    post_step_words: UInt[Array, " 2"]
+    inputs_valid: Bool[Array, ""]
+    lifetime_counter_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    nested_lifetime_counter_valid: Bool[Array, ""]
+    nested_lifetime_capacity_available: Bool[Array, ""]
+    nested_updates_required: Int[Array, ""]
+    nested_updates_applied: Int[Array, ""]
+    proposed_state_valid: Bool[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -717,6 +838,17 @@ class STOMPArrayResult:
     option_importance_ratios: Float[Array, " num_steps"]
     planning_backups: Int[Array, " num_steps"]
     planning_td_errors: Float[Array, " num_steps"]
+    pre_step_words: UInt[Array, "num_steps 2"]
+    post_step_words: UInt[Array, "num_steps 2"]
+    inputs_valid: Bool[Array, " num_steps"]
+    lifetime_counter_valid: Bool[Array, " num_steps"]
+    lifetime_capacity_available: Bool[Array, " num_steps"]
+    nested_lifetime_counter_valid: Bool[Array, " num_steps"]
+    nested_lifetime_capacity_available: Bool[Array, " num_steps"]
+    nested_updates_required: Int[Array, " num_steps"]
+    nested_updates_applied: Int[Array, " num_steps"]
+    proposed_state_valid: Bool[Array, " num_steps"]
+    update_applied: Bool[Array, " num_steps"]
 
 
 # ---------------------------------------------------------------------------
@@ -789,6 +921,38 @@ def _select_action_epsilon_greedy_from_q(
         jnp.int32
     )
     random_action = jr.randint(explore_key, (), 0, n_actions).astype(jnp.int32)
+    explore = jr.uniform(key) < jnp.asarray(epsilon, dtype=jnp.float32)
+    action = jnp.where(explore, random_action, greedy)
+    return action, key
+
+
+def _select_action_epsilon_greedy_from_q_masked(
+    q_vals: Array,
+    key: Array,
+    epsilon: float,
+    action_mask: Array,
+) -> tuple[Array, Array]:
+    """Select only eligible actions while preserving all-true RNG parity.
+
+    The key split, Gumbel draw, exploration draw, and returned key are exactly
+    the same as :func:`_select_action_epsilon_greedy_from_q`.  With an all-true
+    mask the selected action is therefore bit-identical to the legacy path.
+    """
+
+    n_actions = q_vals.shape[0]
+    key, explore_key, noise_key = jr.split(key, 3)
+    noisy = q_vals + 1e-6 * jr.gumbel(noise_key, (n_actions,))
+    masked_noisy = jnp.where(action_mask, noisy, -jnp.inf)
+    greedy = jnp.argmax(masked_noisy).astype(jnp.int32)
+    eligible_count = jnp.sum(action_mask.astype(jnp.int32))
+    safe_count = jnp.maximum(eligible_count, jnp.asarray(1, dtype=jnp.int32))
+    random_rank = jr.randint(explore_key, (), 0, safe_count).astype(jnp.int32)
+    eligible_indices = jnp.nonzero(
+        action_mask,
+        size=n_actions,
+        fill_value=0,
+    )[0]
+    random_action = eligible_indices[random_rank]
     explore = jr.uniform(key) < jnp.asarray(epsilon, dtype=jnp.float32)
     action = jnp.where(explore, random_action, greedy)
     return action, key
@@ -965,7 +1129,14 @@ def _update_option_model(
         jnp.float32
     )
     new_ns_weights = models.next_state_weights + mask[:, None, None] * ns_update[None, :, :]
-    new_completions = models.n_completions + mask.astype(jnp.int32)
+    incremented_completions = _saturating_int32_counter_increment(
+        models.n_completions
+    )
+    new_completions = jnp.where(
+        mask.astype(jnp.bool_),
+        incremented_completions,
+        models.n_completions,
+    )
 
     return OptionModelsState(
         cumreward_ema=jnp.where(mask, new_cumreward, models.cumreward_ema),
@@ -978,6 +1149,75 @@ def _update_option_model(
         next_state_weights=new_ns_weights,
         n_completions=new_completions,
     )
+
+
+def _reset_linear_stomp_feature_axes(
+    base_state: MultiHeadMLPState,
+    option_policies: IntraOptionPoliciesState,
+    option_models: OptionModelsState,
+    feature_mask: Array,
+) -> tuple[MultiHeadMLPState, IntraOptionPoliciesState, OptionModelsState]:
+    """Scrub recycled representation axes after learning, before selection.
+
+    This deliberately supports only STOMP's linear base learner.  It removes
+    every selected input coefficient and eligibility trace from the base and
+    intra-option heads, plus both the input and predicted-output axes from the
+    option transition models.  Clocks, scalar baselines, and current-transition
+    learning diagnostics are unchanged.
+    """
+
+    selected = jnp.asarray(feature_mask, dtype=jnp.bool_)
+    head_params = cast(
+        Any,
+        base_state.head_params.replace(
+            weights=tuple(
+                jnp.where(selected[None, :], 0.0, weights)
+                for weights in base_state.head_params.weights
+            )
+        ),
+    )
+    head_traces = tuple(
+        (
+            jnp.where(selected[None, :], 0.0, weight_trace),
+            bias_trace,
+        )
+        for weight_trace, bias_trace in base_state.head_traces
+    )
+    scrubbed_base = cast(
+        MultiHeadMLPState,
+        base_state.replace(
+            head_params=head_params,
+            head_traces=head_traces,
+        ),
+    )
+    scrubbed_policies = IntraOptionPoliciesState(
+        q_weights=jnp.where(
+            selected[None, None, :],
+            0.0,
+            option_policies.q_weights,
+        ),
+        traces=jnp.where(
+            selected[None, None, :],
+            0.0,
+            option_policies.traces,
+        ),
+        average_rewards=option_policies.average_rewards,
+    )
+    model_axis_mask = selected[None, :, None] | selected[None, None, :]
+    scrubbed_models = OptionModelsState(
+        cumreward_ema=option_models.cumreward_ema,
+        env_return_ema=option_models.env_return_ema,
+        duration_ema=option_models.duration_ema,
+        baseline_mass_ema=option_models.baseline_mass_ema,
+        discount_ema=option_models.discount_ema,
+        next_state_weights=jnp.where(
+            model_axis_mask,
+            0.0,
+            option_models.next_state_weights,
+        ),
+        n_completions=option_models.n_completions,
+    )
+    return scrubbed_base, scrubbed_policies, scrubbed_models
 
 
 def _update_intra_option_policy(
@@ -1100,6 +1340,8 @@ class STOMPConfig:
                     f"SubtaskSpec.feature_index={spec.feature_index} >= "
                     f"observation_dim={self.observation_dim}"
                 )
+            if spec.max_option_steps > _INT32_MAX:
+                raise ValueError("SubtaskSpec.max_option_steps must fit int32 telemetry")
         if not math.isfinite(self.option_gamma) or not 0.0 <= self.option_gamma <= 1.0:
             raise ValueError("option_gamma must be finite and in [0, 1]")
         if self.option_target_epsilon is not None and not (
@@ -1114,6 +1356,14 @@ class STOMPConfig:
             or self.option_planning_backups_per_step < 0
         ):
             raise ValueError("option_planning_backups_per_step must be a nonnegative integer")
+        if self.option_planning_backups_per_step >= _INT32_MAX:
+            raise ValueError(
+                "option_planning_backups_per_step must be smaller than int32 max"
+            )
+        if not self.subtask_specs and self.option_planning_backups_per_step != 0:
+            raise ValueError(
+                "primitive-only STOMP requires option_planning_backups_per_step == 0"
+            )
 
     @property
     def n_options(self) -> int:
@@ -1183,8 +1433,6 @@ class STOMPAgent:
 
     def __init__(self, config: STOMPConfig):
         """Initialize the STOMP agent with a given configuration."""
-        if config.n_options == 0:
-            raise ValueError("STOMPAgent requires at least one subtask/option")
         self._config = config
         self._spec_arrays = STOMPSpecArrays.from_specs(list(config.subtask_specs))
         self._base_learner = MultiHeadMLPLearner(
@@ -1215,6 +1463,55 @@ class STOMPAgent:
     def base_q_values(self, state: STOMPState, observation: Array) -> Array:
         """Compute Q-values for all extended actions from a STOMPState."""
         return self._base_learner.predict(state.base_learner_state, observation)
+
+    def state_valid(self, state: STOMPState) -> Bool[Array, ""]:
+        """Return the complete source-state validity gate for an update."""
+
+        cfg = self._config
+        static_valid, rng_valid = _stomp_static_dispatch_contract(
+            state,
+            n_options=cfg.n_options,
+            n_primitive_actions=cfg.n_primitive_actions,
+            observation_dim=cfg.observation_dim,
+        )
+        outer_clock_valid = _lifetime_counter_valid(
+            state.step_words,
+            state.step_count,
+        )
+        nested_clock_valid = _lifetime_counter_valid(
+            state.base_learner_state.step_words,
+            state.base_learner_state.step_count,
+        )
+        values_valid = (
+            _all_floating_leaves_finite(state)
+            & (state.option_baseline_mass >= 0.0)
+            & (state.option_discount >= 0.0)
+            & (state.option_discount <= 1.0)
+            & jnp.all(state.option_models.duration_ema >= 0.0)
+            & jnp.all(state.option_models.baseline_mass_ema >= 0.0)
+            & jnp.all(state.option_models.discount_ema >= 0.0)
+            & jnp.all(state.option_models.discount_ema <= 1.0)
+        )
+        counters_valid = (
+            _all_integer_leaves_nonnegative(state.base_learner_state)
+            & jnp.all(state.option_models.n_completions >= 0)
+            & (state.option_steps >= 0)
+            & (state.option_steps <= state.step_count)
+        )
+        ownership_valid = _stomp_action_ownership_valid(
+            state,
+            n_options=cfg.n_options,
+            n_primitive_actions=cfg.n_primitive_actions,
+        )
+        return (
+            jnp.asarray(static_valid, dtype=jnp.bool_)
+            & jnp.asarray(rng_valid, dtype=jnp.bool_)
+            & outer_clock_valid
+            & nested_clock_valid
+            & values_valid
+            & counters_valid
+            & ownership_valid
+        )
 
     def to_config(self) -> dict[str, Any]:
         """Serialize agent configuration."""
@@ -1264,6 +1561,7 @@ class STOMPAgent:
             option_discount=jnp.array(1.0, dtype=jnp.float32),
             option_steps=jnp.array(0, dtype=jnp.int32),
             step_count=jnp.array(0, dtype=jnp.int32),
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -1282,6 +1580,22 @@ class STOMPAgent:
         extended_action, key = _select_action_epsilon_greedy_from_q(
             q_vals, key, cfg.epsilon_base, cfg.n_total_actions
         )
+        if cfg.n_options == 0:
+            return cast(
+                STOMPState,
+                state.replace(
+                    base_last_obs=obs,
+                    base_last_action=extended_action,
+                    last_primitive_action=extended_action,
+                    rng_key=key,
+                    executing_option=jnp.asarray(-1, dtype=jnp.int32),
+                    option_cumreward=jnp.asarray(0.0, dtype=jnp.float32),
+                    option_env_cumreward=jnp.asarray(0.0, dtype=jnp.float32),
+                    option_baseline_mass=jnp.asarray(0.0, dtype=jnp.float32),
+                    option_discount=jnp.asarray(1.0, dtype=jnp.float32),
+                    option_steps=jnp.asarray(0, dtype=jnp.int32),
+                ),
+            )
         is_starting_option = extended_action >= jnp.asarray(
             cfg.n_primitive_actions, dtype=jnp.int32
         )
@@ -1344,6 +1658,138 @@ class STOMPAgent:
             primitive_action=primed.last_primitive_action,
         )
 
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def start_with_extended_action_mask(
+        self,
+        state: STOMPState,
+        initial_observation: Array,
+        extended_action_mask: Array,
+    ) -> STOMPStartResult:
+        """Prime control while keeping inactive option heads behavior-ineligible.
+
+        The mask spans primitive actions followed by option actions. Every
+        primitive action must remain eligible; callers may disable any subset
+        of option slots. Invalid mask values or persistent state are exact
+        state no-ops. An all-true mask preserves legacy :meth:`start` state and
+        RNG bits exactly.
+        """
+
+        cfg = self._config
+        raw_mask = jnp.asarray(extended_action_mask)
+        if raw_mask.shape != (cfg.n_total_actions,):
+            raise ValueError(
+                "extended_action_mask must have shape "
+                f"({cfg.n_total_actions},), got {raw_mask.shape}"
+            )
+        if raw_mask.dtype != jnp.bool_:
+            raise TypeError(
+                "extended_action_mask must have dtype bool, "
+                f"got {raw_mask.dtype}"
+            )
+        obs = jnp.asarray(initial_observation, dtype=jnp.float32).reshape(
+            (cfg.observation_dim,)
+        )
+        mask_valid = jnp.all(raw_mask[: cfg.n_primitive_actions]) & jnp.any(raw_mask)
+        values_valid = jnp.all(jnp.isfinite(obs))
+        key = state.rng_key
+        q_vals = self._base_learner.predict(state.base_learner_state, obs)
+        extended_action, key = _select_action_epsilon_greedy_from_q_masked(
+            q_vals,
+            key,
+            cfg.epsilon_base,
+            raw_mask,
+        )
+        if cfg.n_options == 0:
+            proposed = cast(
+                STOMPState,
+                state.replace(
+                    base_last_obs=obs,
+                    base_last_action=extended_action,
+                    last_primitive_action=extended_action,
+                    rng_key=key,
+                    executing_option=jnp.asarray(-1, dtype=jnp.int32),
+                    option_cumreward=jnp.asarray(0.0, dtype=jnp.float32),
+                    option_env_cumreward=jnp.asarray(0.0, dtype=jnp.float32),
+                    option_baseline_mass=jnp.asarray(0.0, dtype=jnp.float32),
+                    option_discount=jnp.asarray(1.0, dtype=jnp.float32),
+                    option_steps=jnp.asarray(0, dtype=jnp.int32),
+                ),
+            )
+            applied = self.state_valid(state) & mask_valid & values_valid
+            next_state = jax.lax.cond(
+                applied,
+                lambda _: proposed,
+                lambda _: state,
+                None,
+            )
+            return STOMPStartResult(
+                state=next_state,
+                primitive_action=jnp.where(
+                    applied,
+                    extended_action,
+                    state.last_primitive_action,
+                ),
+            )
+        is_starting_option = extended_action >= jnp.asarray(
+            cfg.n_primitive_actions, dtype=jnp.int32
+        )
+        selected_option = jnp.clip(
+            extended_action - cfg.n_primitive_actions,
+            0,
+            cfg.n_options - 1,
+        )
+        intra_action, key = _select_action_epsilon_greedy(
+            state.option_policies.q_weights[selected_option],
+            obs,
+            key,
+            cfg.epsilon_option,
+            cfg.n_primitive_actions,
+        )
+        primitive_action = jnp.where(
+            is_starting_option,
+            intra_action,
+            extended_action,
+        )
+        proposed = cast(
+            STOMPState,
+            state.replace(
+                base_last_obs=obs,
+                base_last_action=extended_action,
+                last_primitive_action=primitive_action,
+                rng_key=key,
+                executing_option=jnp.where(
+                    is_starting_option,
+                    selected_option,
+                    jnp.asarray(-1, dtype=jnp.int32),
+                ),
+                option_start_obs=jnp.where(
+                    is_starting_option,
+                    obs,
+                    state.option_start_obs,
+                ),
+                option_last_intra_action=jnp.where(
+                    is_starting_option,
+                    intra_action,
+                    state.option_last_intra_action,
+                ),
+                option_cumreward=jnp.asarray(0.0, dtype=jnp.float32),
+                option_env_cumreward=jnp.asarray(0.0, dtype=jnp.float32),
+                option_baseline_mass=jnp.asarray(0.0, dtype=jnp.float32),
+                option_discount=jnp.asarray(1.0, dtype=jnp.float32),
+                option_steps=jnp.asarray(0, dtype=jnp.int32),
+            ),
+        )
+        applied = self.state_valid(state) & mask_valid & values_valid
+        next_state = jax.lax.cond(applied, lambda _: proposed, lambda _: state, None)
+        return STOMPStartResult(
+            state=next_state,
+            primitive_action=jnp.where(
+                applied,
+                primitive_action,
+                state.last_primitive_action,
+            ),
+        )
+
     @staticmethod
     def current_primitive_action(state: STOMPState) -> Int[Array, ""]:
         """Return the primitive action currently selected for dispatch."""
@@ -1355,7 +1801,8 @@ class STOMPAgent:
         models: OptionModelsState,
         anchor_observation: Array,
         average_reward: Array,
-        selection_offset: Array,
+        selection_words: Array,
+        extended_action_mask: Array,
     ) -> tuple[MultiHeadMLPState, Array, Array]:
         """Apply a fixed number of Dyna backups from completed option models.
 
@@ -1369,7 +1816,9 @@ class STOMPAgent:
         outcomes must not update the real experience reward-rate estimate.
         """
         cfg = self._config
-        completed_mask = models.n_completions > 0
+        completed_mask = (models.n_completions > 0) & extended_action_mask[
+            cfg.n_primitive_actions :
+        ]
         n_completed = jnp.sum(completed_mask.astype(jnp.int32))
         completed_indices = jnp.nonzero(
             completed_mask,
@@ -1384,10 +1833,11 @@ class STOMPAgent:
                 carry: tuple[MultiHeadMLPState, Array],
             ) -> tuple[MultiHeadMLPState, Array]:
                 current_learner_state, td_sum = carry
-                completed_rank = jnp.mod(
-                    jnp.asarray(selection_offset, dtype=jnp.int32) + backup_idx,
+                exact_phase = _lifetime_words_mod(
+                    selection_words,
                     n_completed,
-                )
+                ).astype(jnp.int32)
+                completed_rank = jnp.mod(exact_phase + backup_idx, n_completed)
                 model_idx = completed_indices[completed_rank]
                 option_action = model_idx + cfg.n_primitive_actions
 
@@ -1396,10 +1846,15 @@ class STOMPAgent:
                 next_q = self._base_learner.predict(
                     current_learner_state, predicted_next
                 )
+                eligible_next_q = jnp.where(
+                    extended_action_mask,
+                    next_q,
+                    -jnp.inf,
+                )
                 target = (
                     models.env_return_ema[model_idx]
                     - average_reward * models.baseline_mass_ema[model_idx]
-                    + models.discount_ema[model_idx] * jnp.max(next_q)
+                    + models.discount_ema[model_idx] * jnp.max(eligible_next_q)
                 )
                 targets = jnp.full(
                     cfg.n_total_actions, jnp.nan, dtype=jnp.float32
@@ -1436,6 +1891,255 @@ class STOMPAgent:
             None,
         )
 
+    def _update_primitive_only(
+        self,
+        state: STOMPState,
+        env_reward: Array,
+        next_observation: Array,
+        discount: Array | None,
+        *,
+        decision_observation: Array | None,
+        execution_boundary: Array | bool,
+        extended_action_mask: Array | None,
+        enable_planning: bool,
+        preselection_feature_reset_mask: Array | None,
+    ) -> STOMPUpdateResult:
+        """Apply one base-control transition when the option set is empty."""
+
+        cfg = self._config
+        if cfg.n_options != 0:
+            raise RuntimeError("primitive-only update requires zero configured options")
+        if enable_planning and cfg.option_planning_backups_per_step != 0:
+            raise RuntimeError("primitive-only STOMP cannot execute option-model backups")
+
+        if preselection_feature_reset_mask is None:
+            reset_mask = jnp.zeros((cfg.observation_dim,), dtype=jnp.bool_)
+        else:
+            if cfg.base_hidden_sizes:
+                raise ValueError(
+                    "preselection feature reset requires a linear STOMP base learner"
+                )
+            raw_reset_mask = jnp.asarray(preselection_feature_reset_mask)
+            if raw_reset_mask.shape != (cfg.observation_dim,):
+                raise ValueError(
+                    "preselection_feature_reset_mask must have shape "
+                    f"({cfg.observation_dim},), got {raw_reset_mask.shape}"
+                )
+            if raw_reset_mask.dtype != jnp.bool_:
+                raise TypeError(
+                    "preselection_feature_reset_mask must have dtype bool, "
+                    f"got {raw_reset_mask.dtype}"
+                )
+            reset_mask = raw_reset_mask
+
+        if extended_action_mask is None:
+            action_mask = jnp.ones((cfg.n_primitive_actions,), dtype=jnp.bool_)
+            action_mask_valid = jnp.asarray(True, dtype=jnp.bool_)
+        else:
+            raw_action_mask = jnp.asarray(extended_action_mask)
+            if raw_action_mask.shape != (cfg.n_primitive_actions,):
+                raise ValueError(
+                    "extended_action_mask must have shape "
+                    f"({cfg.n_primitive_actions},), got {raw_action_mask.shape}"
+                )
+            if raw_action_mask.dtype != jnp.bool_:
+                raise TypeError(
+                    "extended_action_mask must have dtype bool, "
+                    f"got {raw_action_mask.dtype}"
+                )
+            action_mask = raw_action_mask
+            action_mask_valid = jnp.all(action_mask) & jnp.any(action_mask)
+
+        bootstrap_obs = jnp.asarray(next_observation, dtype=jnp.float32).reshape(
+            (cfg.observation_dim,)
+        )
+        decision_obs = (
+            bootstrap_obs
+            if decision_observation is None
+            else jnp.asarray(decision_observation, dtype=jnp.float32).reshape(
+                (cfg.observation_dim,)
+            )
+        )
+        reward = jnp.asarray(env_reward, dtype=jnp.float32).reshape(())
+        _ = jnp.asarray(execution_boundary, dtype=jnp.bool_).reshape(())
+        input_values_valid = (
+            jnp.isfinite(reward)
+            & jnp.all(jnp.isfinite(bootstrap_obs))
+            & jnp.all(jnp.isfinite(decision_obs))
+            & action_mask_valid
+        )
+        if discount is None:
+            primitive_discount = jnp.asarray(1.0, dtype=jnp.float32)
+        else:
+            supplied_discount = jnp.asarray(discount, dtype=jnp.float32).reshape(())
+            valid_discount = (
+                jnp.isfinite(supplied_discount)
+                & (supplied_discount >= 0.0)
+                & (supplied_discount <= 1.0)
+            )
+            primitive_discount = jnp.where(
+                valid_discount,
+                supplied_discount,
+                jnp.asarray(jnp.nan, dtype=jnp.float32),
+            )
+            input_values_valid = input_values_valid & valid_discount
+
+        outer_words, outer_capacity = _checked_lifetime_words_increment(
+            state.step_words
+        )
+        outer_counter_valid = _lifetime_counter_valid(
+            state.step_words,
+            state.step_count,
+        )
+        nested_counter_valid = _lifetime_counter_valid(
+            state.base_learner_state.step_words,
+            state.base_learner_state.step_count,
+        )
+        source_state_valid = self.state_valid(state)
+        nested_updates_required = jnp.asarray(1, dtype=jnp.int32)
+        expected_nested_words, nested_capacity = _checked_lifetime_words_advance(
+            state.base_learner_state.step_words,
+            nested_updates_required,
+        )
+        transaction_preflight = (
+            source_state_valid
+            & input_values_valid
+            & outer_capacity
+            & nested_counter_valid
+            & nested_capacity
+        )
+
+        next_q_values = self._base_learner.predict(
+            state.base_learner_state,
+            bootstrap_obs,
+        )
+        eligible_next_q = jnp.where(action_mask, next_q_values, -jnp.inf)
+        td_target = (
+            reward
+            - state.base_average_reward
+            + primitive_discount * jnp.max(eligible_next_q)
+        )
+        targets = jnp.full(
+            cfg.n_primitive_actions,
+            jnp.nan,
+            dtype=jnp.float32,
+        ).at[state.base_last_action].set(td_target)
+        trace_adjusted_state = cast(
+            MultiHeadMLPState,
+            state.base_learner_state.replace(
+                head_traces=jax.tree_util.tree_map(
+                    lambda trace: primitive_discount * trace,
+                    state.base_learner_state.head_traces,
+                )
+            ),
+        )
+        base_update = self._base_learner.update(
+            trace_adjusted_state,
+            state.base_last_obs,
+            targets,
+        )
+        base_td = base_update.errors[state.base_last_action]
+        new_average_reward = (
+            state.base_average_reward
+            + jnp.asarray(cfg.base_avg_reward_step_size, dtype=jnp.float32) * base_td
+        )
+        new_base_state = base_update.state
+        new_option_policies = state.option_policies
+        new_option_models = state.option_models
+        if preselection_feature_reset_mask is not None:
+            (
+                new_base_state,
+                new_option_policies,
+                new_option_models,
+            ) = _reset_linear_stomp_feature_axes(
+                new_base_state,
+                new_option_policies,
+                new_option_models,
+                reset_mask,
+            )
+
+        next_q_values = self._base_learner.predict(new_base_state, decision_obs)
+        next_action, next_key = _select_action_epsilon_greedy_from_q_masked(
+            next_q_values,
+            state.rng_key,
+            cfg.epsilon_base,
+            action_mask,
+        )
+        proposed_state = STOMPState(
+            base_learner_state=new_base_state,
+            base_average_reward=new_average_reward,
+            base_last_obs=decision_obs,
+            base_last_action=next_action,
+            last_primitive_action=next_action,
+            rng_key=next_key,
+            option_policies=new_option_policies,
+            option_models=new_option_models,
+            executing_option=jnp.asarray(-1, dtype=jnp.int32),
+            option_start_obs=state.option_start_obs,
+            option_last_intra_action=state.option_last_intra_action,
+            option_cumreward=jnp.asarray(0.0, dtype=jnp.float32),
+            option_env_cumreward=jnp.asarray(0.0, dtype=jnp.float32),
+            option_baseline_mass=jnp.asarray(0.0, dtype=jnp.float32),
+            option_discount=jnp.asarray(1.0, dtype=jnp.float32),
+            option_steps=jnp.asarray(0, dtype=jnp.int32),
+            step_count=_saturating_int32_counter_increment(state.step_count),
+            step_words=outer_words,
+        )
+        nested_post_matches = jnp.all(
+            proposed_state.base_learner_state.step_words == expected_nested_words
+        )
+        proposed_state_valid = self.state_valid(proposed_state)
+        transaction_applied = (
+            transaction_preflight
+            & base_update.update_applied
+            & nested_post_matches
+            & proposed_state_valid
+        )
+        new_state = jax.lax.cond(
+            transaction_applied,
+            lambda: proposed_state,
+            lambda: state,
+        )
+        return STOMPUpdateResult(
+            state=new_state,
+            td_error=jnp.where(
+                transaction_applied,
+                base_td,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ),
+            average_reward=jnp.where(
+                transaction_applied,
+                new_average_reward,
+                state.base_average_reward,
+            ),
+            primitive_action=jnp.where(
+                transaction_applied,
+                next_action,
+                state.last_primitive_action,
+            ),
+            executing_option=jnp.asarray(-1, dtype=jnp.int32),
+            option_terminated=jnp.asarray(False, dtype=jnp.bool_),
+            pseudo_reward=jnp.asarray(0.0, dtype=jnp.float32),
+            option_importance_ratio=jnp.asarray(0.0, dtype=jnp.float32),
+            planning_backups=jnp.asarray(0, dtype=jnp.int32),
+            planning_td_error=jnp.asarray(0.0, dtype=jnp.float32),
+            pre_step_words=state.step_words,
+            post_step_words=new_state.step_words,
+            inputs_valid=input_values_valid,
+            lifetime_counter_valid=outer_counter_valid,
+            lifetime_capacity_available=outer_capacity,
+            nested_lifetime_counter_valid=nested_counter_valid,
+            nested_lifetime_capacity_available=nested_capacity,
+            nested_updates_required=nested_updates_required,
+            nested_updates_applied=jnp.where(
+                transaction_applied,
+                nested_updates_required,
+                jnp.asarray(0, dtype=jnp.int32),
+            ),
+            proposed_state_valid=proposed_state_valid,
+            update_applied=transaction_applied,
+        )
+
     @functools.partial(
         jax.jit,
         static_argnums=(0,),
@@ -1450,7 +2154,9 @@ class STOMPAgent:
         *,
         decision_observation: Array | None = None,
         execution_boundary: Array | bool = False,
+        extended_action_mask: Array | None = None,
         enable_planning: bool = True,
+        preselection_feature_reset_mask: Array | None = None,
     ) -> STOMPUpdateResult:
         """Process one real-time transition update.
 
@@ -1487,9 +2193,72 @@ class STOMPAgent:
         compatibility mode: primitive and intra-option bootstraps use one,
         while option-return accumulation uses ``config.option_gamma`` exactly
         as releases before the explicit transition contract did.
+
+        ``extended_action_mask`` is an opt-in behavior-eligibility boundary
+        over primitive actions followed by options. Every primitive action
+        must remain true. The mask affects a newly selected extended action
+        plus real-transition and option-model-planning bootstraps. Inactive
+        option models are not selected for planning. An already executing
+        option continues until its normal lifecycle boundary. ``None`` is the
+        exact legacy all-actions-eligible path.
+
+        ``preselection_feature_reset_mask`` is the narrow causal recycling
+        hook.  It is valid only for the linear base learner.  Selected feature
+        axes are scrubbed from all linear STOMP consumers after this real
+        transition's learning and before the sole next-action selection.
         """
         cfg = self._config
+        if cfg.n_options == 0:
+            return self._update_primitive_only(
+                state,
+                env_reward,
+                next_observation,
+                discount,
+                decision_observation=decision_observation,
+                execution_boundary=execution_boundary,
+                extended_action_mask=extended_action_mask,
+                enable_planning=enable_planning,
+                preselection_feature_reset_mask=preselection_feature_reset_mask,
+            )
         spec = self._spec_arrays
+        if preselection_feature_reset_mask is None:
+            reset_mask = jnp.zeros((cfg.observation_dim,), dtype=jnp.bool_)
+        else:
+            if cfg.base_hidden_sizes:
+                raise ValueError(
+                    "preselection feature reset requires a linear STOMP base learner"
+                )
+            raw_reset_mask = jnp.asarray(preselection_feature_reset_mask)
+            if raw_reset_mask.shape != (cfg.observation_dim,):
+                raise ValueError(
+                    "preselection_feature_reset_mask must have shape "
+                    f"({cfg.observation_dim},), got {raw_reset_mask.shape}"
+                )
+            if raw_reset_mask.dtype != jnp.bool_:
+                raise TypeError(
+                    "preselection_feature_reset_mask must have dtype bool, "
+                    f"got {raw_reset_mask.dtype}"
+                )
+            reset_mask = raw_reset_mask
+        if extended_action_mask is None:
+            action_mask = jnp.ones((cfg.n_total_actions,), dtype=jnp.bool_)
+            action_mask_valid = jnp.asarray(True, dtype=jnp.bool_)
+        else:
+            raw_action_mask = jnp.asarray(extended_action_mask)
+            if raw_action_mask.shape != (cfg.n_total_actions,):
+                raise ValueError(
+                    "extended_action_mask must have shape "
+                    f"({cfg.n_total_actions},), got {raw_action_mask.shape}"
+                )
+            if raw_action_mask.dtype != jnp.bool_:
+                raise TypeError(
+                    "extended_action_mask must have dtype bool, "
+                    f"got {raw_action_mask.dtype}"
+                )
+            action_mask = raw_action_mask
+            action_mask_valid = jnp.all(
+                action_mask[: cfg.n_primitive_actions]
+            ) & jnp.any(action_mask)
         bootstrap_obs = jnp.asarray(next_observation, dtype=jnp.float32).reshape(
             (cfg.observation_dim,)
         )
@@ -1501,7 +2270,13 @@ class STOMPAgent:
             )
         )
         boundary = jnp.asarray(execution_boundary, dtype=jnp.bool_).reshape(())
-        reward = jnp.asarray(env_reward, dtype=jnp.float32)
+        reward = jnp.asarray(env_reward, dtype=jnp.float32).reshape(())
+        input_values_valid = (
+            jnp.isfinite(reward)
+            & jnp.all(jnp.isfinite(bootstrap_obs))
+            & jnp.all(jnp.isfinite(decision_obs))
+            & action_mask_valid
+        )
         if discount is None:
             primitive_discount = jnp.array(1.0, dtype=jnp.float32)
             intra_option_discount = jnp.array(1.0, dtype=jnp.float32)
@@ -1526,9 +2301,27 @@ class STOMPAgent:
             intra_option_discount = supplied_discount
             option_step_discount = supplied_discount
             environmental_termination = supplied_discount <= 0.0
+            input_values_valid = input_values_valid & valid_discount
+
+        outer_words, outer_capacity = _checked_lifetime_words_increment(
+            state.step_words
+        )
+        outer_counter_valid = _lifetime_counter_valid(
+            state.step_words,
+            state.step_count,
+        )
+        nested_counter_valid = _lifetime_counter_valid(
+            state.base_learner_state.step_words,
+            state.base_learner_state.step_count,
+        )
+        source_state_valid = self.state_valid(state)
 
         is_executing = state.executing_option >= 0
-        option_idx = jnp.maximum(state.executing_option, jnp.array(0, dtype=jnp.int32))
+        option_idx = jnp.clip(
+            state.executing_option,
+            jnp.array(0, dtype=jnp.int32),
+            jnp.asarray(cfg.n_options - 1, dtype=jnp.int32),
+        )
 
         # Compute pseudo-reward for the currently-executing (or notional) option
         pseudo_r = compute_pseudo_reward(spec, option_idx, bootstrap_obs)
@@ -1547,12 +2340,45 @@ class STOMPAgent:
         )
 
         # Option termination check
-        new_option_steps = state.option_steps + 1
+        new_option_steps = _saturating_int32_counter_increment(state.option_steps)
         option_completes = (
             check_option_terminated(spec, option_idx, bootstrap_obs, new_option_steps)
             | environmental_termination
         )
         option_lifecycle_ends = option_completes | boundary
+        should_update_model = is_executing & option_completes
+        should_update_base = (~is_executing) | (is_executing & option_lifecycle_ends)
+        completed_after = (state.option_models.n_completions > 0) | (
+            jnp.arange(cfg.n_options, dtype=jnp.int32) == option_idx
+        ) & should_update_model
+        has_completed_model_after = jnp.any(
+            completed_after & action_mask[cfg.n_primitive_actions :]
+        )
+        if enable_planning and cfg.option_planning_backups_per_step > 0:
+            planning_updates_required = jnp.where(
+                has_completed_model_after,
+                jnp.asarray(
+                    cfg.option_planning_backups_per_step,
+                    dtype=jnp.int32,
+                ),
+                jnp.asarray(0, dtype=jnp.int32),
+            )
+        else:
+            planning_updates_required = jnp.asarray(0, dtype=jnp.int32)
+        nested_updates_required = (
+            should_update_base.astype(jnp.int32) + planning_updates_required
+        )
+        expected_nested_words, nested_capacity = _checked_lifetime_words_advance(
+            state.base_learner_state.step_words,
+            nested_updates_required,
+        )
+        transaction_preflight = (
+            source_state_valid
+            & input_values_valid
+            & outer_capacity
+            & nested_counter_valid
+            & nested_capacity
+        )
 
         # --- Intra-option policy update (only active when executing) ---
         # Gated on is_executing: idle steps must not pollute option 0 (the
@@ -1622,8 +2448,6 @@ class STOMPAgent:
         # A pure execution boundary is a censored option trajectory, not an
         # observed option-model completion. If the subtask also completes
         # naturally (or the environment terminates), preserve completion.
-        should_update_model = is_executing & option_completes
-
         def do_update_model(_: None) -> OptionModelsState:
             return _update_option_model(
                 state.option_models,
@@ -1671,7 +2495,6 @@ class STOMPAgent:
             primitive_discount,
         )
         # Only update base Q on: (a) primitive steps, or (b) option termination
-        should_update_base = (~is_executing) | (is_executing & option_lifecycle_ends)
         n_total = cfg.n_total_actions
         beta = jnp.asarray(cfg.base_avg_reward_step_size, dtype=jnp.float32)
         # The base extended action was selected at the option's start state.
@@ -1686,11 +2509,14 @@ class STOMPAgent:
             state.base_last_obs,
         )
 
-        def do_base_update(_: None) -> tuple[MultiHeadMLPState, Array, Array]:
+        def do_base_update(
+            _: None,
+        ) -> tuple[MultiHeadMLPState, Array, Array, Array]:
             next_q_vals = self._base_learner.predict(
                 state.base_learner_state, bootstrap_obs
             )
-            max_next_q = base_discount * jnp.max(next_q_vals)
+            eligible_next_q = jnp.where(action_mask, next_q_vals, -jnp.inf)
+            max_next_q = base_discount * jnp.max(eligible_next_q)
             td_target = (
                 base_reward
                 - state.base_average_reward * base_baseline_mass
@@ -1713,19 +2539,35 @@ class STOMPAgent:
             )
             td_err = result.errors[state.base_last_action]
             new_avg_reward = state.base_average_reward + beta * td_err
-            return result.state, new_avg_reward, td_err
+            return result.state, new_avg_reward, td_err, result.update_applied
 
-        def skip_base_update(_: None) -> tuple[MultiHeadMLPState, Array, Array]:
+        def skip_base_update(
+            _: None,
+        ) -> tuple[MultiHeadMLPState, Array, Array, Array]:
             prev_q = self._base_learner.predict(
                 state.base_learner_state, state.base_last_obs
             )
             next_q = self._base_learner.predict(
                 state.base_learner_state, bootstrap_obs
             )
-            td = primitive_discount * jnp.max(next_q) - prev_q[state.base_last_action]
-            return state.base_learner_state, state.base_average_reward, td
+            eligible_next_q = jnp.where(action_mask, next_q, -jnp.inf)
+            td = (
+                primitive_discount * jnp.max(eligible_next_q)
+                - prev_q[state.base_last_action]
+            )
+            return (
+                state.base_learner_state,
+                state.base_average_reward,
+                td,
+                jnp.asarray(True, dtype=jnp.bool_),
+            )
 
-        new_base_learner_state, new_avg_r, base_td = jax.lax.cond(
+        (
+            new_base_learner_state,
+            new_avg_r,
+            base_td,
+            real_base_update_applied,
+        ) = jax.lax.cond(
             should_update_base, do_base_update, skip_base_update, None
         )
 
@@ -1742,11 +2584,24 @@ class STOMPAgent:
                 new_option_models,
                 bootstrap_obs,
                 new_avg_r,
-                state.step_count,
+                state.step_words,
+                action_mask,
             )
         else:
             planning_backups = jnp.array(0, dtype=jnp.int32)
             planning_td_error = jnp.array(0.0, dtype=jnp.float32)
+
+        if preselection_feature_reset_mask is not None:
+            (
+                new_base_learner_state,
+                new_option_policies,
+                new_option_models,
+            ) = _reset_linear_stomp_feature_axes(
+                new_base_learner_state,
+                new_option_policies,
+                new_option_models,
+                reset_mask,
+            )
 
         # --- Select next extended action ---
         # After primitive or option termination: select from extended action space.
@@ -1755,8 +2610,11 @@ class STOMPAgent:
         key, ext_key, intra_key = jr.split(key, 3)
 
         ext_q_vals = self._base_learner.predict(new_base_learner_state, decision_obs)
-        extended_action, _ = _select_action_epsilon_greedy_from_q(
-            ext_q_vals, ext_key, cfg.epsilon_base, cfg.n_total_actions
+        extended_action, _ = _select_action_epsilon_greedy_from_q_masked(
+            ext_q_vals,
+            ext_key,
+            cfg.epsilon_base,
+            action_mask,
         )
         next_select_extended = (~is_executing) | (
             is_executing & option_lifecycle_ends
@@ -1841,7 +2699,7 @@ class STOMPAgent:
             new_option_steps,
         )
 
-        new_state = STOMPState(
+        proposed_state = STOMPState(
             base_learner_state=new_base_learner_state,
             base_average_reward=new_avg_r,
             base_last_obs=decision_obs,
@@ -1864,19 +2722,87 @@ class STOMPAgent:
             option_baseline_mass=new_option_baseline_mass,
             option_discount=new_option_discount,
             option_steps=new_option_steps,
-            step_count=state.step_count + 1,
+            step_count=_saturating_int32_counter_increment(state.step_count),
+            step_words=outer_words,
+        )
+        nested_post_matches = jnp.all(
+            proposed_state.base_learner_state.step_words == expected_nested_words
+        )
+        proposed_state_valid = self.state_valid(proposed_state)
+        transaction_applied = (
+            transaction_preflight
+            & real_base_update_applied
+            & nested_post_matches
+            & proposed_state_valid
+        )
+        new_state = jax.lax.cond(
+            transaction_applied,
+            lambda: proposed_state,
+            lambda: state,
+        )
+        committed_base_td = jnp.where(
+            transaction_applied,
+            base_td,
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        committed_planning_backups = jnp.where(
+            transaction_applied,
+            planning_backups,
+            jnp.asarray(0, dtype=jnp.int32),
+        )
+        committed_planning_td_error = jnp.where(
+            transaction_applied,
+            planning_td_error,
+            jnp.asarray(0.0, dtype=jnp.float32),
         )
         return STOMPUpdateResult(
             state=new_state,
-            td_error=base_td,
-            average_reward=new_avg_r,
-            primitive_action=primitive_action,
-            executing_option=new_executing_option,
-            option_terminated=is_executing & option_lifecycle_ends,
-            pseudo_reward=jnp.where(is_executing, pseudo_r, jnp.array(0.0, dtype=jnp.float32)),
-            option_importance_ratio=option_importance_ratio,
-            planning_backups=planning_backups,
-            planning_td_error=planning_td_error,
+            td_error=committed_base_td,
+            average_reward=jnp.where(
+                transaction_applied,
+                new_avg_r,
+                state.base_average_reward,
+            ),
+            primitive_action=jnp.where(
+                transaction_applied,
+                primitive_action,
+                state.last_primitive_action,
+            ),
+            executing_option=jnp.where(
+                transaction_applied,
+                new_executing_option,
+                state.executing_option,
+            ),
+            option_terminated=transaction_applied
+            & is_executing
+            & option_lifecycle_ends,
+            pseudo_reward=jnp.where(
+                transaction_applied & is_executing,
+                pseudo_r,
+                jnp.array(0.0, dtype=jnp.float32),
+            ),
+            option_importance_ratio=jnp.where(
+                transaction_applied,
+                option_importance_ratio,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ),
+            planning_backups=committed_planning_backups,
+            planning_td_error=committed_planning_td_error,
+            pre_step_words=state.step_words,
+            post_step_words=new_state.step_words,
+            inputs_valid=input_values_valid,
+            lifetime_counter_valid=outer_counter_valid,
+            lifetime_capacity_available=outer_capacity,
+            nested_lifetime_counter_valid=nested_counter_valid,
+            nested_lifetime_capacity_available=nested_capacity,
+            nested_updates_required=nested_updates_required,
+            nested_updates_applied=jnp.where(
+                transaction_applied,
+                nested_updates_required,
+                jnp.asarray(0, dtype=jnp.int32),
+            ),
+            proposed_state_valid=proposed_state_valid,
+            update_applied=transaction_applied,
         )
 
     def scan(
@@ -1888,6 +2814,7 @@ class STOMPAgent:
         *,
         decision_observations: Array | None = None,
         execution_boundaries: Array | None = None,
+        extended_action_masks: Array | None = None,
     ) -> STOMPArrayResult:
         """Run STOMP over transition arrays via scan.
 
@@ -1895,11 +2822,13 @@ class STOMPAgent:
         Omitting it preserves the historical ``option_gamma`` behavior.
         ``decision_observations`` and ``execution_boundaries`` provide the
         batched autoreset-boundary split accepted by :meth:`update`.
+        ``extended_action_masks`` threads the per-transition action-eligibility
+        contract, including bootstrap and planning eligibility.
         """
 
         def step_fn(
             carry: STOMPState,
-            inputs: tuple[Array, Array, Array, Array, Array],
+            inputs: tuple[Array, Array, Array, Array, Array, Array],
         ) -> tuple[STOMPState, tuple[Array, ...]]:
             (
                 reward,
@@ -1907,6 +2836,7 @@ class STOMPAgent:
                 transition_discount,
                 decision_obs,
                 execution_boundary,
+                extended_action_mask,
             ) = inputs
             result = self.update(
                 carry,
@@ -1915,6 +2845,11 @@ class STOMPAgent:
                 transition_discount if discounts is not None else None,
                 decision_observation=decision_obs,
                 execution_boundary=execution_boundary,
+                extended_action_mask=(
+                    extended_action_mask
+                    if extended_action_masks is not None
+                    else None
+                ),
             )
             return result.state, (
                 result.td_error,
@@ -1926,6 +2861,17 @@ class STOMPAgent:
                 result.option_importance_ratio,
                 result.planning_backups,
                 result.planning_td_error,
+                result.pre_step_words,
+                result.post_step_words,
+                result.inputs_valid,
+                result.lifetime_counter_valid,
+                result.lifetime_capacity_available,
+                result.nested_lifetime_counter_valid,
+                result.nested_lifetime_capacity_available,
+                result.nested_updates_required,
+                result.nested_updates_applied,
+                result.proposed_state_valid,
+                result.update_applied,
             )
 
         if discounts is None:
@@ -1942,6 +2888,24 @@ class STOMPAgent:
             if execution_boundaries is None
             else jnp.asarray(execution_boundaries, dtype=jnp.bool_)
         )
+        scan_extended_action_masks = (
+            jnp.ones(
+                (env_rewards.shape[0], self._config.n_total_actions),
+                dtype=jnp.bool_,
+            )
+            if extended_action_masks is None
+            else jnp.asarray(extended_action_masks)
+        )
+        if scan_extended_action_masks.shape != (
+            env_rewards.shape[0],
+            self._config.n_total_actions,
+        ):
+            raise ValueError(
+                "extended_action_masks must have shape "
+                f"({env_rewards.shape[0]}, {self._config.n_total_actions})"
+            )
+        if scan_extended_action_masks.dtype != jnp.bool_:
+            raise TypeError("extended_action_masks must have dtype bool")
 
         final_state, (
             td_errors,
@@ -1953,6 +2917,17 @@ class STOMPAgent:
             option_importance_ratios,
             planning_backups,
             planning_td_errors,
+            pre_step_words,
+            post_step_words,
+            inputs_valid,
+            lifetime_counter_valid,
+            lifetime_capacity_available,
+            nested_lifetime_counter_valid,
+            nested_lifetime_capacity_available,
+            nested_updates_required,
+            nested_updates_applied,
+            proposed_state_valid,
+            update_applied,
         ) = jax.lax.scan(
             step_fn,
             state,
@@ -1962,6 +2937,7 @@ class STOMPAgent:
                 scan_discounts,
                 scan_decision_observations,
                 scan_execution_boundaries,
+                scan_extended_action_masks,
             ),
         )
         return STOMPArrayResult(
@@ -1975,6 +2951,17 @@ class STOMPAgent:
             option_importance_ratios=option_importance_ratios,
             planning_backups=planning_backups,
             planning_td_errors=planning_td_errors,
+            pre_step_words=pre_step_words,
+            post_step_words=post_step_words,
+            inputs_valid=inputs_valid,
+            lifetime_counter_valid=lifetime_counter_valid,
+            lifetime_capacity_available=lifetime_capacity_available,
+            nested_lifetime_counter_valid=nested_lifetime_counter_valid,
+            nested_lifetime_capacity_available=nested_lifetime_capacity_available,
+            nested_updates_required=nested_updates_required,
+            nested_updates_applied=nested_updates_applied,
+            proposed_state_valid=proposed_state_valid,
+            update_applied=update_applied,
         )
 
 
@@ -2060,6 +3047,45 @@ STOMP_STATE_EXPANSION_FIELDS = (
     "option_env_cumreward",
     "option_baseline_mass",
 )
+
+#: Exact-lifetime fields introduced by ``STOMP_STATE_SCHEMA`` v2.
+STOMP_STATE_LIFETIME_FIELDS = ("step_words",)
+
+
+def measure_stomp_state_nbytes(state: STOMPState) -> int:
+    """Measure STOMP-owned arrays plus its nested base-learner arrays."""
+
+    persistent_learner = state.base_learner_state.replace(
+        birth_timestamp=0.0,
+        uptime_s=0.0,
+    )
+    persistent_state = state.replace(base_learner_state=persistent_learner)
+    return sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree.leaves(persistent_state)
+        if isinstance(leaf, Array)
+    )
+
+
+def measure_stomp_wrapper_state_nbytes(state: STOMPState) -> int:
+    """Measure STOMP-owned arrays, excluding the nested base learner."""
+
+    persistent_learner = state.base_learner_state.replace(
+        birth_timestamp=0.0,
+        uptime_s=0.0,
+    )
+    nested_nbytes = sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree.leaves(persistent_learner)
+        if isinstance(leaf, Array)
+    )
+    return measure_stomp_state_nbytes(state) - nested_nbytes
+
+
+def stomp_lifetime_counter_nbytes() -> int:
+    """Return bytes for STOMP's primitive and base-update exact clocks."""
+
+    return 2 * STOMP_LIFETIME_COUNTER_NBYTES
 
 
 def stomp_state_to_checkpoint_payload(state: STOMPState) -> dict[str, Any]:
@@ -2149,12 +3175,18 @@ def load_stomp_state_with_migration(payload: dict[str, Any]) -> STOMPState:
     unknown = sorted(set(data) - state_field_names)
     if unknown:
         raise ValueError(f"Unknown STOMPState checkpoint fields: {unknown}")
-    missing_required = sorted(
-        state_field_names - set(data) - set(STOMP_STATE_EXPANSION_FIELDS)
+    missing_state_fields = state_field_names - set(data)
+    pre_lifetime_fields = set(STOMP_STATE_LIFETIME_FIELDS)
+    pre_expansion_fields = set(STOMP_STATE_EXPANSION_FIELDS) | pre_lifetime_fields
+    allowed_missing_state_fields: tuple[set[str], ...] = (
+        set(),
+        pre_lifetime_fields,
+        pre_expansion_fields,
     )
-    if missing_required:
+    if missing_state_fields not in allowed_missing_state_fields:
         raise ValueError(
-            f"STOMP checkpoint payload is missing required fields: {missing_required}"
+            "STOMP checkpoint state-field manifest is not a known schema; "
+            f"missing={sorted(missing_state_fields)}"
         )
 
     models = _sub_payload_as_dict(
@@ -2169,12 +3201,16 @@ def load_stomp_state_with_migration(payload: dict[str, Any]) -> STOMPState:
         raise ValueError(
             f"Unknown OptionModelsState checkpoint fields: {unknown_models}"
         )
-    missing_models = sorted(
-        model_field_names - set(models) - set(STOMP_OPTION_MODEL_EXPANSION_FIELDS)
+    missing_model_fields = model_field_names - set(models)
+    expected_missing_model_fields = (
+        set(STOMP_OPTION_MODEL_EXPANSION_FIELDS)
+        if missing_state_fields == pre_expansion_fields
+        else set()
     )
-    if missing_models:
+    if missing_model_fields != expected_missing_model_fields:
         raise ValueError(
-            f"STOMP option-model payload is missing required fields: {missing_models}"
+            "STOMP option-model field manifest does not match the state schema; "
+            f"missing={sorted(missing_model_fields)}"
         )
     cumreward_ema = jnp.asarray(models["cumreward_ema"], dtype=jnp.float32)
     for name in STOMP_OPTION_MODEL_EXPANSION_FIELDS:
@@ -2204,6 +3240,48 @@ def load_stomp_state_with_migration(payload: dict[str, Any]) -> STOMPState:
         else:
             data[name] = jnp.array(0.0, dtype=jnp.float32)
 
+    base_learner = data["base_learner_state"]
+    if not isinstance(base_learner, MultiHeadMLPState):
+        base_fields = _sub_payload_as_dict(
+            base_learner,
+            "base_learner_state",
+            MultiHeadMLPState,
+        )
+        current_base_names = {
+            field.name
+            for field in dataclasses.fields(MultiHeadMLPState)  # type: ignore[arg-type]
+        }
+        if set(base_fields) == current_base_names:
+            base_learner = MultiHeadMLPState(**base_fields)
+        else:
+            base_learner = migrate_legacy_multi_head_mlp_state(base_fields)
+    if not bool(
+        _lifetime_counter_valid(
+            base_learner.step_words,
+            base_learner.step_count,
+        )
+    ):
+        raise ValueError("STOMP base-learner lifetime counter is invalid")
+    data["base_learner_state"] = base_learner
+
+    if "step_words" not in data:
+        legacy_step = jnp.asarray(data["step_count"])
+        if legacy_step.shape != () or legacy_step.dtype != jnp.dtype(jnp.int32):
+            raise TypeError("legacy STOMP step_count must be scalar int32")
+        legacy_step_value = int(legacy_step)
+        if legacy_step_value < 0:
+            raise ValueError("negative legacy STOMP step_count indicates wrap")
+        if legacy_step_value >= _INT32_MAX:
+            raise ValueError("saturated legacy STOMP step_count is ambiguous")
+        data["step_words"] = jnp.asarray(
+            (0, legacy_step_value),
+            dtype=jnp.uint32,
+        )
+    else:
+        data["step_words"] = jnp.asarray(data["step_words"])
+    if not bool(_lifetime_counter_valid(data["step_words"], data["step_count"])):
+        raise ValueError("STOMP lifetime counter is invalid")
+
     return STOMPState(
         option_models=option_models,
         option_policies=option_policies,
@@ -2222,17 +3300,24 @@ __all__ = [
     "STOMPAgent",
     "STOMPArrayResult",
     "STOMPConfig",
+    "STOMP_LIFETIME_COUNTER_DELTA_NBYTES",
+    "STOMP_LIFETIME_COUNTER_NBYTES",
+    "STOMP_STATE_SCHEMA",
     "STOMPSpecArrays",
     "STOMPStartResult",
     "STOMPState",
     "STOMPUpdateResult",
     "STOMP_OPTION_MODEL_EXPANSION_FIELDS",
     "STOMP_STATE_EXPANSION_FIELDS",
+    "STOMP_STATE_LIFETIME_FIELDS",
     "SubtaskSpec",
     "check_option_terminated",
     "compute_pseudo_reward",
     "load_stomp_state_with_migration",
+    "measure_stomp_state_nbytes",
+    "measure_stomp_wrapper_state_nbytes",
     "replace_dispatched_primitive_action",
     "stomp_state_to_checkpoint_payload",
+    "stomp_lifetime_counter_nbytes",
     "subtasks_from_feature_scores",
 ]

@@ -48,6 +48,9 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
+from collections.abc import Mapping
+from numbers import Real
 from typing import Any, cast
 
 import chex
@@ -55,19 +58,44 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Bool, Float
+from jaxtyping import Bool, Float, UInt
 
 from alberta_framework.core.multi_head_learner import (
     AnyOptimizer,
     MultiHeadMLPLearner,
     MultiHeadMLPState,
     MultiHeadMLPUpdateResult,
+    measure_multi_head_mlp_state_nbytes,
+    migrate_legacy_multi_head_mlp_state,
+)
+from alberta_framework.core.normalizers import (
+    _checked_lifetime_words_increment,
+    _lifetime_counter_valid,
+    _lifetime_words_are_zero,
+    _saturating_int32_counter_increment,
 )
 from alberta_framework.core.optimizers import Bounder
 from alberta_framework.core.types import TraceMode
 
 EVIDENCE_LEVEL = "L0"
 SCIENTIFIC_PROMOTION_ALLOWED = False
+LATENT_WORLD_MODEL_CONFIG_SCHEMA = "alberta.latent-world-model-config.v2"
+LATENT_WORLD_MODEL_STATE_SCHEMA = "alberta.latent-world-model-state.v2"
+LATENT_WORLD_MODEL_LIFETIME_COUNTER_NBYTES = 12
+LATENT_WORLD_MODEL_LIFETIME_COUNTER_DELTA_NBYTES = 8
+
+_INT32_MAX = 2**31 - 1
+
+
+def _floating_tree_is_finite(tree: object) -> Bool[Array, ""]:
+    """Return whether every floating/complex persistent leaf is finite."""
+
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for leaf in jax.tree.leaves(tree):
+        array = jnp.asarray(leaf)
+        if jnp.issubdtype(array.dtype, jnp.inexact):
+            valid = valid & jnp.all(jnp.isfinite(array))
+    return valid
 
 
 @dataclasses.dataclass(frozen=True)
@@ -113,6 +141,7 @@ class LatentWorldModelConfig:
         """Serialize to a JSON-compatible dictionary."""
         payload = dataclasses.asdict(self)
         payload["type"] = "LatentWorldModelConfig"
+        payload["schema"] = LATENT_WORLD_MODEL_CONFIG_SCHEMA
         payload["hidden_sizes"] = list(self.hidden_sizes)
         payload["trace_mode"] = self.trace_mode.value
         if self.observation_scale is not None:
@@ -124,6 +153,11 @@ class LatentWorldModelConfig:
         """Reconstruct from :meth:`to_config` output."""
         payload = dict(config)
         payload.pop("type", None)
+        schema = payload.pop("schema", LATENT_WORLD_MODEL_CONFIG_SCHEMA)
+        if schema != LATENT_WORLD_MODEL_CONFIG_SCHEMA:
+            raise ValueError(
+                f"Unsupported LatentWorldModel config schema: {schema!r}"
+            )
         if "hidden_sizes" in payload:
             payload["hidden_sizes"] = tuple(payload["hidden_sizes"])
         if "observation_scale" in payload and payload["observation_scale"] is not None:
@@ -146,6 +180,19 @@ class LatentWorldModelState:
     prediction_error_ema: Float[Array, ""]
     collapse_score_ema: Float[Array, ""]
     step_count: Array
+    step_words: UInt[Array, " 2"]
+
+
+@chex.dataclass(frozen=True)
+class _LatentWorldCounterStatus:
+    """Preflight facts for an atomic world/learner transaction."""
+
+    proposed_step_words: UInt[Array, " 2"]
+    lifetime_counter_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    learner_counter_aligned: Bool[Array, ""]
+    learner_estimator_capacity_available: Bool[Array, ""]
+    update_available: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -185,6 +232,13 @@ class LatentWorldModelUpdateResult:
     encoder_update_applied: Bool[Array, ""]
     encoder_collapse_gated: Bool[Array, ""]
     encoder_gradient_norm: Float[Array, ""]
+    pre_step_words: UInt[Array, " 2"]
+    post_step_words: UInt[Array, " 2"]
+    lifetime_counter_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    learner_counter_aligned: Bool[Array, ""]
+    learner_estimator_capacity_available: Bool[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -207,6 +261,7 @@ class LatentWorldModelLearningResult:
     encoder_updates_applied: Bool[Array, " num_steps"]
     encoder_collapse_gates: Bool[Array, " num_steps"]
     encoder_gradient_norms: Float[Array, " num_steps"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 class LatentWorldModel:
@@ -275,6 +330,7 @@ class LatentWorldModel:
         """Serialize model configuration and learner components."""
         return {
             "type": "LatentWorldModel",
+            "state_schema": LATENT_WORLD_MODEL_STATE_SCHEMA,
             "config": self._config.to_config(),
             "learner": self._learner.to_config(),
         }
@@ -289,6 +345,14 @@ class LatentWorldModel:
 
         payload = dict(config)
         payload.pop("type", None)
+        state_schema = payload.pop(
+            "state_schema",
+            LATENT_WORLD_MODEL_STATE_SCHEMA,
+        )
+        if state_schema != LATENT_WORLD_MODEL_STATE_SCHEMA:
+            raise ValueError(
+                f"Unsupported LatentWorldModel state schema: {state_schema!r}"
+            )
         model_config = LatentWorldModelConfig.from_config(payload["config"])
         learner_cfg = dict(payload["learner"])
         optimizer = optimizer_from_config(learner_cfg["optimizer"])
@@ -334,6 +398,80 @@ class LatentWorldModel:
             prediction_error_ema=jnp.array(0.0, dtype=jnp.float32),
             collapse_score_ema=jnp.array(0.0, dtype=jnp.float32),
             step_count=jnp.array(0, dtype=jnp.int32),
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
+        )
+
+    def _counter_status(
+        self,
+        state: LatentWorldModelState,
+    ) -> _LatentWorldCounterStatus:
+        """Validate exact alignment of world and nested learner clocks."""
+
+        proposed_words, outer_capacity = _checked_lifetime_words_increment(
+            state.step_words
+        )
+        outer_valid = _lifetime_counter_valid(
+            state.step_words,
+            state.step_count,
+        )
+        learner_status = self._learner._counter_status(state.learner_state)
+        aligned = jnp.all(state.step_words == state.learner_state.step_words)
+        counter_valid = (
+            outer_valid
+            & learner_status.lifetime_counter_valid
+            & aligned
+        )
+        lifetime_capacity = (
+            outer_capacity
+            & learner_status.lifetime_capacity_available
+        )
+        estimator_capacity = (
+            learner_status.normalizer_estimator_capacity_available
+        )
+        update_available = (
+            counter_valid
+            & lifetime_capacity
+            & estimator_capacity
+        )
+        return _LatentWorldCounterStatus(
+            proposed_step_words=proposed_words,
+            lifetime_counter_valid=counter_valid,
+            lifetime_capacity_available=lifetime_capacity,
+            learner_counter_aligned=aligned,
+            learner_estimator_capacity_available=estimator_capacity,
+            update_available=update_available,
+        )
+
+    def _refused_learner_result(
+        self,
+        state: MultiHeadMLPState,
+        predictions: Array,
+        targets: Array,
+    ) -> MultiHeadMLPUpdateResult:
+        """Build read-only learner output without invoking learner.update."""
+
+        errors = targets - predictions
+        unavailable_step_size = jnp.full_like(errors, jnp.nan)
+        metrics = jnp.stack(
+            (errors**2, errors, unavailable_step_size),
+            axis=-1,
+        )
+        status = self._learner._counter_status(state)
+        return MultiHeadMLPUpdateResult(
+            state=state,
+            predictions=predictions,
+            errors=errors,
+            per_head_metrics=metrics,
+            trunk_bounding_metric=jnp.asarray(1.0, dtype=jnp.float32),
+            pre_step_words=state.step_words,
+            post_step_words=state.step_words,
+            lifetime_counter_valid=status.lifetime_counter_valid,
+            lifetime_capacity_available=status.lifetime_capacity_available,
+            normalizer_counter_aligned=status.normalizer_counter_aligned,
+            normalizer_estimator_capacity_available=(
+                status.normalizer_estimator_capacity_available
+            ),
+            update_applied=jnp.asarray(False, dtype=jnp.bool_),
         )
 
     def _encode_with(
@@ -559,14 +697,84 @@ class LatentWorldModel:
         followed by one bounded, collapse-gated encoder gradient step; the
         updated encoder takes effect from the next event.  With the default
         ``encoder_learning=False`` the computation is exactly the
-        fixed-encoder path.
+        fixed-encoder path. The world and nested learner clocks commit
+        atomically; failed preflight preserves all persistent JAX learning and
+        counter leaves. The learner's two legacy host-only timing floats are
+        outside that bit-exact contract.
         """
+        array_contracts = (
+            (
+                "observation",
+                observation,
+                (self._config.observation_dim,),
+                jnp.dtype(jnp.float32),
+            ),
+            ("action", action, (), jnp.dtype(jnp.int32)),
+            ("reward", reward, (), jnp.dtype(jnp.float32)),
+            ("discount", discount, (), jnp.dtype(jnp.float32)),
+            (
+                "next_observation",
+                next_observation,
+                (self._config.observation_dim,),
+                jnp.dtype(jnp.float32),
+            ),
+        )
+        for name, value, shape, dtype in array_contracts:
+            if getattr(value, "shape", None) != shape:
+                raise ValueError(f"{name} must have shape {shape}")
+            if getattr(value, "dtype", None) != dtype:
+                raise TypeError(f"{name} must have dtype {dtype}")
+        counter_status = self._counter_status(state)
+        source_state_finite = _floating_tree_is_finite(state)
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(next_observation))
+            & jnp.isfinite(reward)
+            & jnp.isfinite(discount)
+            & (discount >= 0.0)
+            & (discount <= 1.0)
+            & (action >= 0)
+            & (action < self._config.n_actions)
+        )
         prediction = self.predict(state, observation, action)
         targets = self.targets(state, observation, reward, discount, next_observation)
-        learner_result = self._learner.update(
-            state.learner_state,
-            self.input_features_from_latent(prediction.latent, action),
-            targets,
+        learner_features = self.input_features_from_latent(
+            prediction.latent,
+            action,
+        )
+
+        def update_learner(_: None) -> MultiHeadMLPUpdateResult:
+            return cast(
+                MultiHeadMLPUpdateResult,
+                self._learner.update(
+                    state.learner_state,
+                    learner_features,
+                    targets,
+                ),
+            )
+
+        def preserve_learner(_: None) -> MultiHeadMLPUpdateResult:
+            return self._refused_learner_result(
+                state.learner_state,
+                prediction.raw_predictions,
+                targets,
+            )
+
+        learner_result = jax.lax.cond(
+            counter_status.update_available,
+            update_learner,
+            preserve_learner,
+            operand=None,
+        )
+        base_update_available = (
+            counter_status.update_available
+            & source_state_finite
+            & inputs_valid
+            & learner_result.update_applied
+            & jnp.all(
+                learner_result.post_step_words
+                == counter_status.proposed_step_words
+            )
         )
         target_next_latent = self.encode(state, next_observation)
         surprise = jnp.mean((prediction.next_latent - target_next_latent) ** 2)
@@ -576,7 +784,7 @@ class LatentWorldModel:
 
         collapse_decay = jnp.asarray(self._config.collapse_decay, dtype=jnp.float32)
         surprise_decay = jnp.asarray(self._config.surprise_decay, dtype=jnp.float32)
-        first = state.step_count == 0
+        first = _lifetime_words_are_zero(state.step_words)
         next_mean = jnp.where(
             first,
             target_next_latent,
@@ -614,13 +822,40 @@ class LatentWorldModel:
         )
 
         if self._config.encoder_learning:
+            def update_encoder(
+                _: None,
+            ) -> tuple[Array, Array, Array, Array, Array]:
+                return self._encoder_step(
+                    state,
+                    observation,
+                    action,
+                    next_observation,
+                    collapse_score,
+                )
+
+            def preserve_encoder(
+                _: None,
+            ) -> tuple[Array, Array, Array, Array, Array]:
+                return (
+                    state.encoder_matrix,
+                    state.encoder_bias,
+                    jnp.asarray(False, dtype=jnp.bool_),
+                    jnp.asarray(False, dtype=jnp.bool_),
+                    jnp.asarray(0.0, dtype=jnp.float32),
+                )
+
             (
                 encoder_matrix,
                 encoder_bias,
                 encoder_update_applied,
                 encoder_collapse_gated,
                 encoder_gradient_norm,
-            ) = self._encoder_step(state, observation, action, next_observation, collapse_score)
+            ) = jax.lax.cond(
+                base_update_available,
+                update_encoder,
+                preserve_encoder,
+                operand=None,
+            )
         else:
             encoder_matrix = state.encoder_matrix
             encoder_bias = state.encoder_bias
@@ -628,7 +863,7 @@ class LatentWorldModel:
             encoder_collapse_gated = jnp.asarray(False, dtype=jnp.bool_)
             encoder_gradient_norm = jnp.asarray(0.0, dtype=jnp.float32)
 
-        new_state = LatentWorldModelState(
+        proposed_state = LatentWorldModelState(
             encoder_matrix=encoder_matrix,
             encoder_bias=encoder_bias,
             learner_state=learner_result.state,
@@ -637,7 +872,20 @@ class LatentWorldModel:
             surprise_ema=next_surprise_ema,
             prediction_error_ema=next_prediction_error_ema,
             collapse_score_ema=next_collapse_score_ema,
-            step_count=state.step_count + 1,
+            step_count=_saturating_int32_counter_increment(state.step_count),
+            step_words=counter_status.proposed_step_words,
+        )
+        candidate_state_finite = _floating_tree_is_finite(proposed_state)
+        update_applied = base_update_available & candidate_state_finite
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: proposed_state,
+            lambda: state,
+        )
+        learner_result = learner_result.replace(
+            state=new_state.learner_state,
+            post_step_words=new_state.learner_state.step_words,
+            update_applied=update_applied,
         )
         return LatentWorldModelUpdateResult(
             state=new_state,
@@ -653,12 +901,74 @@ class LatentWorldModel:
             collapse_score=collapse_score,
             per_head_metrics=learner_result.per_head_metrics,
             learner_result=learner_result,
-            encoder_update_applied=encoder_update_applied,
+            encoder_update_applied=encoder_update_applied & update_applied,
             encoder_collapse_gated=encoder_collapse_gated,
             encoder_gradient_norm=encoder_gradient_norm,
+            pre_step_words=state.step_words,
+            post_step_words=new_state.step_words,
+            lifetime_counter_valid=counter_status.lifetime_counter_valid,
+            lifetime_capacity_available=(
+                counter_status.lifetime_capacity_available
+            ),
+            learner_counter_aligned=counter_status.learner_counter_aligned,
+            learner_estimator_capacity_available=(
+                counter_status.learner_estimator_capacity_available
+            ),
+            update_applied=update_applied,
         )
 
     def _validate_config(self, config: LatentWorldModelConfig) -> None:
+        integer_fields = (
+            ("observation_dim", config.observation_dim),
+            ("n_actions", config.n_actions),
+            ("latent_dim", config.latent_dim),
+        )
+        for integer_name, integer_value in integer_fields:
+            if type(integer_value) is not int:
+                raise TypeError(f"{integer_name} must be an exact integer")
+        boolean_fields = (
+            ("predict_delta", config.predict_delta),
+            ("use_layer_norm", config.use_layer_norm),
+            ("include_action_interactions", config.include_action_interactions),
+            ("encoder_learning", config.encoder_learning),
+        )
+        for boolean_name, boolean_value in boolean_fields:
+            if type(boolean_value) is not bool:
+                raise TypeError(f"{boolean_name} must be an exact boolean")
+        finite_fields = (
+            ("gamma", config.gamma),
+            ("reward_scale", config.reward_scale),
+            ("encoder_scale", config.encoder_scale),
+            ("encoder_bias_scale", config.encoder_bias_scale),
+            ("step_size", config.step_size),
+            ("sparsity", config.sparsity),
+            ("leaky_relu_slope", config.leaky_relu_slope),
+            ("utility_decay", config.utility_decay),
+            ("surprise_decay", config.surprise_decay),
+            ("collapse_decay", config.collapse_decay),
+            ("min_latent_std", config.min_latent_std),
+            ("max_latent_delta", config.max_latent_delta),
+            ("encoder_step_size", config.encoder_step_size),
+            ("max_encoder_update", config.max_encoder_update),
+            (
+                "encoder_collapse_gate_threshold",
+                config.encoder_collapse_gate_threshold,
+            ),
+        )
+        for finite_name, finite_value in finite_fields:
+            if (
+                not isinstance(finite_value, Real)
+                or isinstance(finite_value, bool)
+                or not math.isfinite(float(finite_value))
+            ):
+                raise ValueError(f"{finite_name} must be a finite real scalar")
+        if not isinstance(config.hidden_sizes, tuple) or any(
+            type(size) is not int for size in config.hidden_sizes
+        ):
+            raise TypeError("hidden_sizes must be a tuple of exact integers")
+        if not isinstance(config.trace_mode, TraceMode):
+            raise TypeError("trace_mode must be a TraceMode")
+
         if config.observation_dim <= 0:
             raise ValueError("observation_dim must be positive")
         if config.n_actions <= 0:
@@ -668,8 +978,17 @@ class LatentWorldModel:
         if not 0.0 <= config.gamma <= 1.0:
             raise ValueError("gamma must be in [0, 1]")
         if config.observation_scale is not None:
+            if not isinstance(config.observation_scale, tuple):
+                raise TypeError("observation_scale must be a tuple or None")
             if len(config.observation_scale) != config.observation_dim:
                 raise ValueError("observation_scale length must equal observation_dim")
+            if any(
+                not isinstance(scale, Real)
+                or isinstance(scale, bool)
+                or not math.isfinite(float(scale))
+                for scale in config.observation_scale
+            ):
+                raise ValueError("observation_scale values must be finite real scalars")
             if any(scale <= 0.0 for scale in config.observation_scale):
                 raise ValueError("observation_scale values must be positive")
         if config.reward_scale <= 0.0:
@@ -680,6 +999,12 @@ class LatentWorldModel:
             raise ValueError("encoder_bias_scale must be non-negative")
         if any(size <= 0 for size in config.hidden_sizes):
             raise ValueError("hidden_sizes must contain only positive widths")
+        if config.step_size <= 0.0:
+            raise ValueError("step_size must be positive")
+        if not 0.0 <= config.sparsity <= 1.0:
+            raise ValueError("sparsity must be in [0, 1]")
+        if config.leaky_relu_slope < 0.0:
+            raise ValueError("leaky_relu_slope must be non-negative")
         if not 0.0 <= config.utility_decay < 1.0:
             raise ValueError("utility_decay must be in [0, 1)")
         if not 0.0 <= config.surprise_decay < 1.0:
@@ -696,6 +1021,98 @@ class LatentWorldModel:
             raise ValueError("max_encoder_update must be positive")
         if not 0.0 <= config.encoder_collapse_gate_threshold <= 1.0:
             raise ValueError("encoder_collapse_gate_threshold must be in [0, 1]")
+
+
+def latent_world_model_wrapper_state_nbytes_formula(
+    config: LatentWorldModelConfig,
+) -> int:
+    """Return exact world-state bytes excluding the nested learner state."""
+
+    return (
+        4 * config.observation_dim * config.latent_dim
+        + 12 * config.latent_dim
+        + 24
+    )
+
+
+def latent_world_model_lifetime_counter_nbytes(
+    *,
+    learner_has_normalizer: bool = False,
+) -> int:
+    """Return exact bytes for aligned world/learner lifetime counters."""
+
+    counter_count = 3 if learner_has_normalizer else 2
+    return LATENT_WORLD_MODEL_LIFETIME_COUNTER_NBYTES * counter_count
+
+
+def measure_latent_world_model_state_nbytes(
+    state: LatentWorldModelState,
+) -> int:
+    """Measure all persistent JAX-array bytes in one world-model state."""
+
+    return sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree.leaves(state)
+        if isinstance(leaf, Array)
+    )
+
+
+def measure_latent_world_model_wrapper_state_nbytes(
+    state: LatentWorldModelState,
+) -> int:
+    """Measure world-model bytes excluding its nested learner state."""
+
+    return measure_latent_world_model_state_nbytes(
+        state
+    ) - measure_multi_head_mlp_state_nbytes(state.learner_state)
+
+
+def _legacy_world_state_mapping(legacy_state: Any) -> dict[str, Any]:
+    if isinstance(legacy_state, Mapping):
+        return dict(legacy_state)
+    if dataclasses.is_dataclass(legacy_state) and not isinstance(legacy_state, type):
+        return {
+            field.name: getattr(legacy_state, field.name)
+            for field in dataclasses.fields(legacy_state)
+        }
+    raise TypeError("legacy LatentWorldModel state must be a mapping or dataclass")
+
+
+def migrate_legacy_latent_world_model_state(
+    legacy_state: Any,
+) -> LatentWorldModelState:
+    """Migrate one exact pre-v2 world/learner checkpoint state on the host."""
+
+    fields = _legacy_world_state_mapping(legacy_state)
+    current_names = {
+        field.name
+        for field in dataclasses.fields(
+            LatentWorldModelState  # type: ignore[arg-type]
+        )
+    }
+    legacy_names = current_names - {"step_words"}
+    supplied_names = set(fields)
+    if supplied_names != legacy_names:
+        missing = sorted(legacy_names - supplied_names)
+        extra = sorted(supplied_names - legacy_names)
+        raise ValueError(
+            "legacy LatentWorldModel field manifest is not exact; "
+            f"missing={missing}, extra={extra}"
+        )
+    step_array = jnp.asarray(fields["step_count"])
+    if step_array.shape != () or step_array.dtype != jnp.dtype(jnp.int32):
+        raise TypeError("legacy LatentWorldModel step_count must be scalar int32")
+    step = int(step_array)
+    if step < 0:
+        raise ValueError("negative legacy LatentWorldModel step_count indicates wrap")
+    if step >= _INT32_MAX:
+        raise ValueError("saturated legacy LatentWorldModel step_count is ambiguous")
+    learner_state = migrate_legacy_multi_head_mlp_state(fields["learner_state"])
+    if int(learner_state.step_count) != step:
+        raise ValueError("legacy world and learner counters are not aligned")
+    fields["learner_state"] = learner_state
+    fields["step_words"] = jnp.asarray((0, step), dtype=jnp.uint32)
+    return LatentWorldModelState(**fields)
 
 
 def run_latent_world_model_learning_loop(
@@ -736,6 +1153,7 @@ def run_latent_world_model_learning_loop(
             result.encoder_update_applied,
             result.encoder_collapse_gated,
             result.encoder_gradient_norm,
+            result.update_applied,
         )
 
     final_state, (
@@ -754,6 +1172,7 @@ def run_latent_world_model_learning_loop(
         encoder_updates_applied,
         encoder_collapse_gates,
         encoder_gradient_norms,
+        updates_applied,
     ) = jax.lax.scan(
         _scan_fn,
         state,
@@ -776,11 +1195,16 @@ def run_latent_world_model_learning_loop(
         encoder_updates_applied=encoder_updates_applied,
         encoder_collapse_gates=encoder_collapse_gates,
         encoder_gradient_norms=encoder_gradient_norms,
+        updates_applied=updates_applied,
     )
 
 
 __all__ = [
     "EVIDENCE_LEVEL",
+    "LATENT_WORLD_MODEL_CONFIG_SCHEMA",
+    "LATENT_WORLD_MODEL_LIFETIME_COUNTER_DELTA_NBYTES",
+    "LATENT_WORLD_MODEL_LIFETIME_COUNTER_NBYTES",
+    "LATENT_WORLD_MODEL_STATE_SCHEMA",
     "LatentWorldModel",
     "LatentWorldModelConfig",
     "LatentWorldModelLearningResult",
@@ -788,5 +1212,10 @@ __all__ = [
     "LatentWorldModelState",
     "LatentWorldModelUpdateResult",
     "SCIENTIFIC_PROMOTION_ALLOWED",
+    "latent_world_model_lifetime_counter_nbytes",
+    "latent_world_model_wrapper_state_nbytes_formula",
+    "measure_latent_world_model_state_nbytes",
+    "measure_latent_world_model_wrapper_state_nbytes",
+    "migrate_legacy_latent_world_model_state",
     "run_latent_world_model_learning_loop",
 ]

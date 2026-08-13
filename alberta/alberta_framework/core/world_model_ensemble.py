@@ -48,7 +48,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Bool, Float, Int, UInt
 
 from alberta_framework.core.checkpoints import (
     load_checkpoint,
@@ -57,6 +57,7 @@ from alberta_framework.core.checkpoints import (
 )
 from alberta_framework.core.learning_signals import (
     LearningSignalAvailability,
+    LearningSignalCounterStatus,
     LearningSignalEstimator,
     LearningSignalEstimatorConfig,
     LearningSignalEstimatorState,
@@ -68,11 +69,13 @@ from alberta_framework.core.world_model import (
     ActionConditionedWorldModelState,
 )
 
-WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA = "alberta.world_model_ensemble.v2"
+WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA = "alberta.world_model_ensemble.v3"
+_WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA_V2 = "alberta.world_model_ensemble.v2"
 _WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA_V1 = "alberta.world_model_ensemble.v1"
 _INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
+_UINT64_MAX = 2**64 - 1
 _REPLAY_KEY_FOLD_IN = 0x5245504C
-_V1_REPLAY_KEY_FOLD_IN = 0x50525632
 
 
 def _saturating_int32_increment(value: Array) -> Array:
@@ -94,6 +97,78 @@ def _saturating_int32_sum(values: Array) -> Array:
             lambda index, total: add(total, values[index]),
             jnp.asarray(0, dtype=jnp.int32),
         ),
+    )
+
+
+def _saturating_int32_add(first: Array, second: Array) -> Array:
+    """Add non-negative compatibility telemetry without signed overflow."""
+
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    left = jnp.minimum(jnp.maximum(first, 0), maximum)
+    right = jnp.minimum(jnp.maximum(second, 0), maximum)
+    return left + jnp.minimum(right, maximum - left)
+
+
+def _checked_lifetime_words_increment(words: Array) -> tuple[Array, Array]:
+    """Increment big-endian uint32 word pairs along the final dimension."""
+
+    if getattr(words, "shape", ())[-1:] != (2,):
+        raise ValueError("lifetime counter words must end in shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("lifetime counter words must have dtype uint32")
+    maximum = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+    capacity = ~jnp.all(words == maximum, axis=-1)
+    one = jnp.asarray(1, dtype=jnp.uint32)
+    low = words[..., 1] + one
+    carry = (low == jnp.asarray(0, dtype=jnp.uint32)).astype(jnp.uint32)
+    candidate = jnp.stack((words[..., 0] + carry, low), axis=-1)
+    return jnp.where(capacity[..., None], candidate, words), capacity
+
+
+def _lifetime_counter_valid(words: Array, telemetry: Array) -> Array:
+    """Validate exact word pairs against saturating int32 telemetry."""
+
+    if getattr(words, "shape", ())[-1:] != (2,):
+        raise ValueError("lifetime counter words must end in shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("lifetime counter words must have dtype uint32")
+    if getattr(telemetry, "shape", None) != words.shape[:-1]:
+        raise ValueError("lifetime telemetry shape must match the word-pair prefix")
+    if getattr(telemetry, "dtype", None) != jnp.dtype(jnp.int32):
+        raise TypeError("lifetime counter telemetry must have dtype int32")
+    maximum_i32 = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    maximum_u32 = jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+    fits = (words[..., 0] == 0) & (words[..., 1] <= maximum_u32)
+    expected = jnp.where(fits, words[..., 1].astype(jnp.int32), maximum_i32)
+    return (telemetry >= 0) & (telemetry == expected)
+
+
+def _checked_lifetime_words_add(first: Array, second: Array) -> tuple[Array, Array]:
+    """Add equally shaped uint32 word pairs and report uint64 overflow."""
+
+    if getattr(first, "shape", None) != getattr(second, "shape", None):
+        raise ValueError("lifetime word addends must have identical shapes")
+    if getattr(first, "shape", ())[-1:] != (2,):
+        raise ValueError("lifetime word addends must end in shape (2,)")
+    if (
+        getattr(first, "dtype", None) != jnp.dtype(jnp.uint32)
+        or getattr(second, "dtype", None) != jnp.dtype(jnp.uint32)
+    ):
+        raise TypeError("lifetime word addends must have dtype uint32")
+    low = first[..., 1] + second[..., 1]
+    carry = (low < first[..., 1]).astype(jnp.uint32)
+    high_without_carry = first[..., 0] + second[..., 0]
+    overflow_high = high_without_carry < first[..., 0]
+    high = high_without_carry + carry
+    overflow_carry = (carry != 0) & (high == jnp.asarray(0, dtype=jnp.uint32))
+    return jnp.stack((high, low), axis=-1), ~(overflow_high | overflow_carry)
+
+
+def _lifetime_words_less_equal(first: Array, second: Array) -> Array:
+    """Return elementwise unsigned comparison for big-endian word pairs."""
+
+    return (first[..., 0] < second[..., 0]) | (
+        (first[..., 0] == second[..., 0]) & (first[..., 1] <= second[..., 1])
     )
 
 
@@ -276,22 +351,13 @@ class WorldModelEnsembleState:
     last_bootstrap_mask: Bool[Array, " ensemble_size"]
     last_replay_bootstrap_mask: Bool[Array, " ensemble_size"]
     member_update_counts: Int[Array, " ensemble_size"]
+    member_update_count_words: UInt[Array, "ensemble_size 2"]
     replay_member_update_counts: Int[Array, " ensemble_size"]
+    replay_member_update_count_words: UInt[Array, "ensemble_size 2"]
     event_count: Int[Array, ""]
+    event_count_words: UInt[Array, " 2"]
     replay_event_count: Int[Array, ""]
-
-
-@chex.dataclass(frozen=True)
-class _WorldModelEnsembleStateV1:
-    """Exact pre-rehearsal checkpoint tree used only for strict migration."""
-
-    member_states: tuple[ActionConditionedWorldModelState, ...]
-    residual_variances: Array
-    signal_state: LearningSignalEstimatorState
-    bootstrap_key: Array
-    last_bootstrap_mask: Array
-    member_update_counts: Array
-    event_count: Array
+    replay_event_count_words: UInt[Array, " 2"]
 
 
 @chex.dataclass(frozen=True)
@@ -352,6 +418,18 @@ class WorldModelEnsembleUpdateResult:
     representation_gradient_valid: Bool[Array, ""]
     bootstrap_mask: Bool[Array, " ensemble_size"]
     member_updates_applied: Bool[Array, " ensemble_size"]
+    pre_event_words: UInt[Array, " 2"]
+    post_event_words: UInt[Array, " 2"]
+    event_counter_valid: Bool[Array, ""]
+    event_capacity_available: Bool[Array, ""]
+    member_pre_step_words: UInt[Array, "ensemble_size 2"]
+    member_post_step_words: UInt[Array, "ensemble_size 2"]
+    member_wrapper_counter_aligned: Bool[Array, " ensemble_size"]
+    member_ensemble_counter_aligned: Bool[Array, " ensemble_size"]
+    member_lifetime_counter_valid: Bool[Array, " ensemble_size"]
+    member_lifetime_capacity_available: Bool[Array, " ensemble_size"]
+    member_normalizer_counter_aligned: Bool[Array, " ensemble_size"]
+    member_normalizer_estimator_capacity_available: Bool[Array, " ensemble_size"]
     diagnostics: WorldModelEnsembleDiagnostics
 
 
@@ -386,6 +464,18 @@ class WorldModelEnsembleReplayUpdateResult:
     member_prediction_losses: Float[Array, " ensemble_size"]
     bootstrap_mask: Bool[Array, " ensemble_size"]
     member_updates_applied: Bool[Array, " ensemble_size"]
+    pre_event_words: UInt[Array, " 2"]
+    post_event_words: UInt[Array, " 2"]
+    event_counter_valid: Bool[Array, ""]
+    event_capacity_available: Bool[Array, ""]
+    member_pre_step_words: UInt[Array, "ensemble_size 2"]
+    member_post_step_words: UInt[Array, "ensemble_size 2"]
+    member_wrapper_counter_aligned: Bool[Array, " ensemble_size"]
+    member_ensemble_counter_aligned: Bool[Array, " ensemble_size"]
+    member_lifetime_counter_valid: Bool[Array, " ensemble_size"]
+    member_lifetime_capacity_available: Bool[Array, " ensemble_size"]
+    member_normalizer_counter_aligned: Bool[Array, " ensemble_size"]
+    member_normalizer_estimator_capacity_available: Bool[Array, " ensemble_size"]
     diagnostics: WorldModelEnsembleReplayDiagnostics
 
 
@@ -421,6 +511,7 @@ class _LogicalTreeAccounting:
 def _zero_signals() -> TypedLearningSignals:
     zero = jnp.asarray(0.0, dtype=jnp.float32)
     false = jnp.asarray(False, dtype=jnp.bool_)
+    zero_words = jnp.zeros((2,), dtype=jnp.uint32)
     return TypedLearningSignals(
         epistemic_disagreement=zero,
         epistemic_surprise=zero,
@@ -437,6 +528,20 @@ def _zero_signals() -> TypedLearningSignals:
             normalized_residual=false,
             learning_progress=false,
             change_probability=false,
+        ),
+        counter_status=LearningSignalCounterStatus(
+            pre_step_words=zero_words,
+            post_step_words=zero_words,
+            pre_valid_words=zero_words,
+            post_valid_words=zero_words,
+            pre_invalid_words=zero_words,
+            post_invalid_words=zero_words,
+            lifetime_counter_valid=false,
+            lifetime_capacity_available=false,
+            state_valid=false,
+            event_recorded=false,
+            valid_event_recorded=false,
+            invalid_event_recorded=false,
         ),
     )
 
@@ -618,12 +723,22 @@ class WorldModelEnsemble:
                 (self._config.ensemble_size,),
                 dtype=jnp.int32,
             ),
+            member_update_count_words=jnp.zeros(
+                (self._config.ensemble_size, 2),
+                dtype=jnp.uint32,
+            ),
             replay_member_update_counts=jnp.zeros(
                 (self._config.ensemble_size,),
                 dtype=jnp.int32,
             ),
+            replay_member_update_count_words=jnp.zeros(
+                (self._config.ensemble_size, 2),
+                dtype=jnp.uint32,
+            ),
             event_count=jnp.asarray(0, dtype=jnp.int32),
+            event_count_words=jnp.zeros((2,), dtype=jnp.uint32),
             replay_event_count=jnp.asarray(0, dtype=jnp.int32),
+            replay_event_count_words=jnp.zeros((2,), dtype=jnp.uint32),
         )
 
     def resource_budget(
@@ -676,7 +791,10 @@ class WorldModelEnsemble:
             raise TypeError("bootstrap PRNG key storage must use uint32 words")
         bootstrap_words = int(bootstrap_key_data.size + replay_key_data.size)
         bootstrap_bytes = int(bootstrap_key_data.nbytes + replay_key_data.nbytes)
-        if persistent.uint32_scalars != bootstrap_words or bootstrap_bytes != 4 * bootstrap_words:
+        if (
+            persistent.uint32_scalars < bootstrap_words
+            or bootstrap_bytes != 4 * bootstrap_words
+        ):
             raise ValueError("bootstrap PRNG key accounting does not match state")
 
         prediction = _logical_tree_accounting(self._zero_prediction())
@@ -731,10 +849,10 @@ class WorldModelEnsemble:
                 self._config.ensemble_size
             ),
             max_replay_member_updates_per_available_sample=self._config.ensemble_size,
-            max_event_count=_INT32_MAX,
-            max_member_update_count=_INT32_MAX,
-            max_replay_event_count=_INT32_MAX,
-            max_replay_member_update_count=_INT32_MAX,
+            max_event_count=_UINT64_MAX,
+            max_member_update_count=_UINT64_MAX,
+            max_replay_event_count=_UINT64_MAX,
+            max_replay_member_update_count=_UINT64_MAX,
             replay_capacity=0,
         )
 
@@ -775,13 +893,33 @@ class WorldModelEnsemble:
                 (self._config.ensemble_size,),
                 jnp.int32,
             ),
+            "state.member_update_count_words": (
+                state.member_update_count_words,
+                (self._config.ensemble_size, 2),
+                jnp.uint32,
+            ),
             "state.replay_member_update_counts": (
                 state.replay_member_update_counts,
                 (self._config.ensemble_size,),
                 jnp.int32,
             ),
+            "state.replay_member_update_count_words": (
+                state.replay_member_update_count_words,
+                (self._config.ensemble_size, 2),
+                jnp.uint32,
+            ),
             "state.event_count": (state.event_count, (), jnp.int32),
+            "state.event_count_words": (
+                state.event_count_words,
+                (2,),
+                jnp.uint32,
+            ),
             "state.replay_event_count": (state.replay_event_count, (), jnp.int32),
+            "state.replay_event_count_words": (
+                state.replay_event_count_words,
+                (2,),
+                jnp.uint32,
+            ),
         }
         for name, (value, shape, dtype) in expected_arrays.items():
             array = jnp.asarray(value)
@@ -795,8 +933,8 @@ class WorldModelEnsemble:
         if replay_key_data.shape != (2,) or replay_key_data.dtype != jnp.uint32:
             raise ValueError("state.replay_bootstrap_key must be one JAX PRNG key")
 
-    @staticmethod
-    def _signal_state_valid(state: LearningSignalEstimatorState) -> Array:
+    def _signal_state_valid(self, state: LearningSignalEstimatorState) -> Array:
+        counter_status = self._signals.counter_status(state)
         counters = jnp.stack(
             (
                 state.valid_count,
@@ -804,7 +942,8 @@ class WorldModelEnsemble:
             )
         )
         return (
-            (state.step_count >= 0)
+            counter_status.lifetime_counter_valid
+            & (state.step_count >= 0)
             & (state.valid_count >= 0)
             & (state.invalid_count >= 0)
             & (state.step_count == _saturating_int32_sum(counters))
@@ -822,9 +961,17 @@ class WorldModelEnsemble:
             & (state.sustained_change_probability <= 1.0)
         )
 
-    @staticmethod
-    def _member_state_valid(state: ActionConditionedWorldModelState) -> Array:
+    def _member_state_valid(self, state: ActionConditionedWorldModelState) -> Array:
         step_count = jnp.asarray(state.step_count, dtype=jnp.int32)
+        learner_status = self._model.learner._counter_status(state.learner_state)
+        wrapper_counter_valid = _lifetime_counter_valid(
+            state.step_words,
+            step_count,
+        )
+        wrapper_aligned = (
+            (state.learner_state.step_count == step_count)
+            & jnp.all(state.learner_state.step_words == state.step_words)
+        )
         pristine_bounds = (
             jnp.all(jnp.isposinf(state.observation_min))
             & jnp.all(jnp.isneginf(state.observation_max))
@@ -842,7 +989,10 @@ class WorldModelEnsemble:
         return (
             (step_count >= 0)
             & (step_count <= _INT32_MAX)
-            & (state.learner_state.step_count == step_count)
+            & wrapper_counter_valid
+            & wrapper_aligned
+            & learner_status.lifetime_counter_valid
+            & learner_status.normalizer_counter_aligned
             & _tree_all_finite(state.learner_state)
             & jnp.isfinite(state.model_error_ema)
             & (state.model_error_ema >= 0.0)
@@ -852,13 +1002,20 @@ class WorldModelEnsemble:
     def _state_valid(self, state: WorldModelEnsembleState) -> Array:
         member_valid = []
         member_counts_match = []
+        member_total_words, member_sum_valid = _checked_lifetime_words_add(
+            state.member_update_count_words,
+            state.replay_member_update_count_words,
+        )
+        member_total_telemetry = _saturating_int32_add(
+            state.member_update_counts,
+            state.replay_member_update_counts,
+        )
         for index, member_state in enumerate(state.member_states):
             member_valid.append(self._member_state_valid(member_state))
             member_counts_match.append(
-                member_state.step_count
-                == (
-                    state.member_update_counts[index]
-                    + state.replay_member_update_counts[index]
+                (member_state.step_count == member_total_telemetry[index])
+                & jnp.all(
+                    member_state.step_words == member_total_words[index]
                 )
             )
         signal_cfg = self._config.signal_estimator
@@ -873,17 +1030,45 @@ class WorldModelEnsemble:
         return (
             (state.event_count >= 0)
             & (state.event_count <= _INT32_MAX)
+            & _lifetime_counter_valid(
+                state.event_count_words,
+                state.event_count,
+            )
             & (state.replay_event_count >= 0)
             & (state.replay_event_count <= _INT32_MAX)
+            & _lifetime_counter_valid(
+                state.replay_event_count_words,
+                state.replay_event_count,
+            )
             & jnp.all(state.member_update_counts >= 0)
             & jnp.all(state.member_update_counts <= state.event_count)
+            & jnp.all(
+                _lifetime_counter_valid(
+                    state.member_update_count_words,
+                    state.member_update_counts,
+                )
+            )
+            & jnp.all(
+                _lifetime_words_less_equal(
+                    state.member_update_count_words,
+                    state.event_count_words,
+                )
+            )
             & jnp.all(state.replay_member_update_counts >= 0)
             & jnp.all(state.replay_member_update_counts <= state.replay_event_count)
             & jnp.all(
-                state.member_update_counts
-                <= jnp.asarray(_INT32_MAX, dtype=jnp.int32)
-                - state.replay_member_update_counts
+                _lifetime_counter_valid(
+                    state.replay_member_update_count_words,
+                    state.replay_member_update_counts,
+                )
             )
+            & jnp.all(
+                _lifetime_words_less_equal(
+                    state.replay_member_update_count_words,
+                    state.replay_event_count_words,
+                )
+            )
+            & jnp.all(member_sum_valid)
             & jnp.all(jnp.stack(member_valid))
             & jnp.all(jnp.stack(member_counts_match))
             & jnp.all(jnp.isfinite(state.residual_variances))
@@ -892,12 +1077,91 @@ class WorldModelEnsemble:
             & self._signal_state_valid(signal_state)
             & signal_bounds_valid
             & (signal_state.step_count == state.event_count)
+            & (signal_state.valid_count == state.event_count)
+            & (signal_state.invalid_count == 0)
+            & jnp.all(signal_state.step_words == state.event_count_words)
+            & jnp.all(signal_state.valid_words == state.event_count_words)
+            & jnp.all(
+                signal_state.invalid_words
+                == jnp.zeros((2,), dtype=jnp.uint32)
+            )
         )
 
     def state_valid(self, state: WorldModelEnsembleState) -> Array:
         """Return the dynamic state-validity verdict after static validation."""
         self._validate_state_static_contract(state)
         return self._state_valid(state)
+
+    def _member_transaction_preflight(
+        self,
+        state: WorldModelEnsembleState,
+    ) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
+        """Return exact member and nested-normalizer transaction facts."""
+
+        pre_words = jnp.stack(
+            tuple(member.learner_state.step_words for member in state.member_states)
+        )
+        learner_statuses = tuple(
+            self._model.learner._counter_status(member.learner_state)
+            for member in state.member_states
+        )
+        wrapper_aligned = jnp.stack(
+            tuple(
+                (member.step_count == member.learner_state.step_count)
+                & jnp.all(member.step_words == member.learner_state.step_words)
+                for member in state.member_states
+            )
+        )
+        total_words, sum_valid = _checked_lifetime_words_add(
+            state.member_update_count_words,
+            state.replay_member_update_count_words,
+        )
+        total_telemetry = _saturating_int32_add(
+            state.member_update_counts,
+            state.replay_member_update_counts,
+        )
+        ensemble_aligned = wrapper_aligned & sum_valid & jnp.stack(
+            tuple(
+                (member.step_count == total_telemetry[index])
+                & jnp.all(member.step_words == total_words[index])
+                for index, member in enumerate(state.member_states)
+            )
+        )
+        lifetime_valid = wrapper_aligned & jnp.stack(
+            tuple(
+                _lifetime_counter_valid(member.step_words, member.step_count)
+                & status.lifetime_counter_valid
+                for member, status in zip(
+                    state.member_states,
+                    learner_statuses,
+                    strict=True,
+                )
+            )
+        )
+        _, wrapper_capacity = _checked_lifetime_words_increment(
+            jnp.stack(tuple(member.step_words for member in state.member_states))
+        )
+        capacity = wrapper_capacity & jnp.stack(
+            tuple(status.lifetime_capacity_available for status in learner_statuses)
+        )
+        normalizer_aligned = jnp.stack(
+            tuple(status.normalizer_counter_aligned for status in learner_statuses)
+        )
+        normalizer_capacity = jnp.stack(
+            tuple(
+                status.normalizer_estimator_capacity_available
+                for status in learner_statuses
+            )
+        )
+        return (
+            pre_words,
+            wrapper_aligned,
+            ensemble_aligned,
+            lifetime_valid,
+            capacity,
+            normalizer_aligned,
+            normalizer_capacity,
+        )
 
     def _zero_prediction(self) -> WorldModelEnsemblePrediction:
         ensemble_size = self._config.ensemble_size
@@ -1044,6 +1308,30 @@ class WorldModelEnsemble:
                 learning_progress=progress_available,
                 change_probability=change_available,
             ),
+            counter_status=signals.counter_status.replace(  # type: ignore[attr-defined]
+                post_step_words=jnp.where(
+                    available,
+                    signals.counter_status.post_step_words,
+                    signals.counter_status.pre_step_words,
+                ),
+                post_valid_words=jnp.where(
+                    available,
+                    signals.counter_status.post_valid_words,
+                    signals.counter_status.pre_valid_words,
+                ),
+                post_invalid_words=jnp.where(
+                    available,
+                    signals.counter_status.post_invalid_words,
+                    signals.counter_status.pre_invalid_words,
+                ),
+                event_recorded=available & signals.counter_status.event_recorded,
+                valid_event_recorded=(
+                    available & signals.counter_status.valid_event_recorded
+                ),
+                invalid_event_recorded=(
+                    available & signals.counter_status.invalid_event_recorded
+                ),
+            ),
         )
 
     def _rejected_update_result(
@@ -1055,6 +1343,15 @@ class WorldModelEnsemble:
         capacity_available: Array,
     ) -> WorldModelEnsembleUpdateResult:
         false = jnp.asarray(False, dtype=jnp.bool_)
+        (
+            member_pre_words,
+            member_wrapper_aligned,
+            member_ensemble_aligned,
+            member_lifetime_valid,
+            member_capacity,
+            member_normalizer_aligned,
+            member_normalizer_capacity,
+        ) = self._member_transaction_preflight(state)
         diagnostics = WorldModelEnsembleDiagnostics(
             state_valid=state_valid,
             input_valid=input_valid,
@@ -1082,6 +1379,23 @@ class WorldModelEnsemble:
             representation_gradient_valid=false,
             bootstrap_mask=jnp.zeros((self._config.ensemble_size,), dtype=jnp.bool_),
             member_updates_applied=jnp.zeros((self._config.ensemble_size,), dtype=jnp.bool_),
+            pre_event_words=state.event_count_words,
+            post_event_words=state.event_count_words,
+            event_counter_valid=_lifetime_counter_valid(
+                state.event_count_words,
+                state.event_count,
+            ),
+            event_capacity_available=capacity_available,
+            member_pre_step_words=member_pre_words,
+            member_post_step_words=member_pre_words,
+            member_wrapper_counter_aligned=member_wrapper_aligned,
+            member_ensemble_counter_aligned=member_ensemble_aligned,
+            member_lifetime_counter_valid=member_lifetime_valid,
+            member_lifetime_capacity_available=member_capacity,
+            member_normalizer_counter_aligned=member_normalizer_aligned,
+            member_normalizer_estimator_capacity_available=(
+                member_normalizer_capacity
+            ),
             diagnostics=diagnostics,
         )
 
@@ -1095,6 +1409,15 @@ class WorldModelEnsemble:
         capacity_available: Array,
     ) -> WorldModelEnsembleReplayUpdateResult:
         false = jnp.asarray(False, dtype=jnp.bool_)
+        (
+            member_pre_words,
+            member_wrapper_aligned,
+            member_ensemble_aligned,
+            member_lifetime_valid,
+            member_capacity,
+            member_normalizer_aligned,
+            member_normalizer_capacity,
+        ) = self._member_transaction_preflight(state)
         diagnostics = WorldModelEnsembleReplayDiagnostics(
             state_valid=state_valid,
             sample_available=sample_available,
@@ -1118,6 +1441,23 @@ class WorldModelEnsemble:
             bootstrap_mask=jnp.zeros((self._config.ensemble_size,), dtype=jnp.bool_),
             member_updates_applied=jnp.zeros(
                 (self._config.ensemble_size,), dtype=jnp.bool_
+            ),
+            pre_event_words=state.replay_event_count_words,
+            post_event_words=state.replay_event_count_words,
+            event_counter_valid=_lifetime_counter_valid(
+                state.replay_event_count_words,
+                state.replay_event_count,
+            ),
+            event_capacity_available=capacity_available,
+            member_pre_step_words=member_pre_words,
+            member_post_step_words=member_pre_words,
+            member_wrapper_counter_aligned=member_wrapper_aligned,
+            member_ensemble_counter_aligned=member_ensemble_aligned,
+            member_lifetime_counter_valid=member_lifetime_valid,
+            member_lifetime_capacity_available=member_capacity,
+            member_normalizer_counter_aligned=member_normalizer_aligned,
+            member_normalizer_estimator_capacity_available=(
+                member_normalizer_capacity
             ),
             diagnostics=diagnostics,
         )
@@ -1171,8 +1511,8 @@ class WorldModelEnsemble:
             & jnp.all(jnp.abs(next_obs) <= magnitude_bound)
         )
         state_valid = self._state_valid(state)
-        capacity_available = (state.replay_event_count < _INT32_MAX) & jnp.all(
-            state.member_update_counts + state.replay_member_update_counts < _INT32_MAX
+        proposed_event_words, capacity_available = (
+            _checked_lifetime_words_increment(state.replay_event_count_words)
         )
         can_attempt = state_valid & available & input_valid & capacity_available
 
@@ -1202,6 +1542,7 @@ class WorldModelEnsemble:
             )
             candidate_members: list[ActionConditionedWorldModelState] = []
             candidate_members_valid: list[Array] = []
+            update_results = []
             for index, member_state in enumerate(state.member_states):
                 update_result = self._model.update(
                     member_state,
@@ -1211,6 +1552,7 @@ class WorldModelEnsemble:
                     disc,
                     next_obs,
                 )
+                update_results.append(update_result)
                 candidate = cast(
                     ActionConditionedWorldModelState,
                     jax.lax.cond(
@@ -1222,22 +1564,87 @@ class WorldModelEnsemble:
                 candidate_members.append(candidate)
                 candidate_members_valid.append(self._member_state_valid(candidate))
 
-            replay_counts = (
-                state.replay_member_update_counts + bootstrap_mask.astype(jnp.int32)
+            member_pre_words = jnp.stack(
+                tuple(result.pre_step_words for result in update_results)
             )
-            total_counts = state.member_update_counts + replay_counts
+            member_wrapper_aligned = jnp.stack(
+                tuple(result.wrapper_counter_aligned for result in update_results)
+            )
+            (
+                state_member_words,
+                ignored_wrapper_alignment,
+                member_ensemble_aligned,
+                ignored_lifetime_validity,
+                ignored_member_capacity,
+                ignored_normalizer_alignment,
+                ignored_normalizer_capacity,
+            ) = self._member_transaction_preflight(state)
+            del ignored_wrapper_alignment, ignored_lifetime_validity
+            del ignored_member_capacity, ignored_normalizer_alignment
+            del ignored_normalizer_capacity
+            member_lifetime_valid = jnp.stack(
+                tuple(result.lifetime_counter_valid for result in update_results)
+            )
+            member_lifetime_capacity = jnp.stack(
+                tuple(result.lifetime_capacity_available for result in update_results)
+            )
+            member_normalizer_aligned = jnp.stack(
+                tuple(result.normalizer_counter_aligned for result in update_results)
+            )
+            member_normalizer_capacity = jnp.stack(
+                tuple(
+                    result.normalizer_estimator_capacity_available
+                    for result in update_results
+                )
+            )
+            member_child_applied = jnp.stack(
+                tuple(result.update_applied for result in update_results)
+            )
+            member_result_post_words = jnp.stack(
+                tuple(result.post_step_words for result in update_results)
+            )
+
+            proposed_replay_words, replay_partition_capacity = (
+                _checked_lifetime_words_increment(
+                    state.replay_member_update_count_words
+                )
+            )
+            replay_words = jnp.where(
+                bootstrap_mask[:, None],
+                proposed_replay_words,
+                state.replay_member_update_count_words,
+            )
+            expected_total_words, total_words_valid = (
+                _checked_lifetime_words_add(
+                    state.member_update_count_words,
+                    replay_words,
+                )
+            )
+            selected_member_available = (~bootstrap_mask) | (
+                replay_partition_capacity
+                & member_lifetime_capacity
+                & member_lifetime_valid
+                & member_wrapper_aligned
+                & member_ensemble_aligned
+                & member_normalizer_aligned
+                & member_normalizer_capacity
+                & member_child_applied
+                & total_words_valid
+                & jnp.all(member_pre_words == state_member_words, axis=1)
+                & jnp.all(member_result_post_words == expected_total_words, axis=1)
+            )
+            replay_counts = jnp.where(
+                bootstrap_mask,
+                _saturating_int32_increment(state.replay_member_update_counts),
+                state.replay_member_update_counts,
+            )
             member_updates_valid = (
                 jnp.all(jnp.stack(candidate_members_valid))
-                & jnp.all(replay_counts >= state.replay_member_update_counts)
-                & jnp.all(total_counts <= _INT32_MAX)
-                & jnp.all(
-                    jnp.stack(
-                        [
-                            candidate_members[index].step_count == total_counts[index]
-                            for index in range(self._config.ensemble_size)
-                        ]
-                    )
-                )
+                & jnp.all(selected_member_available)
+            )
+            required_capacity_available = capacity_available & jnp.all(
+                (~bootstrap_mask)
+                | (replay_partition_capacity & member_lifetime_capacity)
             )
             candidate_state = WorldModelEnsembleState(
                 member_states=tuple(candidate_members),
@@ -1248,12 +1655,21 @@ class WorldModelEnsemble:
                 last_bootstrap_mask=state.last_bootstrap_mask,
                 last_replay_bootstrap_mask=bootstrap_mask,
                 member_update_counts=state.member_update_counts,
+                member_update_count_words=state.member_update_count_words,
                 replay_member_update_counts=replay_counts,
+                replay_member_update_count_words=replay_words,
                 event_count=state.event_count,
+                event_count_words=state.event_count_words,
                 replay_event_count=_saturating_int32_increment(state.replay_event_count),
+                replay_event_count_words=proposed_event_words,
             )
             candidate_state_valid = self._state_valid(candidate_state)
-            applied = predictions_valid & member_updates_valid & candidate_state_valid
+            applied = (
+                predictions_valid
+                & required_capacity_available
+                & member_updates_valid
+                & candidate_state_valid
+            )
             next_state = cast(
                 WorldModelEnsembleState,
                 jax.lax.cond(applied, lambda: candidate_state, lambda: state),
@@ -1262,7 +1678,7 @@ class WorldModelEnsemble:
                 state_valid=state_valid,
                 sample_available=available,
                 input_valid=input_valid,
-                capacity_available=capacity_available,
+                capacity_available=required_capacity_available,
                 predictions_valid=predictions_valid,
                 member_updates_valid=member_updates_valid,
                 candidate_state_valid=candidate_state_valid,
@@ -1283,6 +1699,28 @@ class WorldModelEnsemble:
                 ),
                 bootstrap_mask=bootstrap_mask,
                 member_updates_applied=bootstrap_mask & applied,
+                pre_event_words=state.replay_event_count_words,
+                post_event_words=next_state.replay_event_count_words,
+                event_counter_valid=_lifetime_counter_valid(
+                    state.replay_event_count_words,
+                    state.replay_event_count,
+                ),
+                event_capacity_available=capacity_available,
+                member_pre_step_words=member_pre_words,
+                member_post_step_words=jnp.stack(
+                    tuple(
+                        member.learner_state.step_words
+                        for member in next_state.member_states
+                    )
+                ),
+                member_wrapper_counter_aligned=member_wrapper_aligned,
+                member_ensemble_counter_aligned=member_ensemble_aligned,
+                member_lifetime_counter_valid=member_lifetime_valid,
+                member_lifetime_capacity_available=member_lifetime_capacity,
+                member_normalizer_counter_aligned=member_normalizer_aligned,
+                member_normalizer_estimator_capacity_available=(
+                    member_normalizer_capacity
+                ),
                 diagnostics=diagnostics,
             )
 
@@ -1343,8 +1781,8 @@ class WorldModelEnsemble:
             & jnp.all(jnp.abs(next_obs) <= magnitude_bound)
         )
         state_valid = self._state_valid(state)
-        capacity_available = (state.event_count < _INT32_MAX) & jnp.all(
-            state.member_update_counts + state.replay_member_update_counts < _INT32_MAX
+        proposed_event_words, capacity_available = (
+            _checked_lifetime_words_increment(state.event_count_words)
         )
         can_attempt = state_valid & input_valid & capacity_available
 
@@ -1396,7 +1834,32 @@ class WorldModelEnsemble:
                 targets,
                 observed_loss,
             )
-            signals_valid = raw_signals.availability.input_valid
+            signal_counter = raw_signals.counter_status
+            signals_valid = (
+                raw_signals.availability.input_valid
+                & signal_counter.lifetime_counter_valid
+                & signal_counter.lifetime_capacity_available
+                & signal_counter.state_valid
+                & signal_counter.event_recorded
+                & signal_counter.valid_event_recorded
+                & ~signal_counter.invalid_event_recorded
+                & jnp.all(
+                    signal_counter.pre_step_words == state.event_count_words
+                )
+                & jnp.all(
+                    signal_counter.pre_valid_words == state.event_count_words
+                )
+                & jnp.all(
+                    signal_counter.pre_invalid_words
+                    == jnp.zeros((2,), dtype=jnp.uint32)
+                )
+                & jnp.all(signal_counter.post_step_words == proposed_event_words)
+                & jnp.all(signal_counter.post_valid_words == proposed_event_words)
+                & jnp.all(
+                    signal_counter.post_invalid_words
+                    == jnp.zeros((2,), dtype=jnp.uint32)
+                )
+            )
 
             residual_floor = jnp.asarray(self._config.residual_variance_floor, dtype=jnp.float32)
             decay = jnp.asarray(self._config.residual_variance_decay, dtype=jnp.float32)
@@ -1422,6 +1885,7 @@ class WorldModelEnsemble:
             )
             candidate_members: list[ActionConditionedWorldModelState] = []
             candidate_members_valid: list[Array] = []
+            update_results = []
             for index, member_state in enumerate(state.member_states):
                 update_result = self._model.update(
                     member_state,
@@ -1431,6 +1895,7 @@ class WorldModelEnsemble:
                     disc,
                     next_obs,
                 )
+                update_results.append(update_result)
                 candidate = cast(
                     ActionConditionedWorldModelState,
                     jax.lax.cond(
@@ -1442,27 +1907,85 @@ class WorldModelEnsemble:
                 candidate_members.append(candidate)
                 candidate_members_valid.append(self._member_state_valid(candidate))
 
-            member_update_counts = state.member_update_counts + bootstrap_mask.astype(jnp.int32)
+            member_pre_words = jnp.stack(
+                tuple(result.pre_step_words for result in update_results)
+            )
+            member_wrapper_aligned = jnp.stack(
+                tuple(result.wrapper_counter_aligned for result in update_results)
+            )
+            (
+                state_member_words,
+                ignored_wrapper_alignment,
+                member_ensemble_aligned,
+                ignored_lifetime_validity,
+                ignored_member_capacity,
+                ignored_normalizer_alignment,
+                ignored_normalizer_capacity,
+            ) = self._member_transaction_preflight(state)
+            del ignored_wrapper_alignment, ignored_lifetime_validity
+            del ignored_member_capacity, ignored_normalizer_alignment
+            del ignored_normalizer_capacity
+            member_lifetime_valid = jnp.stack(
+                tuple(result.lifetime_counter_valid for result in update_results)
+            )
+            member_lifetime_capacity = jnp.stack(
+                tuple(result.lifetime_capacity_available for result in update_results)
+            )
+            member_normalizer_aligned = jnp.stack(
+                tuple(result.normalizer_counter_aligned for result in update_results)
+            )
+            member_normalizer_capacity = jnp.stack(
+                tuple(
+                    result.normalizer_estimator_capacity_available
+                    for result in update_results
+                )
+            )
+            member_child_applied = jnp.stack(
+                tuple(result.update_applied for result in update_results)
+            )
+            member_result_post_words = jnp.stack(
+                tuple(result.post_step_words for result in update_results)
+            )
+
+            proposed_member_words, member_partition_capacity = (
+                _checked_lifetime_words_increment(state.member_update_count_words)
+            )
+            member_words = jnp.where(
+                bootstrap_mask[:, None],
+                proposed_member_words,
+                state.member_update_count_words,
+            )
+            expected_total_words, total_words_valid = (
+                _checked_lifetime_words_add(
+                    member_words,
+                    state.replay_member_update_count_words,
+                )
+            )
+            selected_member_available = (~bootstrap_mask) | (
+                member_partition_capacity
+                & member_lifetime_capacity
+                & member_lifetime_valid
+                & member_wrapper_aligned
+                & member_ensemble_aligned
+                & member_normalizer_aligned
+                & member_normalizer_capacity
+                & member_child_applied
+                & total_words_valid
+                & jnp.all(member_pre_words == state_member_words, axis=1)
+                & jnp.all(member_result_post_words == expected_total_words, axis=1)
+            )
+            member_update_counts = jnp.where(
+                bootstrap_mask,
+                _saturating_int32_increment(state.member_update_counts),
+                state.member_update_counts,
+            )
             member_updates_valid = (
                 jnp.all(jnp.stack(candidate_members_valid))
-                & jnp.all(member_update_counts >= state.member_update_counts)
-                & jnp.all(
-                    member_update_counts
-                    <= jnp.asarray(_INT32_MAX, dtype=jnp.int32)
-                    - state.replay_member_update_counts
-                )
-                & jnp.all(
-                    jnp.stack(
-                        [
-                            candidate_members[index].step_count
-                            == (
-                                member_update_counts[index]
-                                + state.replay_member_update_counts[index]
-                            )
-                            for index in range(self._config.ensemble_size)
-                        ]
-                    )
-                )
+                & jnp.all(selected_member_available)
+            )
+            required_capacity_available = capacity_available & jnp.all(
+                (~bootstrap_mask)
+                | (member_partition_capacity & member_lifetime_capacity)
             )
             candidate_state = WorldModelEnsembleState(
                 member_states=tuple(candidate_members),
@@ -1473,9 +1996,15 @@ class WorldModelEnsemble:
                 last_bootstrap_mask=bootstrap_mask,
                 last_replay_bootstrap_mask=state.last_replay_bootstrap_mask,
                 member_update_counts=member_update_counts,
+                member_update_count_words=member_words,
                 replay_member_update_counts=state.replay_member_update_counts,
+                replay_member_update_count_words=(
+                    state.replay_member_update_count_words
+                ),
                 event_count=_saturating_int32_increment(state.event_count),
+                event_count_words=proposed_event_words,
                 replay_event_count=state.replay_event_count,
+                replay_event_count_words=state.replay_event_count_words,
             )
             candidate_state_valid = self._state_valid(candidate_state)
             applied = (
@@ -1483,6 +2012,7 @@ class WorldModelEnsemble:
                 & representation_gradient_valid
                 & signals_valid
                 & residual_update_valid
+                & required_capacity_available
                 & member_updates_valid
                 & candidate_state_valid
             )
@@ -1500,7 +2030,7 @@ class WorldModelEnsemble:
             diagnostics = WorldModelEnsembleDiagnostics(
                 state_valid=state_valid,
                 input_valid=input_valid,
-                capacity_available=capacity_available,
+                capacity_available=required_capacity_available,
                 predictions_valid=predictions_valid,
                 representation_gradient_valid=representation_gradient_valid,
                 signals_valid=signals_valid,
@@ -1530,6 +2060,28 @@ class WorldModelEnsemble:
                 representation_gradient_valid=(applied & representation_gradient_valid),
                 bootstrap_mask=bootstrap_mask,
                 member_updates_applied=bootstrap_mask & applied,
+                pre_event_words=state.event_count_words,
+                post_event_words=next_state.event_count_words,
+                event_counter_valid=_lifetime_counter_valid(
+                    state.event_count_words,
+                    state.event_count,
+                ),
+                event_capacity_available=capacity_available,
+                member_pre_step_words=member_pre_words,
+                member_post_step_words=jnp.stack(
+                    tuple(
+                        member.learner_state.step_words
+                        for member in next_state.member_states
+                    )
+                ),
+                member_wrapper_counter_aligned=member_wrapper_aligned,
+                member_ensemble_counter_aligned=member_ensemble_aligned,
+                member_lifetime_counter_valid=member_lifetime_valid,
+                member_lifetime_capacity_available=member_lifetime_capacity,
+                member_normalizer_counter_aligned=member_normalizer_aligned,
+                member_normalizer_estimator_capacity_available=(
+                    member_normalizer_capacity
+                ),
                 diagnostics=diagnostics,
             )
 
@@ -1559,96 +2111,6 @@ def _ensemble_config_digest(config: dict[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _legacy_v1_template(state: WorldModelEnsembleState) -> _WorldModelEnsembleStateV1:
-    return _WorldModelEnsembleStateV1(
-        member_states=state.member_states,
-        residual_variances=state.residual_variances,
-        signal_state=state.signal_state,
-        bootstrap_key=state.bootstrap_key,
-        last_bootstrap_mask=state.last_bootstrap_mask,
-        member_update_counts=state.member_update_counts,
-        event_count=state.event_count,
-    )
-
-
-def _legacy_v1_resource_budget(
-    ensemble: WorldModelEnsemble,
-    current_template: WorldModelEnsembleState,
-) -> dict[str, int]:
-    """Reconstruct the exact resource payload written by the v1 saver."""
-    legacy = _legacy_v1_template(current_template)
-    current = ensemble.resource_budget(current_template)
-    persistent = _logical_tree_accounting(legacy)
-    prediction = _logical_tree_accounting(ensemble._zero_prediction())
-    false = jnp.asarray(False, dtype=jnp.bool_)
-    update = cast(
-        Any,
-        ensemble._rejected_update_result(
-            current_template,
-            state_valid=false,
-            input_valid=false,
-            capacity_available=false,
-        ),
-    ).replace(state=legacy)
-    update_account = _logical_tree_accounting(update)
-    key_data = jr.key_data(legacy.bootstrap_key)
-    return {
-        "ensemble_size": current.ensemble_size,
-        "observation_dim": current.observation_dim,
-        "target_dim": current.target_dim,
-        "member_state_scalars_per_member": current.member_state_scalars_per_member,
-        "member_state_bytes_per_member": current.member_state_bytes_per_member,
-        "member_trainable_scalars": current.member_trainable_scalars,
-        "total_trainable_scalars": current.total_trainable_scalars,
-        "persistent_float32_scalars": persistent.float32_scalars,
-        "persistent_float64_scalars": persistent.float64_scalars,
-        "persistent_int32_scalars": persistent.int32_scalars,
-        "persistent_int64_scalars": persistent.int64_scalars,
-        "persistent_uint32_scalars": persistent.uint32_scalars,
-        "persistent_bool_scalars": persistent.bool_scalars,
-        "persistent_state_scalars": persistent.logical_scalars,
-        "persistent_state_bytes": persistent.logical_bytes,
-        "bootstrap_prng_keys": 1,
-        "bootstrap_prng_uint32_scalars": int(key_data.size),
-        "bootstrap_prng_bytes": int(key_data.nbytes),
-        "prediction_output_logical_scalars": prediction.logical_scalars,
-        "prediction_output_logical_bytes": prediction.logical_bytes,
-        "update_result_output_logical_scalars": update_account.logical_scalars,
-        "update_result_output_logical_bytes": update_account.logical_bytes,
-        "member_update_candidates_per_valid_event": (
-            current.member_update_candidates_per_valid_event
-        ),
-        "max_member_updates_per_event": current.max_member_updates_per_event,
-        "max_event_count": current.max_event_count,
-        "max_member_update_count": current.max_member_update_count,
-    }
-
-
-def _migrate_v1_state(legacy: _WorldModelEnsembleStateV1) -> WorldModelEnsembleState:
-    return WorldModelEnsembleState(
-        member_states=legacy.member_states,
-        residual_variances=legacy.residual_variances,
-        signal_state=legacy.signal_state,
-        bootstrap_key=legacy.bootstrap_key,
-        replay_bootstrap_key=jr.fold_in(
-            legacy.bootstrap_key,
-            _V1_REPLAY_KEY_FOLD_IN,
-        ),
-        last_bootstrap_mask=legacy.last_bootstrap_mask,
-        last_replay_bootstrap_mask=jnp.zeros_like(
-            legacy.last_bootstrap_mask,
-            dtype=jnp.bool_,
-        ),
-        member_update_counts=legacy.member_update_counts,
-        replay_member_update_counts=jnp.zeros_like(
-            legacy.member_update_counts,
-            dtype=jnp.int32,
-        ),
-        event_count=legacy.event_count,
-        replay_event_count=jnp.asarray(0, dtype=jnp.int32),
-    )
-
-
 def save_world_model_ensemble_checkpoint(
     ensemble: WorldModelEnsemble,
     state: WorldModelEnsembleState,
@@ -1676,20 +2138,26 @@ def load_world_model_ensemble_checkpoint(
     *,
     template_key: Array | None = None,
 ) -> tuple[WorldModelEnsemble, WorldModelEnsembleState]:
-    """Restore v2 or strictly migrate a pre-rehearsal v1 ensemble.
+    """Restore an exact v3 ensemble checkpoint.
 
-    Migration preserves every v1 member, residual, causal-signal, real-key,
-    real-mask, and real-counter field exactly.  Only the replay lane is added:
-    its key is deterministically folded from the stored real key and all replay
-    masks/counters start at zero.  New saves always use the v2 schema.
+    The historical v1/v2 schemas did not persist enough nested clock identity
+    to reconstruct current world-model and learning-signal states exactly.
+    They therefore fail closed instead of being restored into synthetic
+    current-shaped templates.
     """
     metadata = load_checkpoint_metadata(path)
     schema = metadata.get("schema")
-    if schema not in {
-        WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA,
+    if schema in {
         _WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA_V1,
+        _WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA_V2,
     }:
-        raise ValueError("checkpoint is not a WorldModelEnsemble v1/v2 checkpoint")
+        raise ValueError(
+            f"{schema} migration unavailable: historical nested world-model "
+            "and learning-signal exact counter state cannot be reconstructed; "
+            "re-export the checkpoint as v3 with its historical runtime"
+        )
+    if schema != WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA:
+        raise ValueError("checkpoint is not a WorldModelEnsemble v3 checkpoint")
     config = metadata.get("ensemble_config")
     if not isinstance(config, dict):
         raise ValueError("ensemble checkpoint is missing ensemble_config")
@@ -1701,27 +2169,16 @@ def load_world_model_ensemble_checkpoint(
         raise ValueError("ensemble checkpoint config is not canonical")
     key = jr.key(0) if template_key is None else template_key
     template = ensemble.init(key)
-    if schema == WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA:
-        expected_budget = ensemble.resource_budget(template).to_config()
-        restore_template: WorldModelEnsembleState | _WorldModelEnsembleStateV1 = template
-    else:
-        expected_budget = _legacy_v1_resource_budget(ensemble, template)
-        restore_template = _legacy_v1_template(template)
+    expected_budget = ensemble.resource_budget(template).to_config()
     if metadata.get("resource_budget") != expected_budget:
         raise ValueError("ensemble checkpoint resource budget does not match config")
-    restored, restored_metadata = load_checkpoint(restore_template, path)
+    restored, restored_metadata = load_checkpoint(template, path)
     if restored_metadata != metadata:
         raise ValueError("ensemble checkpoint metadata changed between reads")
-    if schema == _WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA_V1:
-        state = _migrate_v1_state(cast(_WorldModelEnsembleStateV1, restored))
-    else:
-        state = cast(WorldModelEnsembleState, restored)
+    state = cast(WorldModelEnsembleState, restored)
     if not bool(ensemble.state_valid(state)):
         raise ValueError("restored WorldModelEnsemble state is invalid")
-    if (
-        schema == WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA
-        and ensemble.resource_budget(state).to_config() != expected_budget
-    ):
+    if ensemble.resource_budget(state).to_config() != expected_budget:
         raise ValueError("restored WorldModelEnsemble state resource budget is invalid")
     return ensemble, state
 

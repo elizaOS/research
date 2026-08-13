@@ -20,6 +20,15 @@ from alberta_framework.core.checkpoints import (
     save_checkpoint,
 )
 from alberta_framework.core.state_builder import (
+    FIXED_STATE_BUILDER_STEP_COUNTER_DELTA_NBYTES,
+    FIXED_STATE_BUILDER_STEP_COUNTER_NBYTES,
+    FIXED_TRACE_STATE_BUILDER_STATE_SCHEMA,
+    IDENTITY_STATE_BUILDER_STATE_SCHEMA,
+    ONLINE_GATED_STATE_BUILDER_STATE_SCHEMA,
+    ONLINE_GATED_STATE_BUILDER_STEP_COUNTER_DELTA_NBYTES,
+    ONLINE_GATED_STATE_BUILDER_STEP_COUNTER_NBYTES,
+    ONLINE_GATED_STATE_BUILDER_UPDATE_COUNTER_DELTA_NBYTES,
+    ONLINE_GATED_STATE_BUILDER_UPDATE_COUNTER_NBYTES,
     STATE_BUILDER_CHECKPOINT_SCHEMA,
     FixedTraceStateBuilder,
     FixedTraceStateBuilderConfig,
@@ -30,7 +39,14 @@ from alberta_framework.core.state_builder import (
     StateBuilder,
     StateBuilderConfig,
     StateBuilderLearningProposal,
+    fixed_state_builder_step_counter_nbytes,
     load_state_builder_checkpoint,
+    measure_online_gated_state_builder_state_nbytes,
+    migrate_legacy_fixed_trace_state_builder_state,
+    migrate_legacy_identity_state_builder_state,
+    migrate_legacy_online_gated_state_builder_state,
+    online_gated_state_builder_step_counter_nbytes,
+    online_gated_state_builder_update_counter_nbytes,
     replace_state_builder_learning_proposal_update,
     save_state_builder_checkpoint,
     state_builder_config_from_config,
@@ -184,6 +200,114 @@ def test_fixed_trace_episode_reset_clears_memory_but_preserves_event_count() -> 
     assert bool(jnp.any(restarted_state.observation_traces != 0.0))
 
 
+@pytest.mark.parametrize(
+    "builder",
+    [
+        IdentityStateBuilder(IdentityStateBuilderConfig(observation_dim=2)),
+        FixedTraceStateBuilder(
+            FixedTraceStateBuilderConfig(observation_dim=2, n_actions=2)
+        ),
+    ],
+    ids=("identity", "fixed-trace"),
+)
+def test_fixed_builder_exact_clock_carry_terminal_noop_and_corruption(
+    builder: StateBuilder[object],
+) -> None:
+    maximum_i32 = 2**31 - 1
+    source = builder.init(jr.key(0)).replace(
+        step_count=jnp.asarray(maximum_i32, dtype=jnp.int32),
+        step_words=jnp.asarray((0, 2**32 - 1), dtype=jnp.uint32),
+    )
+    carried, _ = jax.jit(builder.update)(
+        source,
+        jnp.asarray([0.25, -0.5], dtype=jnp.float32),
+        1,
+        0.5,
+        0.9,
+    )
+    assert bool(builder.state_valid(carried))
+    assert int(carried.step_count) == maximum_i32
+    chex.assert_trees_all_equal(
+        carried.step_words,
+        jnp.asarray((1, 0), dtype=jnp.uint32),
+    )
+
+    terminal = carried.replace(
+        step_words=jnp.full((2,), 2**32 - 1, dtype=jnp.uint32)
+    )
+    stopped, _ = builder.update(
+        terminal,
+        jnp.asarray([9.0, -9.0], dtype=jnp.float32),
+        0,
+        -2.0,
+        0.0,
+    )
+    chex.assert_trees_all_equal(stopped, terminal)
+
+    corrupt = carried.replace(step_words=jnp.asarray((0, 1), dtype=jnp.uint32))
+    assert not bool(builder.state_valid(corrupt))
+    rejected, _ = builder.update(
+        corrupt,
+        jnp.asarray([9.0, -9.0], dtype=jnp.float32),
+        0,
+        -2.0,
+        0.0,
+    )
+    chex.assert_trees_all_equal(rejected, corrupt)
+
+
+def test_fixed_builder_schemas_resources_and_legacy_migrations_are_exact() -> None:
+    identity = IdentityStateBuilder(IdentityStateBuilderConfig(observation_dim=2))
+    fixed = FixedTraceStateBuilder(
+        FixedTraceStateBuilderConfig(observation_dim=2, n_actions=2)
+    )
+    assert identity.to_config()["state_schema"] == IDENTITY_STATE_BUILDER_STATE_SCHEMA
+    assert fixed.to_config()["state_schema"] == FIXED_TRACE_STATE_BUILDER_STATE_SCHEMA
+    assert (
+        fixed_state_builder_step_counter_nbytes()
+        == FIXED_STATE_BUILDER_STEP_COUNTER_NBYTES
+    )
+    assert FIXED_STATE_BUILDER_STEP_COUNTER_DELTA_NBYTES == 8
+
+    identity_migrated = migrate_legacy_identity_state_builder_state(
+        {"step_count": jnp.asarray(7, dtype=jnp.int32)}
+    )
+    chex.assert_trees_all_equal(
+        identity_migrated.step_words,
+        jnp.asarray((0, 7), dtype=jnp.uint32),
+    )
+    fixed_state = fixed.init(jr.key(0)).replace(
+        step_count=jnp.asarray(9, dtype=jnp.int32)
+    )
+    fixed_legacy = {
+        "observation_traces": fixed_state.observation_traces,
+        "action_traces": fixed_state.action_traces,
+        "reward_traces": fixed_state.reward_traces,
+        "step_count": fixed_state.step_count,
+        "last_gate": fixed_state.last_gate,
+    }
+    fixed_migrated = migrate_legacy_fixed_trace_state_builder_state(fixed_legacy)
+    chex.assert_trees_all_equal(
+        fixed_migrated.step_words,
+        jnp.asarray((0, 9), dtype=jnp.uint32),
+    )
+    for migrate, legacy in (
+        (
+            migrate_legacy_identity_state_builder_state,
+            {"step_count": jnp.asarray(2**31 - 1, dtype=jnp.int32)},
+        ),
+        (
+            migrate_legacy_fixed_trace_state_builder_state,
+            {
+                **fixed_legacy,
+                "step_count": jnp.asarray(2**31 - 1, dtype=jnp.int32),
+            },
+        ),
+    ):
+        with pytest.raises(ValueError, match="ambiguous"):
+            migrate(legacy)
+
+
 def test_online_gated_builder_updates_recurrent_parameters_from_delayed_gradient() -> None:
     builder = OnlineGatedStateBuilder(
         OnlineGatedStateBuilderConfig(
@@ -248,11 +372,255 @@ def test_online_gated_episode_reset_preserves_learning_and_lifetime_counters() -
     chex.assert_trees_all_equal(reset_state.last_gradient_norm, state.last_gradient_norm)
     assert int(reset_state.step_count) == 1
     assert int(reset_state.update_count) == 1
+    chex.assert_trees_all_equal(reset_state.step_words, state.step_words)
+    chex.assert_trees_all_equal(reset_state.update_words, state.update_words)
 
     restarted_state, _ = builder.start(reset_state, jnp.asarray([-0.25, 0.75]))
     assert int(restarted_state.step_count) == 2
     assert int(restarted_state.update_count) == 1
     assert bool(jnp.any(restarted_state.parameter_sensitivity != 0.0))
+
+
+def test_online_transition_status_preserves_tuple_update_compatibility() -> None:
+    builder = OnlineGatedStateBuilder(
+        OnlineGatedStateBuilderConfig(observation_dim=2, n_actions=2, hidden_dim=3)
+    )
+    state = builder.init(jr.key(31))
+    observation = jnp.asarray([0.25, -0.5], dtype=jnp.float32)
+
+    status = builder.update_with_status(state, observation, 1, 0.5, 0.9)
+    tuple_state, tuple_representation = builder.update(state, observation, 1, 0.5, 0.9)
+
+    chex.assert_trees_all_equal(status.state, tuple_state)
+    chex.assert_trees_all_equal(status.representation, tuple_representation)
+    chex.assert_trees_all_equal(status.pre_step_words, state.step_words)
+    chex.assert_trees_all_equal(status.post_step_words, status.state.step_words)
+    chex.assert_trees_all_equal(
+        status.state.step_words,
+        jnp.asarray((0, 1), dtype=jnp.uint32),
+    )
+    assert bool(status.state_valid)
+    assert bool(status.input_valid)
+    assert bool(status.candidate_state_valid)
+    assert bool(status.candidate_representation_valid)
+    assert bool(status.step_counter_valid)
+    assert bool(status.step_capacity_available)
+    assert bool(status.transition_applied)
+
+
+def test_online_step_clock_corruption_exhaustion_and_invalid_input_are_atomic() -> None:
+    builder = OnlineGatedStateBuilder(
+        OnlineGatedStateBuilderConfig(observation_dim=2, n_actions=2, hidden_dim=2)
+    )
+    state, _ = builder.start(
+        builder.init(jr.key(32)),
+        jnp.asarray([0.1, -0.2], dtype=jnp.float32),
+    )
+    observation = jnp.asarray([0.3, 0.4], dtype=jnp.float32)
+
+    corrupt = state.replace(step_words=jnp.asarray((0, 2), dtype=jnp.uint32))
+    corrupt_result = builder.update_with_status(corrupt, observation, 0, 0.0, 1.0)
+    chex.assert_trees_all_equal(corrupt_result.state, corrupt)
+    assert not bool(corrupt_result.state_valid)
+    assert not bool(corrupt_result.step_counter_valid)
+    assert not bool(corrupt_result.transition_applied)
+
+    exhausted = state.replace(
+        step_count=jnp.asarray(2**31 - 1, dtype=jnp.int32),
+        step_words=jnp.full((2,), 2**32 - 1, dtype=jnp.uint32),
+    )
+    exhausted_result = jax.jit(builder.update_with_status)(
+        exhausted,
+        observation,
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(1.0, dtype=jnp.float32),
+    )
+    chex.assert_trees_all_equal(exhausted_result.state, exhausted)
+    chex.assert_trees_all_equal(
+        exhausted_result.pre_step_words,
+        exhausted_result.post_step_words,
+    )
+    assert bool(exhausted_result.state_valid)
+    assert not bool(exhausted_result.step_capacity_available)
+    assert not bool(exhausted_result.transition_applied)
+    exhausted_start, _ = builder.start(exhausted, observation)
+    chex.assert_trees_all_equal(exhausted_start, exhausted)
+
+    invalid_input = builder.update_with_status(
+        state,
+        observation.at[0].set(jnp.nan),
+        0,
+        0.0,
+        1.0,
+    )
+    chex.assert_trees_all_equal(invalid_input.state, state)
+    assert bool(invalid_input.state_valid)
+    assert not bool(invalid_input.input_valid)
+    assert not bool(invalid_input.transition_applied)
+    assert bool(jnp.all(jnp.isfinite(invalid_input.representation)))
+
+
+def test_online_transition_candidate_overflow_is_an_atomic_finite_rejection() -> None:
+    builder = OnlineGatedStateBuilder(
+        OnlineGatedStateBuilderConfig(observation_dim=2, n_actions=2, hidden_dim=2)
+    )
+    state = builder.init(jr.key(36))
+    maximum = jnp.asarray(jnp.finfo(jnp.float32).max, dtype=jnp.float32)
+    extreme = state.replace(parameters=jnp.full_like(state.parameters, maximum))
+    observation = jnp.full((2,), maximum, dtype=jnp.float32)
+
+    result = jax.jit(builder.update_with_status)(
+        extreme,
+        observation,
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(1.0, dtype=jnp.float32),
+    )
+
+    chex.assert_trees_all_equal(result.state, extreme)
+    chex.assert_trees_all_equal(result.pre_step_words, result.post_step_words)
+    assert bool(result.state_valid)
+    assert bool(result.input_valid)
+    assert not bool(result.candidate_state_valid)
+    assert not bool(result.transition_applied)
+    assert bool(jnp.all(jnp.isfinite(result.representation)))
+
+
+def test_online_transition_static_input_contracts_reject_shape_and_dtype_laundering() -> None:
+    builder = OnlineGatedStateBuilder(
+        OnlineGatedStateBuilderConfig(observation_dim=2, n_actions=2, hidden_dim=2)
+    )
+    state = builder.init(jr.key(37))
+    observation = jnp.zeros((2,), dtype=jnp.float32)
+    action = jnp.asarray(0, dtype=jnp.int32)
+    reward = jnp.asarray(0.0, dtype=jnp.float32)
+    discount = jnp.asarray(1.0, dtype=jnp.float32)
+
+    with pytest.raises(ValueError, match="raw_observation must have shape"):
+        builder.update_with_status(
+            state,
+            jnp.zeros((1, 2), dtype=jnp.float32),
+            action,
+            reward,
+            discount,
+        )
+    with pytest.raises(TypeError, match="raw_observation must have dtype float32"):
+        builder.update_with_status(
+            state,
+            jnp.zeros((2,), dtype=jnp.int32),
+            action,
+            reward,
+            discount,
+        )
+    for wrong_action in (
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(False, dtype=jnp.bool_),
+        jnp.asarray(0, dtype=jnp.int16),
+    ):
+        with pytest.raises(TypeError, match="previous_action must have dtype int32"):
+            builder.update_with_status(
+                state,
+                observation,
+                wrong_action,
+                reward,
+                discount,
+            )
+    with pytest.raises(TypeError, match="previous_reward must have dtype float32"):
+        builder.update_with_status(
+            state,
+            observation,
+            action,
+            jnp.asarray(0, dtype=jnp.int32),
+            discount,
+        )
+    with pytest.raises(TypeError, match="previous_discount must have dtype float32"):
+        builder.update_with_status(
+            state,
+            observation,
+            action,
+            reward,
+            jnp.asarray(1, dtype=jnp.int32),
+        )
+
+
+def test_online_transition_static_state_contracts_reject_shape_and_dtype_laundering() -> None:
+    builder = OnlineGatedStateBuilder(
+        OnlineGatedStateBuilderConfig(observation_dim=2, n_actions=2, hidden_dim=2)
+    )
+    state = builder.init(jr.key(38))
+    observation = jnp.zeros((2,), dtype=jnp.float32)
+    action = jnp.asarray(0, dtype=jnp.int32)
+    reward = jnp.asarray(0.0, dtype=jnp.float32)
+    discount = jnp.asarray(1.0, dtype=jnp.float32)
+
+    wrong_dtype = state.replace(parameters=state.parameters.astype(jnp.int32))
+    with pytest.raises(TypeError, match="state.parameters must have dtype float32"):
+        builder.update_with_status(
+            wrong_dtype,
+            observation,
+            action,
+            reward,
+            discount,
+        )
+
+    wrong_shape = state.replace(hidden=jnp.zeros((1, 2), dtype=jnp.float32))
+    with pytest.raises(ValueError, match="state.hidden must have shape"):
+        builder.update_with_status(
+            wrong_shape,
+            observation,
+            action,
+            reward,
+            discount,
+        )
+
+
+def test_online_step_clock_rollover_is_exact_under_jitted_scan() -> None:
+    builder = OnlineGatedStateBuilder(
+        OnlineGatedStateBuilderConfig(observation_dim=2, n_actions=2, hidden_dim=2)
+    )
+    initial = builder.init(jr.key(33)).replace(
+        step_count=jnp.asarray(2**31 - 1, dtype=jnp.int32),
+        step_words=jnp.asarray((3, 2**32 - 1), dtype=jnp.uint32),
+    )
+    observations = jnp.asarray(
+        [[0.1, 0.2], [0.3, -0.4], [-0.2, 0.5]],
+        dtype=jnp.float32,
+    )
+
+    def run_scan(initial_state: object) -> tuple[object, tuple[jax.Array, ...]]:
+        def step(carry: object, observation: jax.Array) -> tuple[object, tuple[jax.Array, ...]]:
+            result = builder.update_with_status(carry, observation, 0, 0.0, 1.0)
+            return result.state, (
+                result.pre_step_words,
+                result.post_step_words,
+                result.transition_applied,
+            )
+
+        return jax.lax.scan(step, initial_state, observations)
+
+    final_state, (pre_words, post_words, applied) = jax.jit(run_scan)(initial)
+
+    chex.assert_trees_all_equal(
+        pre_words,
+        jnp.asarray(
+            [[3, 2**32 - 1], [4, 0], [4, 1]],
+            dtype=jnp.uint32,
+        ),
+    )
+    chex.assert_trees_all_equal(
+        post_words,
+        jnp.asarray(
+            [[4, 0], [4, 1], [4, 2]],
+            dtype=jnp.uint32,
+        ),
+    )
+    assert bool(jnp.all(applied))
+    assert int(final_state.step_count) == 2**31 - 1
+    chex.assert_trees_all_equal(
+        final_state.step_words,
+        jnp.asarray((4, 2), dtype=jnp.uint32),
+    )
 
 
 def _online_learning_source() -> tuple[
@@ -289,6 +657,7 @@ def test_online_learning_proposal_is_pure_source_bound_and_uses_current_sensitiv
     chex.assert_trees_all_equal(source, source_before)
     chex.assert_trees_all_equal(proposal.source_parameters, source.parameters)
     chex.assert_trees_all_equal(proposal.source_update_count, source.update_count)
+    chex.assert_trees_all_equal(proposal.source_update_words, source.update_words)
     expected_raw_gradient = source.parameter_sensitivity.T @ gradient[-builder.config.hidden_dim :]
     chex.assert_trees_all_close(proposal.raw_parameter_gradient, expected_raw_gradient)
     chex.assert_trees_all_close(
@@ -331,10 +700,26 @@ def test_online_proposal_from_source_commits_into_advanced_destination_causally(
         destination.parameter_sensitivity,
     )
     chex.assert_trees_all_equal(eager_state.step_count, destination.step_count)
+    chex.assert_trees_all_equal(eager_state.step_words, destination.step_words)
     assert int(eager_state.update_count) == int(destination.update_count) + 1
+    chex.assert_trees_all_equal(
+        eager_state.update_words,
+        destination.update_words.at[1].add(jnp.asarray(1, dtype=jnp.uint32)),
+    )
     chex.assert_trees_all_equal(eager_state.last_gradient_norm, proposal.gradient_norm)
     assert bool(eager_diagnostics.source_matches)
     assert bool(eager_diagnostics.applied)
+    assert bool(eager_diagnostics.update_applied)
+    assert bool(eager_diagnostics.lifetime_counter_valid)
+    assert bool(eager_diagnostics.lifetime_capacity_available)
+    chex.assert_trees_all_equal(
+        eager_diagnostics.pre_update_words,
+        destination.update_words,
+    )
+    chex.assert_trees_all_equal(
+        eager_diagnostics.post_update_words,
+        eager_state.update_words,
+    )
     assert bool(eager_diagnostics.valid)
 
 
@@ -433,29 +818,197 @@ def test_online_learn_equals_propose_then_same_state_commit() -> None:
     chex.assert_trees_all_equal(learned_diagnostics, committed_diagnostics)
 
 
-def test_online_proposal_capacity_max_minus_one_and_exhaustion_are_fail_closed() -> None:
+def test_online_exact_update_clock_outlives_saturated_int32_telemetry() -> None:
     builder, source, gradient = _online_learning_source()
-    almost_exhausted = source.replace(
-        update_count=jnp.asarray(2**31 - 2, dtype=jnp.int32)
+    at_telemetry_boundary = source.replace(
+        update_count=jnp.asarray(2**31 - 1, dtype=jnp.int32),
+        update_words=jnp.asarray((0, 2**31 - 1), dtype=jnp.uint32),
     )
-    proposal = builder.propose_learning_update(almost_exhausted, gradient)
-    final_state, final_diagnostics = builder.commit_learning_update(
-        almost_exhausted,
+    proposal = builder.propose_learning_update(at_telemetry_boundary, gradient)
+    final_state, diagnostics = builder.commit_learning_update(
+        at_telemetry_boundary,
         proposal,
     )
     assert bool(proposal.capacity_available)
-    assert bool(final_diagnostics.applied)
+    assert bool(diagnostics.applied)
     assert int(final_state.update_count) == 2**31 - 1
+    chex.assert_trees_all_equal(
+        final_state.update_words,
+        jnp.asarray((0, 2**31), dtype=jnp.uint32),
+    )
 
-    exhausted_proposal = builder.propose_learning_update(final_state, gradient)
-    exhausted_state, exhausted_diagnostics = jax.jit(builder.commit_learning_update)(
+    next_proposal = builder.propose_learning_update(final_state, gradient)
+    next_state, next_diagnostics = builder.commit_learning_update(
         final_state,
+        next_proposal,
+    )
+    assert bool(next_diagnostics.update_applied)
+    assert int(next_state.update_count) == 2**31 - 1
+    chex.assert_trees_all_equal(
+        next_state.update_words,
+        jnp.asarray((0, 2**31 + 1), dtype=jnp.uint32),
+    )
+
+
+def test_online_exact_update_clock_rolls_words_and_exhaustion_is_atomic() -> None:
+    builder, source, gradient = _online_learning_source()
+    rollover_source = source.replace(
+        update_count=jnp.asarray(2**31 - 1, dtype=jnp.int32),
+        update_words=jnp.asarray((7, 2**32 - 1), dtype=jnp.uint32),
+    )
+    proposal = builder.propose_learning_update(rollover_source, gradient)
+    rolled, diagnostics = jax.jit(builder.commit_learning_update)(
+        rollover_source,
+        proposal,
+    )
+    assert bool(diagnostics.update_applied)
+    chex.assert_trees_all_equal(
+        rolled.update_words,
+        jnp.asarray((8, 0), dtype=jnp.uint32),
+    )
+    chex.assert_trees_all_equal(diagnostics.pre_update_words, rollover_source.update_words)
+    chex.assert_trees_all_equal(diagnostics.post_update_words, rolled.update_words)
+
+    exhausted = rolled.replace(
+        update_count=jnp.asarray(2**31 - 1, dtype=jnp.int32),
+        update_words=jnp.full((2,), 2**32 - 1, dtype=jnp.uint32),
+    )
+    exhausted_proposal = builder.propose_learning_update(exhausted, gradient)
+    exhausted_state, exhausted_diagnostics = jax.jit(builder.commit_learning_update)(
+        exhausted,
         exhausted_proposal,
     )
-    chex.assert_trees_all_equal(exhausted_state, final_state)
+    chex.assert_trees_all_equal(exhausted_state, exhausted)
     assert not bool(exhausted_proposal.capacity_available)
     assert not bool(exhausted_diagnostics.capacity_available)
+    assert not bool(exhausted_diagnostics.lifetime_capacity_available)
+    assert not bool(exhausted_diagnostics.update_applied)
+    chex.assert_trees_all_equal(
+        exhausted_diagnostics.pre_update_words,
+        exhausted.update_words,
+    )
+    chex.assert_trees_all_equal(
+        exhausted_diagnostics.post_update_words,
+        exhausted.update_words,
+    )
     assert bool(exhausted_diagnostics.rejected)
+
+
+def test_online_update_clock_corruption_and_exact_source_mismatch_fail_closed() -> None:
+    builder, source, gradient = _online_learning_source()
+    corrupt = source.replace(
+        update_words=jnp.asarray((0, 1), dtype=jnp.uint32),
+    )
+    corrupt_proposal = builder.propose_learning_update(corrupt, gradient)
+    corrupt_state, corrupt_diagnostics = builder.commit_learning_update(
+        corrupt,
+        corrupt_proposal,
+    )
+    chex.assert_trees_all_equal(corrupt_state, corrupt)
+    assert not bool(corrupt_proposal.source_state_valid)
+    assert not bool(corrupt_proposal.valid)
+    assert not bool(corrupt_diagnostics.lifetime_counter_valid)
+    assert not bool(corrupt_diagnostics.update_applied)
+
+    saturated = source.replace(
+        update_count=jnp.asarray(2**31 - 1, dtype=jnp.int32),
+        update_words=jnp.asarray((0, 2**31), dtype=jnp.uint32),
+    )
+    proposal = builder.propose_learning_update(saturated, gradient)
+    different_exact_version = saturated.replace(
+        update_words=jnp.asarray((0, 2**31 + 1), dtype=jnp.uint32),
+    )
+    stale_state, stale_diagnostics = jax.jit(builder.commit_learning_update)(
+        different_exact_version,
+        proposal,
+    )
+    chex.assert_trees_all_equal(stale_state, different_exact_version)
+    assert bool(stale_diagnostics.lifetime_counter_valid)
+    assert not bool(stale_diagnostics.source_matches)
+    assert not bool(stale_diagnostics.update_applied)
+
+
+def test_online_update_clock_static_contract_is_strict() -> None:
+    builder, source, gradient = _online_learning_source()
+    wrong_state_shape = source.replace(
+        update_words=jnp.zeros((3,), dtype=jnp.uint32),
+    )
+    with pytest.raises(ValueError, match="state.update_words must have shape"):
+        builder.propose_learning_update(wrong_state_shape, gradient)
+
+    proposal = builder.propose_learning_update(source, gradient)
+    wrong_proposal_dtype = proposal.replace(
+        source_update_words=proposal.source_update_words.astype(jnp.int32),
+    )
+    with pytest.raises(TypeError, match="proposal.source_update_words must have dtype"):
+        builder.commit_learning_update(source, wrong_proposal_dtype)
+
+
+def test_online_state_schema_resource_formula_and_legacy_migration_are_exact() -> None:
+    builder, source, _ = _online_learning_source()
+    config = builder.to_config()
+    assert config["state_schema"] == ONLINE_GATED_STATE_BUILDER_STATE_SCHEMA
+    restored = state_builder_from_config(config)
+    assert restored.to_config() == config
+
+    for bad_config in (
+        {key: value for key, value in config.items() if key != "state_schema"},
+        {**config, "state_schema": "alberta.online-gated-state-builder-state.v1"},
+        {**config, "unexpected": True},
+    ):
+        with pytest.raises(ValueError):
+            state_builder_from_config(bad_config)
+
+    budget = builder.resource_budget()
+    assert (
+        online_gated_state_builder_step_counter_nbytes()
+        == ONLINE_GATED_STATE_BUILDER_STEP_COUNTER_NBYTES
+        == 12
+    )
+    assert ONLINE_GATED_STATE_BUILDER_STEP_COUNTER_DELTA_NBYTES == 8
+    assert (
+        online_gated_state_builder_update_counter_nbytes()
+        == ONLINE_GATED_STATE_BUILDER_UPDATE_COUNTER_NBYTES
+        == 12
+    )
+    assert ONLINE_GATED_STATE_BUILDER_UPDATE_COUNTER_DELTA_NBYTES == 8
+    assert budget.state_bytes == measure_online_gated_state_builder_state_nbytes(source)
+
+    legacy = {
+        name: getattr(source, name)
+        for name in (
+            "parameters",
+            "hidden",
+            "parameter_sensitivity",
+            "step_count",
+            "update_count",
+            "last_gradient_norm",
+        )
+    }
+    migrated = migrate_legacy_online_gated_state_builder_state(legacy)
+    chex.assert_trees_all_equal(
+        migrated.update_words,
+        jnp.asarray((0, int(source.update_count)), dtype=jnp.uint32),
+    )
+    chex.assert_trees_all_equal(
+        migrated.step_words,
+        jnp.asarray((0, int(source.step_count)), dtype=jnp.uint32),
+    )
+    assert bool(builder.state_valid(migrated))
+
+    legacy_v2 = {**legacy, "update_words": source.update_words}
+    migrated_v2 = migrate_legacy_online_gated_state_builder_state(legacy_v2)
+    chex.assert_trees_all_equal(migrated_v2, source)
+
+    ambiguous = dict(legacy)
+    ambiguous["update_count"] = jnp.asarray(2**31 - 1, dtype=jnp.int32)
+    with pytest.raises(ValueError, match="ambiguous"):
+        migrate_legacy_online_gated_state_builder_state(ambiguous)
+
+    ambiguous_step = dict(legacy)
+    ambiguous_step["step_count"] = jnp.asarray(2**31 - 1, dtype=jnp.int32)
+    with pytest.raises(ValueError, match="step_count is ambiguous"):
+        migrate_legacy_online_gated_state_builder_state(ambiguous_step)
 
 
 def test_online_commit_rejects_corrupt_proposal_and_static_contract_errors() -> None:
@@ -1088,8 +1641,74 @@ def test_state_builder_v1_checkpoint_without_config_digest_fails_closed(
         },
     )
 
-    with pytest.raises(ValueError, match="v2 checkpoint"):
+    with pytest.raises(ValueError, match="lack exact step/update clocks"):
         load_state_builder_checkpoint(legacy_path)
+
+
+def test_state_builder_v2_checkpoint_is_rejected_with_migration_guidance(
+    tmp_path: Path,
+) -> None:
+    builder = OnlineGatedStateBuilder(
+        OnlineGatedStateBuilderConfig(observation_dim=2, hidden_dim=2)
+    )
+    state = builder.init(jr.key(34))
+    legacy_config = dict(builder.to_config())
+    legacy_config.pop("state_schema")
+    legacy_path = tmp_path / "legacy-v2"
+    save_checkpoint(
+        state,
+        legacy_path,
+        metadata={
+            "schema": "alberta.state_builder.v2",
+            "builder_config": legacy_config,
+            "config_sha256": hashlib.sha256(
+                json.dumps(
+                    legacy_config,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest(),
+            "resource_budget": builder.resource_budget().to_config(),
+        },
+    )
+
+    with pytest.raises(ValueError, match="lack exact step/update clocks"):
+        load_state_builder_checkpoint(legacy_path)
+
+
+def test_state_builder_checkpoint_rejects_corrupt_exact_clocks_on_save_and_load(
+    tmp_path: Path,
+) -> None:
+    builder = OnlineGatedStateBuilder(
+        OnlineGatedStateBuilderConfig(observation_dim=2, hidden_dim=2)
+    )
+    state = builder.init(jr.key(35))
+    valid_path = tmp_path / "valid"
+    save_state_builder_checkpoint(builder, state, valid_path)
+    metadata = load_checkpoint_metadata(valid_path)
+    corrupt_states = {
+        "step": state.replace(
+            step_words=jnp.asarray((0, 1), dtype=jnp.uint32)
+        ),
+        "update": state.replace(
+            update_words=jnp.asarray((0, 1), dtype=jnp.uint32)
+        ),
+    }
+
+    for name, corrupt in corrupt_states.items():
+        with pytest.raises(ValueError, match="refusing to save an invalid"):
+            save_state_builder_checkpoint(
+                builder,
+                corrupt,
+                tmp_path / f"rejected-save-{name}",
+            )
+
+        corrupt_path = tmp_path / f"corrupt-load-{name}"
+        save_checkpoint(corrupt, corrupt_path, metadata=metadata)
+        with pytest.raises(ValueError, match="restored an invalid state"):
+            load_state_builder_checkpoint(corrupt_path)
 
 
 def test_online_gated_checkpoint_resume_matches_uninterrupted_learning(

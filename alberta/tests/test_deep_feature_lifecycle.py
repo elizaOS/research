@@ -3,11 +3,15 @@
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import pytest
 
 from alberta_framework.core.deep_feature_lifecycle import (
+    DEEP_FEATURE_LIFECYCLE_CONFIG_SCHEMA,
+    DEEP_FEATURE_LIFECYCLE_STATE_SCHEMA,
     DeepFeatureGeneratingMultiHeadMLPLearner,
     DeepFeatureLifecycleConfig,
     DeepFeatureLifecycleState,
+    _lifetime_words_mod,
     run_deep_feature_lifecycle_arrays,
 )
 from alberta_framework.core.optimizers import ObGDBounding
@@ -54,6 +58,37 @@ class TestDeepFeatureLifecycleConfig:
         )
         restored = DeepFeatureLifecycleConfig.from_config(config.to_config())
         assert restored == config
+
+        payload = config.to_config()
+        assert payload["config_schema"] == DEEP_FEATURE_LIFECYCLE_CONFIG_SCHEMA
+        assert payload["state_schema"] == DEEP_FEATURE_LIFECYCLE_STATE_SCHEMA
+
+    @pytest.mark.parametrize("missing", ["config_schema", "state_schema"])
+    def test_roundtrip_fails_closed_without_current_schema(self, missing: str) -> None:
+        payload = DeepFeatureLifecycleConfig().to_config()  # type: ignore[call-arg]
+        payload.pop(missing)
+
+        with pytest.raises(ValueError, match="schema is unsupported"):
+            DeepFeatureLifecycleConfig.from_config(payload)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"promotion_interval": True},
+            {"candidate_step_size": jnp.nan},
+            {"candidate_utility_decay": jnp.inf},
+            {"promotion_margin": -0.1},
+            {"layer_promotion_budget": 2**31},
+            {"candidate_gate_init": 0.3, "candidate_gate_max_abs": 0.25},
+            {"enabled": 1},
+        ],
+    )
+    def test_config_rejects_ambiguous_or_nonfinite_values(
+        self,
+        overrides: dict[str, object],
+    ) -> None:
+        with pytest.raises((TypeError, ValueError)):
+            DeepFeatureLifecycleConfig(**overrides)  # type: ignore[arg-type,call-arg]
 
     def test_learner_roundtrip(self) -> None:
         learner = DeepFeatureGeneratingMultiHeadMLPLearner(
@@ -889,6 +924,8 @@ class TestDeepFeaturePromotion:
         chex.assert_shape(result.per_head_metrics, (8, 1, 3))
         chex.assert_shape(result.lifecycle_metrics, (8, 4))
         chex.assert_shape(result.promotions_made, (8, 1))
+        chex.assert_shape(result.updates_applied, (8,))
+        assert bool(jnp.all(result.updates_applied))
         chex.assert_tree_all_finite(result.lifecycle_metrics)
 
     def test_scan_loop_predictions_remain_finite_without_shape_drift(self) -> None:
@@ -972,3 +1009,195 @@ class TestDeepFeaturePromotion:
             != active_state.mlp_state.trunk_params.weights[0]
         )
         chex.assert_tree_all_finite(active_result.state.mlp_state.trunk_params.weights[0])
+
+
+class TestDeepFeatureLifecycleHorizon:
+    """Lifecycle bookkeeping must remain atomic at exact-clock boundaries."""
+
+    @staticmethod
+    def _learner(**config_overrides: object) -> DeepFeatureGeneratingMultiHeadMLPLearner:
+        return DeepFeatureGeneratingMultiHeadMLPLearner(
+            n_heads=1,
+            hidden_sizes=(4,),
+            lifecycle_config=DeepFeatureLifecycleConfig(  # type: ignore[call-arg]
+                candidate_count=2,
+                promotion_interval=2**31 - 1,
+                candidate_min_age=2**31 - 1,
+                min_unit_age=2**31 - 1,
+                **config_overrides,
+            ),
+            step_size=0.0,
+            sparsity=0.0,
+            use_layer_norm=False,
+        )
+
+    @staticmethod
+    def _assert_learning_state_equal(
+        actual: DeepFeatureLifecycleState,
+        expected: DeepFeatureLifecycleState,
+    ) -> None:
+        """Compare persistent JAX state, excluding legacy host timing floats."""
+
+        expected = expected.replace(  # type: ignore[attr-defined]
+            mlp_state=expected.mlp_state.replace(  # type: ignore[attr-defined]
+                birth_timestamp=actual.mlp_state.birth_timestamp,
+                uptime_s=actual.mlp_state.uptime_s,
+            )
+        )
+        chex.assert_trees_all_equal(actual, expected)
+
+    def test_exact_modulo_uses_high_and_low_words(self) -> None:
+        assert int(
+            _lifetime_words_mod(jnp.array([1, 0], dtype=jnp.uint32), 3)
+        ) == 1
+        assert int(
+            _lifetime_words_mod(jnp.array([1, 1], dtype=jnp.uint32), 3)
+        ) == 2
+        assert int(
+            _lifetime_words_mod(jnp.array([1, 0], dtype=jnp.uint32), 2)
+        ) == 0
+        assert int(
+            _lifetime_words_mod(jnp.array([1, 1], dtype=jnp.uint32), 2)
+        ) == 1
+
+    def test_terminal_child_refusal_rolls_back_all_lifecycle_and_rng_state(self) -> None:
+        learner = self._learner()
+        state = learner.init(feature_dim=3, key=jr.key(40))
+        state = state.replace(  # type: ignore[attr-defined]
+            mlp_state=state.mlp_state.replace(  # type: ignore[attr-defined]
+                step_count=jnp.asarray(2**31 - 1, dtype=jnp.int32),
+                step_words=jnp.full((2,), 2**32 - 1, dtype=jnp.uint32),
+            )
+        )
+
+        result = learner.update(
+            state,
+            jnp.array([0.2, -0.1, 0.4], dtype=jnp.float32),
+            jnp.array([0.5], dtype=jnp.float32),
+        )
+
+        assert not bool(result.base_update_applied)
+        assert not bool(result.update_applied)
+        assert bool(result.update_rejected)
+        self._assert_learning_state_equal(result.state, state)
+        chex.assert_trees_all_equal(result.pre_step_words, result.post_step_words)
+
+    def test_invalid_auxiliary_source_and_nonfinite_input_are_atomic_noops(self) -> None:
+        learner = self._learner()
+        state = learner.init(feature_dim=3, key=jr.key(41))
+        corrupt = state.replace(  # type: ignore[attr-defined]
+            candidate_ages=(jnp.array([-1, 0], dtype=jnp.int32),)
+        )
+
+        corrupt_result = learner.update(
+            corrupt,
+            jnp.ones(3, dtype=jnp.float32),
+            jnp.zeros(1, dtype=jnp.float32),
+        )
+        assert not bool(corrupt_result.source_state_valid)
+        assert not bool(corrupt_result.update_applied)
+        self._assert_learning_state_equal(corrupt_result.state, corrupt)
+
+        nonfinite_result = learner.update(
+            state,
+            jnp.array([0.0, jnp.inf, 1.0], dtype=jnp.float32),
+            jnp.zeros(1, dtype=jnp.float32),
+        )
+        assert not bool(nonfinite_result.inputs_valid)
+        assert not bool(nonfinite_result.update_applied)
+        self._assert_learning_state_equal(nonfinite_result.state, state)
+
+    def test_ages_saturate_instead_of_wrapping(self) -> None:
+        learner = self._learner()
+        state = learner.init(feature_dim=3, key=jr.key(42))
+        maximum = jnp.asarray(2**31 - 1, dtype=jnp.int32)
+        state = state.replace(  # type: ignore[attr-defined]
+            candidate_ages=(jnp.full((2,), maximum, dtype=jnp.int32),),
+            unit_ages=(jnp.full((4,), maximum, dtype=jnp.int32),),
+        )
+
+        result = learner.update(
+            state,
+            jnp.ones(3, dtype=jnp.float32),
+            jnp.zeros(1, dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        chex.assert_trees_all_equal(result.state.candidate_ages, state.candidate_ages)
+        chex.assert_trees_all_equal(result.state.unit_ages, state.unit_ages)
+
+    def test_disabled_lifecycle_is_exact_base_passthrough_without_rng_use(self) -> None:
+        learner = self._learner(
+            enabled=False,
+            active_perturbation_std=0.1,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(45))
+        observation = jnp.array([0.2, -0.1, 0.4], dtype=jnp.float32)
+        target = jnp.array([0.5], dtype=jnp.float32)
+
+        result = learner.update(state, observation, target)
+        base = learner.learner.update(state.mlp_state, observation, target)
+        expected = state.replace(mlp_state=base.state)  # type: ignore[attr-defined]
+
+        assert bool(result.update_applied)
+        chex.assert_trees_all_equal(result.state, expected)
+        chex.assert_trees_all_equal(result.state.rng_key, state.rng_key)
+
+    def test_active_perturbation_schedule_is_exact_after_low_word_wrap(self) -> None:
+        learner = self._learner(
+            active_perturbation_std=0.01,
+            active_perturbation_interval=2,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(43))
+        saturated_telemetry = jnp.asarray(2**31 - 1, dtype=jnp.int32)
+        due = state.replace(  # type: ignore[attr-defined]
+            mlp_state=state.mlp_state.replace(  # type: ignore[attr-defined]
+                step_count=saturated_telemetry,
+                step_words=jnp.array([1, 2**32 - 1], dtype=jnp.uint32),
+            )
+        )
+        not_due = state.replace(  # type: ignore[attr-defined]
+            mlp_state=state.mlp_state.replace(  # type: ignore[attr-defined]
+                step_count=saturated_telemetry,
+                step_words=jnp.array([2, 0], dtype=jnp.uint32),
+            )
+        )
+        observation = jnp.array([0.2, -0.1, 0.4], dtype=jnp.float32)
+        target = jnp.array([0.0], dtype=jnp.float32)
+
+        due_result = learner.update(due, observation, target)
+        not_due_result = learner.update(not_due, observation, target)
+
+        assert bool(due_result.update_applied)
+        assert bool(not_due_result.update_applied)
+        assert jnp.any(
+            due_result.state.mlp_state.trunk_params.weights[0]
+            != due.mlp_state.trunk_params.weights[0]
+        )
+        chex.assert_trees_all_equal(
+            not_due_result.state.mlp_state.trunk_params.weights[0],
+            not_due.mlp_state.trunk_params.weights[0],
+        )
+
+    def test_scan_surfaces_rejections_instead_of_hiding_stalled_learning(self) -> None:
+        learner = self._learner()
+        state = learner.init(feature_dim=3, key=jr.key(44))
+        state = state.replace(  # type: ignore[attr-defined]
+            mlp_state=state.mlp_state.replace(  # type: ignore[attr-defined]
+                step_count=jnp.asarray(2**31 - 1, dtype=jnp.int32),
+                step_words=jnp.full((2,), 2**32 - 1, dtype=jnp.uint32),
+            )
+        )
+
+        result = run_deep_feature_lifecycle_arrays(
+            learner,
+            state,
+            jnp.ones((3, 3), dtype=jnp.float32),
+            jnp.zeros((3, 1), dtype=jnp.float32),
+        )
+
+        chex.assert_trees_all_equal(
+            result.updates_applied,
+            jnp.zeros((3,), dtype=jnp.bool_),
+        )
+        self._assert_learning_state_equal(result.state, state)

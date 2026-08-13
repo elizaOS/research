@@ -29,13 +29,25 @@ for ``jax.jit`` and ``jax.lax.scan``.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import dataclasses
+import math
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, cast
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
 from jaxtyping import Bool, Float, Int, PRNGKeyArray
+
+from alberta_framework.core.checkpoints import (
+    load_checkpoint,
+    load_checkpoint_metadata,
+    save_checkpoint,
+)
 
 MEET_CONTEXT = 0
 AVOID_CONTEXT = 1
@@ -51,7 +63,96 @@ MEET_CONTEXT_INDEX = 4
 AVOID_CONTEXT_INDEX = 5
 BASE_OBSERVATION_DIM = 6
 
+_INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
+
+RECURRING_TWO_AGENT_CONFIG_SCHEMA = "alberta.recurring-two-agent-config.v2"
+RECURRING_TWO_AGENT_STATE_SCHEMA = "alberta.recurring-two-agent-state.v2"
+RECURRING_TWO_AGENT_CHECKPOINT_SCHEMA = "alberta.recurring-two-agent-checkpoint.v2"
+_LEGACY_RECURRING_TWO_AGENT_CHECKPOINT_SCHEMA = (
+    "alberta.recurring-two-agent-checkpoint.v1"
+)
+RECURRING_TWO_AGENT_CLOCK_NBYTES = 12
+RECURRING_TWO_AGENT_CLOCK_DELTA_NBYTES = 8
+
 type PartnerPolicy = Callable[[Array, Array], Array]
+
+
+def _require_array(
+    value: Any,
+    *,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: jnp.dtype,
+) -> Array:
+    array = jnp.asarray(value)
+    if array.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {array.shape}")
+    if array.dtype != dtype:
+        raise TypeError(f"{name} must have dtype {dtype}, got {array.dtype}")
+    return array
+
+
+def _checked_words_increment(words: Array) -> tuple[Array, Array]:
+    _require_array(
+        words,
+        name="recurring two-agent step_words",
+        shape=(2,),
+        dtype=jnp.dtype(jnp.uint32),
+    )
+    maximum = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+    available = ~jnp.all(words == maximum)
+    low = words[1] + jnp.asarray(1, dtype=jnp.uint32)
+    carry_word = (low == jnp.asarray(0, dtype=jnp.uint32)).astype(jnp.uint32)
+    candidate = jnp.stack((words[0] + carry_word, low)).astype(jnp.uint32)
+    return jnp.where(available, candidate, words), available
+
+
+def _words_to_int32_telemetry(words: Array) -> Array:
+    saturated = (words[0] > jnp.asarray(0, dtype=jnp.uint32)) | (
+        words[1] >= jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+    )
+    return jnp.where(
+        saturated,
+        jnp.asarray(_INT32_MAX, dtype=jnp.int32),
+        words[1].astype(jnp.int32),
+    )
+
+
+def _divmod_words_by_u32(words: Array, divisor: int | Array) -> tuple[Array, Array]:
+    """Exact 64-by-32 long division without enabling JAX x64."""
+    divisor_array = jnp.asarray(divisor, dtype=jnp.uint32)
+
+    def body(index: Array, carry: tuple[Array, Array, Array]) -> tuple[Array, Array, Array]:
+        remainder, quotient_high, quotient_low = carry
+        in_high = index < 32
+        bit_index = jnp.asarray(31, dtype=jnp.int32) - jnp.mod(index, 32)
+        source = jnp.where(in_high, words[0], words[1])
+        bit = jnp.bitwise_and(
+            jnp.right_shift(source, bit_index.astype(jnp.uint32)),
+            jnp.asarray(1, dtype=jnp.uint32),
+        )
+        doubled = remainder + remainder + bit
+        subtract = doubled >= divisor_array
+        remainder = jnp.where(subtract, doubled - divisor_array, doubled)
+        mask = jnp.left_shift(
+            jnp.asarray(1, dtype=jnp.uint32), bit_index.astype(jnp.uint32)
+        )
+        quotient_high = jnp.where(
+            in_high & subtract,
+            jnp.bitwise_or(quotient_high, mask),
+            quotient_high,
+        )
+        quotient_low = jnp.where(
+            (~in_high) & subtract,
+            jnp.bitwise_or(quotient_low, mask),
+            quotient_low,
+        )
+        return remainder, quotient_high, quotient_low
+
+    zero = jnp.asarray(0, dtype=jnp.uint32)
+    remainder, high, low = jax.lax.fori_loop(0, 64, body, (zero, zero, zero))
+    return jnp.stack((high, low)).astype(jnp.uint32), remainder
 
 
 @chex.dataclass(frozen=True)
@@ -67,6 +168,26 @@ class RecurringTwoAgentState:
     velocities: Float[Array, " 2"]
     nuisance: Float[Array, "2 nuisance_dim"]
     step_count: Int[Array, ""]
+    step_words: Array | None = None
+
+    def __post_init__(self) -> None:
+        """Migrate omitted unsaturated compatibility clocks at construction."""
+        if self.step_words is None:
+            if self.step_count is None:
+                # JAX tree transformations construct a transient all-None
+                # placeholder before unflattening real leaves.
+                return
+            count_array = jnp.asarray(self.step_count)
+            if count_array.shape != () or count_array.dtype != jnp.dtype(jnp.int32):
+                raise TypeError("legacy recurring two-agent step_count must be scalar int32")
+            count = int(count_array)
+            if count < 0 or count >= _INT32_MAX:
+                raise ValueError("legacy recurring two-agent step_count is ambiguous")
+            object.__setattr__(
+                self,
+                "step_words",
+                jnp.asarray((0, count), dtype=jnp.uint32),
+            )
 
 
 @chex.dataclass(frozen=True)
@@ -80,8 +201,11 @@ class RecurringTwoAgentOracle:
     """
 
     step_count: Int[Array, ""]
+    step_words: Array
     segment_index: Int[Array, ""]
+    segment_words: Array
     cycle_index: Int[Array, ""]
+    cycle_words: Array
     context_id: Int[Array, ""]
     next_context_id: Int[Array, ""]
     context_switched: Bool[Array, ""]
@@ -109,6 +233,43 @@ class RecurringTwoAgentTransition:
     terminated: Bool[Array, ""]
     discount: Float[Array, ""]
     oracle: RecurringTwoAgentOracle
+
+
+@chex.dataclass(frozen=True)
+class RecurringTwoAgentStepResult:
+    """One transactional environment proposal and its commit diagnostics."""
+
+    transition: RecurringTwoAgentTransition
+    state: RecurringTwoAgentState
+    pre_step_words: Array
+    post_step_words: Array
+    state_valid: Array
+    candidate_state_valid: Array
+    lifetime_capacity_available: Array
+    input_valid: Array
+    update_applied: Array
+    update_rejected: Array
+
+
+@dataclass(frozen=True)
+class RecurringTwoAgentResourceBudget:
+    """Exact fixed-shape environment-state accounting."""
+
+    state_nbytes: int
+    exact_clock_nbytes: int
+    exact_clock_delta_nbytes: int
+    trainable_scalars: int = 0
+    replay_capacity: int = 0
+
+    def to_dict(self) -> dict[str, int | str]:
+        return {
+            "type": type(self).__name__,
+            "state_nbytes": self.state_nbytes,
+            "exact_clock_nbytes": self.exact_clock_nbytes,
+            "exact_clock_delta_nbytes": self.exact_clock_delta_nbytes,
+            "trainable_scalars": self.trainable_scalars,
+            "replay_capacity": self.replay_capacity,
+        }
 
 
 def scripted_meet_avoid_partner_policy(
@@ -184,12 +345,30 @@ class RecurringTwoAgentWorld:
         initial_positions: tuple[float, float] = (-0.5, 0.5),
         partner_policy: PartnerPolicy | None = None,
     ) -> None:
-        if context_length <= 0:
+        if (
+            isinstance(context_length, bool)
+            or not isinstance(context_length, int)
+            or context_length <= 0
+        ):
             raise ValueError(
                 f"context_length must be positive, got {context_length}"
             )
-        if nuisance_dim < 0:
+        if context_length > _INT32_MAX // 2:
+            raise ValueError("2 * context_length must fit in signed schedule telemetry")
+        if isinstance(nuisance_dim, bool) or not isinstance(nuisance_dim, int) or nuisance_dim < 0:
             raise ValueError(f"nuisance_dim must be non-negative, got {nuisance_dim}")
+        for name, value in (
+            ("nuisance_scale", nuisance_scale),
+            ("world_limit", world_limit),
+            ("damping", damping),
+            ("acceleration", acceleration),
+            ("time_delta", time_delta),
+            ("max_speed", max_speed),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be a finite real number")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
         if nuisance_scale < 0.0:
             raise ValueError(
                 f"nuisance_scale must be non-negative, got {nuisance_scale}"
@@ -209,6 +388,8 @@ class RecurringTwoAgentWorld:
                 f"initial_positions must contain {N_AGENTS} values, "
                 f"got {len(initial_positions)}"
             )
+        if any(not math.isfinite(float(position)) for position in initial_positions):
+            raise ValueError("initial_positions must be finite")
         if any(abs(position) > world_limit for position in initial_positions):
             raise ValueError(
                 "initial_positions must lie within [-world_limit, world_limit]"
@@ -222,7 +403,9 @@ class RecurringTwoAgentWorld:
         self._acceleration = float(acceleration)
         self._time_delta = float(time_delta)
         self._max_speed = float(max_speed)
+        self._initial_positions_tuple = tuple(float(value) for value in initial_positions)
         self._initial_positions = jnp.asarray(initial_positions, dtype=jnp.float32)
+        self._partner_policy_is_default = partner_policy is None
         self._partner_policy = (
             scripted_meet_avoid_partner_policy
             if partner_policy is None
@@ -277,11 +460,122 @@ class RecurringTwoAgentWorld:
 
         return self._max_speed
 
+    @property
+    def resource_budget(self) -> RecurringTwoAgentResourceBudget:
+        """Return exact persistent-state and lifetime-clock accounting."""
+        state = self.init(jr.key(0))
+        return RecurringTwoAgentResourceBudget(
+            state_nbytes=measure_recurring_two_agent_state_nbytes(state),
+            exact_clock_nbytes=RECURRING_TWO_AGENT_CLOCK_NBYTES,
+            exact_clock_delta_nbytes=RECURRING_TWO_AGENT_CLOCK_DELTA_NBYTES,
+        )
+
+    def to_config(self) -> dict[str, Any]:
+        """Serialize the default-policy world under strict v2 schemas."""
+        if not self._partner_policy_is_default:
+            raise ValueError("custom partner policies are not serializable")
+        return {
+            "type": type(self).__name__,
+            "config_schema": RECURRING_TWO_AGENT_CONFIG_SCHEMA,
+            "state_schema": RECURRING_TWO_AGENT_STATE_SCHEMA,
+            "context_length": self._context_length,
+            "nuisance_dim": self._nuisance_dim,
+            "nuisance_scale": self._nuisance_scale,
+            "world_limit": self._world_limit,
+            "damping": self._damping,
+            "acceleration": self._acceleration,
+            "time_delta": self._time_delta,
+            "max_speed": self._max_speed,
+            "initial_positions": list(self._initial_positions_tuple),
+            "partner_policy": "scripted_meet_avoid_partner_policy",
+        }
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> RecurringTwoAgentWorld:
+        """Strictly reconstruct a default-policy v2 environment."""
+        values = dict(config)
+        expected = set(cls().to_config())
+        if set(values) != expected:
+            raise ValueError("recurring two-agent config fields are invalid")
+        if values.pop("type") != cls.__name__:
+            raise ValueError("recurring two-agent config type is unsupported")
+        if values.pop("config_schema") != RECURRING_TWO_AGENT_CONFIG_SCHEMA:
+            raise ValueError("recurring two-agent config schema is unsupported")
+        if values.pop("state_schema") != RECURRING_TWO_AGENT_STATE_SCHEMA:
+            raise ValueError("recurring two-agent state schema is unsupported")
+        if values.pop("partner_policy") != "scripted_meet_avoid_partner_policy":
+            raise ValueError("recurring two-agent partner policy is unsupported")
+        initial = values.pop("initial_positions")
+        if not isinstance(initial, (list, tuple)):
+            raise ValueError("recurring two-agent initial_positions is invalid")
+        return cls(initial_positions=tuple(initial), **values)
+
+    def _require_state_contract(self, state: RecurringTwoAgentState) -> None:
+        """Require every fixed-shape v2 state leaf."""
+        _require_array(state.positions, name="positions", shape=(2,), dtype=jnp.dtype(jnp.float32))
+        _require_array(
+            state.velocities,
+            name="velocities",
+            shape=(2,),
+            dtype=jnp.dtype(jnp.float32),
+        )
+        _require_array(
+            state.nuisance,
+            name="nuisance",
+            shape=(2, self._nuisance_dim),
+            dtype=jnp.dtype(jnp.float32),
+        )
+        _require_array(
+            state.step_count,
+            name="step_count",
+            shape=(),
+            dtype=jnp.dtype(jnp.int32),
+        )
+        _require_array(
+            cast(Array, state.step_words),
+            name="step_words",
+            shape=(2,),
+            dtype=jnp.dtype(jnp.uint32),
+        )
+        key_data = jr.key_data(state.key)
+        if key_data.shape != (2,) or key_data.dtype != jnp.dtype(jnp.uint32):
+            raise TypeError("recurring two-agent key must be a scalar JAX PRNG key")
+
+    def state_is_valid(self, state: RecurringTwoAgentState) -> Array:
+        """Authenticate exact time and bounded finite physical state."""
+        self._require_state_contract(state)
+        words = cast(Array, state.step_words)
+        return (
+            (state.step_count == _words_to_int32_telemetry(words))
+            & jnp.all(jnp.isfinite(state.positions))
+            & jnp.all(jnp.isfinite(state.velocities))
+            & jnp.all(jnp.isfinite(state.nuisance))
+            & jnp.all(jnp.abs(state.positions) <= self._world_limit)
+            & jnp.all(jnp.abs(state.velocities) <= self._max_speed)
+        )
+
     def context_id(self, state: RecurringTwoAgentState) -> Array:
         """Return the visible recurring context id for ``state``."""
+        self._require_state_contract(state)
+        segment_words, _remainder = _divmod_words_by_u32(
+            cast(Array, state.step_words), self._context_length
+        )
+        return jnp.bitwise_and(
+            segment_words[1], jnp.asarray(1, dtype=jnp.uint32)
+        ).astype(jnp.int32)
 
-        segment_index = jnp.floor_divide(state.step_count, self._context_length)
-        return jnp.mod(segment_index, 2).astype(jnp.int32)
+    def _schedule_identities(
+        self, words: Array
+    ) -> tuple[Array, Array, Array, Array]:
+        """Return exact segment/cycle identities and bounded schedule phase."""
+        segment_words, segment_step = _divmod_words_by_u32(
+            words, self._context_length
+        )
+        cycle_words, _parity = _divmod_words_by_u32(segment_words, 2)
+        context = jnp.bitwise_and(
+            segment_words[1], jnp.asarray(1, dtype=jnp.uint32)
+        ).astype(jnp.int32)
+        return segment_words, cycle_words, segment_step.astype(jnp.int32), context
 
     def init(self, key: Array) -> RecurringTwoAgentState:
         """Create a deterministic initial state from ``key``."""
@@ -294,6 +588,7 @@ class RecurringTwoAgentWorld:
             velocities=jnp.zeros((N_AGENTS,), dtype=jnp.float32),
             nuisance=nuisance,
             step_count=jnp.array(0, dtype=jnp.int32),
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
         )
 
     def observe(self, state: RecurringTwoAgentState) -> Array:
@@ -337,8 +632,17 @@ class RecurringTwoAgentWorld:
         ``[-1, 1]``.  The input state is never mutated.
         """
 
+        result = self.step_result(state, joint_action)
+        return result.transition, result.state
+
+    def step_result(
+        self,
+        state: RecurringTwoAgentState,
+        joint_action: Array,
+    ) -> RecurringTwoAgentStepResult:
+        """Stage one joint action and expose whether the whole event committed."""
         next_key, nuisance_key = jr.split(state.key)
-        return self._advance(state, joint_action, next_key, nuisance_key)
+        return self._advance_result(state, joint_action, next_key, nuisance_key)
 
     def step_with_partner(
         self,
@@ -352,6 +656,15 @@ class RecurringTwoAgentWorld:
         accepted for convenience.
         """
 
+        result = self.step_with_partner_result(state, learner_action)
+        return result.transition, result.state
+
+    def step_with_partner_result(
+        self,
+        state: RecurringTwoAgentState,
+        learner_action: Array,
+    ) -> RecurringTwoAgentStepResult:
+        """Stage learner and partner actions as one atomic environment event."""
         next_key, nuisance_key, policy_key = jr.split(state.key, 3)
         observation = self.observe(state)
         partner_action = jnp.asarray(
@@ -371,7 +684,7 @@ class RecurringTwoAgentWorld:
                 jnp.reshape(partner_action, ()),
             )
         )
-        return self._advance(state, joint_action, next_key, nuisance_key)
+        return self._advance_result(state, joint_action, next_key, nuisance_key)
 
     def _sample_nuisance(self, key: Array) -> Array:
         return self._nuisance_scale * jr.normal(
@@ -380,20 +693,29 @@ class RecurringTwoAgentWorld:
             dtype=jnp.float32,
         )
 
-    def _advance(
+    def _advance_result(
         self,
         state: RecurringTwoAgentState,
         joint_action: Array,
         next_key: Array,
         nuisance_key: Array,
-    ) -> tuple[RecurringTwoAgentTransition, RecurringTwoAgentState]:
-        requested_actions = jnp.asarray(joint_action, dtype=jnp.float32)
+    ) -> RecurringTwoAgentStepResult:
+        self._require_state_contract(state)
+        requested_actions = jnp.asarray(joint_action)
         if requested_actions.shape != (N_AGENTS,):
             raise ValueError(
                 f"joint_action must have shape ({N_AGENTS},), "
                 f"got {requested_actions.shape}"
             )
-        applied_actions = jnp.clip(requested_actions, -1.0, 1.0)
+        if requested_actions.dtype != jnp.dtype(jnp.float32):
+            raise TypeError("joint_action must have dtype float32")
+        state_valid = self.state_is_valid(state)
+        proposed_words, lifetime_capacity_available = _checked_words_increment(
+            cast(Array, state.step_words)
+        )
+        input_valid = jnp.all(jnp.isfinite(requested_actions))
+        safe_actions = jnp.where(jnp.isfinite(requested_actions), requested_actions, 0.0)
+        applied_actions = jnp.clip(safe_actions, -1.0, 1.0)
 
         accelerated = (
             self._damping * state.velocities
@@ -433,22 +755,40 @@ class RecurringTwoAgentWorld:
         ).astype(jnp.float32)
         reward = jnp.full((N_AGENTS,), reward_scalar, dtype=jnp.float32)
 
-        new_state = RecurringTwoAgentState(  # type: ignore[call-arg]
+        candidate_state = RecurringTwoAgentState(  # type: ignore[call-arg]
             key=next_key,
             positions=positions,
             velocities=velocities,
             nuisance=self._sample_nuisance(nuisance_key),
-            step_count=state.step_count + jnp.array(1, dtype=jnp.int32),
+            step_count=_words_to_int32_telemetry(proposed_words),
+            step_words=proposed_words,
         )
-        next_context = self.context_id(new_state)
-        segment_index = jnp.floor_divide(
-            state.step_count,
-            self._context_length,
-        ).astype(jnp.int32)
+        candidate_state_valid = self.state_is_valid(candidate_state)
+        update_applied = (
+            state_valid
+            & input_valid
+            & lifetime_capacity_available
+            & candidate_state_valid
+        )
+        new_state = cast(
+            RecurringTwoAgentState,
+            jax.tree.map(
+                lambda proposed, current: jnp.where(update_applied, proposed, current),
+                candidate_state,
+                state,
+            ),
+        )
+        next_context = self.context_id(candidate_state)
+        segment_words, cycle_words, _segment_step, _context = self._schedule_identities(
+            cast(Array, state.step_words)
+        )
         oracle = RecurringTwoAgentOracle(  # type: ignore[call-arg]
             step_count=state.step_count,
-            segment_index=segment_index,
-            cycle_index=jnp.floor_divide(segment_index, 2).astype(jnp.int32),
+            step_words=cast(Array, state.step_words),
+            segment_index=_words_to_int32_telemetry(segment_words),
+            segment_words=segment_words,
+            cycle_index=_words_to_int32_telemetry(cycle_words),
+            cycle_words=cycle_words,
             context_id=context,
             next_context_id=next_context,
             context_switched=context != next_context,
@@ -460,7 +800,7 @@ class RecurringTwoAgentWorld:
             distance_after=distance_after,
             meet_reward=meet_reward,
             avoid_reward=avoid_reward,
-            requested_actions=requested_actions,
+            requested_actions=safe_actions,
             applied_actions=applied_actions,
             hit_boundary=hit_boundary,
         )
@@ -468,9 +808,201 @@ class RecurringTwoAgentWorld:
             observation=self.observe(state),
             action=applied_actions,
             reward=reward,
-            next_observation=self.observe(new_state),
-            terminated=jnp.array(False),
-            discount=jnp.array(1.0, dtype=jnp.float32),
+            next_observation=self.observe(candidate_state),
+            terminated=~update_applied,
+            discount=jnp.where(
+                update_applied,
+                jnp.asarray(1.0, dtype=jnp.float32),
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ),
             oracle=oracle,
         )
-        return transition, new_state
+        transition = cast(
+            RecurringTwoAgentTransition,
+            jax.tree.map(
+                lambda value: jnp.where(
+                    update_applied,
+                    value,
+                    (
+                        jnp.full_like(value, jnp.nan)
+                        if jnp.issubdtype(value.dtype, jnp.floating)
+                        else (
+                            jnp.zeros_like(value)
+                            if jnp.issubdtype(value.dtype, jnp.bool_)
+                            else jnp.full_like(value, -1)
+                        )
+                    ),
+                ),
+                transition,
+            ),
+        ).replace(  # type: ignore[attr-defined]
+            terminated=~update_applied,
+            discount=jnp.where(update_applied, 1.0, 0.0).astype(jnp.float32),
+        )
+        return RecurringTwoAgentStepResult(  # type: ignore[call-arg]
+            transition=transition,
+            state=new_state,
+            pre_step_words=cast(Array, state.step_words),
+            post_step_words=cast(Array, new_state.step_words),
+            state_valid=state_valid,
+            candidate_state_valid=candidate_state_valid,
+            lifetime_capacity_available=lifetime_capacity_available,
+            input_valid=input_valid,
+            update_applied=update_applied,
+            update_rejected=~update_applied,
+        )
+
+
+def measure_recurring_two_agent_state_nbytes(state: RecurringTwoAgentState) -> int:
+    """Measure every persistent JAX-array byte in one environment state."""
+    return sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree.leaves(state)
+        if isinstance(leaf, Array)
+    )
+
+
+def _recurring_checkpoint_storage_state(
+    state: RecurringTwoAgentState,
+) -> RecurringTwoAgentState:
+    """Encode empty nuisance arrays as Orbax-compatible storage sentinels."""
+    return cast(
+        RecurringTwoAgentState,
+        jax.tree.map(
+            lambda leaf: (
+                jnp.zeros((1,), dtype=leaf.dtype)
+                if isinstance(leaf, Array) and leaf.size == 0
+                else leaf
+            ),
+            state,
+        ),
+    )
+
+
+def _recurring_empty_leaf_indices(state: RecurringTwoAgentState) -> list[int]:
+    return [
+        index
+        for index, leaf in enumerate(jax.tree.leaves(state))
+        if isinstance(leaf, Array) and leaf.size == 0
+    ]
+
+
+def _restore_recurring_empty_arrays(
+    restored: RecurringTwoAgentState,
+    template: RecurringTwoAgentState,
+) -> RecurringTwoAgentState:
+    return cast(
+        RecurringTwoAgentState,
+        jax.tree.map(
+            lambda stored, expected: (
+                expected
+                if isinstance(expected, Array) and expected.size == 0
+                else stored
+            ),
+            restored,
+            template,
+        ),
+    )
+
+
+def migrate_legacy_recurring_two_agent_state(
+    legacy_state: Any,
+    *,
+    world: RecurringTwoAgentWorld,
+) -> RecurringTwoAgentState:
+    """Migrate only an unsaturated pre-v2 environment lifetime."""
+    if isinstance(legacy_state, Mapping):
+        fields = dict(legacy_state)
+    elif dataclasses.is_dataclass(legacy_state) and not isinstance(legacy_state, type):
+        fields = {
+            field.name: getattr(legacy_state, field.name)
+            for field in dataclasses.fields(legacy_state)
+        }
+    else:
+        raise TypeError("legacy recurring two-agent state must be a mapping or dataclass")
+    expected = {"key", "positions", "velocities", "nuisance", "step_count"}
+    if set(fields) != expected:
+        raise ValueError("legacy recurring two-agent state fields are invalid")
+    count_array = _require_array(
+        fields["step_count"],
+        name="legacy recurring two-agent step_count",
+        shape=(),
+        dtype=jnp.dtype(jnp.int32),
+    )
+    count = int(count_array)
+    if count < 0:
+        raise ValueError("negative legacy recurring two-agent step_count indicates wrap")
+    if count >= _INT32_MAX:
+        raise ValueError("saturated legacy recurring two-agent step_count is ambiguous")
+    fields["step_words"] = jnp.asarray((0, count), dtype=jnp.uint32)
+    migrated = RecurringTwoAgentState(**fields)
+    world._require_state_contract(migrated)
+    if not bool(jax.device_get(world.state_is_valid(migrated))):
+        raise ValueError("legacy recurring two-agent state violates the v2 contract")
+    return migrated
+
+
+def save_recurring_two_agent_checkpoint(
+    world: RecurringTwoAgentWorld,
+    state: RecurringTwoAgentState,
+    path: str | Path,
+) -> None:
+    """Persist one valid exact-clock default-policy environment state."""
+    world._require_state_contract(state)
+    if not bool(jax.device_get(world.state_is_valid(state))):
+        raise ValueError("recurring two-agent checkpoint state is invalid")
+    save_checkpoint(
+        _recurring_checkpoint_storage_state(state),
+        path,
+        metadata={
+            "schema": RECURRING_TWO_AGENT_CHECKPOINT_SCHEMA,
+            "world_config": world.to_config(),
+            "memory_accounting": world.resource_budget.to_dict(),
+            "zero_sized_array_leaf_indices": _recurring_empty_leaf_indices(state),
+        },
+    )
+
+
+def load_recurring_two_agent_checkpoint(
+    path: str | Path,
+) -> tuple[RecurringTwoAgentWorld, RecurringTwoAgentState]:
+    """Restore only a strict v2 exact-clock environment checkpoint."""
+    metadata = load_checkpoint_metadata(path)
+    expected = {
+        "schema",
+        "world_config",
+        "memory_accounting",
+        "zero_sized_array_leaf_indices",
+    }
+    if set(metadata) != expected:
+        raise ValueError("recurring two-agent checkpoint metadata fields are invalid")
+    schema = metadata.get("schema")
+    if schema == _LEGACY_RECURRING_TWO_AGENT_CHECKPOINT_SCHEMA:
+        raise ValueError(
+            "legacy recurring two-agent checkpoint lacks exact step_words; "
+            "migrate its state and resave it"
+        )
+    if schema != RECURRING_TWO_AGENT_CHECKPOINT_SCHEMA:
+        raise ValueError("recurring two-agent checkpoint schema is unsupported")
+    raw_config = metadata.get("world_config")
+    if not isinstance(raw_config, Mapping):
+        raise ValueError("recurring two-agent checkpoint world_config is invalid")
+    world = RecurringTwoAgentWorld.from_config(raw_config)
+    template = world.init(jr.key(0))
+    expected_empty = _recurring_empty_leaf_indices(template)
+    if metadata.get("zero_sized_array_leaf_indices") != expected_empty:
+        raise ValueError("recurring two-agent empty-array manifest does not match")
+    restored, restored_metadata = load_checkpoint(
+        _recurring_checkpoint_storage_state(template), path
+    )
+    if restored_metadata != metadata:
+        raise ValueError("recurring two-agent checkpoint metadata changed between reads")
+    state = _restore_recurring_empty_arrays(
+        cast(RecurringTwoAgentState, restored), template
+    )
+    world._require_state_contract(state)
+    if not bool(jax.device_get(world.state_is_valid(state))):
+        raise ValueError("restored recurring two-agent state is invalid")
+    if world.resource_budget.to_dict() != metadata.get("memory_accounting"):
+        raise ValueError("recurring two-agent checkpoint resource contract does not match")
+    return world, state

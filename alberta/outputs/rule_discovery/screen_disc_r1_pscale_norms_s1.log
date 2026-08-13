@@ -1,0 +1,10 @@
+An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-08-03 18:13:01,004 INFO loading MNIST from data_home=/home/shaw/milady/alberta/outputs/step2_published_mnist_openml_cache
+2026-08-03 18:13:05,542 INFO running disc_r1_pscale_norms seed=1 for 60 tasks x 5000 steps (noise_mode=step)
+2026-08-03 18:13:25,690 INFO disc_r1_pscale_norms seed=1 task 10/60 online_acc=0.8554 elapsed=17.3s
+2026-08-03 18:13:41,841 INFO disc_r1_pscale_norms seed=1 task 20/60 online_acc=0.8666 elapsed=33.4s
+2026-08-03 18:13:58,003 INFO disc_r1_pscale_norms seed=1 task 30/60 online_acc=0.8738 elapsed=49.6s
+2026-08-03 18:14:12,925 INFO disc_r1_pscale_norms seed=1 task 40/60 online_acc=0.8616 elapsed=64.5s
+2026-08-03 18:14:27,721 INFO disc_r1_pscale_norms seed=1 task 50/60 online_acc=0.8754 elapsed=79.3s
+2026-08-03 18:14:42,167 INFO disc_r1_pscale_norms seed=1 task 60/60 online_acc=0.8570 elapsed=93.8s
+2026-08-03 18:14:42,211 INFO disc_r1_pscale_norms seed=1 done: avg online acc 0.8663 (wall 93.8s) -> outputs/ipmnist_screening/shards/disc_r1_pscale_norms_seed1.json

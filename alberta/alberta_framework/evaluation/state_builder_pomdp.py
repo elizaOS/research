@@ -6,11 +6,14 @@ Each continuing trial presents a binary cue once, followed by same-channel
 distractors, and finally a query.  A separate cue marker says when the state
 should be written; no reset is exposed between trials.
 
-Three representation arms share the same online normalized-LMS probe:
+Five representation arms share the same online normalized-LMS probe:
 
 * current observation only;
 * a fixed multi-timescale trace bank; and
-* the learnable gated recurrent builder with online sensitivity credit.
+* the learnable diagonal gated recurrent builder with online sensitivity
+  credit; and
+* the conventional dense full-GRU builder with exact fixed-parameter RTRL; and
+* the diagonal complex RTU builder with compressed exact fixed-parameter RTRL.
 
 Only query labels in the training prefix update either the probe or recurrent
 parameters.  The suffix is scored with both frozen.  Seeds are explicitly
@@ -41,8 +44,12 @@ from alberta_framework.core.state_builder import (
     FixedTraceStateBuilderConfig,
     IdentityStateBuilder,
     IdentityStateBuilderConfig,
+    LearnableGRUStateBuilder,
+    LearnableGRUStateBuilderConfig,
     OnlineGatedStateBuilder,
     OnlineGatedStateBuilderConfig,
+    RecurrentTraceUnitStateBuilder,
+    RecurrentTraceUnitStateBuilderConfig,
     StateBuilder,
 )
 
@@ -65,6 +72,11 @@ class StateBuilderPomdpConfig:
     recurrent_gradient_clip: float = 5.0
     recurrent_initial_gate_bias: float = -2.5
     recurrent_initialization_scale: float = 0.2
+    rtu_r_min: float = 0.2
+    rtu_r_max: float = 0.95
+    rtu_max_phase: float = 6.28
+    rtu_epsilon: float = 1.0e-8
+    rtu_taylor_correction: bool = False
 
     def __post_init__(self) -> None:
         if not self.development_seeds:
@@ -97,6 +109,18 @@ class StateBuilderPomdpConfig:
             or self.recurrent_initialization_scale <= 0.0
         ):
             raise ValueError("recurrent_initialization_scale must be finite and positive")
+        if (
+            not np.isfinite(self.rtu_r_min)
+            or not np.isfinite(self.rtu_r_max)
+            or not 0.0 <= self.rtu_r_min < self.rtu_r_max <= 1.0
+        ):
+            raise ValueError("rtu radii must satisfy 0 <= rtu_r_min < rtu_r_max <= 1")
+        if not np.isfinite(self.rtu_max_phase) or not 0.0 < self.rtu_max_phase <= 2.0 * np.pi:
+            raise ValueError("rtu_max_phase must lie in (0, 2*pi]")
+        if not np.isfinite(self.rtu_epsilon) or not 0.0 < self.rtu_epsilon < 1.0:
+            raise ValueError("rtu_epsilon must lie in (0, 1)")
+        if type(self.rtu_taylor_correction) is not bool:
+            raise ValueError("rtu_taylor_correction must be an exact bool")
 
     def to_config(self) -> dict[str, Any]:
         """Return a JSON-compatible diagnostic configuration."""
@@ -140,11 +164,13 @@ class StateBuilderPomdpResult:
     observation_only: StateBuilderPomdpArmResult
     fixed_trace: StateBuilderPomdpArmResult
     learned_gated: StateBuilderPomdpArmResult
+    learned_full_gru: StateBuilderPomdpArmResult
+    learned_rtu: StateBuilderPomdpArmResult
 
     def to_config(self) -> dict[str, Any]:
         """Return a JSON-compatible result payload."""
         return {
-            "schema": "alberta.state_builder_pomdp.development.v1",
+            "schema": "alberta.state_builder_pomdp.development.v3",
             "evidence_scope": "development_only",
             "accepted_scientific_evidence": False,
             "config": self.config.to_config(),
@@ -152,6 +178,8 @@ class StateBuilderPomdpResult:
                 "observation_only": self.observation_only.to_config(),
                 "fixed_trace": self.fixed_trace.to_config(),
                 "learned_gated": self.learned_gated.to_config(),
+                "learned_full_gru": self.learned_full_gru.to_config(),
+                "learned_rtu": self.learned_rtu.to_config(),
             },
             "limitations": [
                 "development seeds only; no held-out evaluation",
@@ -159,6 +187,9 @@ class StateBuilderPomdpResult:
                 "one hand-designed cue marker and one fixed delay",
                 "no non-stationarity, retention recurrence, or feature recycling",
                 "arms have unequal representation and persistent-state budgets",
+                "full-GRU RTRL carry after online parameter updates is approximate",
+                "RTU RTRL carry is exact only for fixed recurrent parameters; the "
+                "default moving-parameter carry is approximate",
                 "environment and learned-initialization seeds are paired one-to-one",
             ],
         }
@@ -336,7 +367,7 @@ def _summarize_arm(
 def run_development_state_builder_pomdp(
     config: StateBuilderPomdpConfig | None = None,
 ) -> StateBuilderPomdpResult:
-    """Run the three-arm deterministic diagnostic on development seeds only."""
+    """Run the five-arm deterministic diagnostic on development seeds only."""
     cfg = config or StateBuilderPomdpConfig()
     builders: tuple[tuple[str, StateBuilder[Any]], ...] = (
         (
@@ -367,6 +398,37 @@ def run_development_state_builder_pomdp(
                 )
             ),
         ),
+        (
+            "learned_full_gru",
+            LearnableGRUStateBuilder(
+                LearnableGRUStateBuilderConfig(
+                    observation_dim=3,
+                    hidden_dim=cfg.recurrent_hidden_dim,
+                    step_size=cfg.recurrent_step_size,
+                    gradient_clip=cfg.recurrent_gradient_clip,
+                    initial_update_bias=-cfg.recurrent_initial_gate_bias,
+                    initial_reset_bias=0.0,
+                    initialization_scale=cfg.recurrent_initialization_scale,
+                )
+            ),
+        ),
+        (
+            "learned_rtu",
+            RecurrentTraceUnitStateBuilder(
+                RecurrentTraceUnitStateBuilderConfig(
+                    observation_dim=3,
+                    hidden_dim=cfg.recurrent_hidden_dim,
+                    step_size=cfg.recurrent_step_size,
+                    gradient_clip=cfg.recurrent_gradient_clip,
+                    r_min=cfg.rtu_r_min,
+                    r_max=cfg.rtu_r_max,
+                    max_phase=cfg.rtu_max_phase,
+                    rtu_epsilon=cfg.rtu_epsilon,
+                    include_raw_observation=True,
+                    rtrl_taylor_correction=cfg.rtu_taylor_correction,
+                )
+            ),
+        ),
     )
 
     summaries: dict[str, StateBuilderPomdpArmResult] = {}
@@ -390,6 +452,8 @@ def run_development_state_builder_pomdp(
         observation_only=summaries["observation_only"],
         fixed_trace=summaries["fixed_trace"],
         learned_gated=summaries["learned_gated"],
+        learned_full_gru=summaries["learned_full_gru"],
+        learned_rtu=summaries["learned_rtu"],
     )
 
 

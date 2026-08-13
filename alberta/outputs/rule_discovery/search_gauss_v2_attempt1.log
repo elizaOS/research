@@ -1,0 +1,2 @@
+An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+2026-08-03 22:12:12,068 INFO rule-discovery search: 1024 initial candidates (19 seeded), tasks=['G1', 'G3'] seeds=[0]

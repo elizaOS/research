@@ -83,6 +83,21 @@ def _unwrap_prng_keys(tree: object) -> object:
     return jax.tree_util.tree_map(unwrap, tree)
 
 
+def _at_exact_step(
+    state: HiddenPartnerWorldFeedbackState,
+    step: int,
+) -> HiddenPartnerWorldFeedbackState:
+    """Move a fixture to one coherent exact non-negative lifetime."""
+
+    return state.replace(
+        step_count=jnp.asarray(min(step, 2**31 - 1), dtype=jnp.int32),
+        step_words=jnp.asarray((step >> 32, step & (2**32 - 1)), dtype=jnp.uint32),
+        previous_outcome=jnp.asarray(0.0 if step == 0 else 1.0, dtype=jnp.float32),
+        previous_partner_action=jnp.asarray(0 if step == 0 else 1, dtype=jnp.int32),
+        has_partner_history=jnp.asarray(step > 0, dtype=jnp.bool_),
+    )
+
+
 def test_default_contract_roundtrip_and_same_shape_observation() -> None:
     config = HiddenPartnerWorldFeedbackConfig()
     world = HiddenPartnerWorldFeedbackWorld(config)
@@ -200,7 +215,7 @@ def test_seeded_initial_state_is_bounded_task_oracle_free_and_exactly_accounted(
     assert budget.trainable_scalars == 0
     assert budget.replay_capacity == 0
     assert budget.state_nbytes == _tree_nbytes(state)
-    assert budget.state_nbytes == 149
+    assert budget.state_nbytes == 157
 
 
 def test_contextual_reward_depends_on_world_state_after_conditioning_joint_action() -> None:
@@ -420,7 +435,7 @@ def test_same_current_observation_can_require_opposite_actions_due_to_recurrent_
     # observation are reachable; the learner's own prior focal action disambiguates
     # their noisy feedback histories.
     world = HiddenPartnerWorldFeedbackWorld(_small_config(cue_flip_probability=0.5))
-    base = world.init(jr.key(9)).replace(
+    base = _at_exact_step(world.init(jr.key(9)), 1).replace(
         current_signals=jnp.asarray((1.0, 1.0, 1.0), dtype=jnp.float32),
         current_cues=jnp.asarray((1.0, -1.0), dtype=jnp.float32),
         previous_outcome=jnp.asarray(1.0, dtype=jnp.float32),
@@ -490,13 +505,12 @@ def test_partner_regime_formulas_preserve_c_and_d_feature_questions(
     expected_partner_sign: float,
 ) -> None:
     world = HiddenPartnerWorldFeedbackWorld(_small_config(lengths=(2,) * 9))
-    state = world.init(jr.key(10)).replace(
+    state = _at_exact_step(world.init(jr.key(10)), 18 + (2 * segment_index)).replace(
         current_signals=jnp.asarray((1.0, 1.0, -1.0), dtype=jnp.float32),
         previous_partner_action=jnp.asarray(-1, dtype=jnp.int32),
         previous_outcome=jnp.asarray(1.0, dtype=jnp.float32),
         has_partner_history=jnp.asarray(True, dtype=jnp.bool_),
         world_sign=jnp.asarray(1.0, dtype=jnp.float32),
-        step_count=jnp.asarray(2 * segment_index, dtype=jnp.int32),
     )
     transition, _ = world.step(state, jnp.asarray(POSITIVE_ACTION, dtype=jnp.int32))
 
@@ -518,8 +532,8 @@ def test_hidden_schedule_and_world_state_do_not_leak_or_reset_at_cycle_boundary(
         world_sign=jnp.asarray(-1.0, dtype=jnp.float32),
         current_cues=jnp.asarray((-1.0, -1.0), dtype=jnp.float32),
     )
-    hidden_a = state.replace(step_count=jnp.asarray(0, dtype=jnp.int32))
-    hidden_b = state.replace(step_count=jnp.asarray(2, dtype=jnp.int32))
+    hidden_a = _at_exact_step(state, 18)
+    hidden_b = _at_exact_step(state, 2)
     chex.assert_trees_all_equal(world.observe(hidden_a), world.observe(hidden_b))
 
     cycle_length = sum(lengths)
@@ -627,8 +641,11 @@ def test_action_static_contract_and_dynamic_invalidity_are_explicit() -> None:
     with pytest.raises(TypeError, match="integer"):
         world.step(state, jnp.asarray(POSITIVE_ACTION, dtype=jnp.float32))
     transition, next_state = world.step(state, jnp.asarray(7, dtype=jnp.int32))
-    assert bool(jnp.isnan(transition.reward))
-    assert bool(jnp.isnan(transition.outcome))
+    assert float(transition.reward) == 0.0
+    assert float(transition.outcome) == 0.0
+    assert float(transition.discount) == 0.0
+    assert not bool(transition.terminated)
+    assert int(transition.focal_action) == -1
     chex.assert_trees_all_equal(
         _unwrap_prng_keys(next_state),
         _unwrap_prng_keys(state),

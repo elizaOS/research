@@ -20,28 +20,63 @@ Reference: Sutton et al. 2011, "Horde: A Scalable Real-time Architecture
 for Learning Knowledge from Unsupervised Sensorimotor Interaction"
 """
 
+import dataclasses
 import functools
 import time
+from collections.abc import Mapping
 from typing import Any, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float, UInt
 
 from alberta_framework.core.multi_head_learner import (
+    MULTI_HEAD_MLP_STATE_SCHEMA,
     AnyOptimizer,
     MultiHeadMLPLearner,
     MultiHeadMLPState,
+    migrate_legacy_multi_head_mlp_state,
 )
 from alberta_framework.core.normalizers import (
     EMANormalizerState,
     Normalizer,
     WelfordNormalizerState,
+    _checked_lifetime_words_increment,
+    _lifetime_counter_valid,
+    _saturating_int32_counter_increment,
 )
 from alberta_framework.core.optimizers import Bounder
 from alberta_framework.core.types import HordeSpec, TraceMode
+
+MIXED_HORDE_STATE_SCHEMA = "alberta.mixed-horde-state.v2"
+MIXED_HORDE_LIFETIME_COUNTER_NBYTES = 12
+MIXED_HORDE_LIFETIME_COUNTER_DELTA_NBYTES = 8
+
+
+def _tree_arrays_finite(tree: Any) -> Bool[Array, ""]:
+    """Return whether every floating/complex persistent array is finite."""
+
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for leaf in jax.tree.leaves(tree):
+        if isinstance(leaf, Array) and jnp.issubdtype(leaf.dtype, jnp.inexact):
+            valid = valid & jnp.all(jnp.isfinite(leaf))
+    return valid
+
+
+def _transition_source_valid(
+    observation: Array,
+    cumulants: Array,
+    next_observation: Array,
+) -> Bool[Array, ""]:
+    """Validate one transition while retaining NaN-as-inactive cumulants."""
+
+    observations_valid = jnp.all(jnp.isfinite(observation)) & jnp.all(
+        jnp.isfinite(next_observation)
+    )
+    cumulants_valid = jnp.all(jnp.isfinite(cumulants) | jnp.isnan(cumulants))
+    return observations_valid & cumulants_valid
 
 # =============================================================================
 # Types
@@ -63,14 +98,50 @@ class HordeUpdateResult:
             Columns: ``[squared_error, raw_error, mean_step_size]``.
             NaN for inactive demons.
         trunk_bounding_metric: Scalar trunk bounding metric
+        pre_step_words: Exact child lifetime identity before the transaction.
+            ``None`` for Horde implementations without the shared child clock.
+        post_step_words: Exact child lifetime identity after the transaction.
+            ``None`` for Horde implementations without the shared child clock.
+        lifetime_counter_valid: Whether the child and nested counters were
+            structurally valid and aligned before the transaction.
+        lifetime_capacity_available: Whether every exact child clock had room.
+        normalizer_counter_aligned: Whether the configured normalizer clock
+            matched the learner clock.
+        normalizer_estimator_capacity_available: Whether the configured
+            estimator could honestly accept another sample.
+        child_counters_aligned: Whether every exact child clock was aligned
+            with its wrapper before the transaction.
+        source_valid: Whether the transition inputs were finite, except for
+            the documented NaN-as-inactive cumulant sentinel.
+        candidate_valid: Whether every persistent floating candidate array
+            was finite and every exact child clock reached the proposed word.
+        state_valid: Whether the supplied persistent state arrays and static
+            route structure were valid before candidate construction.
+        update_applied: Whether the complete child transaction committed.
+
+        The transaction fields remain optional for compatibility with older
+        third-party Horde implementations.  The shared, independent, and mixed
+        implementations in this package populate the fields they can support;
+        the exact-clock wrappers populate every field.
     """
 
-    state: MultiHeadMLPState
+    state: Any
     predictions: Float[Array, " n_demons"]
     td_errors: Float[Array, " n_demons"]
     td_targets: Float[Array, " n_demons"]
     per_demon_metrics: Float[Array, "n_demons 3"]
     trunk_bounding_metric: Float[Array, ""]
+    pre_step_words: UInt[Array, " 2"] | None = None
+    post_step_words: UInt[Array, " 2"] | None = None
+    lifetime_counter_valid: Bool[Array, ""] | None = None
+    lifetime_capacity_available: Bool[Array, ""] | None = None
+    normalizer_counter_aligned: Bool[Array, ""] | None = None
+    normalizer_estimator_capacity_available: Bool[Array, ""] | None = None
+    child_counters_aligned: Bool[Array, ""] | None = None
+    source_valid: Bool[Array, ""] | None = None
+    candidate_valid: Bool[Array, ""] | None = None
+    state_valid: Bool[Array, ""] | None = None
+    update_applied: Bool[Array, ""] | None = None
 
 
 @chex.dataclass(frozen=True)
@@ -107,11 +178,18 @@ class BatchedHordeResult:
 
 @chex.dataclass(frozen=True)
 class MixedHordeState:
-    """State for a mixed shared/independent Horde."""
+    """State for a mixed shared/independent Horde.
+
+    ``step_count`` is saturating int32 compatibility telemetry.  The exact
+    finite lifetime identity is the big-endian uint32 pair ``step_words``.
+    Every configured route owns the same exact event identity; a mixed update
+    commits only if all route candidates reach the next identity together.
+    """
 
     shared_state: MultiHeadMLPState | None
     independent_state: Any | None
     step_count: Array = None  # type: ignore[assignment]
+    step_words: UInt[Array, " 2"] = None  # type: ignore[assignment]
     birth_timestamp: float = 0.0
     uptime_s: float = 0.0
 
@@ -275,6 +353,9 @@ class HordeLearner:
 
         config = dict(config)
         config.pop("type", None)
+        state_schema = config.pop("state_schema", MULTI_HEAD_MLP_STATE_SCHEMA)
+        if state_schema != MULTI_HEAD_MLP_STATE_SCHEMA:
+            raise ValueError(f"unsupported Horde state schema: {state_schema!r}")
 
         horde_spec = HordeSpec.from_config(config.pop("horde_spec"))
         optimizer = optimizer_from_config(config.pop("optimizer"))
@@ -376,6 +457,15 @@ class HordeLearner:
             td_targets=targets,
             per_demon_metrics=result.per_head_metrics,
             trunk_bounding_metric=result.trunk_bounding_metric,
+            pre_step_words=result.pre_step_words,
+            post_step_words=result.post_step_words,
+            lifetime_counter_valid=result.lifetime_counter_valid,
+            lifetime_capacity_available=result.lifetime_capacity_available,
+            normalizer_counter_aligned=result.normalizer_counter_aligned,
+            normalizer_estimator_capacity_available=(
+                result.normalizer_estimator_capacity_available
+            ),
+            update_applied=result.update_applied,
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -418,6 +508,15 @@ class HordeLearner:
             td_targets=targets,
             per_demon_metrics=result.per_head_metrics,
             trunk_bounding_metric=result.trunk_bounding_metric,
+            pre_step_words=result.pre_step_words,
+            post_step_words=result.post_step_words,
+            lifetime_counter_valid=result.lifetime_counter_valid,
+            lifetime_capacity_available=result.lifetime_capacity_available,
+            normalizer_counter_aligned=result.normalizer_counter_aligned,
+            normalizer_estimator_capacity_available=(
+                result.normalizer_estimator_capacity_available
+            ),
+            update_applied=result.update_applied,
         )
 
 
@@ -545,6 +644,7 @@ class MixedHorde:
         """Serialize learner configuration to dict."""
         return {
             "type": "MixedHorde",
+            "state_schema": MIXED_HORDE_STATE_SCHEMA,
             "horde_spec": self._horde_spec.to_config(),
             "hidden_sizes": list(self._hidden_sizes),
             "optimizer": (
@@ -579,6 +679,9 @@ class MixedHorde:
 
         config = dict(config)
         config.pop("type", None)
+        state_schema = config.pop("state_schema", MIXED_HORDE_STATE_SCHEMA)
+        if state_schema != MIXED_HORDE_STATE_SCHEMA:
+            raise ValueError(f"Unsupported mixed Horde state schema: {state_schema!r}")
         horde_spec = HordeSpec.from_config(config.pop("horde_spec"))
         opt_cfg = config.pop("optimizer", None)
         optimizer = optimizer_from_config(opt_cfg) if opt_cfg is not None else None
@@ -627,6 +730,7 @@ class MixedHorde:
             shared_state=shared_state,
             independent_state=independent_state,
             step_count=jnp.array(0, dtype=jnp.int32),
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
             birth_timestamp=time.time(),
             uptime_s=0.0,
         )
@@ -635,7 +739,7 @@ class MixedHorde:
         """Compute predictions in original demon order."""
         preds = jnp.full((self.n_demons,), jnp.nan, dtype=jnp.float32)
         if self._shared_horde is not None:
-            shared_state = cast(MultiHeadMLPState, state.shared_state)
+            shared_state = state.shared_state
             shared_preds = self._shared_horde.predict(shared_state, observation)
             preds = preds.at[jnp.asarray(self._shared_indices, dtype=jnp.int32)].set(
                 shared_preds
@@ -649,6 +753,7 @@ class MixedHorde:
             ].set(independent_preds)
         return preds
 
+    @functools.partial(jax.jit, static_argnums=(0,))
     def update(
         self,
         state: MixedHordeState,
@@ -656,24 +761,84 @@ class MixedHorde:
         cumulants: Array,
         next_observation: Array,
     ) -> HordeUpdateResult:
-        """Update routed demons and return outputs in original demon order."""
+        """Atomically update every route and return original demon ordering.
+
+        Shared and independent route candidates are computed from the same
+        pre-state, then committed as one transaction.  A malformed/exhausted
+        wrapper, a misaligned child clock, an invalid source, a refused child,
+        or a non-finite candidate leaves the complete mixed state unchanged.
+        """
+        if getattr(observation, "shape", None) != getattr(
+            next_observation, "shape", None
+        ):
+            raise ValueError("observation and next_observation shapes must match")
+        if getattr(cumulants, "shape", None) != (self.n_demons,):
+            raise ValueError(f"cumulants must have shape ({self.n_demons},)")
+
+        outer_valid = _lifetime_counter_valid(state.step_words, state.step_count)
+        proposed_words, outer_capacity = _checked_lifetime_words_increment(
+            state.step_words
+        )
+        source_valid = _transition_source_valid(
+            observation,
+            cumulants,
+            next_observation,
+        )
+        state_valid = _tree_arrays_finite(state)
+
         predictions = jnp.full((self.n_demons,), jnp.nan, dtype=jnp.float32)
         td_errors = jnp.full((self.n_demons,), jnp.nan, dtype=jnp.float32)
         td_targets = jnp.full((self.n_demons,), jnp.nan, dtype=jnp.float32)
         per_demon_metrics = jnp.full((self.n_demons, 3), jnp.nan, dtype=jnp.float32)
         trunk_bounding_metric = jnp.array(1.0, dtype=jnp.float32)
-        new_shared_state = state.shared_state
-        new_independent_state = state.independent_state
+        candidate_shared_state = state.shared_state
+        candidate_independent_state = state.independent_state
+        children_pre_aligned = jnp.asarray(True, dtype=jnp.bool_)
+        children_post_aligned = jnp.asarray(True, dtype=jnp.bool_)
+        child_counter_valid = jnp.asarray(True, dtype=jnp.bool_)
+        child_capacity = jnp.asarray(True, dtype=jnp.bool_)
+        normalizer_aligned = jnp.asarray(True, dtype=jnp.bool_)
+        estimator_capacity = jnp.asarray(True, dtype=jnp.bool_)
+        children_applied = jnp.asarray(True, dtype=jnp.bool_)
 
         if self._shared_horde is not None:
+            if state.shared_state is None:
+                raise ValueError("mixed Horde shared route state is missing")
             idx = jnp.asarray(self._shared_indices, dtype=jnp.int32)
+            shared_state = state.shared_state
+            children_pre_aligned = children_pre_aligned & jnp.all(
+                shared_state.step_words == state.step_words
+            )
             shared_result = self._shared_horde.update(
-                cast(MultiHeadMLPState, state.shared_state),
+                shared_state,
                 observation,
                 cumulants[idx],
                 next_observation,
             )
-            new_shared_state = shared_result.state
+            candidate_shared_state = cast(MultiHeadMLPState, shared_result.state)
+            children_post_aligned = children_post_aligned & jnp.all(
+                candidate_shared_state.step_words == proposed_words
+            )
+            child_counter_valid = child_counter_valid & jnp.asarray(
+                shared_result.lifetime_counter_valid,
+                dtype=jnp.bool_,
+            )
+            child_capacity = child_capacity & jnp.asarray(
+                shared_result.lifetime_capacity_available,
+                dtype=jnp.bool_,
+            )
+            normalizer_aligned = normalizer_aligned & jnp.asarray(
+                shared_result.normalizer_counter_aligned,
+                dtype=jnp.bool_,
+            )
+            estimator_capacity = estimator_capacity & jnp.asarray(
+                shared_result.normalizer_estimator_capacity_available,
+                dtype=jnp.bool_,
+            )
+            children_applied = children_applied & jnp.asarray(
+                shared_result.update_applied,
+                dtype=jnp.bool_,
+            )
             predictions = predictions.at[idx].set(shared_result.predictions)
             td_errors = td_errors.at[idx].set(shared_result.td_errors)
             td_targets = td_targets.at[idx].set(shared_result.td_targets)
@@ -683,14 +848,43 @@ class MixedHorde:
             trunk_bounding_metric = shared_result.trunk_bounding_metric
 
         if self._independent_horde is not None:
+            if state.independent_state is None:
+                raise ValueError("mixed Horde independent route state is missing")
             idx = jnp.asarray(self._independent_indices, dtype=jnp.int32)
+            independent_state = state.independent_state
+            children_pre_aligned = children_pre_aligned & jnp.all(
+                independent_state.step_words == state.step_words
+            )
             independent_result = self._independent_horde.update(
-                state.independent_state,
+                independent_state,
                 observation,
                 cumulants[idx],
                 next_observation,
             )
-            new_independent_state = independent_result.state
+            candidate_independent_state = independent_result.state
+            children_post_aligned = children_post_aligned & jnp.all(
+                candidate_independent_state.step_words == proposed_words
+            )
+            child_counter_valid = child_counter_valid & jnp.asarray(
+                independent_result.lifetime_counter_valid,
+                dtype=jnp.bool_,
+            )
+            child_capacity = child_capacity & jnp.asarray(
+                independent_result.lifetime_capacity_available,
+                dtype=jnp.bool_,
+            )
+            normalizer_aligned = normalizer_aligned & jnp.asarray(
+                independent_result.normalizer_counter_aligned,
+                dtype=jnp.bool_,
+            )
+            estimator_capacity = estimator_capacity & jnp.asarray(
+                independent_result.normalizer_estimator_capacity_available,
+                dtype=jnp.bool_,
+            )
+            children_applied = children_applied & jnp.asarray(
+                independent_result.update_applied,
+                dtype=jnp.bool_,
+            )
             predictions = predictions.at[idx].set(independent_result.predictions)
             td_errors = td_errors.at[idx].set(independent_result.td_errors)
             td_targets = td_targets.at[idx].set(independent_result.td_targets)
@@ -698,12 +892,46 @@ class MixedHorde:
                 independent_result.per_demon_metrics
             )
 
-        new_state = MixedHordeState(
-            shared_state=new_shared_state,
-            independent_state=new_independent_state,
-            step_count=state.step_count + 1,
+        candidate_state = MixedHordeState(
+            shared_state=candidate_shared_state,
+            independent_state=candidate_independent_state,
+            step_count=_saturating_int32_counter_increment(state.step_count),
+            step_words=proposed_words,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
+        )
+        candidate_finite = _tree_arrays_finite(candidate_state)
+        active_mask = ~jnp.isnan(cumulants)
+        reported_values_valid = (
+            jnp.all(jnp.isfinite(predictions))
+            & jnp.all((~active_mask) | jnp.isfinite(td_errors))
+            & jnp.all((~active_mask) | jnp.isfinite(td_targets))
+            & jnp.all(
+                (~active_mask[:, None]) | jnp.isfinite(per_demon_metrics)
+            )
+            & jnp.isfinite(trunk_bounding_metric)
+        )
+        candidate_valid = (
+            children_post_aligned & candidate_finite & reported_values_valid
+        )
+        update_applied = (
+            outer_valid
+            & outer_capacity
+            & source_valid
+            & state_valid
+            & children_pre_aligned
+            & child_counter_valid
+            & child_capacity
+            & normalizer_aligned
+            & estimator_capacity
+            & children_applied
+            & candidate_valid
+        )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda _: candidate_state,
+            lambda _: state,
+            operand=None,
         )
         return HordeUpdateResult(
             state=new_state,
@@ -712,7 +940,154 @@ class MixedHorde:
             td_targets=td_targets,
             per_demon_metrics=per_demon_metrics,
             trunk_bounding_metric=trunk_bounding_metric,
+            pre_step_words=state.step_words,
+            post_step_words=new_state.step_words,
+            lifetime_counter_valid=outer_valid & child_counter_valid,
+            lifetime_capacity_available=outer_capacity & child_capacity,
+            normalizer_counter_aligned=normalizer_aligned,
+            normalizer_estimator_capacity_available=estimator_capacity,
+            child_counters_aligned=children_pre_aligned,
+            source_valid=source_valid,
+            candidate_valid=candidate_valid,
+            state_valid=state_valid,
+            update_applied=update_applied,
         )
+
+
+def measure_mixed_horde_state_nbytes(state: MixedHordeState) -> int:
+    """Measure persistent JAX-array bytes for one concrete mixed state."""
+
+    def measure(value: Any) -> int:
+        if isinstance(value, Array):
+            return int(value.size) * int(value.dtype.itemsize)
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return sum(
+                measure(getattr(value, field.name))
+                for field in dataclasses.fields(value)
+                if field.name not in {"birth_timestamp", "uptime_s"}
+            )
+        if isinstance(value, Mapping):
+            return sum(measure(item) for item in value.values())
+        if isinstance(value, (tuple, list)):
+            return sum(measure(item) for item in value)
+        return 0
+
+    return measure(state)
+
+
+def mixed_horde_lifetime_counter_nbytes() -> int:
+    """Return bytes owned by the mixed wrapper's exact lifetime identity."""
+
+    return MIXED_HORDE_LIFETIME_COUNTER_NBYTES
+
+
+def _host_state_mapping(state: Any, *, label: str) -> dict[str, Any]:
+    """Return an exact shallow host mapping for migration."""
+
+    if isinstance(state, Mapping):
+        return dict(state)
+    if dataclasses.is_dataclass(state) and not isinstance(state, type):
+        return {
+            field.name: getattr(state, field.name)
+            for field in dataclasses.fields(state)
+        }
+    raise TypeError(f"legacy {label} state must be a mapping or dataclass")
+
+
+def _legacy_unsaturated_step(fields: Mapping[str, Any], *, label: str) -> int:
+    """Authenticate the only unambiguous region of one legacy int32 clock."""
+
+    step_array = jnp.asarray(fields["step_count"])
+    if step_array.shape != () or step_array.dtype != jnp.dtype(jnp.int32):
+        raise TypeError(f"legacy {label} step_count must be scalar int32")
+    step = int(step_array)
+    if step < 0:
+        raise ValueError(f"negative legacy {label} step_count indicates wrap")
+    if step >= 2**31 - 1:
+        raise ValueError(f"saturated legacy {label} step_count is ambiguous")
+    return step
+
+
+def _coerce_or_migrate_multi_head_state(state: Any) -> MultiHeadMLPState:
+    fields = _host_state_mapping(state, label="shared Horde child")
+    current_names = {
+        field.name
+        for field in dataclasses.fields(cast(Any, MultiHeadMLPState))
+    }
+    if set(fields) == current_names:
+        return MultiHeadMLPState(**fields)
+    return migrate_legacy_multi_head_mlp_state(fields)
+
+
+def migrate_legacy_mixed_horde_state(legacy_state: Any) -> MixedHordeState:
+    """Migrate an exact pre-v2 mixed wrapper without guessing wrapped clocks.
+
+    Only non-negative, unsaturated legacy wrapper clocks are authenticable.
+    Every present route must migrate to the same event identity; otherwise the
+    historical state could already contain a partial mixed transaction and is
+    rejected fail closed.
+    """
+
+    from alberta_framework.core.independent_demon_horde import (
+        IndependentDemonHordeState,
+        migrate_legacy_independent_demon_horde_state,
+    )
+
+    fields = _host_state_mapping(legacy_state, label="mixed Horde")
+    current_names = {
+        field.name for field in dataclasses.fields(cast(Any, MixedHordeState))
+    }
+    legacy_names = current_names - {"step_words"}
+    supplied_names = set(fields)
+    if supplied_names != legacy_names:
+        missing = sorted(legacy_names - supplied_names)
+        extra = sorted(supplied_names - legacy_names)
+        raise ValueError(
+            "legacy mixed Horde field manifest is not exact; "
+            f"missing={missing}, extra={extra}"
+        )
+    step = _legacy_unsaturated_step(fields, label="mixed Horde")
+    expected_words = jnp.asarray((0, step), dtype=jnp.uint32)
+
+    shared = fields["shared_state"]
+    independent = fields["independent_state"]
+    if shared is None and independent is None:
+        raise ValueError("legacy mixed Horde must contain at least one route")
+    if shared is not None:
+        shared = _coerce_or_migrate_multi_head_state(shared)
+        if not bool(jnp.all(shared.step_words == expected_words)):
+            raise ValueError("legacy mixed/shared route clocks are not aligned")
+        if not bool(_lifetime_counter_valid(shared.step_words, shared.step_count)):
+            raise ValueError("migrated shared route lifetime counter is invalid")
+        fields["shared_state"] = shared
+    if independent is not None:
+        independent_fields = _host_state_mapping(
+            independent,
+            label="independent Horde child",
+        )
+        independent_current_names = {
+            field.name
+            for field in dataclasses.fields(cast(Any, IndependentDemonHordeState))
+        }
+        if set(independent_fields) == independent_current_names:
+            independent = IndependentDemonHordeState(**independent_fields)
+        else:
+            independent = migrate_legacy_independent_demon_horde_state(
+                independent_fields
+            )
+        if not bool(jnp.all(independent.step_words == expected_words)):
+            raise ValueError("legacy mixed/independent route clocks are not aligned")
+        if not bool(
+            _lifetime_counter_valid(
+                independent.step_words,
+                independent.step_count,
+            )
+        ):
+            raise ValueError("migrated independent route lifetime counter is invalid")
+        fields["independent_state"] = independent
+
+    fields["step_words"] = expected_words
+    return MixedHordeState(**fields)
 
 
 # =============================================================================

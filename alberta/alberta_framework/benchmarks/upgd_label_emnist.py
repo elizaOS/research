@@ -117,6 +117,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
 )
 from alberta_framework.benchmarks.upgd_ipmnist import (
     _LEARNER_FACTORIES,
+    IPMNISTConfig,
     LearnerInitFn,
     init_mlp_params,
     task_index_for_step,
@@ -498,11 +499,12 @@ def run_label_emnist(
     if not seed_tuple:
         raise ValueError("at least one seed is required")
     seeds_array = jnp.asarray(seed_tuple, dtype=jnp.uint32)
+    initialization_config = IPMNISTConfig(**config.to_config())
 
     def init_seed(seed: Array) -> tuple[dict[str, Array], Any, LabelEMNISTSchedule, Array]:
         root = jr.key(seed)
         key_init, key_schedule, key_noise = jr.split(root, 3)
-        params = init_mlp_params(key_init, config)
+        params = init_mlp_params(key_init, initialization_config)
         return params, init_fn(params), build_schedule(key_schedule, config, n_train), key_noise
 
     params, opt_state, schedules, noise_keys = jax.jit(jax.vmap(init_seed))(seeds_array)
@@ -642,13 +644,13 @@ def load_emnist_balanced_train(
     if x_path.is_file() and y_path.is_file() and meta_path.is_file():
         x = np.load(x_path)
         y = np.load(y_path)
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        cached_meta = json.loads(meta_path.read_text(encoding="utf-8"))
         if (
-            materialized_array_sha256(x) != meta["x_sha256"]
-            or materialized_array_sha256(y) != meta["y_sha256"]
+            materialized_array_sha256(x) != cached_meta["x_sha256"]
+            or materialized_array_sha256(y) != cached_meta["y_sha256"]
         ):
             raise RuntimeError(f"EMNIST npy cache under {home} does not match its pinned digests")
-        return x, y, dict(meta)
+        return x, y, dict(cached_meta)
 
     try:
         from sklearn.datasets import fetch_openml  # type: ignore[import-untyped]

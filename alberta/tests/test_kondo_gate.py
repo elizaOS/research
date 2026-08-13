@@ -15,9 +15,11 @@ import pytest
 import alberta_framework as alberta
 import alberta_framework.core as core
 from alberta_framework.core.kondo_gate import (
+    KONDO_GATE_LEGACY_V1_SCHEMA,
     KONDO_GATE_SCHEMA,
     KondoGate,
     KondoGateConfig,
+    KondoGateResult,
     KondoGateState,
 )
 
@@ -57,6 +59,25 @@ def _assert_tree_equal(left: object, right: object) -> None:
         np.testing.assert_array_equal(lhs_array, rhs_array)
 
 
+def _legacy_v1_config(config: KondoGateConfig) -> dict[str, object]:
+    payload = config.to_config()
+    payload["schema"] = KONDO_GATE_LEGACY_V1_SCHEMA
+    payload.pop("backward_admission_intent_semantics")
+    payload["sparks_joy_semantics"] = "selected-for-backward-pass"
+    return payload
+
+
+def _legacy_v1_checkpoint(payload: dict[str, object]) -> dict[str, object]:
+    legacy = copy.deepcopy(payload)
+    legacy["schema"] = KONDO_GATE_LEGACY_V1_SCHEMA
+    config = legacy["config"]
+    assert isinstance(config, dict)
+    config["schema"] = KONDO_GATE_LEGACY_V1_SCHEMA
+    config.pop("backward_admission_intent_semantics")
+    config["sparks_joy_semantics"] = "selected-for-backward-pass"
+    return legacy
+
+
 def test_config_names_the_paper_semantics_and_roundtrips_strictly() -> None:
     assert alberta.KondoGate is KondoGate
     assert core.KondoGate is KondoGate
@@ -65,7 +86,11 @@ def test_config_names_the_paper_semantics_and_roundtrips_strictly() -> None:
 
     assert payload["schema"] == KONDO_GATE_SCHEMA
     assert payload["delight_semantics"] == "advantage-times-action-surprisal"
-    assert payload["sparks_joy_semantics"] == "selected-for-backward-pass"
+    assert (
+        payload["backward_admission_intent_semantics"]
+        == "detached-forward-selection-not-backward-execution"
+    )
+    assert "sparks_joy_semantics" not in payload
     assert payload["generic_gradient_quality_audit"] is False
     assert payload["wall_clock_savings_claimed"] is False
     assert payload["backward_capacity"] == 3
@@ -89,13 +114,43 @@ def test_config_names_the_paper_semantics_and_roundtrips_strictly() -> None:
     with pytest.raises(ValueError, match="target_rate must be a float"):
         KondoGateConfig.from_config(malformed)
     malformed = dict(payload)
-    malformed["sparks_joy_semantics"] = "generic-gradient-quality"
-    with pytest.raises(ValueError, match="sparks_joy_semantics"):
+    malformed["backward_admission_intent_semantics"] = "executed-backward"
+    with pytest.raises(ValueError, match="backward_admission_intent_semantics"):
         KondoGateConfig.from_config(malformed)
     malformed = dict(payload)
     malformed["extra"] = 1
     with pytest.raises(ValueError, match="fields"):
         KondoGateConfig.from_config(malformed)
+
+
+def test_legitimate_v1_config_imports_strictly_and_normalizes_to_v2() -> None:
+    config = KondoGateConfig(batch_size=10, target_rate=0.26)
+    legacy = _legacy_v1_config(config)
+
+    restored = KondoGateConfig.from_config(legacy)
+
+    assert restored == config
+    assert restored.to_config()["schema"] == KONDO_GATE_SCHEMA
+    assert "sparks_joy_semantics" not in restored.to_config()
+    assert KondoGate.from_config(legacy).to_config() == config.to_config()
+
+    malformed = dict(legacy)
+    malformed["sparks_joy_semantics"] = "executed-backward"
+    with pytest.raises(ValueError, match="legacy v1 sparks_joy_semantics"):
+        KondoGateConfig.from_config(malformed)
+    mixed = dict(legacy)
+    mixed["schema"] = KONDO_GATE_SCHEMA
+    with pytest.raises(ValueError, match="fields do not match v2"):
+        KondoGateConfig.from_config(mixed)
+    noncanonical_schema = dict(config.to_config())
+    noncanonical_schema["schema"] = np.str_(KONDO_GATE_SCHEMA)
+    with pytest.raises(ValueError, match="schema is invalid"):
+        KondoGateConfig.from_config(noncanonical_schema)
+
+
+def test_gate_sparks_joy_is_a_read_only_legacy_result_alias() -> None:
+    assert isinstance(KondoGateResult.sparks_joy, property)
+    assert KondoGateResult.sparks_joy.fset is None
 
 
 @pytest.mark.parametrize(
@@ -129,7 +184,7 @@ def test_config_rejects_unsafe_or_ambiguous_values(kwargs: dict[str, object]) ->
         KondoGateConfig(**values)  # type: ignore[arg-type]
 
 
-def test_top_k_delight_is_exact_and_sparks_joy_means_backward_selection() -> None:
+def test_top_k_delight_is_exact_and_gate_records_backward_admission_intent() -> None:
     gate = KondoGate(KondoGateConfig(batch_size=6, target_rate=0.5))
     state = gate.init(jr.key(9))
     advantage, log_probability, valid, forced = _arrays()
@@ -153,7 +208,11 @@ def test_top_k_delight_is_exact_and_sparks_joy_means_backward_selection() -> Non
         jnp.asarray([True, False, False, True, True, False]),
     )
     np.testing.assert_array_equal(result.selected_by_delight_gate, result.selected_mask)
-    np.testing.assert_array_equal(result.sparks_joy, result.selected_mask)
+    np.testing.assert_array_equal(
+        result.backward_admission_intent,
+        result.selected_mask,
+    )
+    np.testing.assert_array_equal(result.sparks_joy, result.backward_admission_intent)
     np.testing.assert_array_equal(result.selected_indices, jnp.asarray([3, 0, 4]))
     assert int(result.selected_count) == 3
     assert int(result.state.forward_slots_screened) == 6
@@ -163,6 +222,36 @@ def test_top_k_delight_is_exact_and_sparks_joy_means_backward_selection() -> Non
     assert not bool(result.full_shape_masked_backward_required)
     assert int(result.random_draw_count) == 0
     np.testing.assert_array_equal(jr.key_data(result.state.rng_key), jr.key_data(state.rng_key))
+
+
+def test_every_float_gate_diagnostic_is_detached_from_actor_inputs() -> None:
+    """The forward gate is control-plane data, never an actor-gradient path."""
+
+    gate = KondoGate(KondoGateConfig(batch_size=6, target_rate=0.5))
+    state = gate.init(jr.key(17))
+    advantage, log_probability, valid, forced = _arrays()
+
+    def diagnostic_sum(candidate_advantage: jax.Array, candidate_logp: jax.Array) -> jax.Array:
+        result = gate.screen(
+            state,
+            candidate_advantage,
+            candidate_logp,
+            valid,
+            forced,
+        )
+        return (
+            jnp.sum(result.delight)
+            + jnp.sum(result.action_surprisal)
+            + jnp.sum(result.gate_probability)
+            + result.effective_price
+        )
+
+    advantage_gradient, logp_gradient = jax.grad(
+        diagnostic_sum,
+        argnums=(0, 1),
+    )(advantage, log_probability)
+    np.testing.assert_array_equal(advantage_gradient, jnp.zeros_like(advantage))
+    np.testing.assert_array_equal(logp_gradient, jnp.zeros_like(log_probability))
 
 
 def test_padding_is_not_selected_and_ties_use_lowest_source_index() -> None:
@@ -871,6 +960,8 @@ def test_checkpoint_roundtrip_and_resource_accounting_are_strict() -> None:
     payload = gate.checkpoint_payload(result.state)
     restored_gate, restored_state = KondoGate.from_checkpoint_payload(payload)
 
+    assert payload["schema"] == KONDO_GATE_SCHEMA
+    assert "sparks_joy_semantics" not in payload["config"]  # type: ignore[operator]
     assert restored_gate.to_config() == gate.to_config()
     _assert_tree_equal(restored_state, result.state)
     resources = gate.resource_declaration(result.state)
@@ -898,3 +989,16 @@ def test_checkpoint_roundtrip_and_resource_accounting_are_strict() -> None:
     malformed["state"]["forward_slots_screened"] += 1  # type: ignore[index]
     with pytest.raises(ValueError, match="state is invalid"):
         KondoGate.from_checkpoint_payload(malformed)
+
+    legacy = _legacy_v1_checkpoint(payload)
+    legacy_gate, legacy_state = KondoGate.from_checkpoint_payload(legacy)
+    assert legacy_gate.to_config() == gate.to_config()
+    _assert_tree_equal(legacy_state, result.state)
+    normalized = legacy_gate.checkpoint_payload(legacy_state)
+    assert normalized["schema"] == KONDO_GATE_SCHEMA
+    assert "sparks_joy_semantics" not in normalized["config"]  # type: ignore[operator]
+
+    mixed = copy.deepcopy(legacy)
+    mixed["schema"] = KONDO_GATE_SCHEMA
+    with pytest.raises(ValueError, match="config schema does not match checkpoint"):
+        KondoGate.from_checkpoint_payload(mixed)

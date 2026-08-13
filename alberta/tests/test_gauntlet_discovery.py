@@ -136,6 +136,8 @@ from alberta_framework.streams.gauntlet import (
     run_gauntlet_batched,
 )
 
+pytestmark = [pytest.mark.development, pytest.mark.slow]
+
 DEVELOPMENT_SEEDS = tuple(range(8, 16))
 N_SEEDS = len(DEVELOPMENT_SEEDS)
 LEARNER_INIT_KEY = 123
@@ -514,8 +516,8 @@ class TestScaleRobustMechanism:
             + legacy_memory["candidate_reacquisition_required_bytes"]
         )
         assert added_probe_and_candidate_confirmation_bytes == 100 + 364 + 91 == 555
-        assert legacy_memory["persistent_array_bytes"] == 3_916 + 555 == 4_471
-        assert robust_memory["persistent_array_bytes"] == 4_471 + 464 == 4_935
+        assert legacy_memory["persistent_array_bytes"] == 3_916 + 555 + 12 == 4_483
+        assert robust_memory["persistent_array_bytes"] == 4_483 + 464 == 4_947
         assert (
             robust_memory["persistent_array_bytes"]
             == legacy_memory["persistent_array_bytes"] + robust_memory["normalizer_bytes"]

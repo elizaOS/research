@@ -121,12 +121,16 @@ def _prepared_state(desired_next_extended_action: int):
         option_baseline_mass=jnp.array(0.0, dtype=jnp.float32),
         option_discount=jnp.array(1.0, dtype=jnp.float32),
         option_steps=jnp.array(0, dtype=jnp.int32),
+        step_count=jnp.array(11, dtype=jnp.int32),
+        step_words=jnp.array([0, 11], dtype=jnp.uint32),
     )
     state = state.replace(
         stomp_state=stomp_state,
         execution_counts=jnp.array([7, 11], dtype=jnp.int32),
         cumulative_pseudo_rewards=jnp.array([2.0, 3.0], dtype=jnp.float32),
         utility_ema=jnp.array([0.2, 0.6], dtype=jnp.float32),
+        step_count=jnp.array(11, dtype=jnp.int32),
+        step_words=jnp.array([0, 11], dtype=jnp.uint32),
     )
     return agent, state
 

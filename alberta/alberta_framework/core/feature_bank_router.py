@@ -33,11 +33,15 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Bool, Int
+from jaxtyping import Bool, Int, UInt
 
-CONFIG_SCHEMA_VERSION = "alberta.feature_bank_router.config.v1"
+CONFIG_SCHEMA_VERSION = "alberta.feature_bank_router.config.v2"
+FEATURE_BANK_ROUTER_STATE_SCHEMA = "alberta.feature-bank-router-state.v2"
+FEATURE_BANK_ROUTER_LIFETIME_COUNTER_NBYTES = 24
+FEATURE_BANK_ROUTER_LIFETIME_COUNTER_DELTA_NBYTES = 16
 INACTIVE_DESCRIPTOR = (-1, -1)
 _INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -78,6 +82,7 @@ class FeatureBankRouterConfig:
         return {
             "type": "FeatureBankRouter",
             "schema_version": CONFIG_SCHEMA_VERSION,
+            "state_schema": FEATURE_BANK_ROUTER_STATE_SCHEMA,
             "base_dim": self.base_dim,
             "active_slots": self.active_slots,
         }
@@ -92,15 +97,18 @@ class FeatureBankRouterConfig:
         expected_keys = {
             "type",
             "schema_version",
+            "state_schema",
             "base_dim",
             "active_slots",
         }
         if set(config) != expected_keys:
-            raise ValueError("feature-bank router config keys do not match the v1 schema")
+            raise ValueError("feature-bank router config keys do not match the v2 schema")
         if config.get("type") != "FeatureBankRouter":
             raise ValueError("feature-bank router config type is invalid")
         if config.get("schema_version") != CONFIG_SCHEMA_VERSION:
             raise ValueError("feature-bank router config schema version is unsupported")
+        if config.get("state_schema") != FEATURE_BANK_ROUTER_STATE_SCHEMA:
+            raise ValueError("feature-bank router state schema is unsupported")
         return cls(
             base_dim=config["base_dim"],  # type: ignore[arg-type]
             active_slots=config["active_slots"],  # type: ignore[arg-type]
@@ -109,7 +117,13 @@ class FeatureBankRouterConfig:
 
 @functools.partial(
     jax.tree_util.register_dataclass,
-    data_fields=("descriptors", "route_count", "generation_count"),
+    data_fields=(
+        "descriptors",
+        "route_count",
+        "generation_count",
+        "route_words",
+        "generation_words",
+    ),
     meta_fields=(),
 )
 @dataclasses.dataclass(frozen=True)
@@ -119,6 +133,8 @@ class FeatureBankRouterState:
     descriptors: Int[Array, "active_slots 2"]
     route_count: Int[Array, ""]
     generation_count: Int[Array, ""]
+    route_words: UInt[Array, " 2"]
+    generation_words: UInt[Array, " 2"]
 
 
 @functools.partial(
@@ -168,6 +184,17 @@ class PairDescriptorValidation:
         "route_count_after",
         "generation_count_before",
         "generation_count_after",
+        "route_words_before",
+        "route_words_after",
+        "generation_words_before",
+        "generation_words_after",
+        "route_counter_valid",
+        "generation_counter_valid",
+        "counter_order_valid",
+        "lifetime_counter_valid",
+        "route_capacity_available",
+        "generation_capacity_available",
+        "lifetime_capacity_available",
     ),
     meta_fields=(),
 )
@@ -195,6 +222,17 @@ class FeatureBankRouteDiagnostics:
     route_count_after: Int[Array, ""]
     generation_count_before: Int[Array, ""]
     generation_count_after: Int[Array, ""]
+    route_words_before: UInt[Array, " 2"]
+    route_words_after: UInt[Array, " 2"]
+    generation_words_before: UInt[Array, " 2"]
+    generation_words_after: UInt[Array, " 2"]
+    route_counter_valid: Bool[Array, ""]
+    generation_counter_valid: Bool[Array, ""]
+    counter_order_valid: Bool[Array, ""]
+    lifetime_counter_valid: Bool[Array, ""]
+    route_capacity_available: Bool[Array, ""]
+    generation_capacity_available: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
 
 
 @functools.partial(
@@ -225,6 +263,7 @@ class FeatureBankRouterResourceBudget:
     total_feature_slots: int
     descriptor_int32_scalars: int
     counter_int32_scalars: int
+    counter_uint32_scalars: int
     router_state_scalars: int
     router_state_nbytes: int
     consumer_leaf_count: int
@@ -289,6 +328,55 @@ def _saturating_increment(value: Array) -> Array:
     return jnp.where(value < _INT32_MAX, value + jnp.int32(1), value)
 
 
+def _checked_lifetime_words_increment(
+    words: Array,
+) -> tuple[UInt[Array, " 2"], Bool[Array, ""]]:
+    """Propose one exact increment without wrapping the all-ones identity."""
+
+    if getattr(words, "shape", None) != (2,):
+        raise ValueError("feature-bank router lifetime words must have shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("feature-bank router lifetime words must have dtype uint32")
+    maximum = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+    capacity_available = ~jnp.all(words == maximum)
+    one = jnp.asarray(1, dtype=jnp.uint32)
+    low = words[1] + one
+    carry = (low == jnp.asarray(0, dtype=jnp.uint32)).astype(jnp.uint32)
+    proposed = jnp.stack((words[0] + carry, low))
+    return (
+        jnp.where(capacity_available, proposed, words).astype(jnp.uint32),
+        capacity_available,
+    )
+
+
+def _lifetime_counter_valid(words: Array, telemetry: Array) -> Bool[Array, ""]:
+    """Validate one exact identity against its saturating int32 telemetry."""
+
+    if getattr(words, "shape", None) != (2,):
+        raise ValueError("feature-bank router lifetime words must have shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("feature-bank router lifetime words must have dtype uint32")
+    if getattr(telemetry, "shape", None) != ():
+        raise ValueError("feature-bank router telemetry must be scalar")
+    if getattr(telemetry, "dtype", None) != jnp.dtype(jnp.int32):
+        raise TypeError("feature-bank router telemetry must have dtype int32")
+    maximum_i32 = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    below_saturation = (words[0] == jnp.asarray(0, dtype=jnp.uint32)) & (
+        words[1] < jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+    )
+    return (telemetry >= 0) & jnp.where(
+        below_saturation,
+        telemetry == words[1].astype(jnp.int32),
+        telemetry == maximum_i32,
+    )
+
+
+def _lifetime_words_le(left: Array, right: Array) -> Bool[Array, ""]:
+    """Compare two big-endian uint32 word identities without narrowing."""
+
+    return (left[0] < right[0]) | ((left[0] == right[0]) & (left[1] <= right[1]))
+
+
 class FeatureBankRouter:
     """Atomic fixed-shape router for every downstream feature consumer."""
 
@@ -341,6 +429,8 @@ class FeatureBankRouter:
             descriptors=descriptor_array,
             route_count=jnp.array(0, dtype=jnp.int32),
             generation_count=jnp.array(0, dtype=jnp.int32),
+            route_words=jnp.zeros((2,), dtype=jnp.uint32),
+            generation_words=jnp.zeros((2,), dtype=jnp.uint32),
         )
 
     def validate_descriptors(
@@ -408,6 +498,15 @@ class FeatureBankRouter:
                 raise ValueError(f"{name} must be scalar")
             if array.dtype != jnp.dtype(jnp.int32):
                 raise TypeError(f"{name} must have dtype int32")
+        for name, value in (
+            ("state.route_words", state.route_words),
+            ("state.generation_words", state.generation_words),
+        ):
+            array = jnp.asarray(value)
+            if array.shape != (2,):
+                raise ValueError(f"{name} must have shape (2,)")
+            if array.dtype != jnp.dtype(jnp.uint32):
+                raise TypeError(f"{name} must have dtype uint32")
 
     def route(
         self,
@@ -454,8 +553,41 @@ class FeatureBankRouter:
             proposed,
             base_dim=self._config.base_dim,
         )
-        counter_invalid = (state.route_count < 0) | (state.generation_count < 0)
-        valid = old_validation.valid & new_validation.valid & ~counter_invalid
+        proposed_route_words, route_capacity_available = (
+            _checked_lifetime_words_increment(state.route_words)
+        )
+        proposed_generation_words, generation_capacity_available = (
+            _checked_lifetime_words_increment(state.generation_words)
+        )
+        route_counter_valid = _lifetime_counter_valid(
+            state.route_words,
+            state.route_count,
+        )
+        generation_counter_valid = _lifetime_counter_valid(
+            state.generation_words,
+            state.generation_count,
+        )
+        counter_order_valid = _lifetime_words_le(
+            state.generation_words,
+            state.route_words,
+        )
+        lifetime_counter_valid = (
+            route_counter_valid & generation_counter_valid & counter_order_valid
+        )
+        counter_invalid = ~lifetime_counter_valid
+        raw_descriptors_changed = jnp.any(proposed != state.descriptors)
+        generation_capacity_sufficient = ~raw_descriptors_changed | (
+            generation_capacity_available
+        )
+        lifetime_capacity_available = (
+            route_capacity_available & generation_capacity_sufficient
+        )
+        valid = (
+            old_validation.valid
+            & new_validation.valid
+            & lifetime_counter_valid
+            & lifetime_capacity_available
+        )
 
         identity_match = jnp.all(
             proposed[:, None, :] == state.descriptors[None, :, :],
@@ -498,7 +630,7 @@ class FeatureBankRouter:
             routed_leaves.append(jnp.where(valid, candidate, leaf))
         routed_consumers = jax.tree_util.tree_unflatten(consumer_tree, routed_leaves)
 
-        descriptors_changed = valid & jnp.any(proposed != state.descriptors)
+        descriptors_changed = valid & raw_descriptors_changed
         candidate_route_count = _saturating_increment(state.route_count)
         candidate_generation_count = jnp.where(
             descriptors_changed,
@@ -512,6 +644,16 @@ class FeatureBankRouter:
                 valid,
                 candidate_generation_count,
                 state.generation_count,
+            ),
+            route_words=jnp.where(
+                valid,
+                proposed_route_words,
+                state.route_words,
+            ),
+            generation_words=jnp.where(
+                descriptors_changed,
+                proposed_generation_words,
+                state.generation_words,
             ),
         )
 
@@ -544,6 +686,17 @@ class FeatureBankRouter:
             route_count_after=next_state.route_count,
             generation_count_before=state.generation_count,
             generation_count_after=next_state.generation_count,
+            route_words_before=state.route_words,
+            route_words_after=next_state.route_words,
+            generation_words_before=state.generation_words,
+            generation_words_after=next_state.generation_words,
+            route_counter_valid=route_counter_valid,
+            generation_counter_valid=generation_counter_valid,
+            counter_order_valid=counter_order_valid,
+            lifetime_counter_valid=lifetime_counter_valid,
+            route_capacity_available=route_capacity_available,
+            generation_capacity_available=generation_capacity_available,
+            lifetime_capacity_available=lifetime_capacity_available,
         )
         return FeatureBankRouteResult(
             state=next_state,
@@ -573,8 +726,11 @@ class FeatureBankRouter:
             total_bytes += scalar_count * int(leaf.dtype.itemsize)
 
         descriptor_scalars = 2 * self._config.active_slots
-        counter_scalars = 2
-        router_state_scalars = descriptor_scalars + counter_scalars
+        counter_int32_scalars = 2
+        counter_uint32_scalars = 4
+        router_state_scalars = (
+            descriptor_scalars + counter_int32_scalars + counter_uint32_scalars
+        )
         router_state_nbytes = 4 * router_state_scalars
         stable_prefix_scalars = feature_groups * self._config.base_dim
         dynamic_tail_scalars = feature_groups * self._config.active_slots
@@ -583,7 +739,8 @@ class FeatureBankRouter:
             dynamic_feature_slots=self._config.active_slots,
             total_feature_slots=self._config.total_feature_dim,
             descriptor_int32_scalars=descriptor_scalars,
-            counter_int32_scalars=counter_scalars,
+            counter_int32_scalars=counter_int32_scalars,
+            counter_uint32_scalars=counter_uint32_scalars,
             router_state_scalars=router_state_scalars,
             router_state_nbytes=router_state_nbytes,
             consumer_leaf_count=len(leaves),
@@ -596,8 +753,80 @@ class FeatureBankRouter:
         )
 
 
+def feature_bank_router_lifetime_counter_nbytes() -> int:
+    """Return bytes occupied by telemetry plus both exact router identities."""
+
+    return FEATURE_BANK_ROUTER_LIFETIME_COUNTER_NBYTES
+
+
+def measure_feature_bank_router_state_nbytes(state: FeatureBankRouterState) -> int:
+    """Measure persistent JAX-array bytes in one router state."""
+
+    return sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree.leaves(state)
+        if isinstance(leaf, Array)
+    )
+
+
+def migrate_legacy_feature_bank_router_state(
+    legacy_state: Any,
+) -> FeatureBankRouterState:
+    """Migrate a pre-v2 router state only when both int32 clocks are exact."""
+
+    if isinstance(legacy_state, Mapping):
+        fields = dict(legacy_state)
+    elif dataclasses.is_dataclass(legacy_state) and not isinstance(legacy_state, type):
+        fields = {
+            field.name: getattr(legacy_state, field.name)
+            for field in dataclasses.fields(legacy_state)
+        }
+    else:
+        raise TypeError("legacy feature-bank router state must be a mapping or dataclass")
+    current_names = {
+        field.name
+        for field in dataclasses.fields(FeatureBankRouterState)
+    }
+    legacy_names = current_names - {"route_words", "generation_words"}
+    supplied_names = set(fields)
+    if supplied_names != legacy_names:
+        missing = sorted(legacy_names - supplied_names)
+        extra = sorted(supplied_names - legacy_names)
+        raise ValueError(
+            "legacy feature-bank router field manifest is not exact; "
+            f"missing={missing}, extra={extra}"
+        )
+    exact_counts: dict[str, int] = {}
+    for name in ("route_count", "generation_count"):
+        value = jnp.asarray(fields[name])
+        if value.shape != () or value.dtype != jnp.dtype(jnp.int32):
+            raise TypeError(f"legacy feature-bank router {name} must be scalar int32")
+        count = int(value)
+        if count < 0:
+            raise ValueError(f"negative legacy feature-bank router {name} indicates wrap")
+        if count >= _INT32_MAX:
+            raise ValueError(
+                f"saturated legacy feature-bank router {name} is ambiguous"
+            )
+        exact_counts[name] = count
+    if exact_counts["generation_count"] > exact_counts["route_count"]:
+        raise ValueError("legacy feature-bank router generation count exceeds route count")
+    fields["route_words"] = jnp.asarray(
+        (0, exact_counts["route_count"]),
+        dtype=jnp.uint32,
+    )
+    fields["generation_words"] = jnp.asarray(
+        (0, exact_counts["generation_count"]),
+        dtype=jnp.uint32,
+    )
+    return FeatureBankRouterState(**fields)
+
+
 __all__ = [
     "CONFIG_SCHEMA_VERSION",
+    "FEATURE_BANK_ROUTER_LIFETIME_COUNTER_DELTA_NBYTES",
+    "FEATURE_BANK_ROUTER_LIFETIME_COUNTER_NBYTES",
+    "FEATURE_BANK_ROUTER_STATE_SCHEMA",
     "INACTIVE_DESCRIPTOR",
     "FeatureBankRouteDiagnostics",
     "FeatureBankRouteResult",
@@ -606,4 +835,7 @@ __all__ = [
     "FeatureBankRouterResourceBudget",
     "FeatureBankRouterState",
     "PairDescriptorValidation",
+    "feature_bank_router_lifetime_counter_nbytes",
+    "measure_feature_bank_router_state_nbytes",
+    "migrate_legacy_feature_bank_router_state",
 ]

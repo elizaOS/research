@@ -6,11 +6,14 @@ from __future__ import annotations
 import chex
 import jax
 import jax.numpy as jnp
+import pytest
 
 from alberta_framework.core.working_memory import (
+    WORKING_MEMORY_STATE_SCHEMA,
     WorkingMemoryConfig,
     WorkingMemoryFeaturizer,
     WorkingMemoryState,
+    migrate_legacy_working_memory_state,
     transform_working_memory_arrays,
 )
 
@@ -214,3 +217,74 @@ def test_working_memory_delayed_action_positive_control() -> None:
 
     chex.assert_trees_all_close(memory_mse, 0.0)
     assert float(memory_mse) < float(raw_mse)
+
+
+def test_working_memory_exact_clock_carries_saturates_and_fails_closed() -> None:
+    memory = WorkingMemoryFeaturizer(
+        WorkingMemoryConfig(observation_dim=1, action_dim=0, reward_dim=0)
+    )
+    maximum_i32 = 2**31 - 1
+    state = memory.init().replace(
+        step_count=jnp.asarray(maximum_i32, dtype=jnp.int32),
+        step_words=jnp.asarray((0, 2**32 - 1), dtype=jnp.uint32),
+    )
+    carried = jax.jit(memory.update)(
+        state,
+        jnp.asarray([1.0], dtype=jnp.float32),
+        memory.zero_action(),
+        memory.zero_reward(),
+    )
+    assert int(carried.step_count) == maximum_i32
+    chex.assert_trees_all_equal(
+        carried.step_words,
+        jnp.asarray((1, 0), dtype=jnp.uint32),
+    )
+
+    terminal = carried.replace(
+        step_words=jnp.full((2,), 2**32 - 1, dtype=jnp.uint32)
+    )
+    stopped = memory.update(
+        terminal,
+        jnp.asarray([9.0], dtype=jnp.float32),
+        memory.zero_action(),
+        memory.zero_reward(),
+    )
+    chex.assert_trees_all_equal(stopped, terminal)
+
+    corrupt = carried.replace(step_words=jnp.asarray((0, 1), dtype=jnp.uint32))
+    rejected = memory.update(
+        corrupt,
+        jnp.asarray([9.0], dtype=jnp.float32),
+        memory.zero_action(),
+        memory.zero_reward(),
+    )
+    chex.assert_trees_all_equal(rejected, corrupt)
+
+
+def test_working_memory_schema_and_legacy_migration_are_unambiguous() -> None:
+    memory = WorkingMemoryFeaturizer(WorkingMemoryConfig(observation_dim=1))
+    config = memory.to_config()
+    assert config["state_schema"] == WORKING_MEMORY_STATE_SCHEMA
+    assert WorkingMemoryFeaturizer.from_config(config).to_config() == config
+    with pytest.raises(ValueError, match="manifest is not exact"):
+        WorkingMemoryFeaturizer.from_config(
+            {key: value for key, value in config.items() if key != "state_schema"}
+        )
+
+    current = memory.init().replace(step_count=jnp.asarray(7, dtype=jnp.int32))
+    legacy = {
+        "observation_traces": current.observation_traces,
+        "action_traces": current.action_traces,
+        "reward_traces": current.reward_traces,
+        "step_count": current.step_count,
+        "last_gate": current.last_gate,
+    }
+    migrated = migrate_legacy_working_memory_state(legacy)
+    chex.assert_trees_all_equal(
+        migrated.step_words,
+        jnp.asarray((0, 7), dtype=jnp.uint32),
+    )
+    with pytest.raises(ValueError, match="ambiguous"):
+        migrate_legacy_working_memory_state(
+            {**legacy, "step_count": jnp.asarray(2**31 - 1, dtype=jnp.int32)}
+        )

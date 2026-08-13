@@ -24,6 +24,8 @@ def test_fast_slow_init_shapes() -> None:
     chex.assert_shape(state.params.slow_kernel, (8, 3))
     chex.assert_shape(state.params.fast_kernel, (8, 3))
     chex.assert_shape(state.params.gate_kernel, (8, 3))
+    chex.assert_shape(state.step_words, (2,))
+    assert state.step_words.dtype == jnp.uint32
     chex.assert_tree_all_finite(state)
 
 
@@ -81,6 +83,7 @@ def test_fast_slow_gate_moves_toward_useful_fast_path() -> None:
             gate_bias=params.gate_bias,
         ),
         step_count=base_state.step_count,
+        step_words=base_state.step_words,
     )
     observation = jnp.asarray([0.6, -0.3], dtype=jnp.float32)
     before = learner.predict_parts(state, observation).gate[0]
@@ -110,6 +113,8 @@ def test_run_fast_slow_arrays_returns_scan_metrics() -> None:
     )
 
     chex.assert_shape(result.metrics, (3, 6))
+    chex.assert_shape(result.update_applied, (3,))
+    assert bool(jnp.all(result.update_applied))
     assert int(result.state.step_count) == 3
     chex.assert_tree_all_finite(result)
 

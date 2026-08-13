@@ -49,6 +49,8 @@ from alberta_framework.streams.gauntlet import (
     run_gauntlet_batched,
 )
 
+pytestmark = [pytest.mark.development, pytest.mark.slow]
+
 N_SEEDS = 8
 N_CYCLES = 8
 

@@ -24,8 +24,10 @@ runners.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import dataclasses
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Literal, cast
 
 import chex
@@ -40,19 +42,26 @@ from alberta_framework.core.associative_memory import (
     AssociativeMemoryLearner,
     AssociativeMemoryState,
 )
-from alberta_framework.core.horde import HordeLearner
+from alberta_framework.core.checkpoints import (
+    load_checkpoint,
+    load_checkpoint_metadata,
+    save_checkpoint,
+)
+from alberta_framework.core.horde import HordeLearner, HordeUpdateResult
 from alberta_framework.core.horde_actor_critic import (
     HordeActorCriticAgent,
     HordeActorCriticConfig,
     HordeActorCriticState,
+    HordeActorCriticUpdateResult,
 )
 from alberta_framework.core.multi_head_learner import MultiHeadMLPState
 from alberta_framework.core.optimizers import ObGDBounding
-from alberta_framework.core.sarsa import SARSAState
+from alberta_framework.core.sarsa import SARSAState, SARSAUpdateResult
 from alberta_framework.core.temporal_context import (
     TemporalContextConfig,
     TemporalContextFeaturizer,
     TemporalContextState,
+    TemporalContextStepResult,
 )
 from alberta_framework.core.upgd import UPGDLearner, UPGDState
 from alberta_framework.steps.step3 import (
@@ -60,14 +69,112 @@ from alberta_framework.steps.step3 import (
     init_step3_state,
     make_step3_horde,
     step3_predict,
-    step3_update,
 )
 from alberta_framework.steps.step4 import (
     Step4SARSAConfig,
     init_step4_state,
     make_step4_sarsa_agent,
-    step4_update,
 )
+
+_INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
+
+ALBERTA_PIPELINE_CONFIG_SCHEMA = "alberta.step1-4-pipeline.config.v2"
+ALBERTA_PIPELINE_STATE_SCHEMA = "alberta.step1-4-pipeline.state.v2"
+ALBERTA_PIPELINE_CHECKPOINT_SCHEMA = "alberta.step1-4-pipeline.checkpoint.v2"
+_LEGACY_ALBERTA_PIPELINE_CHECKPOINT_SCHEMA = (
+    "alberta.step1-4-pipeline.checkpoint.v1"
+)
+ALBERTA_PIPELINE_LIFETIME_COUNTER_NBYTES = 12
+ALBERTA_PIPELINE_LIFETIME_COUNTER_DELTA_NBYTES = 8
+
+PIPELINE_REJECTION_NONE = 0
+PIPELINE_REJECTION_STATE_INVALID = 1
+PIPELINE_REJECTION_LIFETIME_EXHAUSTED = 2
+PIPELINE_REJECTION_SOURCE_INVALID = 3
+PIPELINE_REJECTION_STEP2_UNAVAILABLE = 4
+PIPELINE_REJECTION_STEP3_REFUSED = 5
+PIPELINE_REJECTION_CONTROL_REFUSED = 6
+PIPELINE_REJECTION_CHILD_MISALIGNED = 7
+PIPELINE_REJECTION_CANDIDATE_INVALID = 8
+PIPELINE_REJECTION_REASON_NAMES = (
+    "none",
+    "state_invalid",
+    "lifetime_exhausted",
+    "source_invalid",
+    "step2_unavailable",
+    "step3_refused",
+    "control_refused",
+    "child_misaligned",
+    "candidate_invalid",
+)
+
+
+def _checked_step_words_increment(step_words: Array) -> tuple[Array, Array]:
+    """Return the next exact uint64 identity and whether it exists."""
+
+    if getattr(step_words, "shape", None) != (2,):
+        raise ValueError("pipeline step_words must have shape (2,)")
+    if getattr(step_words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("pipeline step_words must have dtype uint32")
+    maximum = jnp.full((2,), _UINT32_MAX, dtype=jnp.uint32)
+    capacity_available = ~jnp.all(step_words == maximum)
+    one = jnp.asarray(1, dtype=jnp.uint32)
+    low = step_words[1] + one
+    carry = (low == jnp.asarray(0, dtype=jnp.uint32)).astype(jnp.uint32)
+    candidate = jnp.stack((step_words[0] + carry, low))
+    return (
+        jnp.where(capacity_available, candidate, step_words).astype(jnp.uint32),
+        capacity_available,
+    )
+
+
+def _saturating_count_from_words(step_words: Array) -> Array:
+    """Return int32 compatibility telemetry authenticated by exact words."""
+
+    saturated = (step_words[0] != jnp.asarray(0, dtype=jnp.uint32)) | (
+        step_words[1] >= jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+    )
+    return jnp.where(
+        saturated,
+        jnp.asarray(_INT32_MAX, dtype=jnp.int32),
+        step_words[1].astype(jnp.int32),
+    )
+
+
+def _lifetime_counter_valid(step_words: Array, step_count: Array) -> Array:
+    """Validate exact identity shape/dtype and its saturating telemetry."""
+
+    _checked_step_words_increment(step_words)
+    if getattr(step_count, "shape", None) != ():
+        raise ValueError("pipeline step_count must be scalar")
+    if getattr(step_count, "dtype", None) != jnp.dtype(jnp.int32):
+        raise TypeError("pipeline step_count must have dtype int32")
+    return step_count == _saturating_count_from_words(step_words)
+
+
+def _tree_arrays_finite(tree: Any) -> Array:
+    """Return whether every persistent floating/complex array is finite."""
+
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for leaf in jax.tree.leaves(tree):
+        dtype = getattr(leaf, "dtype", None)
+        if dtype is not None and jnp.issubdtype(dtype, jnp.inexact):
+            valid = valid & jnp.all(jnp.isfinite(leaf))
+    return valid
+
+
+def _host_field_mapping(value: Any, *, name: str) -> dict[str, Any]:
+    """Return a strict shallow mapping for explicit host migration."""
+
+    if isinstance(value, Mapping):
+        return dict(value)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {
+            item.name: getattr(value, item.name)
+            for item in dataclasses.fields(value)
+        }
+    raise TypeError(f"{name} must be a mapping or dataclass")
 
 Step2Mode = Literal["temporal_context", "upgd", "associative", "identity"]
 Step2UPGDPreset = Literal["default", "strict_digit_readout"]
@@ -169,8 +276,11 @@ class Step2UPGDConfig:
     feature vector for downstream Step 3 and Step 4 learners. The number of
     UPGD heads is configurable; supervised targets may optionally be passed
     through :meth:`AlbertaPipeline.update` to drive UPGD learning. When no
-    targets are supplied, UPGD operates as a representation extractor whose
-    weights are unchanged and the hidden activations are propagated as-is.
+    targets are supplied, callers may still use :meth:`AlbertaPipeline.predict`
+    as a representation extractor, but an atomic pipeline *update* refuses:
+    there is no authenticated Step 2 learning event to advance alongside
+    Steps 3 and 4. Explicit all-NaN targets mean an intentional inactive-head
+    UPGD event and retain UPGD's own perturbation semantics.
     """
 
     observation_dim: int = 4
@@ -480,8 +590,11 @@ class AlbertaPipelineConfig:
         return self.features.output_dim()
 
     def to_dict(self) -> dict[str, object]:
-        """Return a JSON-serializable representation."""
+        """Return the strict v2 JSON-serializable representation."""
         return {
+            "type": "AlbertaPipelineConfig",
+            "schema": ALBERTA_PIPELINE_CONFIG_SCHEMA,
+            "state_schema": ALBERTA_PIPELINE_STATE_SCHEMA,
             "features": self.features.to_dict(),
             "upgd": self.upgd.to_dict() if self.upgd is not None else None,
             "associative": (
@@ -498,10 +611,42 @@ class AlbertaPipelineConfig:
 
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> AlbertaPipelineConfig:
-        """Reconstruct from :meth:`to_dict` output."""
-        upgd_payload = payload.get("upgd")
-        associative_payload = payload.get("associative")
-        horde_ac_payload = payload.get("horde_ac")
+        """Strictly reconstruct a v2 pipeline configuration."""
+        if type(payload) is not dict:
+            raise TypeError("pipeline config must be an exact dict")
+        expected = {
+            "type",
+            "schema",
+            "state_schema",
+            "features",
+            "upgd",
+            "associative",
+            "horde",
+            "control",
+            "horde_ac",
+            "step2",
+            "control_mode",
+        }
+        if set(payload) != expected:
+            if "schema" not in payload:
+                raise ValueError(
+                    "legacy pipeline config requires explicit migration"
+                )
+            missing = sorted(expected - set(payload))
+            extra = sorted(set(payload) - expected)
+            raise ValueError(
+                "pipeline config fields do not match v2; "
+                f"missing={missing}, extra={extra}"
+            )
+        if payload["type"] != "AlbertaPipelineConfig":
+            raise ValueError("unexpected pipeline config type")
+        if payload["schema"] != ALBERTA_PIPELINE_CONFIG_SCHEMA:
+            raise ValueError("pipeline config schema is unsupported")
+        if payload["state_schema"] != ALBERTA_PIPELINE_STATE_SCHEMA:
+            raise ValueError("pipeline state schema is unsupported")
+        upgd_payload = payload["upgd"]
+        associative_payload = payload["associative"]
+        horde_ac_payload = payload["horde_ac"]
         return cls(
             features=Step2FeatureConfig.from_dict(
                 cast(dict[str, object], payload["features"])
@@ -525,9 +670,42 @@ class AlbertaPipelineConfig:
             )
             if horde_ac_payload is not None
             else None,
-            step2=cast(Step2Mode, payload.get("step2", "temporal_context")),
-            control_mode=cast(ControlMode, payload.get("control_mode", "sarsa")),
+            step2=cast(Step2Mode, payload["step2"]),
+            control_mode=cast(ControlMode, payload["control_mode"]),
         )
+
+
+def migrate_legacy_alberta_pipeline_config(
+    payload: Mapping[str, object],
+) -> AlbertaPipelineConfig:
+    """Explicitly migrate the pre-v2 unversioned pipeline config."""
+
+    fields = dict(payload)
+    expected = {
+        "features",
+        "upgd",
+        "associative",
+        "horde",
+        "control",
+        "horde_ac",
+        "step2",
+        "control_mode",
+    }
+    if set(fields) != expected:
+        missing = sorted(expected - set(fields))
+        extra = sorted(set(fields) - expected)
+        raise ValueError(
+            "legacy pipeline config fields are unsupported; "
+            f"missing={missing}, extra={extra}"
+        )
+    fields.update(
+        {
+            "type": "AlbertaPipelineConfig",
+            "schema": ALBERTA_PIPELINE_CONFIG_SCHEMA,
+            "state_schema": ALBERTA_PIPELINE_STATE_SCHEMA,
+        }
+    )
+    return AlbertaPipelineConfig.from_dict(fields)
 
 
 @chex.dataclass(frozen=True)
@@ -540,6 +718,8 @@ class AlbertaPipelineState:
     ``associative_state`` stores the associative-memory state when ``step2``
     is ``"associative"``; otherwise it is None. ``control_state`` is either
     a SARSA state or a HordeActorCritic state depending on ``control_mode``.
+    ``step_words`` is the authoritative big-endian uint32 pair for the finite
+    pipeline event lifetime; ``step_count`` is saturating int32 telemetry.
     """
 
     feature_state: TemporalContextState | None
@@ -549,6 +729,7 @@ class AlbertaPipelineState:
     control_state: SARSAState | HordeActorCriticState
     last_features: Array
     step_count: Array
+    step_words: Array
 
 
 @chex.dataclass(frozen=True)
@@ -557,7 +738,11 @@ class AlbertaPipelineStepResult:
 
     ``q_values`` carries Q-values when ``control_mode == "sarsa"`` and the
     softmax policy when ``control_mode == "horde_ac"``. The ``action`` field
-    is the action selected/sampled at the new observation.
+    is the action selected/sampled at the new observation. On refusal the
+    complete state is the input state and emitted learning values are safe
+    zeros; ``rejection_reason`` indexes
+    :data:`PIPELINE_REJECTION_REASON_NAMES`, while the availability/applied
+    booleans preserve the child-level verdicts that led to it.
     """
 
     state: AlbertaPipelineState
@@ -569,6 +754,24 @@ class AlbertaPipelineStepResult:
     action: Array
     control_td_error: Array
     reward: Array
+    pre_step_words: Array
+    post_step_words: Array
+    lifetime_counter_valid: Array
+    lifetime_capacity_available: Array
+    source_valid: Array
+    state_valid: Array
+    step2_contract_available: Array
+    step2_update_applied: Array
+    step3_contract_available: Array
+    step3_update_applied: Array
+    control_contract_available: Array
+    control_update_applied: Array
+    children_pre_aligned: Array
+    children_post_aligned: Array
+    candidate_state_valid: Array
+    update_applied: Array
+    update_rejected: Array
+    rejection_reason: Array
 
 
 @chex.dataclass(frozen=True)
@@ -582,6 +785,43 @@ class AlbertaPipelineArrayResult:
     q_values: Array
     actions: Array
     control_td_errors: Array
+    update_applied: Array
+    rejection_reasons: Array
+
+
+@dataclass(frozen=True)
+class AlbertaPipelineResourceBudget:
+    """Exact persistent-array accounting for one pipeline state."""
+
+    persistent_state_nbytes: int
+    exact_pipeline_identity_nbytes: int = 8
+    compatibility_telemetry_nbytes: int = 4
+
+    def to_dict(self) -> dict[str, int]:
+        """Return a JSON-serializable resource declaration."""
+
+        return asdict(self)
+
+
+def measure_alberta_pipeline_state_nbytes(state: AlbertaPipelineState) -> int:
+    """Measure persistent JAX-array bytes in a concrete pipeline state."""
+
+    def measure(value: Any) -> int:
+        if isinstance(value, Array):
+            return int(value.size) * int(value.dtype.itemsize)
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return sum(
+                measure(getattr(value, item.name))
+                for item in dataclasses.fields(value)
+                if item.name not in {"birth_timestamp", "uptime_s"}
+            )
+        if isinstance(value, Mapping):
+            return sum(measure(item) for item in value.values())
+        if isinstance(value, (tuple, list)):
+            return sum(measure(item) for item in value)
+        return 0
+
+    return measure(state)
 
 
 @dataclass(frozen=True)
@@ -779,6 +1019,199 @@ class AlbertaPipeline:
         """Cumulant function used by Step 3."""
         return self._cumulant_fn
 
+    @staticmethod
+    def _exact_child_aligned(child_state: Any, step_words: Array) -> Array:
+        """Authenticate one exact-clock child against the pipeline identity."""
+
+        child_words = getattr(child_state, "step_words", None)
+        child_count = getattr(child_state, "step_count", None)
+        if child_words is None or child_count is None:
+            raise ValueError("configured child does not expose an exact clock")
+        return _lifetime_counter_valid(child_words, child_count) & jnp.all(
+            child_words == step_words
+        )
+
+    @staticmethod
+    def _trees_equal(left: Any, right: Any) -> Array:
+        """Return bitwise array equality for two statically identical trees."""
+
+        left_leaves = jax.tree.leaves(left)
+        right_leaves = jax.tree.leaves(right)
+        if len(left_leaves) != len(right_leaves):
+            raise ValueError("duplicated child trees have different structures")
+        equal = jnp.asarray(True, dtype=jnp.bool_)
+        for left_leaf, right_leaf in zip(left_leaves, right_leaves, strict=True):
+            if getattr(left_leaf, "shape", None) != getattr(right_leaf, "shape", None):
+                raise ValueError("duplicated child leaves have different shapes")
+            leaf_equal = left_leaf == right_leaf
+            dtype = getattr(left_leaf, "dtype", None)
+            if dtype is not None and jnp.issubdtype(dtype, jnp.inexact):
+                leaf_equal = leaf_equal | (
+                    jnp.isnan(left_leaf) & jnp.isnan(right_leaf)
+                )
+            equal = equal & jnp.all(leaf_equal)
+        return equal
+
+    def _validate_state_static_contract(self, state: AlbertaPipelineState) -> None:
+        """Reject structural state mismatches before tracing child updates."""
+
+        if not isinstance(state, AlbertaPipelineState):
+            raise TypeError("state must be an AlbertaPipelineState")
+        _lifetime_counter_valid(state.step_words, state.step_count)
+        if getattr(state.last_features, "shape", None) != (self.feature_dim,):
+            raise ValueError(
+                f"last_features must have shape ({self.feature_dim},)"
+            )
+        if getattr(state.last_features, "dtype", None) != jnp.dtype(jnp.float32):
+            raise TypeError("last_features must have dtype float32")
+        if self._config.step2 == "temporal_context":
+            if state.feature_state is None:
+                raise ValueError("temporal-context state is missing")
+            if state.upgd_state is not None or state.associative_state is not None:
+                raise ValueError("inactive Step 2 state must be absent")
+        elif self._config.step2 == "upgd":
+            if state.upgd_state is None:
+                raise ValueError("UPGD state is missing")
+            if state.feature_state is not None or state.associative_state is not None:
+                raise ValueError("inactive Step 2 state must be absent")
+        elif self._config.step2 == "associative":
+            if state.associative_state is None:
+                raise ValueError("associative state is missing")
+            if state.feature_state is not None or state.upgd_state is not None:
+                raise ValueError("inactive Step 2 state must be absent")
+        elif (
+            state.feature_state is not None
+            or state.upgd_state is not None
+            or state.associative_state is not None
+        ):
+            raise ValueError("identity Step 2 must not carry learner state")
+
+    def _children_aligned(self, state: AlbertaPipelineState) -> Array:
+        """Return exact wrapper/child identity and route alignment."""
+
+        outer_valid = _lifetime_counter_valid(state.step_words, state.step_count)
+        horde_aligned = self._exact_child_aligned(
+            state.horde_state,
+            state.step_words,
+        )
+        step2_aligned = jnp.asarray(True, dtype=jnp.bool_)
+        if self._config.step2 == "temporal_context":
+            feature_state = cast(TemporalContextState, state.feature_state)
+            featurizer = cast(TemporalContextFeaturizer, self._featurizer)
+            expected_words, offset_available = _checked_step_words_increment(
+                state.step_words
+            )
+            step2_aligned = (
+                offset_available
+                & featurizer.state_valid(feature_state)
+                & jnp.all(feature_state.step_words == expected_words)
+            )
+        elif self._config.step2 == "upgd":
+            step2_aligned = self._exact_child_aligned(
+                cast(UPGDState, state.upgd_state),
+                state.step_words,
+            )
+        elif self._config.step2 == "associative":
+            associative_state = cast(
+                AssociativeMemoryState,
+                state.associative_state,
+            )
+            if getattr(associative_state.step_count, "shape", None) != ():
+                raise ValueError("associative step_count must be scalar")
+            if getattr(associative_state.step_count, "dtype", None) != jnp.dtype(
+                jnp.int32
+            ):
+                raise TypeError("associative step_count must have dtype int32")
+            bounded_identity = (
+                state.step_words[0] == jnp.asarray(0, dtype=jnp.uint32)
+            ) & (
+                state.step_words[1]
+                <= jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+            )
+            step2_aligned = bounded_identity & (
+                associative_state.step_count
+                == state.step_words[1].astype(jnp.int32)
+            )
+            step2_aligned = (
+                step2_aligned
+                & (associative_state.allocations >= 0)
+                & (associative_state.replacements >= 0)
+                & jnp.all(associative_state.counts >= 0.0)
+                & jnp.all(associative_state.last_update >= 0)
+                & jnp.all(
+                    associative_state.last_update
+                    <= associative_state.step_count
+                )
+            )
+
+        control_state = state.control_state
+        control_count = getattr(control_state, "step_count", None)
+        if control_count is None or getattr(control_count, "shape", None) != ():
+            raise ValueError("control step_count must be scalar")
+        if getattr(control_count, "dtype", None) != jnp.dtype(jnp.int32):
+            raise TypeError("control step_count must have dtype int32")
+        control_aligned = control_count == _saturating_count_from_words(
+            state.step_words
+        )
+        if self._config.control_mode == "horde_ac":
+            ac_state = cast(HordeActorCriticState, control_state)
+            control_aligned = (
+                control_aligned
+                & self._exact_child_aligned(ac_state.critic_state, state.step_words)
+                & self._trees_equal(state.horde_state, ac_state.critic_state)
+                & (ac_state.last_action >= 0)
+                & (
+                    ac_state.last_action
+                    < cast(
+                        HordeActorCriticPipelineConfig,
+                        self._config.horde_ac,
+                    ).n_actions
+                )
+            )
+        else:
+            sarsa_state = cast(SARSAState, control_state)
+            control_aligned = control_aligned & self._exact_child_aligned(
+                sarsa_state.learner_state,
+                state.step_words,
+            )
+            control_aligned = control_aligned & (
+                (sarsa_state.last_action >= 0)
+                & (sarsa_state.last_action < self._config.control.n_actions)
+            )
+
+        return (
+            outer_valid
+            & horde_aligned
+            & step2_aligned
+            & control_aligned
+        )
+
+    def _state_valid(self, state: AlbertaPipelineState) -> Array:
+        """Return dynamic integrity and exact child-alignment validity."""
+
+        return (
+            self._children_aligned(state)
+            & _tree_arrays_finite(state)
+            & jnp.all(jnp.isfinite(state.last_features))
+        )
+
+    def state_valid(self, state: AlbertaPipelineState) -> Array:
+        """Return whether a state satisfies the complete pipeline contract."""
+
+        self._validate_state_static_contract(state)
+        return self._state_valid(state)
+
+    def resource_budget(
+        self,
+        state: AlbertaPipelineState,
+    ) -> AlbertaPipelineResourceBudget:
+        """Return exact persistent-array accounting for ``state``."""
+
+        self._validate_state_static_contract(state)
+        return AlbertaPipelineResourceBudget(
+            persistent_state_nbytes=measure_alberta_pipeline_state_nbytes(state)
+        )
+
     def _features_from_observation(
         self,
         feature_state: TemporalContextState | None,
@@ -821,6 +1254,24 @@ class AlbertaPipeline:
 
     def init(self, key: Array, initial_observation: Array) -> AlbertaPipelineState:
         """Initialize learner state and prime control with the first observation."""
+        expected_shape = (self._observation_dim(),)
+        if getattr(initial_observation, "shape", None) != expected_shape:
+            raise ValueError(
+                f"initial_observation must have shape {expected_shape}"
+            )
+        expected_dtype = jnp.dtype(
+            jnp.int32
+            if self._config.step2 == "associative"
+            else jnp.float32
+        )
+        if getattr(initial_observation, "dtype", None) != expected_dtype:
+            raise TypeError(
+                f"initial_observation must have dtype {expected_dtype.name}"
+            )
+        initial_observation = jnp.asarray(
+            initial_observation,
+            dtype=expected_dtype,
+        )
         upgd_key, horde_key, control_key = jr.split(key, 3)
 
         feature_state: TemporalContextState | None = None
@@ -852,7 +1303,9 @@ class AlbertaPipeline:
                 jnp.asarray(initial_observation, dtype=jnp.int32),
             ).probabilities
         else:
-            initial_features = initial_observation
+            initial_features = jnp.asarray(initial_observation, dtype=jnp.float32)
+
+        initial_features = jnp.asarray(initial_features, dtype=jnp.float32)
 
         horde_state = init_step3_state(
             self._horde,
@@ -883,6 +1336,7 @@ class AlbertaPipeline:
             control_state=control_state,
             last_features=initial_features,
             step_count=jnp.array(0, dtype=jnp.int32),
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
         )
 
     def predict(self, state: AlbertaPipelineState) -> tuple[Array, Array]:
@@ -919,11 +1373,15 @@ class AlbertaPipeline:
         upgd_targets: Array | None = None,
         associative_label: Array | None = None,
     ) -> AlbertaPipelineStepResult:
-        """Advance every pipeline component by one transition.
+        """Atomically advance every configured pipeline component.
 
         ``state.last_features`` represents the previous observation. The new
         raw ``observation`` is transformed by Step 2, then Step 3 and Step 4
-        both update on the resulting transition.
+        stage updates on the resulting transition. The staged state commits
+        only if the source, exact pipeline identity, every child contract, and
+        every persistent candidate are valid together. Any refusal preserves
+        the complete input state, including RNG keys, traces, optimizer state,
+        and all duplicate critic leaves.
 
         Args:
             state: Current pipeline state.
@@ -936,55 +1394,291 @@ class AlbertaPipeline:
                 is used.
             upgd_targets: Optional supervised targets of shape ``(n_heads,)``
                 that drive UPGD learning when ``step2='upgd'``. NaN entries
-                mark inactive heads. When omitted, UPGD weights stay frozen
-                and the trunk acts as a pure feature extractor.
+                mark intentionally inactive heads. When omitted, UPGD stays
+                frozen and the complete pipeline transaction refuses because
+                Step 2 has no authenticated event to advance.
             associative_label: Optional integer next-token/class label that
                 drives associative-memory writes when ``step2='associative'``.
+                It is required for an associative pipeline transaction; its
+                absence makes the bounded Step 2 contract unavailable and the
+                whole pipeline update is rejected.
         """
-        (
-            new_feature_state,
-            new_upgd_state,
-            new_associative_state,
-            features,
-        ) = self._features_from_observation(
-            state.feature_state,
-            state.upgd_state,
-            state.associative_state,
-            observation,
+        self._validate_state_static_contract(state)
+        expected_observation_shape = (self._observation_dim(),)
+        if getattr(observation, "shape", None) != expected_observation_shape:
+            raise ValueError(
+                f"observation must have shape {expected_observation_shape}"
+            )
+        expected_observation_dtype = jnp.dtype(
+            jnp.int32
+            if self._config.step2 == "associative"
+            else jnp.float32
         )
-        if (
-            self._config.step2 == "upgd"
-            and upgd_targets is not None
-            and new_upgd_state is not None
-        ):
-            upgd = cast(UPGDLearner, self._upgd)
-            upgd_result = upgd.update(new_upgd_state, observation, upgd_targets)
-            new_upgd_state = upgd_result.state
-            features = upgd._trunk_forward(  # noqa: SLF001
-                new_upgd_state.trunk_params.weights,
-                new_upgd_state.trunk_params.biases,
-                observation,
-                upgd._leaky_relu_slope,  # noqa: SLF001
-                upgd._use_layer_norm,  # noqa: SLF001
+        if getattr(observation, "dtype", None) != expected_observation_dtype:
+            raise TypeError(
+                f"observation must have dtype {expected_observation_dtype.name}"
             )
-        if (
-            self._config.step2 == "associative"
-            and associative_label is not None
-            and new_associative_state is not None
-        ):
-            associative = cast(AssociativeMemoryLearner, self._associative)
-            assoc_result = associative.update(
-                new_associative_state,
-                jnp.asarray(observation, dtype=jnp.int32),
-                jnp.asarray(associative_label, dtype=jnp.int32),
-            )
-            new_associative_state = assoc_result.state
-            features = assoc_result.predictions
+        observation = jnp.asarray(
+            observation,
+            dtype=expected_observation_dtype,
+        )
+        if getattr(reward, "dtype", None) != jnp.dtype(jnp.float32):
+            raise TypeError("reward must have dtype float32")
+        if getattr(terminated, "dtype", None) != jnp.dtype(jnp.float32):
+            raise TypeError("terminated must have dtype float32")
+        reward = jnp.asarray(reward, dtype=jnp.float32)
+        terminated = jnp.asarray(terminated, dtype=jnp.float32)
+        if reward.shape != ():
+            raise ValueError("reward must be scalar")
+        if terminated.shape != ():
+            raise ValueError("terminated must be scalar")
 
         if horde_cumulants is None:
             horde_cumulants = self._cumulant_fn(observation, reward, terminated)
+        if getattr(horde_cumulants, "dtype", None) != jnp.dtype(jnp.float32):
+            raise TypeError("horde_cumulants must have dtype float32")
         horde_cumulants = jnp.asarray(horde_cumulants, dtype=jnp.float32)
+        if horde_cumulants.shape != (self._config.horde.n_demons,):
+            raise ValueError(
+                "horde_cumulants must have shape "
+                f"({self._config.horde.n_demons},)"
+            )
 
+        upgd_targets_array: Array | None = None
+        upgd_targets_available = upgd_targets is not None
+        if self._config.step2 == "upgd":
+            n_heads = cast(Step2UPGDConfig, self._config.upgd).n_heads
+            upgd_targets_array = (
+                jnp.full((n_heads,), jnp.nan, dtype=jnp.float32)
+                if upgd_targets is None
+                else upgd_targets
+            )
+            if getattr(upgd_targets_array, "dtype", None) != jnp.dtype(jnp.float32):
+                raise TypeError("upgd_targets must have dtype float32")
+            upgd_targets_array = jnp.asarray(upgd_targets_array, dtype=jnp.float32)
+            if upgd_targets_array.shape != (n_heads,):
+                raise ValueError(f"upgd_targets must have shape ({n_heads},)")
+        elif upgd_targets is not None:
+            raise ValueError("upgd_targets require step2='upgd'")
+
+        associative_label_array: Array | None = None
+        if associative_label is not None:
+            if self._config.step2 != "associative":
+                raise ValueError("associative_label requires step2='associative'")
+            if getattr(associative_label, "dtype", None) != jnp.dtype(jnp.int32):
+                raise TypeError("associative_label must have dtype int32")
+            associative_label_array = jnp.asarray(
+                associative_label,
+                dtype=jnp.int32,
+            )
+            if associative_label_array.shape != ():
+                raise ValueError("associative_label must be scalar")
+
+        proposed_step_words, lifetime_capacity_available = (
+            _checked_step_words_increment(state.step_words)
+        )
+        lifetime_counter_valid = _lifetime_counter_valid(
+            state.step_words,
+            state.step_count,
+        )
+        state_valid = self._state_valid(state)
+        observation_valid = jnp.all(jnp.isfinite(observation))
+        if self._config.step2 == "associative":
+            associative_cfg = cast(
+                Step2AssociativePipelineConfig,
+                self._config.associative,
+            )
+            observation_valid = observation_valid & jnp.all(
+                (observation >= 0) & (observation < associative_cfg.vocab_size)
+            )
+        terminated_valid = jnp.isfinite(terminated) & (
+            (terminated == 0.0) | (terminated == 1.0)
+        )
+        cumulants_valid = jnp.all(jnp.isfinite(horde_cumulants))
+        target_source_valid = jnp.asarray(True, dtype=jnp.bool_)
+        if upgd_targets_array is not None:
+            target_source_valid = jnp.all(
+                jnp.isfinite(upgd_targets_array) | jnp.isnan(upgd_targets_array)
+            )
+        label_source_valid = jnp.asarray(True, dtype=jnp.bool_)
+        if associative_label_array is not None:
+            associative_cfg = cast(
+                Step2AssociativePipelineConfig,
+                self._config.associative,
+            )
+            label_source_valid = (
+                (associative_label_array >= 0)
+                & (associative_label_array < associative_cfg.vocab_size)
+            )
+        source_valid = (
+            observation_valid
+            & jnp.isfinite(reward)
+            & terminated_valid
+            & cumulants_valid
+            & target_source_valid
+            & label_source_valid
+        )
+
+        # Stage Step 2. Explicit all-NaN UPGD targets are an intentional exact
+        # inactive-head event; an omitted target vector is unavailable and
+        # leaves UPGD untouched. Temporal context owns an exact clock with a
+        # one-event priming offset; associative memory remains explicitly
+        # bounded by its legacy int32 identity.
+        temporal_step_result: TemporalContextStepResult | None = None
+        if self._config.step2 == "temporal_context":
+            featurizer = cast(TemporalContextFeaturizer, self._featurizer)
+            temporal_step_result = featurizer.step_result(
+                cast(TemporalContextState, state.feature_state),
+                observation,
+            )
+            new_feature_state = temporal_step_result.state
+            new_upgd_state = state.upgd_state
+            new_associative_state = state.associative_state
+            features = temporal_step_result.features
+        else:
+            (
+                new_feature_state,
+                new_upgd_state,
+                new_associative_state,
+                features,
+            ) = self._features_from_observation(
+                state.feature_state,
+                state.upgd_state,
+                state.associative_state,
+                observation,
+            )
+        step2_contract_available = jnp.asarray(True, dtype=jnp.bool_)
+        step2_update_applied = jnp.asarray(True, dtype=jnp.bool_)
+        if self._config.step2 == "temporal_context":
+            assert temporal_step_result is not None
+            temporal_update = temporal_step_result.update
+            expected_pre_words, pre_offset_available = (
+                _checked_step_words_increment(state.step_words)
+            )
+            expected_post_words, post_offset_available = (
+                _checked_step_words_increment(proposed_step_words)
+            )
+            step2_contract_available = (
+                pre_offset_available
+                & post_offset_available
+                & temporal_update.lifetime_capacity_available
+            )
+            step2_update_applied = (
+                step2_contract_available
+                & temporal_update.update_applied
+                & temporal_update.state_valid
+                & temporal_update.input_valid
+                & temporal_update.candidate_state_finite
+                & jnp.all(temporal_update.pre_step_words == expected_pre_words)
+                & jnp.all(temporal_update.post_step_words == expected_post_words)
+                & jnp.all(jnp.isfinite(features))
+            )
+        elif self._config.step2 == "upgd":
+            step2_contract_available = jnp.asarray(
+                upgd_targets_available,
+                dtype=jnp.bool_,
+            )
+            if upgd_targets_available:
+                upgd = cast(UPGDLearner, self._upgd)
+                upgd_result = upgd.update(
+                    cast(UPGDState, new_upgd_state),
+                    observation,
+                    cast(Array, upgd_targets_array),
+                )
+                new_upgd_state = upgd_result.state
+                features = upgd._trunk_forward(  # noqa: SLF001
+                    new_upgd_state.trunk_params.weights,
+                    new_upgd_state.trunk_params.biases,
+                    observation,
+                    upgd._leaky_relu_slope,  # noqa: SLF001
+                    upgd._use_layer_norm,  # noqa: SLF001
+                )
+                step2_contract_available = step2_contract_available & jnp.asarray(
+                    upgd_result.lifetime_capacity_available,
+                    dtype=jnp.bool_,
+                )
+                step2_update_applied = (
+                    jnp.asarray(upgd_result.update_applied, dtype=jnp.bool_)
+                    & jnp.all(upgd_result.pre_step_words == state.step_words)
+                    & jnp.all(upgd_result.post_step_words == proposed_step_words)
+                    & jnp.all(jnp.isfinite(features))
+                )
+            else:
+                step2_update_applied = jnp.asarray(False, dtype=jnp.bool_)
+        elif self._config.step2 == "associative":
+            associative_state = cast(
+                AssociativeMemoryState,
+                state.associative_state,
+            )
+            associative = cast(AssociativeMemoryLearner, self._associative)
+            maximum_row_events = associative.max_active_features
+            diagnostic_counter_capacity = (
+                associative_state.allocations
+                <= jnp.asarray(
+                    _INT32_MAX - maximum_row_events,
+                    dtype=jnp.int32,
+                )
+            ) & (
+                associative_state.replacements
+                <= jnp.asarray(
+                    _INT32_MAX - maximum_row_events,
+                    dtype=jnp.int32,
+                )
+            )
+            # Float32 row counts cease to represent every +1 event at 2**24.
+            # The legacy child has no exact per-row identity, so refuse before
+            # that estimator boundary instead of treating a rounded write as
+            # authenticated progress.
+            row_count_capacity = jnp.all(
+                associative_state.counts
+                < jnp.asarray(2**24, dtype=jnp.float32)
+            )
+            step2_contract_available = (
+                associative_label_array is not None
+            ) & (
+                associative_state.step_count
+                < jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+            ) & diagnostic_counter_capacity & row_count_capacity
+            if associative_label_array is not None:
+                assoc_result = associative.update(
+                    cast(AssociativeMemoryState, new_associative_state),
+                    observation,
+                    associative_label_array,
+                )
+                new_associative_state = assoc_result.state
+                features = assoc_result.predictions
+                step2_update_applied = (
+                    step2_contract_available
+                    & (
+                        new_associative_state.step_count
+                        == associative_state.step_count
+                        + jnp.asarray(1, dtype=jnp.int32)
+                    )
+                    & _tree_arrays_finite(new_associative_state)
+                    & (
+                        new_associative_state.allocations
+                        >= associative_state.allocations
+                    )
+                    & (
+                        new_associative_state.replacements
+                        >= associative_state.replacements
+                    )
+                    & jnp.all(
+                        new_associative_state.counts >= associative_state.counts
+                    )
+                    & jnp.all(jnp.isfinite(assoc_result.metrics))
+                    & jnp.all(jnp.isfinite(features))
+                )
+            else:
+                step2_update_applied = jnp.asarray(False, dtype=jnp.bool_)
+        else:
+            features = jnp.asarray(features, dtype=jnp.float32)
+            step2_update_applied = jnp.all(jnp.isfinite(features))
+
+        features = jnp.asarray(features, dtype=jnp.float32)
+
+        horde_result: HordeUpdateResult
+        new_control_state: SARSAState | HordeActorCriticState
         if self._config.control_mode == "horde_ac":
             ac = cast(HordeActorCriticAgent, self._control)
             ac_state = cast(HordeActorCriticState, state.control_state)
@@ -998,13 +1692,16 @@ class AlbertaPipeline:
                 dtype=jnp.int32,
             )
             auxiliary_cumulants = horde_cumulants[aux_indices] if aux_indices.size else None
-            ac_result = ac.update(
+            value_gamma = self._horde.horde_spec.gammas[value_index]
+            transition_discount = jnp.where(terminated != 0.0, 0.0, value_gamma)
+            ac_result: HordeActorCriticUpdateResult = ac.update(
                 ac_state,
                 reward,
                 features,
                 auxiliary_cumulants=auxiliary_cumulants,
+                discount=transition_discount,
             )
-            new_control_state: SARSAState | HordeActorCriticState = ac_result.state
+            new_control_state = ac_result.state
             q_values_or_policy = ac_result.policy
             action_out = ac_result.action
             control_td_error = ac_result.td_error
@@ -1015,21 +1712,30 @@ class AlbertaPipeline:
             horde_predictions = ac_result.critic_result.predictions
             horde_td_errors = ac_result.critic_result.td_errors
             horde_td_targets = ac_result.critic_result.td_targets
+            horde_result = ac_result.critic_result
+            control_update_applied = jnp.asarray(
+                ac_result.update_applied,
+                dtype=jnp.bool_,
+            )
         else:
-            horde_result = step3_update(
-                self._horde,
+            horde_result = self._horde.update(
                 state.horde_state,
                 state.last_features,
                 horde_cumulants,
                 features,
             )
             sarsa_state = cast(SARSAState, state.control_state)
-            control_result = step4_update(
-                self._control,
+            next_action, next_key = self._control.select_action(
                 sarsa_state,
+                features,
+            )
+            ready_sarsa_state = sarsa_state.replace(rng_key=next_key)
+            control_result: SARSAUpdateResult = self._control.update(
+                ready_sarsa_state,
                 reward,
                 features,
                 terminated,
+                next_action,
                 prediction_cumulants=horde_cumulants,
             )
             new_control_state = control_result.state
@@ -1041,26 +1747,230 @@ class AlbertaPipeline:
             horde_predictions = horde_result.predictions
             horde_td_errors = horde_result.td_errors
             horde_td_targets = horde_result.td_targets
+            control_update_applied = jnp.asarray(
+                control_result.update_applied,
+                dtype=jnp.bool_,
+            )
 
-        next_state = AlbertaPipelineState(
+        step3_pre_available = (
+            horde_result.pre_step_words is not None
+            and horde_result.post_step_words is not None
+            and horde_result.update_applied is not None
+            and horde_result.lifetime_capacity_available is not None
+        )
+        if step3_pre_available:
+            step3_contract_available = jnp.asarray(
+                horde_result.lifetime_capacity_available,
+                dtype=jnp.bool_,
+            )
+            step3_update_applied = (
+                jnp.asarray(horde_result.update_applied, dtype=jnp.bool_)
+                & jnp.all(cast(Array, horde_result.pre_step_words) == state.step_words)
+                & jnp.all(
+                    cast(Array, horde_result.post_step_words)
+                    == proposed_step_words
+                )
+            )
+        else:
+            step3_contract_available = jnp.asarray(False, dtype=jnp.bool_)
+            step3_update_applied = jnp.asarray(False, dtype=jnp.bool_)
+
+        control_contract_available = lifetime_capacity_available
+        if self._config.control_mode == "horde_ac":
+            control_contract_available = control_contract_available & jnp.asarray(
+                ac_result.critic_update_applied,
+                dtype=jnp.bool_,
+            )
+        else:
+            control_contract_available = control_contract_available & jnp.asarray(
+                control_result.horde_update_applied,
+                dtype=jnp.bool_,
+            )
+
+        candidate_state = AlbertaPipelineState(
             feature_state=new_feature_state,
             upgd_state=new_upgd_state,
             associative_state=new_associative_state,
             horde_state=new_horde_state,
             control_state=new_control_state,
             last_features=features,
-            step_count=state.step_count + 1,
+            step_count=_saturating_count_from_words(proposed_step_words),
+            step_words=proposed_step_words,
+        )
+        children_pre_aligned = self._children_aligned(state)
+        children_post_aligned = self._children_aligned(candidate_state)
+        horde_outputs_valid = (
+            jnp.all(jnp.isfinite(horde_predictions))
+            & jnp.all(jnp.isfinite(horde_td_errors))
+            & jnp.all(jnp.isfinite(horde_td_targets))
+            & jnp.all(jnp.isfinite(horde_result.per_demon_metrics))
+            & jnp.isfinite(horde_result.trunk_bounding_metric)
+        )
+        control_outputs_valid = (
+            jnp.all(jnp.isfinite(q_values_or_policy))
+            & jnp.isfinite(control_td_error)
+            & jnp.isfinite(reward_out)
+        )
+        if self._config.control_mode == "horde_ac":
+            control_outputs_valid = control_outputs_valid & jnp.isfinite(
+                ac_result.bound_metric
+            )
+            action_valid = (action_out >= 0) & (
+                action_out
+                < cast(HordeActorCriticPipelineConfig, self._config.horde_ac).n_actions
+            )
+        else:
+            action_valid = (action_out >= 0) & (
+                action_out < self._config.control.n_actions
+            )
+        candidate_state_valid = (
+            children_post_aligned
+            & _tree_arrays_finite(candidate_state)
+            & jnp.all(jnp.isfinite(features))
+            & horde_outputs_valid
+            & control_outputs_valid
+            & action_valid
+        )
+        update_applied = (
+            lifetime_counter_valid
+            & lifetime_capacity_available
+            & source_valid
+            & state_valid
+            & step2_contract_available
+            & step2_update_applied
+            & step3_contract_available
+            & step3_update_applied
+            & control_contract_available
+            & control_update_applied
+            & children_pre_aligned
+            & children_post_aligned
+            & candidate_state_valid
+        )
+        next_state = jax.lax.cond(
+            update_applied,
+            lambda _: candidate_state,
+            lambda _: state,
+            operand=None,
+        )
+
+        rejection_reason = jnp.asarray(
+            PIPELINE_REJECTION_NONE,
+            dtype=jnp.int32,
+        )
+        rejection_reason = jnp.where(
+            ~candidate_state_valid,
+            PIPELINE_REJECTION_CANDIDATE_INVALID,
+            rejection_reason,
+        )
+        rejection_reason = jnp.where(
+            ~(children_pre_aligned & children_post_aligned),
+            PIPELINE_REJECTION_CHILD_MISALIGNED,
+            rejection_reason,
+        )
+        rejection_reason = jnp.where(
+            ~(control_contract_available & control_update_applied),
+            PIPELINE_REJECTION_CONTROL_REFUSED,
+            rejection_reason,
+        )
+        rejection_reason = jnp.where(
+            ~(step3_contract_available & step3_update_applied),
+            PIPELINE_REJECTION_STEP3_REFUSED,
+            rejection_reason,
+        )
+        rejection_reason = jnp.where(
+            ~(step2_contract_available & step2_update_applied),
+            PIPELINE_REJECTION_STEP2_UNAVAILABLE,
+            rejection_reason,
+        )
+        rejection_reason = jnp.where(
+            ~source_valid,
+            PIPELINE_REJECTION_SOURCE_INVALID,
+            rejection_reason,
+        )
+        rejection_reason = jnp.where(
+            ~lifetime_capacity_available,
+            PIPELINE_REJECTION_LIFETIME_EXHAUSTED,
+            rejection_reason,
+        )
+        rejection_reason = jnp.where(
+            ~state_valid,
+            PIPELINE_REJECTION_STATE_INVALID,
+            rejection_reason,
+        )
+        rejection_reason = jnp.where(
+            update_applied,
+            PIPELINE_REJECTION_NONE,
+            rejection_reason,
+        ).astype(jnp.int32)
+
+        safe_features = jnp.where(
+            update_applied,
+            features,
+            jnp.zeros_like(features),
+        )
+        safe_horde_predictions = jnp.where(
+            update_applied,
+            horde_predictions,
+            jnp.zeros_like(horde_predictions),
+        )
+        safe_horde_td_errors = jnp.where(
+            update_applied,
+            horde_td_errors,
+            jnp.zeros_like(horde_td_errors),
+        )
+        safe_horde_td_targets = jnp.where(
+            update_applied,
+            horde_td_targets,
+            jnp.zeros_like(horde_td_targets),
+        )
+        safe_q_values = jnp.where(
+            update_applied,
+            q_values_or_policy,
+            jnp.zeros_like(q_values_or_policy),
+        )
+        safe_action = jnp.where(
+            update_applied,
+            action_out,
+            jnp.asarray(0, dtype=jnp.int32),
+        )
+        safe_control_td_error = jnp.where(
+            update_applied,
+            control_td_error,
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        safe_reward = jnp.where(
+            update_applied,
+            reward_out,
+            jnp.asarray(0.0, dtype=jnp.float32),
         )
         return AlbertaPipelineStepResult(
             state=next_state,
-            features=features,
-            horde_predictions=horde_predictions,
-            horde_td_errors=horde_td_errors,
-            horde_td_targets=horde_td_targets,
-            q_values=q_values_or_policy,
-            action=action_out,
-            control_td_error=control_td_error,
-            reward=reward_out,
+            features=safe_features,
+            horde_predictions=safe_horde_predictions,
+            horde_td_errors=safe_horde_td_errors,
+            horde_td_targets=safe_horde_td_targets,
+            q_values=safe_q_values,
+            action=safe_action,
+            control_td_error=safe_control_td_error,
+            reward=safe_reward,
+            pre_step_words=state.step_words,
+            post_step_words=next_state.step_words,
+            lifetime_counter_valid=lifetime_counter_valid,
+            lifetime_capacity_available=lifetime_capacity_available,
+            source_valid=source_valid,
+            state_valid=state_valid,
+            step2_contract_available=step2_contract_available,
+            step2_update_applied=step2_update_applied,
+            step3_contract_available=step3_contract_available,
+            step3_update_applied=step3_update_applied,
+            control_contract_available=control_contract_available,
+            control_update_applied=control_update_applied,
+            children_pre_aligned=children_pre_aligned,
+            children_post_aligned=children_post_aligned,
+            candidate_state_valid=candidate_state_valid,
+            update_applied=update_applied,
+            update_rejected=~update_applied,
+            rejection_reason=rejection_reason,
         )
 
     def run_arrays(
@@ -1080,6 +1990,7 @@ class AlbertaPipeline:
         (the per-step callable variant is :meth:`update`); array runs use a
         fully resolved cumulant table for ``jax.lax.scan`` compatibility.
         """
+        use_upgd_targets = upgd_targets is not None
         if upgd_targets is None:
             steps = observations.shape[0]
             upgd_targets_array = jnp.full(
@@ -1088,7 +1999,15 @@ class AlbertaPipeline:
                 dtype=jnp.float32,
             )
         else:
+            if getattr(upgd_targets, "dtype", None) != jnp.dtype(jnp.float32):
+                raise TypeError("upgd_targets must have dtype float32")
             upgd_targets_array = jnp.asarray(upgd_targets, dtype=jnp.float32)
+        if associative_labels is not None and getattr(
+            associative_labels,
+            "dtype",
+            None,
+        ) != jnp.dtype(jnp.int32):
+            raise TypeError("associative_labels must have dtype int32")
         associative_labels_array = (
             jnp.asarray(associative_labels, dtype=jnp.int32)
             if associative_labels is not None
@@ -1101,7 +2020,10 @@ class AlbertaPipeline:
         def step_fn(
             carry: AlbertaPipelineState,
             inputs: tuple[Array, Array, Array, Array, Array, Array],
-        ) -> tuple[AlbertaPipelineState, tuple[Array, Array, Array, Array, Array, Array]]:
+        ) -> tuple[
+            AlbertaPipelineState,
+            tuple[Array, Array, Array, Array, Array, Array, Array, Array],
+        ]:
             (
                 obs_t,
                 reward_t,
@@ -1116,7 +2038,11 @@ class AlbertaPipeline:
                 reward_t,
                 terminated_t,
                 cumulants_t,
-                upgd_target_t if self._config.step2 == "upgd" else None,
+                (
+                    upgd_target_t
+                    if self._config.step2 == "upgd" and use_upgd_targets
+                    else None
+                ),
                 associative_label_t if use_associative_labels else None,
             )
             return result.state, (
@@ -1126,6 +2052,8 @@ class AlbertaPipeline:
                 result.q_values,
                 result.action,
                 result.control_td_error,
+                result.update_applied,
+                result.rejection_reason,
             )
 
         final_state, outputs = jax.lax.scan(
@@ -1147,6 +2075,8 @@ class AlbertaPipeline:
             q_values,
             actions,
             control_td_errors,
+            update_applied,
+            rejection_reasons,
         ) = outputs
         return AlbertaPipelineArrayResult(
             state=final_state,
@@ -1156,7 +2086,153 @@ class AlbertaPipeline:
             q_values=q_values,
             actions=actions,
             control_td_errors=control_td_errors,
+            update_applied=update_applied,
+            rejection_reasons=rejection_reasons,
         )
+
+
+def migrate_legacy_alberta_pipeline_state(
+    pipeline: AlbertaPipeline,
+    legacy_state: Any,
+) -> AlbertaPipelineState:
+    """Migrate an unsaturated pre-v2 wrapper state on the host.
+
+    This migration can authenticate only a legacy wrapper whose int32 clock
+    never saturated and whose already-versioned exact children agree with that
+    clock. Legacy child trees that lack their own exact identity require their
+    component-specific migration first and are rejected here rather than
+    assigned a guessed history.
+    """
+
+    fields = _host_field_mapping(legacy_state, name="legacy pipeline state")
+    current_names = {
+        item.name for item in dataclasses.fields(AlbertaPipelineState)
+    }
+    legacy_names = current_names - {"step_words"}
+    if set(fields) != legacy_names:
+        missing = sorted(legacy_names - set(fields))
+        extra = sorted(set(fields) - legacy_names)
+        raise ValueError(
+            "legacy pipeline state fields are unsupported; "
+            f"missing={missing}, extra={extra}"
+        )
+    legacy_step = fields["step_count"]
+    if getattr(legacy_step, "shape", None) != ():
+        raise ValueError("legacy pipeline step_count must be scalar")
+    if getattr(legacy_step, "dtype", None) != jnp.dtype(jnp.int32):
+        raise TypeError("legacy pipeline step_count must have dtype int32")
+    host_step = int(legacy_step)
+    if host_step < 0:
+        raise ValueError("negative legacy pipeline step_count is invalid")
+    if host_step >= _INT32_MAX:
+        raise ValueError(
+            "saturated legacy pipeline step_count cannot authenticate an exact lifetime"
+        )
+    if pipeline.config.step2 == "temporal_context" and not hasattr(
+        fields["feature_state"],
+        "step_words",
+    ):
+        raise ValueError(
+            "legacy temporal-context child lacks exact step_words; migrate it "
+            "with migrate_legacy_temporal_context_state before the pipeline wrapper"
+        )
+    fields["step_words"] = jnp.asarray((0, host_step), dtype=jnp.uint32)
+    migrated = AlbertaPipelineState(**fields)
+    pipeline._validate_state_static_contract(migrated)  # noqa: SLF001
+    if not bool(pipeline._state_valid(migrated)):  # noqa: SLF001
+        raise ValueError(
+            "legacy pipeline children are not exact-clock aligned; migrate each "
+            "bounded child before migrating the wrapper"
+        )
+    return migrated
+
+
+def save_alberta_pipeline_checkpoint(
+    pipeline: AlbertaPipeline,
+    state: AlbertaPipelineState,
+    path: str | Path,
+) -> None:
+    """Save only a structurally valid v2 exact-transaction checkpoint."""
+
+    pipeline._validate_state_static_contract(state)  # noqa: SLF001
+    if not bool(pipeline._state_valid(state)):  # noqa: SLF001
+        raise ValueError("pipeline checkpoint state is invalid")
+    save_checkpoint(
+        state,
+        path,
+        metadata={
+            "schema": ALBERTA_PIPELINE_CHECKPOINT_SCHEMA,
+            "state_schema": ALBERTA_PIPELINE_STATE_SCHEMA,
+            "mechanism_status": "development_mechanism_only",
+            "scientific_promotion_allowed": False,
+            "pipeline_config": pipeline.config.to_dict(),
+            "resource_budget": pipeline.resource_budget(state).to_dict(),
+        },
+    )
+
+
+def load_alberta_pipeline_checkpoint(
+    path: str | Path,
+    *,
+    cumulant_fn: CumulantFn | None = None,
+) -> tuple[AlbertaPipeline, AlbertaPipelineState]:
+    """Restore a strict v2 pipeline checkpoint and revalidate every child."""
+
+    metadata = load_checkpoint_metadata(path)
+    expected_metadata = {
+        "schema",
+        "state_schema",
+        "mechanism_status",
+        "scientific_promotion_allowed",
+        "pipeline_config",
+        "resource_budget",
+    }
+    if set(metadata) != expected_metadata:
+        raise ValueError("pipeline checkpoint metadata fields are invalid")
+    schema = metadata["schema"]
+    if schema == _LEGACY_ALBERTA_PIPELINE_CHECKPOINT_SCHEMA:
+        raise ValueError(
+            "legacy pipeline checkpoint v1 lacks exact wrapper identity; "
+            "decode it with its original schema and call "
+            "migrate_legacy_alberta_pipeline_state explicitly"
+        )
+    if schema != ALBERTA_PIPELINE_CHECKPOINT_SCHEMA:
+        raise ValueError("pipeline checkpoint schema is unsupported")
+    if metadata["state_schema"] != ALBERTA_PIPELINE_STATE_SCHEMA:
+        raise ValueError("pipeline checkpoint state schema is unsupported")
+    if metadata["mechanism_status"] != "development_mechanism_only":
+        raise ValueError("pipeline checkpoint mechanism status is invalid")
+    if metadata["scientific_promotion_allowed"] is not False:
+        raise ValueError("pipeline checkpoint promotion flag is invalid")
+    config_payload = metadata["pipeline_config"]
+    if type(config_payload) is not dict:
+        raise ValueError("pipeline checkpoint config is invalid")
+    pipeline = AlbertaPipeline(
+        AlbertaPipelineConfig.from_dict(cast(dict[str, object], config_payload)),
+        cumulant_fn=cumulant_fn,
+    )
+    initial_observation = jnp.zeros(
+        (pipeline._observation_dim(),),  # noqa: SLF001
+        dtype=(
+            jnp.int32
+            if pipeline.config.step2 == "associative"
+            else jnp.float32
+        ),
+    )
+    template = pipeline.init(jr.key(0), initial_observation)
+    restored, restored_metadata = load_checkpoint(template, path)
+    if restored_metadata != metadata:
+        raise ValueError("pipeline checkpoint metadata changed between reads")
+    state = cast(AlbertaPipelineState, restored)
+    pipeline._validate_state_static_contract(state)  # noqa: SLF001
+    if not bool(pipeline._state_valid(state)):  # noqa: SLF001
+        raise ValueError("pipeline checkpoint state is invalid")
+    resource_payload = metadata["resource_budget"]
+    if type(resource_payload) is not dict:
+        raise ValueError("pipeline checkpoint resource contract is invalid")
+    if resource_payload != pipeline.resource_budget(state).to_dict():
+        raise ValueError("pipeline checkpoint resource contract does not match")
+    return pipeline, state
 
 
 def make_alberta_pipeline(
@@ -1209,12 +2285,18 @@ def run_pipeline_smoke(
     horde_cumulants = observations[1:, cumulant_indices].astype(jnp.float32)
 
     state = pipeline.init(state_key, observations[0])
+    smoke_upgd_targets = (
+        jnp.zeros((steps, cfg.upgd.n_heads), dtype=jnp.float32)
+        if cfg.step2 == "upgd" and cfg.upgd is not None
+        else None
+    )
     result = pipeline.run_arrays(
         state,
         observations[1:],
         rewards,
         terminated,
         horde_cumulants,
+        upgd_targets=smoke_upgd_targets,
         associative_labels=associative_labels,
     )
     result.q_values.block_until_ready()
@@ -1231,6 +2313,7 @@ def run_pipeline_smoke(
         & jnp.all(jnp.isfinite(result.horde_td_errors))
         & jnp.all(jnp.isfinite(result.q_values))
         & jnp.all(jnp.isfinite(result.control_td_errors))
+        & jnp.all(result.update_applied)
         & finite_actions
     )
     return AlbertaPipelineSmokeResult(

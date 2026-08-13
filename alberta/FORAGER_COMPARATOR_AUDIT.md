@@ -2,11 +2,13 @@
 
 Date: 2026-07-31
 
-> **Frozen-v1 status:** `matched_current_open_tuning_2c3b214c_v1` is immutable and
-> nonmodifiable. This audit records comparator provenance and limitations. It does not
-> authorize edits to v1, evidence promotion, or performance claims. As of 2026-08-01 no
-> open-tuning cell and no held-out evaluation has been executed; every limitation below
-> is therefore prospective, constraining how a future v1 result may be interpreted.
+> **Historical-v1/current-v2 status:** `matched_current_open_tuning_2c3b214c_v1` is
+> immutable, historical, and source-incompatible with the current tree. Candidate-universe
+> schema v2 retains the same named 23-candidate panel but narrows its claim boundary; its
+> canonical digest is `6a9315cb996fe5698e4c1580d30da9b0524e9875ce085d1399bb975cc5b510a8`.
+> No renewed v2 qualification, open-tuning cell, or held-out evaluation exists. A future
+> run requires fresh qualification and a new output namespace. This audit does not authorize
+> resuming v1, evidence promotion, or a performance claim.
 
 ## Technical summary
 
@@ -268,6 +270,126 @@ Other explicit omissions are:
 These are frozen panel-scope choices. They must not be interpreted as negative findings
 about an omitted method.
 
+### Repository-wide configured families and popular-orientation gaps
+
+A second read-only scan grouped the pinned upstream repository by implementation family,
+collapsing sweep, hyperparameter, greedy, frozen-checkpoint, width, and rollout suffixes.
+In addition to the v2 arms, the repository has configured Foragax transfers for:
+
+- DQN L2, L2-to-initialization, reset, shrink-and-perturb, Hare-and-Tortoise, ReDo,
+  reward trace, and SWR variants;
+- current-XFinal DRQN and PT-DQN;
+- convolutional and MLP PPO, convolutional and MLP RTU-PPO, archived RTU pooling,
+  balanced/hint and hint-only RTU aliases, and ESMAC;
+- Random, Search, and simulator-based MCTS descriptive policies.
+
+Canonical transfer configurations include:
+
+- `experiments/XFinal/foragax/ForagaxSquareWaveTwoBiome-v11/9/DQN_reward_trace.json`
+- `experiments/XFinal/foragax/ForagaxSquareWaveTwoBiome-v11/9/DQN_L2_Init.json`
+- `experiments/XFinal/foragax/ForagaxSquareWaveTwoBiome-v11/9/DRQN.json`
+- `experiments/XFinal/foragax/ForagaxSquareWaveTwoBiome-v11/9/PT_DQN_64.json`
+- `experiments/XFinal/foragax/ForagaxSquareWaveTwoBiome-v11/9/ActorCriticMLP.json`
+- `experiments/R1-ForagaxSquareWaveTwoBiome-v11-color/foragax/`
+  `ForagaxSquareWaveTwoBiome-v11/9/PPO-RTU_LN_2048.json`
+
+Every item in that list is a different-task transfer requiring a new exact-task
+configuration, fresh development seeds, explicit field-level transforms, and new held-out
+evaluation. A development screen that excluded current-XFinal DRQN or PT-DQN is not negative
+evidence about either method.
+
+The pinned repository has no Foragax configuration for its AADRQN, ATAADRQN, MADRQN, EQRC,
+DQN spectral-regularization, ESARSA, SoftmaxAC, or multi-RTU-MLP registry implementations.
+Those are implemented families, not ready-to-run official Foragax comparators.
+
+Two important popular orientations are absent from both v2 and the pinned repository:
+
+- a Rainbow-class value baseline combining the defining multi-step, prioritized-replay,
+  distributional, dueling, noisy, and double-Q components rather than merely reusing a
+  generic DQN knob;
+- a matched recurrent policy-gradient baseline such as PPO-LSTM or PPO-GRU, needed to
+  distinguish RTU recurrence from generic recurrence. An R2D2-class arm is a reasonable
+  recurrent-value alternative, but DRQN alone does not represent it.
+
+These are comparator-completeness gaps, not evidence that Rainbow, PPO-LSTM/GRU, or R2D2 is
+SOTA on the exact task. Each needs a separately pinned source, a qualified independent RNG
+stream, an exact-task adapter/configuration, and a new development/evaluation cycle.
+
+Recommended source pins from the primary-source review are:
+
+- Dopamine
+  [`JaxFullRainbowAgent` at `5873f5494ee0c2d7c016d0ab2ad530354fec59d0`](https://github.com/google/dopamine/blob/5873f5494ee0c2d7c016d0ab2ad530354fec59d0/dopamine/jax/agents/full_rainbow/full_rainbow_agent.py),
+  under its
+  [Apache-2.0 license](https://github.com/google/dopamine/blob/5873f5494ee0c2d7c016d0ab2ad530354fec59d0/LICENSE).
+  The ordinary Dopamine `JaxRainbowAgent` is a reduced variant; the full
+  agent is the orientation that binds all six canonical Rainbow components. A local Flax
+  observation adapter should preserve and test C51 support, n-step returns, prioritized
+  replay and importance weights, Double Q, noisy-network behavior, and dueling heads.
+- POBAX
+  [`ppo.py` at `a5e1d62d14e4efe783885b9d4f19cffa2a568eec`](https://github.com/taodav/pobax/blob/a5e1d62d14e4efe783885b9d4f19cffa2a568eec/pobax/algos/ppo.py)
+  plus its pinned
+  [`network.py`](https://github.com/taodav/pobax/blob/a5e1d62d14e4efe783885b9d4f19cffa2a568eec/pobax/models/network.py),
+  also under an
+  [Apache-2.0 license](https://github.com/taodav/pobax/blob/a5e1d62d14e4efe783885b9d4f19cffa2a568eec/LICENSE).
+  Its discrete PPO-GRU path already preserves recurrent sequences and
+  resets carry at episode boundaries; the Forager adapter must keep those semantics and
+  count environment interactions rather than vectorized optimizer steps.
+- Acme JAX
+  [`R2D2` at `b7e40814a42873fa5c1cd504cddffda14d452fbe`](https://github.com/google-deepmind/acme/tree/b7e40814a42873fa5c1cd504cddffda14d452fbe/acme/agents/jax/r2d2),
+  under its
+  [Apache-2.0 license](https://github.com/google-deepmind/acme/blob/b7e40814a42873fa5c1cd504cddffda14d452fbe/LICENSE),
+  is an optional recurrent-value orientation. Its Reverb, TensorFlow, pmap, and
+  older dependency stack make it substantially higher risk than PPO-GRU, so it is not in
+  the minimum next panel.
+
+These commits are provenance anchors for reviewed local adapters. Porting them to the
+Foragax observation and execution boundary means the resulting candidates are derivatives,
+not exact executions of those repositories.
+
+### Future memory-comparator source registry
+
+A later primary-source review added a descriptor-only registry for memory orientations that
+postdate or extend the minimum matched-v3 panel:
+`alberta_framework/benchmarks/forager_memory_comparator_development_sources.py`. Its v2
+descriptor is pinned at
+`a98f78d5e5483c8dfbd821b953793e61ae820c1f1b3906a18b886836da7e116c` and is explicitly
+disjoint from the frozen 28-candidate universe. It grants no download, import, execution,
+qualification, promotion, or performance-claim authority.
+
+The licensed source families registered for possible future, nonpromoting development are:
+
+- POBAX learning-dynamics PPO-GRU and GTrXL concepts, motivated by the
+  [POBAX evaluation](https://arxiv.org/abs/2508.00046) and pinned to the
+  [official source](https://github.com/taodav/pobax/tree/a5e1d62d14e4efe783885b9d4f19cffa2a568eec).
+- [AGaLiTe](https://openreview.net/forum?id=lh6vOAHuvo), pinned to its
+  [official source](https://github.com/subho406/agalite/tree/101acbecc121a258ad8f7e58e2f782f546674979).
+- [Memory Traces](https://arxiv.org/abs/2503.15200), pinned to its
+  [official source](https://github.com/onnoeberhard/memory-traces/tree/fcfdacc0b0a06dc181b49b9ef95893dbae7f2bcd).
+- [Sparse Hierarchical Memory](https://openreview.net/forum?id=We5z3UEnUY), pinned to its
+  [official source](https://github.com/thaihungle/SHM/tree/651f9e27e0fd3a3ec46a0f45b84e0128c5f8a312).
+- [Fast and Forgetful Memory](https://arxiv.org/abs/2310.04128), pinned to its
+  [MIT-licensed official source](https://github.com/proroklab/ffm/tree/b3f94d2a0f35ba05089faf19ab1df846057cf8b6).
+  The registry separates the standalone-JAX initialization/reset behavior from the paper's
+  `m=32`, `c=4`, double-precision-oriented configuration; those results may not be merged or
+  described as exact upstream execution.
+
+The compressed archive hashes in this registry are audit-time receipts, not stable download
+authentication. An independent replay reproduced the FFM archive exactly, but current
+AGaLiTe and Memory Traces archive bytes differed from their retained compressed-byte receipts
+even though all declared extracted subset files still verified exactly. Any future source
+materializer must therefore establish its own commit/tree and extracted-file closure; it may
+not treat a codeload archive SHA alone as execution or provenance authority.
+
+[Memoroids with tape-based batching](https://arxiv.org/abs/2402.09900) is retained only as
+an unregistered paper-level gap. The audited
+[official repository snapshot](https://github.com/proroklab/memoroids/tree/78709d2b5f99d40f10c8f5f4047c15f3dbb023b9)
+declares no repository license and contains no license file, so this project registers no source
+family or code-derived candidate from it. A future clean-room paper specification would also
+have to match interaction, update, batching, and resource budgets before comparison.
+
+These entries are candidate ideas for a separately versioned development cycle. None is a
+Forager result, a matched-v3 amendment, or evidence that the method is SOTA on this task.
+
 ## Future-cycle recommendations
 
 All recommendations apply only to a separately versioned future protocol. **Do not modify
@@ -295,7 +417,16 @@ frozen v1 or its pinned outputs.**
 9. Add explicit resource-control arms for replay 10k versus 1k, fixed versus decaying
    exploration, previous-action/reward inputs, parameter count, and optimizer updates.
 10. Continue binding source commits, trees, configuration hashes, and field-level
-   transforms. Automate an exact-environment inventory before freezing the next universe.
+    transforms. Automate an exact-environment inventory before freezing the next universe.
+11. Add separately source-pinned Rainbow and recurrent PPO-LSTM/GRU implementations, or
+    preregister R2D2 as the recurrent-value alternative. Treat each as a new task adapter,
+    not as an exact upstream Forager replay.
+12. If the next protocol makes a best-in-panel claim, execute every frozen inferential arm
+    on held-out seeds and use preregistered simultaneous comparisons. A selector-only
+    evaluation estimates the selector, not the best member of the candidate universe.
+13. Report native/tuned performance separately from matched-resource ablations. Include
+    trainable parameters, target and optimizer copies, replay and rollout storage,
+    recurrent/RTRL state, update counts, and wall-clock use.
 
 No recommendation above changes the evidence status of v1 or upgrades any current claim.
 

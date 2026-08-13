@@ -151,7 +151,7 @@ def _sync_replay_attestation(root: Path) -> None:
 
 
 @pytest.mark.unit
-def test_exact_chain_supports_only_the_original_historical_claim(
+def test_exact_chain_fails_closed_after_invariant_source_drift(
     tmp_path: Path,
 ) -> None:
     spec = _copy_fixture(tmp_path)
@@ -164,37 +164,50 @@ def test_exact_chain_supports_only_the_original_historical_claim(
 
     replay = load_ftl_decision_artifact(tmp_path / _REPLAY_PATH)
     replay_validation = validate_ftl_decision_artifact(replay)
-    assert replay_validation.valid is True
-    assert replay_validation.accepted is True
-    assert replay_validation.errors == ()
+    assert replay_validation.valid is False
+    assert replay_validation.accepted is False
+    assert replay_validation.errors == (_SOURCE_DRIFT_ERROR,)
 
     claim = _claim(tmp_path, spec)
 
-    assert claim["status"] == "accepted"
-    assert claim["valid"] is True
-    assert claim["accepted"] is True
-    assert claim["scientific_claim_supported"] is True
+    assert claim["status"] == "invalid"
+    assert claim["valid"] is False
+    assert claim["accepted"] is False
+    assert claim["scientific_claim_supported"] is False
     assert (
         claim["validation_basis"]
-        == "historical-accepted-consumed-seed-compatibility-chain"
+        == "historical-acceptance-compatibility-chain-failed"
     )
     assert claim["primary_validator_valid"] is False
     assert claim["primary_validator_accepted"] is False
-    assert claim["validator_accepted"] is True
-    assert claim["errors"] == []
+    assert claim["validator_accepted"] is False
+    errors = cast(list[str], claim["errors"])
+    assert any(
+        "historical/current FTL source drift must be exactly" in error
+        for error in errors
+    )
+    assert any(
+        _INVARIANT_PATHS[1].as_posix() in error
+        for error in errors
+    )
+    assert any(
+        _INVARIANT_PATHS[2].as_posix() in error
+        for error in errors
+    )
 
     historical = cast(dict[str, object], claim["historical_validation"])
-    assert historical["valid"] is True
-    assert historical["historical_scientific_claim_supported"] is True
+    assert historical["valid"] is False
+    assert historical["classification"] == "invalid"
+    assert historical["historical_scientific_claim_supported"] is False
     assert historical["current_replay_scientific_promotion_allowed"] is False
     original_record = cast(dict[str, object], historical["historical_artifact"])
-    assert original_record["reconstructed_validator_valid"] is True
-    assert original_record["reconstructed_validator_accepted"] is True
+    assert original_record["reconstructed_validator_valid"] is False
+    assert original_record["reconstructed_validator_accepted"] is False
     replay_record = cast(dict[str, object], historical["current_source_replay"])
     assert replay_record["role"] == "nonpromoting_consumed_seed_replay"
     assert replay_record["consumed_seed_schedule"] is True
-    assert replay_record["strict_validator_valid"] is True
-    assert replay_record["validator_accepted"] is True
+    assert replay_record["strict_validator_valid"] is False
+    assert replay_record["validator_accepted"] is False
     recoverability = cast(
         dict[str, object],
         historical["historical_source_recoverability"],

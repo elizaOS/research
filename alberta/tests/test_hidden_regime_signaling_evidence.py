@@ -5,8 +5,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import sys
 from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -292,6 +294,26 @@ def test_source_snapshot_closes_over_protocol_algorithm_and_dependency_lock() ->
     } <= paths
     assert not any(path.startswith("tests/") for path in paths)
     assert "alberta_framework/evaluation/continual_ia_artifact.py" not in paths
+
+
+def test_source_snapshot_is_independent_of_unrelated_loaded_modules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = evidence_module._algorithm_source_paths()
+    unrelated_path = (
+        evidence_module.REPO_ROOT
+        / "alberta_framework/evaluation/continual_ia_artifact.py"
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "alberta_framework.evaluation.collection_order_probe",
+        SimpleNamespace(__file__=str(unrelated_path)),
+    )
+
+    after = evidence_module._algorithm_source_paths()
+
+    assert after == before
+    assert unrelated_path.relative_to(evidence_module.REPO_ROOT) not in after
 
 
 def test_manual_plan_is_sha_separated_deterministic_and_source_bound() -> None:

@@ -13,9 +13,15 @@ import pytest
 
 from alberta_framework.core.feature_bank_router import (
     CONFIG_SCHEMA_VERSION,
+    FEATURE_BANK_ROUTER_LIFETIME_COUNTER_DELTA_NBYTES,
+    FEATURE_BANK_ROUTER_LIFETIME_COUNTER_NBYTES,
+    FEATURE_BANK_ROUTER_STATE_SCHEMA,
     FeatureBankRouter,
     FeatureBankRouterConfig,
     FeatureBankRouterState,
+    feature_bank_router_lifetime_counter_nbytes,
+    measure_feature_bank_router_state_nbytes,
+    migrate_legacy_feature_bank_router_state,
 )
 
 _OLD = jnp.asarray(
@@ -137,6 +143,10 @@ def test_reorder_survival_birth_removal_routes_every_consumer_atomically() -> No
     assert int(diagnostics.evicted_count) == 1
     assert int(result.state.route_count) == 1
     assert int(result.state.generation_count) == 1
+    np.testing.assert_array_equal(result.state.route_words, [0, 1])
+    np.testing.assert_array_equal(result.state.generation_words, [0, 1])
+    assert bool(diagnostics.lifetime_counter_valid)
+    assert bool(diagnostics.lifetime_capacity_available)
     np.testing.assert_array_equal(result.state.descriptors, _NEW)
 
     routed = cast(dict[str, Any], result.consumers)
@@ -177,6 +187,8 @@ def test_reorder_survival_birth_removal_routes_every_consumer_atomically() -> No
     )
     assert int(same_generation.state.route_count) == 2
     assert int(same_generation.state.generation_count) == 1
+    np.testing.assert_array_equal(same_generation.state.route_words, [0, 2])
+    np.testing.assert_array_equal(same_generation.state.generation_words, [0, 1])
     assert not bool(same_generation.diagnostics.descriptors_changed)
 
 
@@ -423,6 +435,114 @@ def test_route_is_jit_vmap_and_scan_compatible_with_fixed_shapes() -> None:
 
 
 @pytest.mark.unit
+def test_exact_clocks_carry_and_exhaustion_is_an_atomic_noop() -> None:
+    router = _router()
+    consumers = _consumers()
+    near_carry = dataclasses.replace(
+        router.init(_OLD),
+        route_count=jnp.asarray(2**31 - 1, dtype=jnp.int32),
+        route_words=jnp.asarray((0, 2**32 - 1), dtype=jnp.uint32),
+    )
+
+    carried = jax.jit(
+        lambda state, values: router.route(
+            state,
+            values,
+            _OLD,
+            feature_axes=_feature_axes(),
+        )
+    )(near_carry, consumers)
+    assert bool(carried.diagnostics.route_applied)
+    np.testing.assert_array_equal(carried.state.route_words, [1, 0])
+    np.testing.assert_array_equal(carried.state.generation_words, [0, 0])
+    assert int(carried.state.route_count) == 2**31 - 1
+    assert int(carried.state.generation_count) == 0
+
+    exhausted = dataclasses.replace(
+        carried.state,
+        route_words=jnp.full((2,), 2**32 - 1, dtype=jnp.uint32),
+    )
+    stopped = router.route(
+        exhausted,
+        carried.consumers,
+        _NEW,
+        feature_axes=_feature_axes(),
+    )
+    assert bool(stopped.diagnostics.lifetime_counter_valid)
+    assert not bool(stopped.diagnostics.route_capacity_available)
+    assert not bool(stopped.diagnostics.lifetime_capacity_available)
+    assert not bool(stopped.diagnostics.route_applied)
+    _assert_state_bit_exact(stopped.state, exhausted)
+    _assert_tree_bit_exact(stopped.consumers, carried.consumers)
+
+
+@pytest.mark.unit
+def test_exact_clock_corruption_and_impossible_generation_order_fail_closed() -> None:
+    router = _router()
+    consumers = _consumers()
+    telemetry_mismatch = dataclasses.replace(
+        router.init(_OLD),
+        route_count=jnp.asarray(1, dtype=jnp.int32),
+    )
+    mismatch = router.route(
+        telemetry_mismatch,
+        consumers,
+        _NEW,
+        feature_axes=_feature_axes(),
+    )
+    assert not bool(mismatch.diagnostics.route_counter_valid)
+    assert bool(mismatch.diagnostics.counter_invalid)
+    assert not bool(mismatch.diagnostics.route_applied)
+    _assert_state_bit_exact(mismatch.state, telemetry_mismatch)
+    _assert_tree_bit_exact(mismatch.consumers, consumers)
+
+    impossible_order = dataclasses.replace(
+        router.init(_OLD),
+        generation_count=jnp.asarray(1, dtype=jnp.int32),
+        generation_words=jnp.asarray((0, 1), dtype=jnp.uint32),
+    )
+    ordered = router.route(
+        impossible_order,
+        consumers,
+        _NEW,
+        feature_axes=_feature_axes(),
+    )
+    assert bool(ordered.diagnostics.generation_counter_valid)
+    assert not bool(ordered.diagnostics.counter_order_valid)
+    assert not bool(ordered.diagnostics.lifetime_counter_valid)
+    assert not bool(ordered.diagnostics.route_applied)
+    _assert_state_bit_exact(ordered.state, impossible_order)
+    _assert_tree_bit_exact(ordered.consumers, consumers)
+
+
+@pytest.mark.unit
+def test_legacy_router_state_migration_is_strict_and_fail_closed() -> None:
+    legacy = {
+        "descriptors": _OLD,
+        "route_count": jnp.asarray(7, dtype=jnp.int32),
+        "generation_count": jnp.asarray(3, dtype=jnp.int32),
+    }
+    migrated = migrate_legacy_feature_bank_router_state(legacy)
+    np.testing.assert_array_equal(migrated.route_words, [0, 7])
+    np.testing.assert_array_equal(migrated.generation_words, [0, 3])
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        migrate_legacy_feature_bank_router_state(
+            {**legacy, "route_count": jnp.asarray(2**31 - 1, dtype=jnp.int32)}
+        )
+    with pytest.raises(ValueError, match="exceeds"):
+        migrate_legacy_feature_bank_router_state(
+            {
+                **legacy,
+                "route_count": jnp.asarray(2, dtype=jnp.int32),
+                "generation_count": jnp.asarray(3, dtype=jnp.int32),
+            }
+        )
+    with pytest.raises(ValueError, match="manifest"):
+        migrate_legacy_feature_bank_router_state({**legacy, "extra": 1})
+
+
+@pytest.mark.unit
 def test_exact_resource_accounting_and_strict_config_roundtrip() -> None:
     config = FeatureBankRouterConfig(base_dim=4, active_slots=4)
     router = FeatureBankRouter(config)
@@ -438,21 +558,27 @@ def test_exact_resource_accounting_and_strict_config_roundtrip() -> None:
     assert budget.total_feature_slots == 8
     assert budget.descriptor_int32_scalars == 8
     assert budget.counter_int32_scalars == 2
-    assert budget.router_state_scalars == 10
-    assert budget.router_state_nbytes == 40
+    assert budget.counter_uint32_scalars == 4
+    assert budget.router_state_scalars == 14
+    assert budget.router_state_nbytes == 56
     assert budget.consumer_leaf_count == 3
     assert budget.consumer_feature_groups == 7
     assert budget.consumer_stable_prefix_scalars == 28
     assert budget.consumer_dynamic_tail_scalars == 28
     assert budget.consumer_total_scalars == 56
     assert budget.consumer_state_nbytes == 224
-    assert budget.total_managed_nbytes == 264
-    assert budget.to_dict()["total_managed_nbytes"] == 264
+    assert budget.total_managed_nbytes == 280
+    assert budget.to_dict()["total_managed_nbytes"] == 280
+    assert measure_feature_bank_router_state_nbytes(state) == 56
+    assert feature_bank_router_lifetime_counter_nbytes() == 24
+    assert FEATURE_BANK_ROUTER_LIFETIME_COUNTER_NBYTES == 24
+    assert FEATURE_BANK_ROUTER_LIFETIME_COUNTER_DELTA_NBYTES == 16
 
     serialized = router.to_config()
     assert serialized == {
         "type": "FeatureBankRouter",
         "schema_version": CONFIG_SCHEMA_VERSION,
+        "state_schema": FEATURE_BANK_ROUTER_STATE_SCHEMA,
         "base_dim": 4,
         "active_slots": 4,
     }
@@ -468,6 +594,8 @@ def test_exact_resource_accounting_and_strict_config_roundtrip() -> None:
         FeatureBankRouter.from_config({**serialized, "extra": 1})
     with pytest.raises(ValueError, match="schema version"):
         FeatureBankRouter.from_config({**serialized, "schema_version": "unsupported.v2"})
+    with pytest.raises(ValueError, match="state schema"):
+        FeatureBankRouter.from_config({**serialized, "state_schema": "unsupported.v1"})
     with pytest.raises(ValueError, match="base_dim"):
         FeatureBankRouterConfig(base_dim=True, active_slots=4)
     with pytest.raises(ValueError, match="active_slots"):

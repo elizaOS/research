@@ -1,12 +1,12 @@
 # mypy: disable-error-code="call-arg"
 """Candidate-update safety audit and paper-defined delight signals.
 
-:func:`assess_gradient_joy` is the historical API name for a multi-objective
-candidate-update safety audit. It checks first-order effects on independent
-objective, retention, and safety probes plus an update-norm trust bound. It is
-optimizer control-plane logic and is *not* the paper-defined meaning of
-``delight`` or “sparks joy.” New prose should call it the candidate-update
-audit; compatibility names remain to avoid checkpoint/API breakage.
+:func:`assess_candidate_update` is the canonical multi-objective candidate-
+update safety audit. It checks first-order effects on independent objective,
+retention, and safety probes plus an update-norm trust bound. It is optimizer
+control-plane logic and is *not* the paper-defined meaning of ``delight`` or
+“sparks joy.” Historical ``GradientJoy*``, ``assess_gradient_joy``, and
+``apply_gradient_joy_update`` names remain exact identity aliases only.
 
 :func:`discrete_delightful_policy_gradient` implements the bounded
 discrete-action experiment described in WP5 of
@@ -91,8 +91,12 @@ class LearningValue:
 
 
 @dataclasses.dataclass(frozen=True)
-class GradientJoyConfig:
+class CandidateUpdateAuditConfig:
     """Static contract for a first-order candidate-gradient assessment.
+
+    ``GradientJoy`` is a historical compatibility name for this separate
+    candidate-update audit.  It is not Kondo delight and cannot establish that
+    a sample gradient entered an executed actor backward pass.
 
     The candidate is interpreted either as a loss gradient ``g`` whose proposed
     plain-gradient update is ``u = -gradient_step_size * g``, or directly as an
@@ -182,7 +186,7 @@ class GradientJoyConfig:
         return payload
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> GradientJoyConfig:
+    def from_config(cls, config: dict[str, Any]) -> CandidateUpdateAuditConfig:
         """Reconstruct from :meth:`to_config` output."""
         payload = dict(config)
         payload.pop("type", None)
@@ -204,7 +208,7 @@ class LearningValueAvailability:
 
 
 @chex.dataclass(frozen=True)
-class GradientJoyEvidence:
+class CandidateUpdateAuditEvidence:
     """Caller-supplied evidence for one candidate update.
 
     ``objective_probe_gradient`` is accepted under an explicit independence
@@ -219,10 +223,10 @@ class GradientJoyEvidence:
     ``learning_value`` retains the eight typed channels and
     ``learning_value_availability`` declares which producers actually emitted
     them. A channel must be both declared available and semantically valid.
-    In particular, the historical ``delight`` field must exactly equal its
-    float32 paper-specific DG ``advantage * action_surprisal`` identity.
-    Channels are reported separately and are never aggregated into the joy
-    weight.
+    In particular, the paper-defined ``delight`` field must exactly equal its
+    float32 DG ``advantage * action_surprisal`` identity.
+    Channels are reported separately and are never aggregated into the
+    candidate-audit weight.
     """
 
     objective_probe_gradient: Any | None
@@ -237,7 +241,7 @@ class GradientJoyEvidence:
 
 
 @chex.dataclass(frozen=True)
-class GradientJoyDiagnostics:
+class CandidateUpdateAuditDiagnostics:
     """Named first-order diagnostics; signs follow minimization convention.
 
     Unqualified update/change fields describe the raw candidate. ``tentative``
@@ -309,16 +313,17 @@ class GradientJoyDiagnostics:
 
 
 @chex.dataclass(frozen=True)
-class GradientJoyAssessment:
+class CandidateUpdateAuditAssessment:
     """Detached candidate-update audit and auditable evidence.
 
     Acceptance certifies the candidate audit only.  It does not assert that an
     update was representable in a parameter dtype or committed to parameters;
-    :class:`GradientJoyApplicationResult` reports that separate boundary.
+    :class:`CandidateUpdateAuditApplicationResult` reports that separate boundary.
 
     ``sparks_joy`` is retained as a historical read-only alias of ``accepted``.
-    In paper-defined terminology, “sparks joy” instead means Kondo selection
-    for a backward pass; see :class:`~alberta_framework.core.kondo_gate.KondoGateResult`.
+    In paper-defined terminology, a sample “sparks joy” only when its gradient
+    contribution enters an executed actor backward; see
+    :class:`~alberta_framework.core.kondo_sparse_actor.KondoSparseActorResult`.
     """
 
     accepted: Bool[Array, ""]
@@ -327,7 +332,7 @@ class GradientJoyAssessment:
     weighted_update: Any
     learning_value: LearningValue
     channel_availability: LearningValueAvailability
-    diagnostics: GradientJoyDiagnostics
+    diagnostics: CandidateUpdateAuditDiagnostics
 
     @property
     def candidate_update_audit_passed(self) -> Bool[Array, ""]:
@@ -341,7 +346,7 @@ class GradientJoyAssessment:
 
 
 @chex.dataclass(frozen=True)
-class GradientJoyApplicationResult:
+class CandidateUpdateAuditApplicationResult:
     """Auditable result of atomically attempting an accepted parameter update.
 
     ``assessment.accepted`` records the formed candidate audit, while
@@ -359,8 +364,8 @@ class GradientJoyApplicationResult:
     """
 
     parameters: Any
-    assessment: GradientJoyAssessment
-    effective_assessment: GradientJoyAssessment
+    assessment: CandidateUpdateAuditAssessment
+    effective_assessment: CandidateUpdateAuditAssessment
     applied: Bool[Array, ""]
     parameters_finite: Bool[Array, ""]
     cast_update_finite: Bool[Array, ""]
@@ -781,7 +786,7 @@ def _learning_value_for_gradient_audit(
 ) -> tuple[LearningValue, LearningValueAvailability, Array]:
     """Detach, sanitize, and semantically validate eight available channels.
 
-    The historical ``LearningValue.delight`` field is accepted only when its
+    The paper-defined ``LearningValue.delight`` field is accepted only when its
     float32 bits exactly equal the declared paper-defined identity
     ``advantage * action_surprisal``. It remains evidence supplied to the
     separate candidate-update safety audit; it never performs Kondo selection.
@@ -850,12 +855,12 @@ def _learning_value_for_gradient_audit(
     return detached, availability, jax.lax.stop_gradient(complete)
 
 
-def assess_gradient_joy(
+def assess_candidate_update(
     candidate: Any,
-    evidence: GradientJoyEvidence,
-    config: GradientJoyConfig | None = None,
-) -> GradientJoyAssessment:
-    """Assess whether a candidate gradient/update passes a local joy audit.
+    evidence: CandidateUpdateAuditEvidence,
+    config: CandidateUpdateAuditConfig | None = None,
+) -> CandidateUpdateAuditAssessment:
+    """Assess whether a candidate passes the candidate-update audit.
 
     Let ``u`` be the proposed parameter update and let ``g_o``, ``g_r``, and
     ``g_s`` be gradients of an independent objective probe, a retention loss,
@@ -895,7 +900,7 @@ def assess_gradient_joy(
     This is an optimizer control-plane assessment, not a differentiable
     meta-objective.
     """
-    cfg = config or GradientJoyConfig()
+    cfg = config or CandidateUpdateAuditConfig()
     candidate_tree, candidate_structure = _detached_float_tree(
         candidate,
         name="candidate",
@@ -1479,7 +1484,7 @@ def assess_gradient_joy(
     )
     safe_update = jax.tree_util.tree_map(jax.lax.stop_gradient, safe_update)
 
-    diagnostics = GradientJoyDiagnostics(
+    diagnostics = CandidateUpdateAuditDiagnostics(
         objective_probe_available=jax.lax.stop_gradient(objective_available),
         retention_probe_available=jax.lax.stop_gradient(retention_available),
         safety_probe_available=jax.lax.stop_gradient(safety_available),
@@ -1568,7 +1573,7 @@ def assess_gradient_joy(
             tentative_safety_change
         ),
     )
-    return GradientJoyAssessment(
+    return CandidateUpdateAuditAssessment(
         accepted=accepted,
         weight=weight,
         candidate_update=safe_update,
@@ -1579,13 +1584,16 @@ def assess_gradient_joy(
     )
 
 
-def apply_gradient_joy_update(
+def apply_candidate_update(
     parameters: Any,
     candidate: Any,
-    evidence: GradientJoyEvidence,
-    config: GradientJoyConfig | None = None,
-) -> GradientJoyApplicationResult:
-    """Assess and atomically apply one joy-weighted parameter update.
+    evidence: CandidateUpdateAuditEvidence,
+    config: CandidateUpdateAuditConfig | None = None,
+) -> CandidateUpdateAuditApplicationResult:
+    """Assess and atomically apply one audit-weighted parameter update.
+
+    Application is not a claim that any actor sample satisfied Kondo's
+    execution-level semantics.
 
     The assessment is created internally so callers cannot substitute a forged
     acceptance decision.  ``parameters`` and the assessed update must be
@@ -1616,7 +1624,7 @@ def apply_gradient_joy_update(
     check. The helper is compatible with :func:`jax.jit` when the PyTree
     structures and ``config`` are static.
     """
-    assessment = assess_gradient_joy(candidate, evidence, config)
+    assessment = assess_candidate_update(candidate, evidence, config)
     parameter_structure: Any
     update_structure: Any
     parameter_leaves, parameter_structure = jax.tree_util.tree_flatten(parameters)
@@ -1626,7 +1634,9 @@ def apply_gradient_joy_update(
     if not parameter_leaves:
         raise ValueError("parameters must be a non-empty PyTree of floating arrays")
     if parameter_structure != update_structure:
-        raise ValueError("parameter and joy-update PyTree structures must match exactly")
+        raise ValueError(
+            "parameter and candidate-update PyTree structures must match exactly"
+        )
 
     prepared_parameters: list[Array] = []
     prepared_updates: list[Array] = []
@@ -1641,11 +1651,12 @@ def apply_gradient_joy_update(
             )
         if not jnp.issubdtype(update_array.dtype, jnp.floating):
             raise ValueError(
-                f"joy-update leaf {position} must have a real floating dtype"
+                f"candidate-update leaf {position} must have a real floating dtype"
             )
         if parameter_array.shape != update_array.shape:
             raise ValueError(
-                f"parameter and joy-update leaf {position} shapes must match exactly"
+                "parameter and candidate-update leaf "
+                f"{position} shapes must match exactly"
             )
         prepared_parameters.append(parameter_array)
         prepared_updates.append(
@@ -1679,10 +1690,10 @@ def apply_gradient_joy_update(
         proposed_parameters,
     )
     effective_config = dataclasses.replace(
-        config or GradientJoyConfig(),
+        config or CandidateUpdateAuditConfig(),
         candidate_semantics="update",
     )
-    effective_assessment = assess_gradient_joy(
+    effective_assessment = assess_candidate_update(
         effective_update,
         evidence,
         effective_config,
@@ -1722,7 +1733,7 @@ def apply_gradient_joy_update(
         parameter_tree,
         proposed_parameters,
     )
-    return GradientJoyApplicationResult(
+    return CandidateUpdateAuditApplicationResult(
         parameters=updated_parameters,
         assessment=assessment,
         effective_assessment=effective_assessment,
@@ -2012,7 +2023,22 @@ def stratify_delight_outcomes(
     )
 
 
+# Historical public spellings are identity aliases, never separate semantics.
+GradientJoyConfig = CandidateUpdateAuditConfig
+GradientJoyEvidence = CandidateUpdateAuditEvidence
+GradientJoyDiagnostics = CandidateUpdateAuditDiagnostics
+GradientJoyAssessment = CandidateUpdateAuditAssessment
+GradientJoyApplicationResult = CandidateUpdateAuditApplicationResult
+assess_gradient_joy = assess_candidate_update
+apply_gradient_joy_update = apply_candidate_update
+
+
 __all__ = [
+    "CandidateUpdateAuditApplicationResult",
+    "CandidateUpdateAuditAssessment",
+    "CandidateUpdateAuditConfig",
+    "CandidateUpdateAuditDiagnostics",
+    "CandidateUpdateAuditEvidence",
     "DelightOutcomeStratification",
     "DelightStratumDiagnostics",
     "DelightfulPolicyGradientConfig",
@@ -2027,7 +2053,9 @@ __all__ = [
     "LearningValue",
     "LearningValueAvailability",
     "PolicyGradientMode",
+    "apply_candidate_update",
     "apply_gradient_joy_update",
+    "assess_candidate_update",
     "assess_gradient_joy",
     "discrete_delightful_policy_gradient",
     "stratify_delight_outcomes",

@@ -16,28 +16,39 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+from collections.abc import Mapping
 from typing import Any
 
 import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float, UInt
 
 from alberta_framework.core.multi_head_learner import (
     AnyOptimizer,
     MultiHeadMLPLearner,
     MultiHeadMLPState,
     MultiHeadMLPUpdateResult,
+    measure_multi_head_mlp_state_nbytes,
+    migrate_legacy_multi_head_mlp_state,
 )
 from alberta_framework.core.normalizers import (
     EMANormalizerState,
     Normalizer,
     WelfordNormalizerState,
+    _checked_lifetime_words_increment,
+    _lifetime_counter_valid,
 )
 from alberta_framework.core.optimizers import Bounder
 from alberta_framework.core.types import TraceMode
 
+ACTION_CONDITIONED_WORLD_MODEL_STATE_SCHEMA = (
+    "alberta.action-conditioned-world-model-state.v2"
+)
+ONE_STEP_WORLD_MODEL_STATE_SCHEMA = "alberta.one-step-world-model-state.v2"
+WORLD_MODEL_LIFETIME_COUNTER_NBYTES = 12
+WORLD_MODEL_LIFETIME_COUNTER_DELTA_NBYTES = 8
 
 @dataclasses.dataclass(frozen=True)
 class ActionConditionedWorldModelConfig:
@@ -127,6 +138,7 @@ class ActionConditionedWorldModelState:
     reward_max: Float[Array, ""]
     model_error_ema: Float[Array, ""]
     step_count: Array
+    step_words: UInt[Array, " 2"]
 
 
 @chex.dataclass(frozen=True)
@@ -141,7 +153,12 @@ class WorldModelPrediction:
 
 @chex.dataclass(frozen=True)
 class WorldModelUpdateResult:
-    """Result from one real transition update."""
+    """Result from one real transition update.
+
+    The exact transaction fields mirror the wrapped
+    :class:`MultiHeadMLPLearner`. ``update_applied=False`` means the child
+    refused before mutation and every wrapper-owned state leaf was preserved.
+    """
 
     state: Any
     prediction: WorldModelPrediction
@@ -154,6 +171,94 @@ class WorldModelUpdateResult:
     next_observation_errors: Float[Array, " observation_dim"]
     discount_error: Float[Array, ""]
     learner_result: MultiHeadMLPUpdateResult
+    pre_step_words: UInt[Array, " 2"]
+    post_step_words: UInt[Array, " 2"]
+    lifetime_counter_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    normalizer_counter_aligned: Bool[Array, ""]
+    normalizer_estimator_capacity_available: Bool[Array, ""]
+    wrapper_counter_aligned: Bool[Array, ""]
+    update_applied: Bool[Array, ""]
+
+
+@chex.dataclass(frozen=True)
+class _WorldModelCounterStatus:
+    """Preflight facts for one wrapper/learner clock transaction."""
+
+    lifetime_counter_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    normalizer_counter_aligned: Bool[Array, ""]
+    normalizer_estimator_capacity_available: Bool[Array, ""]
+    wrapper_counter_aligned: Bool[Array, ""]
+    update_available: Bool[Array, ""]
+
+
+def _world_model_counter_status(
+    learner: MultiHeadMLPLearner,
+    wrapper_step_count: Array,
+    wrapper_step_words: Array,
+    learner_state: MultiHeadMLPState,
+) -> _WorldModelCounterStatus:
+    """Validate exact wrapper, learner, and optional normalizer clocks."""
+
+    _, wrapper_capacity = _checked_lifetime_words_increment(wrapper_step_words)
+    wrapper_valid = _lifetime_counter_valid(wrapper_step_words, wrapper_step_count)
+    learner_status = learner._counter_status(learner_state)
+    wrapper_aligned = (
+        (wrapper_step_count == learner_state.step_count)
+        & jnp.all(wrapper_step_words == learner_state.step_words)
+    )
+    lifetime_valid = (
+        wrapper_valid
+        & learner_status.lifetime_counter_valid
+        & wrapper_aligned
+    )
+    lifetime_capacity = (
+        wrapper_capacity & learner_status.lifetime_capacity_available
+    )
+    update_available = (
+        lifetime_valid
+        & lifetime_capacity
+        & learner_status.normalizer_counter_aligned
+        & learner_status.normalizer_estimator_capacity_available
+    )
+    return _WorldModelCounterStatus(
+        lifetime_counter_valid=lifetime_valid,
+        lifetime_capacity_available=lifetime_capacity,
+        normalizer_counter_aligned=learner_status.normalizer_counter_aligned,
+        normalizer_estimator_capacity_available=(
+            learner_status.normalizer_estimator_capacity_available
+        ),
+        wrapper_counter_aligned=wrapper_aligned,
+        update_available=update_available,
+    )
+
+
+def _gate_world_model_learner_transaction(
+    learner_state: MultiHeadMLPState,
+    result: MultiHeadMLPUpdateResult,
+    status: _WorldModelCounterStatus,
+) -> MultiHeadMLPUpdateResult:
+    """Apply the wrapper clock veto to one otherwise-complete child result."""
+
+    update_applied = status.update_available & result.update_applied
+    committed_state = jax.lax.cond(
+        update_applied,
+        lambda: result.state,
+        lambda: learner_state,
+    )
+    return result.replace(  # type: ignore[attr-defined,no-any-return]
+        state=committed_state,
+        pre_step_words=learner_state.step_words,
+        post_step_words=committed_state.step_words,
+        lifetime_counter_valid=status.lifetime_counter_valid,
+        lifetime_capacity_available=status.lifetime_capacity_available,
+        normalizer_counter_aligned=status.normalizer_counter_aligned,
+        normalizer_estimator_capacity_available=(
+            status.normalizer_estimator_capacity_available
+        ),
+        update_applied=update_applied,
+    )
 
 
 @chex.dataclass(frozen=True)
@@ -246,6 +351,7 @@ class ActionConditionedWorldModel:
         learner_cfg = self._learner.to_config()
         return {
             "type": "ActionConditionedWorldModel",
+            "state_schema": ACTION_CONDITIONED_WORLD_MODEL_STATE_SCHEMA,
             "config": self._config.to_config(),
             "learner": learner_cfg,
         }
@@ -266,6 +372,15 @@ class ActionConditionedWorldModel:
 
         payload = dict(config)
         payload.pop("type", None)
+        state_schema = payload.pop(
+            "state_schema",
+            ACTION_CONDITIONED_WORLD_MODEL_STATE_SCHEMA,
+        )
+        if state_schema != ACTION_CONDITIONED_WORLD_MODEL_STATE_SCHEMA:
+            raise ValueError(
+                "Unsupported ActionConditionedWorldModel state schema: "
+                f"{state_schema!r}"
+            )
         model_config = ActionConditionedWorldModelConfig.from_config(payload["config"])
         learner_cfg = dict(payload["learner"])
         optimizer = optimizer_from_config(learner_cfg["optimizer"])
@@ -297,6 +412,7 @@ class ActionConditionedWorldModel:
             reward_max=jnp.array(-jnp.inf, dtype=jnp.float32),
             model_error_ema=jnp.array(0.0, dtype=jnp.float32),
             step_count=jnp.array(0, dtype=jnp.int32),
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -423,7 +539,17 @@ class ActionConditionedWorldModel:
         prediction = self.predict(state, observation, action)
         targets = self.targets(observation, reward, discount, next_observation)
         inputs = self.input_features(observation, action)
-        learner_result = self._learner.update(state.learner_state, inputs, targets)
+        counter_status = _world_model_counter_status(
+            self._learner,
+            state.step_count,
+            state.step_words,
+            state.learner_state,
+        )
+        learner_result = _gate_world_model_learner_transaction(
+            state.learner_state,
+            self._learner.update(state.learner_state, inputs, targets),
+            counter_status,
+        )
 
         next_obs = jnp.asarray(next_observation, dtype=jnp.float32).reshape(
             (self._config.observation_dim,)
@@ -449,14 +575,20 @@ class ActionConditionedWorldModel:
         )
         observed_stack_min = jnp.minimum(obs, next_obs)
         observed_stack_max = jnp.maximum(obs, next_obs)
-        new_state = ActionConditionedWorldModelState(
+        proposed_state = ActionConditionedWorldModelState(
             learner_state=learner_result.state,
             observation_min=jnp.minimum(state.observation_min, observed_stack_min),
             observation_max=jnp.maximum(state.observation_max, observed_stack_max),
             reward_min=jnp.minimum(state.reward_min, reward_arr),
             reward_max=jnp.maximum(state.reward_max, reward_arr),
             model_error_ema=next_error_ema,
-            step_count=state.step_count + 1,
+            step_count=learner_result.state.step_count,
+            step_words=learner_result.state.step_words,
+        )
+        new_state = jax.lax.cond(
+            learner_result.update_applied,
+            lambda: proposed_state,
+            lambda: state,
         )
 
         return WorldModelUpdateResult(
@@ -471,6 +603,16 @@ class ActionConditionedWorldModel:
             next_observation_errors=next_observation_errors,
             discount_error=discount_error,
             learner_result=learner_result,
+            pre_step_words=learner_result.pre_step_words,
+            post_step_words=learner_result.post_step_words,
+            lifetime_counter_valid=learner_result.lifetime_counter_valid,
+            lifetime_capacity_available=learner_result.lifetime_capacity_available,
+            normalizer_counter_aligned=learner_result.normalizer_counter_aligned,
+            normalizer_estimator_capacity_available=(
+                learner_result.normalizer_estimator_capacity_available
+            ),
+            wrapper_counter_aligned=counter_status.wrapper_counter_aligned,
+            update_applied=learner_result.update_applied,
         )
 
     def _validate_config(self, config: ActionConditionedWorldModelConfig) -> None:
@@ -572,6 +714,10 @@ def run_action_conditioned_world_model_learning_loop(
 
 
 __all__ = [
+    "ACTION_CONDITIONED_WORLD_MODEL_STATE_SCHEMA",
+    "ONE_STEP_WORLD_MODEL_STATE_SCHEMA",
+    "WORLD_MODEL_LIFETIME_COUNTER_DELTA_NBYTES",
+    "WORLD_MODEL_LIFETIME_COUNTER_NBYTES",
     "ActionConditionedWorldModel",
     "ActionConditionedWorldModelConfig",
     "ActionConditionedWorldModelLearningResult",
@@ -582,8 +728,17 @@ __all__ = [
     "WorldModelPrediction",
     "WorldModelState",
     "WorldModelUpdateResult",
+    "action_conditioned_world_model_wrapper_state_nbytes_formula",
+    "measure_action_conditioned_world_model_state_nbytes",
+    "measure_action_conditioned_world_model_wrapper_state_nbytes",
+    "measure_world_model_state_nbytes",
+    "measure_world_model_wrapper_state_nbytes",
+    "migrate_legacy_action_conditioned_world_model_state",
+    "migrate_legacy_world_model_state",
+    "one_step_world_model_wrapper_state_nbytes_formula",
     "run_action_conditioned_world_model_learning_loop",
     "run_world_model_learning_loop",
+    "world_model_lifetime_counter_nbytes",
 ]
 
 
@@ -631,6 +786,7 @@ class WorldModelState:
 
     learner_state: MultiHeadMLPState
     step_count: Array
+    step_words: UInt[Array, " 2"]
 
 
 @chex.dataclass(frozen=True)
@@ -704,6 +860,7 @@ class OneStepWorldModel:
         """Serialize model configuration."""
         return {
             "type": "OneStepWorldModel",
+            "state_schema": ONE_STEP_WORLD_MODEL_STATE_SCHEMA,
             "config": self._config.to_config(),
             "learner": self._learner.to_config(),
         }
@@ -719,6 +876,14 @@ class OneStepWorldModel:
 
         payload = dict(config)
         payload.pop("type", None)
+        state_schema = payload.pop(
+            "state_schema",
+            ONE_STEP_WORLD_MODEL_STATE_SCHEMA,
+        )
+        if state_schema != ONE_STEP_WORLD_MODEL_STATE_SCHEMA:
+            raise ValueError(
+                f"Unsupported OneStepWorldModel state schema: {state_schema!r}"
+            )
         model_config = WorldModelConfig.from_config(payload["config"])
         learner_cfg = dict(payload["learner"])
         optimizer = optimizer_from_config(learner_cfg["optimizer"])
@@ -744,6 +909,7 @@ class OneStepWorldModel:
         return WorldModelState(
             learner_state=self._learner.init(self.input_dim, key),
             step_count=jnp.array(0, dtype=jnp.int32),
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -819,10 +985,20 @@ class OneStepWorldModel:
         """Update from one real transition."""
         prediction = self.predict(state, observation, action)
         targets = self.targets(observation, reward, next_observation)
-        learner_result = self._learner.update(
+        counter_status = _world_model_counter_status(
+            self._learner,
+            state.step_count,
+            state.step_words,
             state.learner_state,
-            self.input_features(observation, action),
-            targets,
+        )
+        learner_result = _gate_world_model_learner_transaction(
+            state.learner_state,
+            self._learner.update(
+                state.learner_state,
+                self.input_features(observation, action),
+                targets,
+            ),
+            counter_status,
         )
         next_obs = jnp.asarray(next_observation, dtype=jnp.float32).reshape(
             (self._config.observation_dim,)
@@ -832,9 +1008,15 @@ class OneStepWorldModel:
         reward_error = prediction.reward - reward_arr
         observation_mse = jnp.nanmean(next_observation_errors**2)
         prediction_error = jnp.nanmean(learner_result.errors**2)
-        new_state = WorldModelState(
+        proposed_state = WorldModelState(
             learner_state=learner_result.state,
-            step_count=state.step_count + 1,
+            step_count=learner_result.state.step_count,
+            step_words=learner_result.state.step_words,
+        )
+        new_state = jax.lax.cond(
+            learner_result.update_applied,
+            lambda: proposed_state,
+            lambda: state,
         )
         return WorldModelUpdateResult(
             state=new_state,
@@ -848,6 +1030,16 @@ class OneStepWorldModel:
             next_observation_errors=next_observation_errors,
             discount_error=jnp.array(jnp.nan, dtype=jnp.float32),
             learner_result=learner_result,
+            pre_step_words=learner_result.pre_step_words,
+            post_step_words=learner_result.post_step_words,
+            lifetime_counter_valid=learner_result.lifetime_counter_valid,
+            lifetime_capacity_available=learner_result.lifetime_capacity_available,
+            normalizer_counter_aligned=learner_result.normalizer_counter_aligned,
+            normalizer_estimator_capacity_available=(
+                learner_result.normalizer_estimator_capacity_available
+            ),
+            wrapper_counter_aligned=counter_status.wrapper_counter_aligned,
+            update_applied=learner_result.update_applied,
         )
 
     def _validate_config(self, config: WorldModelConfig) -> None:
@@ -902,3 +1094,173 @@ def run_world_model_learning_loop(
         next_observation_errors=next_observation_errors,
         per_head_metrics=per_head_metrics,
     )
+
+
+def action_conditioned_world_model_wrapper_state_nbytes_formula(
+    config: ActionConditionedWorldModelConfig,
+) -> int:
+    """Return exact wrapper bytes excluding the nested learner state."""
+
+    return 8 * config.observation_dim + 24
+
+
+def one_step_world_model_wrapper_state_nbytes_formula() -> int:
+    """Return exact wrapper bytes excluding the nested learner state."""
+
+    return WORLD_MODEL_LIFETIME_COUNTER_NBYTES
+
+
+def world_model_lifetime_counter_nbytes(
+    *,
+    learner_has_normalizer: bool = False,
+) -> int:
+    """Return bytes for aligned wrapper, learner, and optional normalizer clocks."""
+
+    counter_count = 3 if learner_has_normalizer else 2
+    return WORLD_MODEL_LIFETIME_COUNTER_NBYTES * counter_count
+
+
+def _measure_array_tree_nbytes(state: Any) -> int:
+    return sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree.leaves(state)
+        if isinstance(leaf, Array)
+    )
+
+
+def measure_action_conditioned_world_model_state_nbytes(
+    state: ActionConditionedWorldModelState,
+) -> int:
+    """Measure all persistent JAX-array bytes in an action model state."""
+
+    return _measure_array_tree_nbytes(state)
+
+
+def measure_action_conditioned_world_model_wrapper_state_nbytes(
+    state: ActionConditionedWorldModelState,
+) -> int:
+    """Measure action-model wrapper bytes excluding its nested learner."""
+
+    return (
+        measure_action_conditioned_world_model_state_nbytes(state)
+        - measure_multi_head_mlp_state_nbytes(state.learner_state)
+    )
+
+
+def measure_world_model_state_nbytes(state: WorldModelState) -> int:
+    """Measure all persistent JAX-array bytes in a one-step model state."""
+
+    return _measure_array_tree_nbytes(state)
+
+
+def measure_world_model_wrapper_state_nbytes(state: WorldModelState) -> int:
+    """Measure one-step wrapper bytes excluding its nested learner."""
+
+    return (
+        measure_world_model_state_nbytes(state)
+        - measure_multi_head_mlp_state_nbytes(state.learner_state)
+    )
+
+
+def _legacy_world_model_state_mapping(
+    legacy_state: Any,
+    *,
+    model_name: str,
+) -> dict[str, Any]:
+    if isinstance(legacy_state, Mapping):
+        return dict(legacy_state)
+    if dataclasses.is_dataclass(legacy_state) and not isinstance(legacy_state, type):
+        return {
+            field.name: getattr(legacy_state, field.name)
+            for field in dataclasses.fields(legacy_state)
+        }
+    raise TypeError(f"legacy {model_name} state must be a mapping or dataclass")
+
+
+def _exact_or_migrated_learner_state(value: Any) -> MultiHeadMLPState:
+    if isinstance(value, MultiHeadMLPState):
+        state = value
+    else:
+        state = migrate_legacy_multi_head_mlp_state(value)
+    words = jnp.asarray(state.step_words)
+    if words.shape != (2,) or words.dtype != jnp.dtype(jnp.uint32):
+        raise TypeError("nested learner step_words must have shape (2,) and dtype uint32")
+    if not bool(_lifetime_counter_valid(words, state.step_count)):
+        raise ValueError("nested learner exact counter is invalid")
+    normalizer_state = state.normalizer_state
+    if normalizer_state is not None:
+        normalizer_words = jnp.asarray(normalizer_state.sample_count_words)
+        if (
+            normalizer_words.shape != (2,)
+            or normalizer_words.dtype != jnp.dtype(jnp.uint32)
+        ):
+            raise TypeError(
+                "nested normalizer sample_count_words must have shape (2,) "
+                "and dtype uint32"
+            )
+        if not bool(
+            _lifetime_counter_valid(
+                normalizer_words,
+                normalizer_state.sample_count,
+            )
+        ):
+            raise ValueError("nested normalizer exact counter is invalid")
+        if not bool(jnp.all(normalizer_words == words)):
+            raise ValueError("nested learner and normalizer counters are not aligned")
+    return state
+
+
+def _migrate_legacy_world_model_state(
+    legacy_state: Any,
+    *,
+    state_type: type[ActionConditionedWorldModelState] | type[WorldModelState],
+    model_name: str,
+) -> ActionConditionedWorldModelState | WorldModelState:
+    fields = _legacy_world_model_state_mapping(legacy_state, model_name=model_name)
+    current_names = {
+        field.name
+        for field in dataclasses.fields(state_type)  # type: ignore[arg-type]
+    }
+    legacy_names = current_names - {"step_words"}
+    supplied_names = set(fields)
+    if supplied_names != legacy_names:
+        missing = sorted(legacy_names - supplied_names)
+        extra = sorted(supplied_names - legacy_names)
+        raise ValueError(
+            f"legacy {model_name} field manifest is not exact; "
+            f"missing={missing}, extra={extra}"
+        )
+    step_array = jnp.asarray(fields["step_count"])
+    if step_array.shape != () or step_array.dtype != jnp.dtype(jnp.int32):
+        raise TypeError(f"legacy {model_name} step_count must be scalar int32")
+    step = int(step_array)
+    if step < 0:
+        raise ValueError(f"negative legacy {model_name} step_count indicates wrap")
+    learner_state = _exact_or_migrated_learner_state(fields["learner_state"])
+    if int(learner_state.step_count) != step:
+        raise ValueError(f"legacy {model_name} and learner counters are not aligned")
+    fields["learner_state"] = learner_state
+    fields["step_words"] = learner_state.step_words
+    return state_type(**fields)
+
+
+def migrate_legacy_action_conditioned_world_model_state(
+    legacy_state: Any,
+) -> ActionConditionedWorldModelState:
+    """Add an exact wrapper clock to one strict historical action-model state."""
+
+    return _migrate_legacy_world_model_state(
+        legacy_state,
+        state_type=ActionConditionedWorldModelState,
+        model_name="ActionConditionedWorldModel",
+    )  # type: ignore[return-value]
+
+
+def migrate_legacy_world_model_state(legacy_state: Any) -> WorldModelState:
+    """Add an exact wrapper clock to one strict historical one-step state."""
+
+    return _migrate_legacy_world_model_state(
+        legacy_state,
+        state_type=WorldModelState,
+        model_name="OneStepWorldModel",
+    )  # type: ignore[return-value]

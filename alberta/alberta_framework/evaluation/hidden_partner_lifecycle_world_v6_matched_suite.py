@@ -169,6 +169,7 @@ _REVIEWED_INITIAL_DATACLASS_FIELDS: tuple[tuple[type[object], tuple[str, ...]], 
             "previous_partner_action",
             "has_partner_history",
             "step_count",
+            "step_words",
         ),
     ),
     (
@@ -191,6 +192,7 @@ _REVIEWED_INITIAL_DATACLASS_FIELDS: tuple[tuple[type[object], tuple[str, ...]], 
             "current_q_value_delta",
             "current_selection",
             "step_count",
+            "step_words",
         ),
     ),
     (
@@ -200,7 +202,9 @@ _REVIEWED_INITIAL_DATACLASS_FIELDS: tuple[tuple[type[object], tuple[str, ...]], 
             "hidden",
             "parameter_sensitivity",
             "step_count",
+            "step_words",
             "update_count",
+            "update_words",
             "last_gradient_norm",
         ),
     ),
@@ -237,19 +241,39 @@ _REVIEWED_INITIAL_DATACLASS_FIELDS: tuple[tuple[type[object], tuple[str, ...]], 
             "candidate_parent_b",
             "candidate_generator",
             "step_count",
+            "step_words",
+            "replacement_phase",
             "birth_timestamp",
             "uptime_s",
         ),
     ),
     (
         BehaviorModelState,
-        ("weights", "bias", "rng_key", "step_count", "nll_ema", "accuracy_ema", "confidence_ema"),
+        (
+            "weights",
+            "bias",
+            "rng_key",
+            "step_count",
+            "step_words",
+            "nll_ema",
+            "accuracy_ema",
+            "confidence_ema",
+        ),
     ),
     (
         BoundedJointOutcomeState,
-        ("reward_predictions", "outcome_predictions", "visit_counts", "step_count"),
+        (
+            "reward_predictions",
+            "outcome_predictions",
+            "visit_counts",
+            "step_count",
+            "step_words",
+        ),
     ),
-    (GroundedJointWorldModelState, ("weights", "bias", "update_count")),
+    (
+        GroundedJointWorldModelState,
+        ("weights", "bias", "update_count", "update_words"),
+    ),
     (
         DifferentialSARSAState,
         (
@@ -263,11 +287,21 @@ _REVIEWED_INITIAL_DATACLASS_FIELDS: tuple[tuple[type[object], tuple[str, ...]], 
             "epsilon",
             "rng_key",
             "step_count",
+            "step_words",
             "birth_timestamp",
             "uptime_s",
         ),
     ),
-    (FeatureBankRouterState, ("descriptors", "route_count", "generation_count")),
+    (
+        FeatureBankRouterState,
+        (
+            "descriptors",
+            "route_count",
+            "generation_count",
+            "route_words",
+            "generation_words",
+        ),
+    ),
     (
         IntegratedPlannerEvaluation,
         (
@@ -316,7 +350,7 @@ _REVIEWED_INITIAL_DATACLASS_FIELDS: tuple[tuple[type[object], tuple[str, ...]], 
 
 _reviewed_initial_field_map = dict(_REVIEWED_INITIAL_DATACLASS_FIELDS)
 V6_MATCHED_INITIAL_STATE_NODE_COUNT = 14
-V6_MATCHED_INITIAL_STATE_LEAF_COUNT = 123
+V6_MATCHED_INITIAL_STATE_LEAF_COUNT = 135
 if len(_reviewed_initial_field_map) != len(_REVIEWED_INITIAL_DATACLASS_FIELDS):
     raise RuntimeError("reviewed initial-state dataclass types must be unique")
 for _state_type, _reviewed_fields in _REVIEWED_INITIAL_DATACLASS_FIELDS:

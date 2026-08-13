@@ -54,19 +54,126 @@ safe under ``jax.jit``, ``jax.vmap``, and ``jax.lax.scan``.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
+import math
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Bool, Float, Int, UInt
+
+from alberta_framework.core.checkpoints import (
+    load_checkpoint,
+    load_checkpoint_metadata,
+    save_checkpoint,
+)
+
+_INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
+_UINT64_MAX = 2**64 - 1
+_FLOAT32_MAX = 3.4028234663852886e38
+
+CONTEXT_INFERENCE_STATE_SCHEMA = "alberta.context-inference-state.v2"
+CONTEXT_INFERENCE_CHECKPOINT_SCHEMA = "alberta.context-inference-checkpoint.v2"
+_LEGACY_CONTEXT_INFERENCE_CHECKPOINT_SCHEMA = "alberta.context-inference-checkpoint.v1"
 
 __all__ = [
+    "CONTEXT_INFERENCE_CHECKPOINT_SCHEMA",
+    "CONTEXT_INFERENCE_STATE_SCHEMA",
     "ContextInference",
     "ContextInferenceConfig",
+    "ContextInferenceResourceBudget",
     "ContextInferenceState",
+    "ContextInferencePrioritizedUpdateResult",
+    "ContextInferenceUpdateResult",
+    "context_inference_clock_nbytes",
+    "context_inference_exact_clock_delta_nbytes",
+    "load_context_inference_checkpoint",
+    "measure_context_inference_state_nbytes",
+    "migrate_legacy_context_inference_state",
+    "save_context_inference_checkpoint",
 ]
+
+
+def _require_array_contract(
+    value: Any,
+    *,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: jnp.dtype,
+) -> Array:
+    """Require a persistent array's trace-time shape and effective dtype."""
+
+    array = jnp.asarray(value)
+    if array.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {array.shape}")
+    if array.dtype != dtype:
+        raise TypeError(f"{name} must have dtype {dtype}, got {array.dtype}")
+    return array
+
+
+def _checked_words_increment(
+    words: Array,
+) -> tuple[UInt[Array, " 2"], Bool[Array, ""]]:
+    """Propose one exact increment without committing an all-ones wrap."""
+
+    maximum = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+    capacity_available = ~jnp.all(words == maximum)
+    low = words[1] + jnp.asarray(1, dtype=jnp.uint32)
+    carry = (low == jnp.asarray(0, dtype=jnp.uint32)).astype(jnp.uint32)
+    proposed = jnp.stack((words[0] + carry, low)).astype(jnp.uint32)
+    return jnp.where(capacity_available, proposed, words), capacity_available
+
+
+def _words_le(left: Array, right: Array) -> Bool[Array, ...]:
+    """Compare big-endian uint32-word identities without enabling x64."""
+
+    return (left[..., 0] < right[..., 0]) | (
+        (left[..., 0] == right[..., 0]) & (left[..., 1] <= right[..., 1])
+    )
+
+
+def _words_predecessor(words: Array) -> UInt[Array, " 2"]:
+    """Return ``max(words - 1, 0)`` in exact two-word arithmetic."""
+
+    zero = jnp.zeros((2,), dtype=jnp.uint32)
+    is_zero = jnp.all(words == zero)
+    borrow = (words[1] == jnp.asarray(0, dtype=jnp.uint32)).astype(jnp.uint32)
+    predecessor = jnp.stack(
+        (
+            words[0] - borrow,
+            words[1] - jnp.asarray(1, dtype=jnp.uint32),
+        )
+    ).astype(jnp.uint32)
+    return jnp.where(is_zero, zero, predecessor)
+
+
+def _words_to_int32_telemetry(words: Array) -> Int[Array, ...]:
+    """Project exact identities onto saturating non-negative int32 telemetry."""
+
+    fits = (words[..., 0] == jnp.asarray(0, dtype=jnp.uint32)) & (
+        words[..., 1] <= jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+    )
+    return jnp.where(
+        fits,
+        words[..., 1].astype(jnp.int32),
+        jnp.asarray(_INT32_MAX, dtype=jnp.int32),
+    )
+
+
+def _words_at_least_python_int(words: Array, threshold: int) -> Bool[Array, ""]:
+    """Compare an exact identity with a validated Python uint64 threshold."""
+
+    threshold_words = jnp.asarray(
+        ((threshold >> 32) & _UINT32_MAX, threshold & _UINT32_MAX),
+        dtype=jnp.uint32,
+    )
+    return _words_le(threshold_words, words)
 
 
 @chex.dataclass(frozen=True)
@@ -111,12 +218,28 @@ class ContextInferenceConfig:
 
     def __post_init__(self) -> None:
         """Validate scalar hyperparameters."""
+        if isinstance(self.n_actions, bool) or not isinstance(self.n_actions, int):
+            raise ValueError("n_actions must be an integer")
         if self.n_actions < 1:
             raise ValueError("n_actions must be positive")
+        if isinstance(self.observation_dim, bool) or not isinstance(self.observation_dim, int):
+            raise ValueError("observation_dim must be an integer")
         if self.observation_dim < 1:
             raise ValueError("observation_dim must be positive")
+        if isinstance(self.max_contexts, bool) or not isinstance(self.max_contexts, int):
+            raise ValueError("max_contexts must be an integer")
         if self.max_contexts < 2:
             raise ValueError("max_contexts must be at least 2")
+        for name, value in (
+            ("model_step_size", self.model_step_size),
+            ("error_decay", self.error_decay),
+            ("switch_threshold", self.switch_threshold),
+            ("novelty_prior_error", self.novelty_prior_error),
+            ("update_error_gate", self.update_error_gate),
+            ("initial_reward_estimate", self.initial_reward_estimate),
+        ):
+            if not math.isfinite(value) or abs(value) > _FLOAT32_MAX:
+                raise ValueError(f"{name} must be finite and representable as float32")
         if self.model_step_size <= 0.0:
             raise ValueError("model_step_size must be positive")
         if not 0.0 <= self.error_decay < 1.0:
@@ -130,8 +253,50 @@ class ContextInferenceConfig:
                 "update_error_gate must exceed novelty_prior_error, or freshly "
                 "allocated slots could never learn"
             )
-        if self.min_dwell < 0:
-            raise ValueError("min_dwell must be non-negative")
+        if (
+            isinstance(self.min_dwell, bool)
+            or not isinstance(self.min_dwell, int)
+            or not 0 <= self.min_dwell < _UINT64_MAX
+        ):
+            raise ValueError("min_dwell must be below the terminal uint64 identity")
+
+    def to_config(self) -> dict[str, Any]:
+        """Return a strict JSON-compatible configuration manifest."""
+
+        return {"type": type(self).__name__, **dataclasses.asdict(cast(Any, self))}
+
+    @classmethod
+    def from_config(cls, payload: Mapping[str, Any]) -> ContextInferenceConfig:
+        """Reconstruct only an exact :meth:`to_config` field manifest."""
+
+        values = dict(payload)
+        expected = {field.name for field in dataclasses.fields(cast(Any, cls))} | {"type"}
+        if set(values) != expected:
+            raise ValueError("context-inference config fields do not match the schema")
+        type_name = values.pop("type")
+        if type_name != cls.__name__:
+            raise ValueError(f"unexpected context-inference config type: {type_name!r}")
+        return cls(**values)
+
+
+@dataclasses.dataclass(frozen=True)
+class ContextInferenceResourceBudget:
+    """Exact persistent-array and clock accounting for one fixed slot bank."""
+
+    allocated_float32_scalars: int
+    allocated_bool_scalars: int
+    allocated_int32_scalars: int
+    allocated_uint32_scalars: int
+    state_nbytes: int
+    clock_nbytes: int
+    exact_clock_delta_nbytes: int
+    max_contexts: int
+    replay_capacity: int = 0
+
+    def to_dict(self) -> dict[str, int]:
+        """Return a JSON-compatible resource record."""
+
+        return dataclasses.asdict(self)
 
 
 @chex.dataclass(frozen=True)
@@ -147,9 +312,15 @@ class ContextInferenceState:
         in_use: Which slots hold an allocated regime model.
         active_context: Currently inferred context slot.
         last_active_step: Step count at which each slot was last active
-            (``-1`` for never); drives least-recently-used eviction.
-        dwell: Steps since the last context switch.
-        step_count: Total updates applied.
+            (``-1`` for never); saturating compatibility telemetry only.
+        dwell: Saturating compatibility telemetry for steps since the last
+            context switch.
+        step_count: Saturating compatibility telemetry for committed updates.
+        last_active_words: Exact big-endian uint32-word recency identities per
+            slot.  Only rows selected by ``in_use`` have semantic meaning.
+        dwell_words: Exact big-endian uint32-word dwell authority.
+        step_words: Exact big-endian uint32-word lifetime identity.  The
+            all-ones value is terminal and can never be incremented.
     """
 
     reward_weights: Float[Array, "max_contexts n_actions observation_dim"]
@@ -159,6 +330,55 @@ class ContextInferenceState:
     last_active_step: Int[Array, " max_contexts"]
     dwell: Int[Array, ""]
     step_count: Int[Array, ""]
+    last_active_words: UInt[Array, "max_contexts 2"]
+    dwell_words: UInt[Array, " 2"]
+    step_words: UInt[Array, " 2"]
+
+
+@chex.dataclass(frozen=True)
+class ContextInferenceUpdateResult:
+    """Transactional update, exact-clock status, and returned context."""
+
+    state: ContextInferenceState
+    context_onehot: Float[Array, " max_contexts"]
+    pre_step_words: UInt[Array, " 2"]
+    post_step_words: UInt[Array, " 2"]
+    source_state_valid: Bool[Array, ""]
+    input_valid: Bool[Array, ""]
+    candidate_state_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    update_applied: Bool[Array, ""]
+
+
+@chex.dataclass(frozen=True)
+class ContextInferencePrioritizedUpdateResult:
+    """Explicit defaults-off full-bank eviction-protection result.
+
+    ``eviction_protection`` never changes stored-context reuse or allocation
+    into a free slot.  It is consulted only when an otherwise-valid change
+    point requests a fresh semantic birth while every slot is occupied.  The
+    least-protected eligible slot is selected, with the ordinary exact LRU
+    order retained as the deterministic tie-break.
+    """
+
+    state: ContextInferenceState
+    context_onehot: Float[Array, " max_contexts"]
+    eviction_protection: Float[Array, " max_contexts"]
+    pre_step_words: UInt[Array, " 2"]
+    post_step_words: UInt[Array, " 2"]
+    source_state_valid: Bool[Array, ""]
+    input_valid: Bool[Array, ""]
+    eviction_protection_input_valid: Bool[Array, ""]
+    candidate_state_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    allocation_requested: Bool[Array, ""]
+    full_bank_eviction_requested: Bool[Array, ""]
+    ordinary_lru_slot: Int[Array, ""]
+    protected_lru_slot: Int[Array, ""]
+    selected_eviction_slot: Int[Array, ""]
+    eviction_protection_used: Bool[Array, ""]
+    eviction_target_adjusted: Bool[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 class ContextInference:
@@ -181,6 +401,59 @@ class ContextInference:
         """The immutable configuration."""
         return self._config
 
+    @property
+    def resource_budget(self) -> ContextInferenceResourceBudget:
+        """Return exact static storage accounting for this slot-bank shape."""
+
+        cfg = self._config
+        float_scalars = cfg.max_contexts * cfg.n_actions * cfg.observation_dim + cfg.max_contexts
+        bool_scalars = cfg.max_contexts
+        int_scalars = cfg.max_contexts + 3
+        uint_scalars = 2 * cfg.max_contexts + 4
+        state_nbytes = (
+            4 * float_scalars
+            + bool_scalars
+            + 4 * int_scalars
+            + 4 * uint_scalars
+        )
+        return ContextInferenceResourceBudget(
+            allocated_float32_scalars=float_scalars,
+            allocated_bool_scalars=bool_scalars,
+            allocated_int32_scalars=int_scalars,
+            allocated_uint32_scalars=uint_scalars,
+            state_nbytes=state_nbytes,
+            clock_nbytes=context_inference_clock_nbytes(cfg.max_contexts),
+            exact_clock_delta_nbytes=context_inference_exact_clock_delta_nbytes(
+                cfg.max_contexts
+            ),
+            max_contexts=cfg.max_contexts,
+        )
+
+    def to_config(self) -> dict[str, Any]:
+        """Serialize the mechanism and exact state schema without learned state."""
+
+        return {
+            "type": type(self).__name__,
+            "state_schema": CONTEXT_INFERENCE_STATE_SCHEMA,
+            "config": self._config.to_config(),
+        }
+
+    @classmethod
+    def from_config(cls, payload: Mapping[str, Any]) -> ContextInference:
+        """Strictly reconstruct one mechanism manifest."""
+
+        values = dict(payload)
+        if set(values) != {"type", "state_schema", "config"}:
+            raise ValueError("context-inference module manifest is not exact")
+        if values["type"] != cls.__name__:
+            raise ValueError(f"unexpected context-inference type: {values['type']!r}")
+        if values["state_schema"] != CONTEXT_INFERENCE_STATE_SCHEMA:
+            raise ValueError("context-inference state schema is unsupported")
+        config = values["config"]
+        if not isinstance(config, Mapping):
+            raise ValueError("context-inference config must be a mapping")
+        return cls(ContextInferenceConfig.from_config(config))
+
     def init(self) -> ContextInferenceState:
         """Create the birth state: slot 0 active and allocated, others free."""
         cfg = self._config
@@ -197,6 +470,123 @@ class ContextInference:
             last_active_step=jnp.full((k,), -1, dtype=jnp.int32).at[0].set(0),
             dwell=jnp.array(0, dtype=jnp.int32),
             step_count=jnp.array(0, dtype=jnp.int32),
+            last_active_words=jnp.zeros((k, 2), dtype=jnp.uint32),
+            dwell_words=jnp.zeros((2,), dtype=jnp.uint32),
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
+        )
+
+    def _require_state_contract(self, state: ContextInferenceState) -> None:
+        """Require every persistent field's static shape and effective dtype."""
+
+        cfg = self._config
+        k = cfg.max_contexts
+        _require_array_contract(
+            state.reward_weights,
+            name="state.reward_weights",
+            shape=(k, cfg.n_actions, cfg.observation_dim),
+            dtype=jnp.dtype(jnp.float32),
+        )
+        _require_array_contract(
+            state.error_ema,
+            name="state.error_ema",
+            shape=(k,),
+            dtype=jnp.dtype(jnp.float32),
+        )
+        _require_array_contract(
+            state.in_use,
+            name="state.in_use",
+            shape=(k,),
+            dtype=jnp.dtype(jnp.bool_),
+        )
+        _require_array_contract(
+            state.active_context,
+            name="state.active_context",
+            shape=(),
+            dtype=jnp.dtype(jnp.int32),
+        )
+        _require_array_contract(
+            state.last_active_step,
+            name="state.last_active_step",
+            shape=(k,),
+            dtype=jnp.dtype(jnp.int32),
+        )
+        _require_array_contract(
+            state.dwell,
+            name="state.dwell",
+            shape=(),
+            dtype=jnp.dtype(jnp.int32),
+        )
+        _require_array_contract(
+            state.step_count,
+            name="state.step_count",
+            shape=(),
+            dtype=jnp.dtype(jnp.int32),
+        )
+        _require_array_contract(
+            state.last_active_words,
+            name="state.last_active_words",
+            shape=(k, 2),
+            dtype=jnp.dtype(jnp.uint32),
+        )
+        _require_array_contract(
+            state.dwell_words,
+            name="state.dwell_words",
+            shape=(2,),
+            dtype=jnp.dtype(jnp.uint32),
+        )
+        _require_array_contract(
+            state.step_words,
+            name="state.step_words",
+            shape=(2,),
+            dtype=jnp.dtype(jnp.uint32),
+        )
+
+    def state_is_valid(self, state: ContextInferenceState) -> Bool[Array, ""]:
+        """Authenticate dynamic values and all exact/telemetry relationships."""
+
+        self._require_state_contract(state)
+        cfg = self._config
+        k = cfg.max_contexts
+        safe_active = jnp.clip(state.active_context, 0, k - 1)
+        active_in_range = (state.active_context >= 0) & (state.active_context < k)
+        expected_last_telemetry = jnp.where(
+            state.in_use,
+            _words_to_int32_telemetry(state.last_active_words),
+            jnp.asarray(-1, dtype=jnp.int32),
+        )
+        unused_words_zero = jnp.all(
+            jnp.where(
+                state.in_use[:, None],
+                jnp.asarray(True),
+                state.last_active_words == jnp.asarray(0, dtype=jnp.uint32),
+            )
+        )
+        active_expected_stamp = _words_predecessor(state.step_words)
+        active_stamp_valid = jnp.all(
+            state.last_active_words[safe_active] == active_expected_stamp
+        )
+        unused_errors_pinned = jnp.all(
+            jnp.where(
+                state.in_use,
+                jnp.asarray(True),
+                state.error_ema == jnp.float32(cfg.novelty_prior_error),
+            )
+        )
+        return (
+            jnp.all(jnp.isfinite(state.reward_weights))
+            & jnp.all(jnp.isfinite(state.error_ema))
+            & jnp.all(state.error_ema >= 0.0)
+            & jnp.any(state.in_use)
+            & active_in_range
+            & state.in_use[safe_active]
+            & (state.step_count == _words_to_int32_telemetry(state.step_words))
+            & (state.dwell == _words_to_int32_telemetry(state.dwell_words))
+            & jnp.all(state.last_active_step == expected_last_telemetry)
+            & _words_le(state.dwell_words, state.step_words)
+            & jnp.all(_words_le(state.last_active_words, active_expected_stamp))
+            & unused_words_zero
+            & active_stamp_valid
+            & unused_errors_pinned
         )
 
     def context_onehot(self, state: ContextInferenceState) -> Float[Array, " max_contexts"]:
@@ -208,37 +598,56 @@ class ContextInference:
         return jnp.sum(state.in_use).astype(jnp.int32)
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def update(
+    def update_result(
         self,
         state: ContextInferenceState,
         observation: Array,
         action: Array,
         reward: Array,
-    ) -> tuple[ContextInferenceState, Float[Array, " max_contexts"]]:
-        """Infer the context of one transition and refine the active model.
+    ) -> ContextInferenceUpdateResult:
+        """Transactionally infer one context and refine its active model.
 
-        Args:
-            state: Current state (never mutated).
-            observation: Observation in which ``action`` was taken (the
-                pre-transition percept the reward is conditioned on).
-            action: Discrete action taken.
-            reward: Reward observed for taking ``action`` in ``observation``.
-
-        Returns:
-            Tuple of (new state, one-hot of the inferred context, shape
-            ``(max_contexts,)``).
+        Invalid source state, invalid input, non-finite proposed state, or an
+        exhausted all-ones lifetime identity returns the source bit-for-bit.
         """
+        self._require_state_contract(state)
         cfg = self._config
         k = cfg.max_contexts
         obs = jnp.asarray(observation, dtype=jnp.float32)
+        if obs.shape != (cfg.observation_dim,):
+            raise ValueError(
+                f"observation must have shape {(cfg.observation_dim,)}, got {obs.shape}"
+            )
         action_index = jnp.squeeze(jnp.asarray(action, dtype=jnp.int32))
+        if action_index.shape != ():
+            raise ValueError("action must be scalar after squeezing")
         reward_s = jnp.squeeze(jnp.asarray(reward, dtype=jnp.float32))
+        if reward_s.shape != ():
+            raise ValueError("reward must be scalar after squeezing")
+
+        source_state_valid = self.state_is_valid(state)
+        input_valid = (
+            jnp.all(jnp.isfinite(obs))
+            & jnp.isfinite(reward_s)
+            & (action_index >= 0)
+            & (action_index < cfg.n_actions)
+        )
+        safe_obs = jnp.where(jnp.isfinite(obs), obs, jnp.zeros_like(obs))
+        safe_reward = jnp.where(jnp.isfinite(reward_s), reward_s, jnp.float32(0.0))
+        safe_action = jnp.clip(action_index, 0, cfg.n_actions - 1)
+        safe_active = jnp.clip(state.active_context, 0, k - 1)
+        proposed_step_words, lifetime_capacity_available = _checked_words_increment(
+            state.step_words
+        )
+        proposed_dwell_words, dwell_capacity_available = _checked_words_increment(
+            state.dwell_words
+        )
 
         # 1. Evidence: every slot predicts the observed reward; in-use slots
         #    track a recent-|error| EMA, unused slots sit at the fresh-model
         #    prior so reuse and allocation compete on one scale.
-        predictions = state.reward_weights[:, action_index, :] @ obs
-        errors = jnp.abs(reward_s - predictions)
+        predictions = state.reward_weights[:, safe_action, :] @ safe_obs
+        errors = jnp.abs(safe_reward - predictions)
         decay = jnp.float32(cfg.error_decay)
         error_ema = decay * state.error_ema + (1.0 - decay) * errors
         error_ema = jnp.where(state.in_use, error_ema, jnp.float32(cfg.novelty_prior_error))
@@ -247,27 +656,46 @@ class ContextInference:
         #    alternative — a stored regime if one explains recent rewards,
         #    else a fresh slot (evicting the least-recently-active slot when
         #    all are in use).
-        active = state.active_context
-        slot_ids = jnp.arange(k)
+        active = safe_active
+        slot_ids = jnp.arange(k, dtype=jnp.int32)
         active_mask = slot_ids == active
         stored_scores = jnp.where(active_mask | ~state.in_use, jnp.inf, error_ema)
         best_stored = jnp.argmin(stored_scores).astype(jnp.int32)
         best_stored_error = stored_scores[best_stored]
         allocate = best_stored_error > cfg.novelty_prior_error
         free_exists = jnp.any(~state.in_use)
-        first_free = jnp.argmin(state.in_use).astype(jnp.int32)
-        lru_scores = jnp.where(
-            active_mask | ~state.in_use,
-            jnp.asarray(2_147_483_647, dtype=jnp.int32),
-            state.last_active_step,
+        free_mask = ~state.in_use
+        first_free = jnp.argmax(free_mask).astype(jnp.int32)
+
+        # LRU is the lexicographic minimum exact timestamp.  ``argmax`` over
+        # the final equality mask makes a timestamp tie deterministic by the
+        # lowest slot id, rather than by saturated int32 telemetry.
+        eligible_lru = state.in_use & ~active_mask
+        maximum_word = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+        eligible_high = jnp.where(
+            eligible_lru,
+            state.last_active_words[:, 0],
+            maximum_word,
         )
-        lru_slot = jnp.argmin(lru_scores).astype(jnp.int32)
+        minimum_high = jnp.min(eligible_high)
+        eligible_low = jnp.where(
+            eligible_lru & (state.last_active_words[:, 0] == minimum_high),
+            state.last_active_words[:, 1],
+            maximum_word,
+        )
+        minimum_low = jnp.min(eligible_low)
+        oldest = (
+            eligible_lru
+            & (state.last_active_words[:, 0] == minimum_high)
+            & (state.last_active_words[:, 1] == minimum_low)
+        )
+        lru_slot = jnp.argmax(oldest).astype(jnp.int32)
         fresh_slot = jnp.where(free_exists, first_free, lru_slot)
         target = jnp.where(allocate, fresh_slot, best_stored).astype(jnp.int32)
         target_error = jnp.minimum(best_stored_error, jnp.float32(cfg.novelty_prior_error))
         do_switch = (
             (error_ema[active] > cfg.switch_threshold)
-            & (state.dwell >= cfg.min_dwell)
+            & _words_at_least_python_int(state.dwell_words, cfg.min_dwell)
             & (target_error < error_ema[active])
         )
         did_allocate = do_switch & allocate
@@ -284,21 +712,469 @@ class ContextInference:
         # 3. Surprise-gated normalized-LMS update of the active model only:
         #    inactive slots get exactly zero gradient (they ARE the memory),
         #    and off-regime samples during the detection lag are rejected.
-        prediction = reward_weights[new_active, action_index, :] @ obs
-        model_error = reward_s - prediction
+        prediction = reward_weights[new_active, safe_action, :] @ safe_obs
+        model_error = safe_reward - prediction
         gate = (jnp.abs(model_error) <= cfg.update_error_gate).astype(jnp.float32)
-        norm = jnp.maximum(obs @ obs, 1e-8)
-        reward_weights = reward_weights.at[new_active, action_index, :].add(
-            jnp.float32(cfg.model_step_size) * gate * model_error * obs / norm
+        norm = jnp.maximum(safe_obs @ safe_obs, 1e-8)
+        reward_weights = reward_weights.at[new_active, safe_action, :].add(
+            jnp.float32(cfg.model_step_size) * gate * model_error * safe_obs / norm
         )
 
-        new_state = ContextInferenceState(
+        next_dwell_words = jnp.where(
+            do_switch,
+            jnp.zeros((2,), dtype=jnp.uint32),
+            proposed_dwell_words,
+        )
+        next_last_active_words = state.last_active_words.at[new_active].set(
+            state.step_words
+        )
+        candidate_state = ContextInferenceState(
             reward_weights=reward_weights,
             error_ema=error_ema,
             in_use=in_use,
             active_context=new_active,
-            last_active_step=state.last_active_step.at[new_active].set(state.step_count),
-            dwell=jnp.where(do_switch, jnp.int32(0), state.dwell + 1),
-            step_count=state.step_count + 1,
+            last_active_step=state.last_active_step.at[new_active].set(
+                _words_to_int32_telemetry(state.step_words)
+            ),
+            dwell=_words_to_int32_telemetry(next_dwell_words),
+            step_count=_words_to_int32_telemetry(proposed_step_words),
+            last_active_words=next_last_active_words,
+            dwell_words=next_dwell_words,
+            step_words=proposed_step_words,
         )
-        return new_state, jax.nn.one_hot(new_active, k, dtype=jnp.float32)
+        candidate_state_valid = self.state_is_valid(candidate_state)
+        update_applied = (
+            source_state_valid
+            & input_valid
+            & lifetime_capacity_available
+            & dwell_capacity_available
+            & candidate_state_valid
+        )
+        new_state = jax.tree_util.tree_map(
+            lambda proposed, current: jnp.where(update_applied, proposed, current),
+            candidate_state,
+            state,
+        )
+        return ContextInferenceUpdateResult(
+            state=new_state,
+            context_onehot=jax.nn.one_hot(
+                new_state.active_context,
+                k,
+                dtype=jnp.float32,
+            ),
+            pre_step_words=state.step_words,
+            post_step_words=new_state.step_words,
+            source_state_valid=source_state_valid,
+            input_valid=input_valid,
+            candidate_state_valid=candidate_state_valid,
+            lifetime_capacity_available=lifetime_capacity_available,
+            update_applied=update_applied,
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def update_result_with_eviction_protection(
+        self,
+        state: ContextInferenceState,
+        observation: Array,
+        action: Array,
+        reward: Array,
+        eviction_protection: Array,
+    ) -> ContextInferencePrioritizedUpdateResult:
+        """Apply explicit full-bank eviction protection.
+
+        The ordinary :meth:`update_result` remains the defaults-off surface
+        and is intentionally unchanged.  This sibling accepts one finite,
+        non-negative float32 protection score per slot.  Scores are ignored
+        for stored-context reuse and free-slot allocation.  On a full-bank
+        fresh allocation, the least-protected non-active slot is chosen; the
+        ordinary exact LRU order breaks equal-score ties.  Invalid scores roll
+        the complete context update back bit-for-bit.
+        """
+
+        self._require_state_contract(state)
+        cfg = self._config
+        k = cfg.max_contexts
+        obs = jnp.asarray(observation, dtype=jnp.float32)
+        if obs.shape != (cfg.observation_dim,):
+            raise ValueError(
+                f"observation must have shape {(cfg.observation_dim,)}, got {obs.shape}"
+            )
+        action_index = jnp.squeeze(jnp.asarray(action, dtype=jnp.int32))
+        if action_index.shape != ():
+            raise ValueError("action must be scalar after squeezing")
+        reward_s = jnp.squeeze(jnp.asarray(reward, dtype=jnp.float32))
+        if reward_s.shape != ():
+            raise ValueError("reward must be scalar after squeezing")
+        raw_protection = jnp.asarray(eviction_protection)
+        if raw_protection.shape != (k,):
+            raise ValueError(f"eviction_protection must have shape {(k,)}")
+        if raw_protection.dtype != jnp.dtype(jnp.float32):
+            raise TypeError("eviction_protection must have dtype float32")
+
+        source_state_valid = self.state_is_valid(state)
+        protection_input_valid = jnp.all(jnp.isfinite(raw_protection)) & jnp.all(
+            raw_protection >= 0.0
+        )
+        input_valid = (
+            jnp.all(jnp.isfinite(obs))
+            & jnp.isfinite(reward_s)
+            & (action_index >= 0)
+            & (action_index < cfg.n_actions)
+            & protection_input_valid
+        )
+        safe_obs = jnp.where(jnp.isfinite(obs), obs, jnp.zeros_like(obs))
+        safe_reward = jnp.where(jnp.isfinite(reward_s), reward_s, jnp.float32(0.0))
+        safe_action = jnp.clip(action_index, 0, cfg.n_actions - 1)
+        safe_protection = jnp.where(
+            jnp.isfinite(raw_protection) & (raw_protection >= 0.0),
+            raw_protection,
+            jnp.zeros_like(raw_protection),
+        )
+        safe_active = jnp.clip(state.active_context, 0, k - 1)
+        proposed_step_words, lifetime_capacity_available = _checked_words_increment(
+            state.step_words
+        )
+        proposed_dwell_words, dwell_capacity_available = _checked_words_increment(
+            state.dwell_words
+        )
+
+        predictions = state.reward_weights[:, safe_action, :] @ safe_obs
+        errors = jnp.abs(safe_reward - predictions)
+        decay = jnp.float32(cfg.error_decay)
+        error_ema = decay * state.error_ema + (1.0 - decay) * errors
+        error_ema = jnp.where(
+            state.in_use,
+            error_ema,
+            jnp.float32(cfg.novelty_prior_error),
+        )
+
+        active = safe_active
+        slot_ids = jnp.arange(k, dtype=jnp.int32)
+        active_mask = slot_ids == active
+        stored_scores = jnp.where(active_mask | ~state.in_use, jnp.inf, error_ema)
+        best_stored = jnp.argmin(stored_scores).astype(jnp.int32)
+        best_stored_error = stored_scores[best_stored]
+        allocate = best_stored_error > cfg.novelty_prior_error
+        free_exists = jnp.any(~state.in_use)
+        first_free = jnp.argmax(~state.in_use).astype(jnp.int32)
+
+        eligible_lru = state.in_use & ~active_mask
+        maximum_word = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+
+        def exact_lru(eligible: Array) -> Array:
+            eligible_high = jnp.where(
+                eligible,
+                state.last_active_words[:, 0],
+                maximum_word,
+            )
+            minimum_high = jnp.min(eligible_high)
+            eligible_low = jnp.where(
+                eligible & (state.last_active_words[:, 0] == minimum_high),
+                state.last_active_words[:, 1],
+                maximum_word,
+            )
+            minimum_low = jnp.min(eligible_low)
+            oldest = (
+                eligible
+                & (state.last_active_words[:, 0] == minimum_high)
+                & (state.last_active_words[:, 1] == minimum_low)
+            )
+            return jnp.argmax(oldest).astype(jnp.int32)
+
+        ordinary_lru_slot = exact_lru(eligible_lru)
+        eligible_protection = jnp.where(eligible_lru, safe_protection, jnp.inf)
+        minimum_protection = jnp.min(eligible_protection)
+        least_protected = eligible_lru & (safe_protection == minimum_protection)
+        protected_lru_slot = exact_lru(least_protected)
+        fresh_slot = jnp.where(free_exists, first_free, protected_lru_slot)
+        target = jnp.where(allocate, fresh_slot, best_stored).astype(jnp.int32)
+        target_error = jnp.minimum(
+            best_stored_error,
+            jnp.float32(cfg.novelty_prior_error),
+        )
+        do_switch = (
+            (error_ema[active] > cfg.switch_threshold)
+            & _words_at_least_python_int(state.dwell_words, cfg.min_dwell)
+            & (target_error < error_ema[active])
+        )
+        did_allocate = do_switch & allocate
+        full_bank_eviction_requested = did_allocate & ~free_exists
+        new_active = jnp.where(do_switch, target, active).astype(jnp.int32)
+
+        reward_weights = jnp.where(
+            did_allocate,
+            state.reward_weights.at[target].set(jnp.float32(cfg.initial_reward_estimate)),
+            state.reward_weights,
+        )
+        in_use = jnp.where(did_allocate, state.in_use.at[target].set(True), state.in_use)
+        error_ema = jnp.where(do_switch, error_ema.at[target].set(0.0), error_ema)
+
+        prediction = reward_weights[new_active, safe_action, :] @ safe_obs
+        model_error = safe_reward - prediction
+        gate = (jnp.abs(model_error) <= cfg.update_error_gate).astype(jnp.float32)
+        norm = jnp.maximum(safe_obs @ safe_obs, 1e-8)
+        reward_weights = reward_weights.at[new_active, safe_action, :].add(
+            jnp.float32(cfg.model_step_size) * gate * model_error * safe_obs / norm
+        )
+
+        next_dwell_words = jnp.where(
+            do_switch,
+            jnp.zeros((2,), dtype=jnp.uint32),
+            proposed_dwell_words,
+        )
+        next_last_active_words = state.last_active_words.at[new_active].set(
+            state.step_words
+        )
+        candidate_state = ContextInferenceState(
+            reward_weights=reward_weights,
+            error_ema=error_ema,
+            in_use=in_use,
+            active_context=new_active,
+            last_active_step=state.last_active_step.at[new_active].set(
+                _words_to_int32_telemetry(state.step_words)
+            ),
+            dwell=_words_to_int32_telemetry(next_dwell_words),
+            step_count=_words_to_int32_telemetry(proposed_step_words),
+            last_active_words=next_last_active_words,
+            dwell_words=next_dwell_words,
+            step_words=proposed_step_words,
+        )
+        candidate_state_valid = self.state_is_valid(candidate_state)
+        update_applied = (
+            source_state_valid
+            & input_valid
+            & lifetime_capacity_available
+            & dwell_capacity_available
+            & candidate_state_valid
+        )
+        new_state = jax.tree_util.tree_map(
+            lambda proposed, current: jnp.where(update_applied, proposed, current),
+            candidate_state,
+            state,
+        )
+        protection_used = update_applied & full_bank_eviction_requested
+        target_adjusted = protection_used & (
+            protected_lru_slot != ordinary_lru_slot
+        )
+        return ContextInferencePrioritizedUpdateResult(
+            state=new_state,
+            context_onehot=jax.nn.one_hot(
+                new_state.active_context,
+                k,
+                dtype=jnp.float32,
+            ),
+            eviction_protection=safe_protection,
+            pre_step_words=state.step_words,
+            post_step_words=new_state.step_words,
+            source_state_valid=source_state_valid,
+            input_valid=input_valid,
+            eviction_protection_input_valid=protection_input_valid,
+            candidate_state_valid=candidate_state_valid,
+            lifetime_capacity_available=lifetime_capacity_available,
+            allocation_requested=update_applied & did_allocate,
+            full_bank_eviction_requested=protection_used,
+            ordinary_lru_slot=ordinary_lru_slot,
+            protected_lru_slot=protected_lru_slot,
+            selected_eviction_slot=jnp.where(
+                protection_used,
+                protected_lru_slot,
+                jnp.asarray(-1, dtype=jnp.int32),
+            ),
+            eviction_protection_used=protection_used,
+            eviction_target_adjusted=target_adjusted,
+            update_applied=update_applied,
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def update(
+        self,
+        state: ContextInferenceState,
+        observation: Array,
+        action: Array,
+        reward: Array,
+    ) -> tuple[ContextInferenceState, Float[Array, " max_contexts"]]:
+        """Preserve the historical tuple API around :meth:`update_result`."""
+
+        result = self.update_result(state, observation, action, reward)
+        return result.state, result.context_onehot
+
+
+def context_inference_exact_clock_delta_nbytes(max_contexts: int) -> int:
+    """Return bytes added by exact lifetime, dwell, and recency authorities."""
+
+    if isinstance(max_contexts, bool) or not isinstance(max_contexts, int) or max_contexts < 2:
+        raise ValueError("max_contexts must be an integer >= 2")
+    return 8 * (max_contexts + 2)
+
+
+def context_inference_clock_nbytes(max_contexts: int) -> int:
+    """Return compatibility telemetry plus all exact authority bytes."""
+
+    if isinstance(max_contexts, bool) or not isinstance(max_contexts, int) or max_contexts < 2:
+        raise ValueError("max_contexts must be an integer >= 2")
+    return 12 * (max_contexts + 2)
+
+
+def measure_context_inference_state_nbytes(state: ContextInferenceState) -> int:
+    """Measure persistent JAX-array bytes in one context-inference state."""
+
+    return sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree.leaves(state)
+        if isinstance(leaf, Array)
+    )
+
+
+def migrate_legacy_context_inference_state(
+    legacy_state: Any,
+    *,
+    config: ContextInferenceConfig,
+) -> ContextInferenceState:
+    """Migrate only an exact, unsaturated pre-v2 counter history.
+
+    Signed saturation cannot distinguish one genuine terminal int32 value
+    from arbitrarily many later events, so no saturated clock or timestamp is
+    inferred.  Such a lifecycle must restart under a fresh namespace.
+    """
+
+    if isinstance(legacy_state, Mapping):
+        fields = dict(legacy_state)
+    elif dataclasses.is_dataclass(legacy_state) and not isinstance(legacy_state, type):
+        fields = {
+            field.name: getattr(legacy_state, field.name)
+            for field in dataclasses.fields(legacy_state)
+        }
+    else:
+        raise TypeError("legacy context-inference state must be a mapping or dataclass")
+    current_names = {
+        field.name
+        for field in dataclasses.fields(cast(Any, ContextInferenceState))
+    }
+    exact_names = {"step_words", "dwell_words", "last_active_words"}
+    legacy_names = current_names - exact_names
+    if set(fields) != legacy_names:
+        missing = sorted(legacy_names - set(fields))
+        extra = sorted(set(fields) - legacy_names)
+        raise ValueError(
+            "legacy context-inference field manifest is not exact; "
+            f"missing={missing}, extra={extra}"
+        )
+
+    def scalar_counter(name: str) -> int:
+        value = jnp.asarray(fields[name])
+        if value.shape != () or value.dtype != jnp.dtype(jnp.int32):
+            raise TypeError(f"legacy context-inference {name} must be scalar int32")
+        count = int(value)
+        if count < 0:
+            raise ValueError(f"negative legacy context-inference {name} indicates wrap")
+        if count >= _INT32_MAX:
+            raise ValueError(f"saturated legacy context-inference {name} is ambiguous")
+        return count
+
+    step = scalar_counter("step_count")
+    dwell = scalar_counter("dwell")
+    if dwell > step:
+        raise ValueError("legacy context-inference dwell exceeds step_count")
+    in_use = jnp.asarray(fields["in_use"])
+    active = jnp.asarray(fields["active_context"])
+    last = jnp.asarray(fields["last_active_step"])
+    if in_use.shape != (config.max_contexts,) or in_use.dtype != jnp.dtype(jnp.bool_):
+        raise TypeError("legacy context-inference in_use has invalid shape or dtype")
+    if active.shape != () or active.dtype != jnp.dtype(jnp.int32):
+        raise TypeError("legacy context-inference active_context must be scalar int32")
+    active_id = int(active)
+    if not 0 <= active_id < config.max_contexts or not bool(in_use[active_id]):
+        raise ValueError("legacy context-inference active context is not allocated")
+    if last.shape != (config.max_contexts,) or last.dtype != jnp.dtype(jnp.int32):
+        raise TypeError("legacy context-inference last_active_step has invalid shape or dtype")
+    last_host = [int(value) for value in last]
+    for slot, (timestamp, used) in enumerate(zip(last_host, in_use.tolist(), strict=True)):
+        if not used:
+            if timestamp != -1:
+                raise ValueError("unused legacy context slot must have last_active_step -1")
+            continue
+        if timestamp < 0:
+            raise ValueError("negative used-slot recency indicates legacy wrap")
+        if timestamp >= _INT32_MAX:
+            raise ValueError("saturated legacy context recency is ambiguous")
+        if timestamp > step:
+            raise ValueError("legacy context recency exceeds step_count")
+    expected_active_timestamp = max(step - 1, 0)
+    if last_host[active_id] != expected_active_timestamp:
+        raise ValueError("legacy active-context recency is not aligned with step_count")
+
+    last_words = jnp.zeros((config.max_contexts, 2), dtype=jnp.uint32)
+    for slot, used in enumerate(in_use.tolist()):
+        if used:
+            last_words = last_words.at[slot, 1].set(
+                jnp.asarray(last_host[slot], dtype=jnp.uint32)
+            )
+    fields["last_active_words"] = last_words
+    fields["dwell_words"] = jnp.asarray((0, dwell), dtype=jnp.uint32)
+    fields["step_words"] = jnp.asarray((0, step), dtype=jnp.uint32)
+    migrated = ContextInferenceState(**fields)
+    module = ContextInference(config)
+    module._require_state_contract(migrated)
+    if not bool(jax.device_get(module.state_is_valid(migrated))):
+        raise ValueError("legacy context-inference state violates the v2 state contract")
+    return migrated
+
+
+def save_context_inference_checkpoint(
+    module: ContextInference,
+    state: ContextInferenceState,
+    path: str | Path,
+) -> None:
+    """Persist one structurally and dynamically authenticated v2 state."""
+
+    module._require_state_contract(state)
+    if not bool(jax.device_get(module.state_is_valid(state))):
+        raise ValueError("context-inference checkpoint state is invalid")
+    if measure_context_inference_state_nbytes(state) != module.resource_budget.state_nbytes:
+        raise ValueError("context-inference state violates its resource contract")
+    save_checkpoint(
+        state,
+        path,
+        metadata={
+            "schema": CONTEXT_INFERENCE_CHECKPOINT_SCHEMA,
+            "module_config": module.to_config(),
+            "memory_accounting": module.resource_budget.to_dict(),
+        },
+    )
+
+
+def load_context_inference_checkpoint(
+    path: str | Path,
+) -> tuple[ContextInference, ContextInferenceState]:
+    """Restore only an authenticated exact-clock v2 checkpoint."""
+
+    metadata = load_checkpoint_metadata(path)
+    expected_fields = {"schema", "module_config", "memory_accounting"}
+    if set(metadata) != expected_fields:
+        raise ValueError("context-inference checkpoint metadata fields are invalid")
+    schema = metadata.get("schema")
+    if schema == _LEGACY_CONTEXT_INFERENCE_CHECKPOINT_SCHEMA:
+        raise ValueError(
+            "legacy context-inference checkpoint v1 lacks exact clocks; migrate "
+            "its state with migrate_legacy_context_inference_state and resave it"
+        )
+    if schema != CONTEXT_INFERENCE_CHECKPOINT_SCHEMA:
+        raise ValueError("context-inference checkpoint schema is unsupported")
+    module_config = metadata.get("module_config")
+    if not isinstance(module_config, Mapping):
+        raise ValueError("context-inference checkpoint module_config is invalid")
+    module = ContextInference.from_config(module_config)
+    template = module.init()
+    restored, restored_metadata = load_checkpoint(template, path)
+    if restored_metadata != metadata:
+        raise ValueError("context-inference checkpoint metadata changed between reads")
+    state = cast(ContextInferenceState, restored)
+    module._require_state_contract(state)
+    if not bool(jax.device_get(module.state_is_valid(state))):
+        raise ValueError("restored context-inference state is invalid")
+    expected_resources = module.resource_budget.to_dict()
+    if metadata.get("memory_accounting") != expected_resources:
+        raise ValueError("context-inference checkpoint resource contract does not match")
+    if measure_context_inference_state_nbytes(state) != module.resource_budget.state_nbytes:
+        raise ValueError("restored context-inference state size does not match")
+    return module, state

@@ -10,15 +10,74 @@ updates.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
-from dataclasses import asdict, dataclass
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, fields
 from typing import Any, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float, UInt
+
+_INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
+
+WORKING_MEMORY_STATE_SCHEMA = "alberta.working-memory-state.v2"
+WORKING_MEMORY_LIFETIME_COUNTER_NBYTES = 12
+WORKING_MEMORY_LIFETIME_COUNTER_DELTA_NBYTES = 8
+
+
+def _saturating_int32_increment(value: Array) -> Array:
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    counter = jnp.asarray(value, dtype=jnp.int32)
+    return jnp.minimum(jnp.maximum(counter, 0), maximum - 1) + 1
+
+
+def _checked_lifetime_words_increment(
+    words: Array,
+) -> tuple[UInt[Array, " 2"], Bool[Array, ""]]:
+    """Propose one exact event identity without wrapping all-ones words."""
+
+    if getattr(words, "shape", None) != (2,):
+        raise ValueError("working-memory step words must have shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("working-memory step words must have dtype uint32")
+    maximum = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+    capacity_available = ~jnp.all(words == maximum)
+    one = jnp.asarray(1, dtype=jnp.uint32)
+    low = words[1] + one
+    carry = (low == jnp.asarray(0, dtype=jnp.uint32)).astype(jnp.uint32)
+    proposed = jnp.stack((words[0] + carry, low))
+    return (
+        jnp.where(capacity_available, proposed, words).astype(jnp.uint32),
+        capacity_available,
+    )
+
+
+def _lifetime_counter_valid(words: Array, telemetry: Array) -> Bool[Array, ""]:
+    """Validate exact event identity against saturating compatibility telemetry."""
+
+    if getattr(words, "shape", None) != (2,):
+        raise ValueError("working-memory step words must have shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("working-memory step words must have dtype uint32")
+    if getattr(telemetry, "shape", None) != ():
+        raise ValueError("working-memory step_count must be scalar")
+    if getattr(telemetry, "dtype", None) != jnp.dtype(jnp.int32):
+        raise TypeError("working-memory step_count must have dtype int32")
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    below_saturation = (words[0] == jnp.asarray(0, dtype=jnp.uint32)) & (
+        words[1] < jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+    )
+    expected = words[1].astype(jnp.int32)
+    return (telemetry >= 0) & jnp.where(
+        below_saturation,
+        telemetry == expected,
+        telemetry == maximum,
+    )
 
 
 @dataclass(frozen=True)
@@ -114,6 +173,7 @@ class WorkingMemoryState:
     action_traces: Float[Array, "n_action_decays action_dim"]
     reward_traces: Float[Array, "n_reward_decays reward_dim"]
     step_count: Array
+    step_words: UInt[Array, " 2"]
     last_gate: Float[Array, " 3"]
 
 
@@ -122,6 +182,9 @@ class WorkingMemoryDiagnostics:
     """Scalar diagnostics for the current memory state."""
 
     step_count: Array
+    step_words: UInt[Array, " 2"]
+    lifetime_counter_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
     trace_energy: Array
     effective_dimension: Array
     observation_energy: Array
@@ -215,13 +278,30 @@ class WorkingMemoryFeaturizer:
         """Serialize the featurizer configuration."""
         return {
             "type": "WorkingMemoryFeaturizer",
+            "state_schema": WORKING_MEMORY_STATE_SCHEMA,
             "config": self._config.to_config(),
         }
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> WorkingMemoryFeaturizer:
         """Reconstruct a featurizer from :meth:`to_config` output."""
-        return cls(WorkingMemoryConfig.from_config(dict(config["config"])))
+        payload = dict(config)
+        expected = {"type", "state_schema", "config"}
+        if set(payload) != expected:
+            missing = sorted(expected - set(payload))
+            extra = sorted(set(payload) - expected)
+            raise ValueError(
+                "working-memory config manifest is not exact; "
+                f"missing={missing}, extra={extra}"
+            )
+        if payload.pop("type") != "WorkingMemoryFeaturizer":
+            raise ValueError("working-memory config type is unsupported")
+        if payload.pop("state_schema") != WORKING_MEMORY_STATE_SCHEMA:
+            raise ValueError("working-memory state schema is unsupported")
+        nested = payload.pop("config")
+        if not isinstance(nested, dict):
+            raise TypeError("working-memory nested config must be a dictionary")
+        return cls(WorkingMemoryConfig.from_config(dict(nested)))
 
     def init(self) -> WorkingMemoryState:
         """Return an all-zero memory state."""
@@ -234,6 +314,7 @@ class WorkingMemoryFeaturizer:
             action_traces=_trace_bank(len(cfg.action_decay_rates), cfg.action_dim),
             reward_traces=_trace_bank(len(cfg.reward_decay_rates), cfg.reward_dim),
             step_count=jnp.array(0, dtype=jnp.int32),
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
             last_gate=jnp.ones((3,), dtype=jnp.float32),
         )
 
@@ -316,7 +397,7 @@ class WorkingMemoryFeaturizer:
         reward: Float[Array, " reward_dim"],
         external_gate: Float[Array, ""] | float = 1.0,
     ) -> WorkingMemoryState:
-        """Advance memory after one observation/action/reward transition."""
+        """Advance one event atomically, or return an exact no-op at exhaustion."""
         cfg = self._config
         obs = _empty_or_vector(observation, cfg.observation_dim)
         act = _empty_or_vector(action, cfg.action_dim)
@@ -340,27 +421,73 @@ class WorkingMemoryFeaturizer:
             threshold,
         )
 
-        return WorkingMemoryState(
-            observation_traces=self._update_trace_bank(
+        candidate_observation_traces = self._update_trace_bank(
                 state.observation_traces,
                 obs,
                 cfg.observation_decay_rates,
                 observation_gate,
-            ),
-            action_traces=self._update_trace_bank(
+            )
+        candidate_action_traces = self._update_trace_bank(
                 state.action_traces,
                 act,
                 cfg.action_decay_rates,
                 action_gate,
-            ),
-            reward_traces=self._update_trace_bank(
+            )
+        candidate_reward_traces = self._update_trace_bank(
                 state.reward_traces,
                 rew,
                 cfg.reward_decay_rates,
                 reward_gate,
+            )
+        candidate_last_gate = jnp.stack(
+            [observation_gate, action_gate, reward_gate]
+        )
+        next_words, capacity_available = _checked_lifetime_words_increment(
+            state.step_words
+        )
+        state_valid = (
+            _lifetime_counter_valid(state.step_words, state.step_count)
+            & jnp.all(jnp.isfinite(state.observation_traces))
+            & jnp.all(jnp.isfinite(state.action_traces))
+            & jnp.all(jnp.isfinite(state.reward_traces))
+            & jnp.all(jnp.isfinite(state.last_gate))
+            & jnp.all(state.last_gate >= 0.0)
+            & jnp.all(state.last_gate <= 1.0)
+        )
+        candidate_valid = (
+            jnp.all(jnp.isfinite(candidate_observation_traces))
+            & jnp.all(jnp.isfinite(candidate_action_traces))
+            & jnp.all(jnp.isfinite(candidate_reward_traces))
+            & jnp.all(jnp.isfinite(candidate_last_gate))
+            & jnp.all(candidate_last_gate >= 0.0)
+            & jnp.all(candidate_last_gate <= 1.0)
+        )
+        commit = state_valid & capacity_available & candidate_valid
+        return WorkingMemoryState(
+            observation_traces=jnp.where(
+                commit,
+                candidate_observation_traces,
+                state.observation_traces,
             ),
-            step_count=state.step_count + 1,
-            last_gate=jnp.stack([observation_gate, action_gate, reward_gate]),
+            action_traces=jnp.where(
+                commit,
+                candidate_action_traces,
+                state.action_traces,
+            ),
+            reward_traces=jnp.where(
+                commit,
+                candidate_reward_traces,
+                state.reward_traces,
+            ),
+            step_count=jnp.where(
+                commit,
+                _saturating_int32_increment(state.step_count),
+                state.step_count,
+            ),
+            step_words=jnp.where(commit, next_words, state.step_words).astype(
+                jnp.uint32
+            ),
+            last_gate=jnp.where(commit, candidate_last_gate, state.last_gate),
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -383,6 +510,14 @@ class WorkingMemoryFeaturizer:
         flat = _flatten_traces(state)
         return WorkingMemoryDiagnostics(
             step_count=state.step_count,
+            step_words=state.step_words,
+            lifetime_counter_valid=_lifetime_counter_valid(
+                state.step_words,
+                state.step_count,
+            ),
+            lifetime_capacity_available=~jnp.all(
+                state.step_words == jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+            ),
             trace_energy=_root_mean_square(flat),
             effective_dimension=_effective_dimension(flat),
             observation_energy=_root_mean_square(state.observation_traces.reshape(-1)),
@@ -424,3 +559,58 @@ def transform_working_memory_arrays(
         tuple[WorkingMemoryState, Float[Array, "steps feature_dim"]],
         jax.lax.scan(step_fn, state, (observations, actions, rewards, gates)),
     )
+
+
+def working_memory_lifetime_counter_nbytes() -> int:
+    """Return bytes occupied by telemetry plus exact lifetime words."""
+
+    return WORKING_MEMORY_LIFETIME_COUNTER_NBYTES
+
+
+def migrate_legacy_working_memory_state(legacy_state: Any) -> WorkingMemoryState:
+    """Migrate an unambiguous pre-v2 state with an unsaturated int32 clock."""
+
+    if isinstance(legacy_state, Mapping):
+        state_fields = dict(legacy_state)
+    elif dataclasses.is_dataclass(legacy_state) and not isinstance(legacy_state, type):
+        state_fields = {
+            state_field.name: getattr(legacy_state, state_field.name)
+            for state_field in fields(legacy_state)
+        }
+    else:
+        raise TypeError("legacy working-memory state must be a mapping or dataclass")
+    current_names = {
+        state_field.name for state_field in fields(cast(Any, WorkingMemoryState))
+    }
+    legacy_names = current_names - {"step_words"}
+    if set(state_fields) != legacy_names:
+        missing = sorted(legacy_names - set(state_fields))
+        extra = sorted(set(state_fields) - legacy_names)
+        raise ValueError(
+            "legacy working-memory state field manifest is not exact; "
+            f"missing={missing}, extra={extra}"
+        )
+    step_count = jnp.asarray(state_fields["step_count"])
+    if step_count.shape != () or step_count.dtype != jnp.dtype(jnp.int32):
+        raise TypeError("legacy working-memory step_count must be scalar int32")
+    step = int(step_count)
+    if step < 0:
+        raise ValueError("negative legacy working-memory step_count indicates wrap")
+    if step >= _INT32_MAX:
+        raise ValueError("saturated legacy working-memory step_count is ambiguous")
+    state_fields["step_words"] = jnp.asarray((0, step), dtype=jnp.uint32)
+    return WorkingMemoryState(**state_fields)
+
+
+__all__ = [
+    "WORKING_MEMORY_LIFETIME_COUNTER_DELTA_NBYTES",
+    "WORKING_MEMORY_LIFETIME_COUNTER_NBYTES",
+    "WORKING_MEMORY_STATE_SCHEMA",
+    "WorkingMemoryConfig",
+    "WorkingMemoryDiagnostics",
+    "WorkingMemoryFeaturizer",
+    "WorkingMemoryState",
+    "migrate_legacy_working_memory_state",
+    "transform_working_memory_arrays",
+    "working_memory_lifetime_counter_nbytes",
+]

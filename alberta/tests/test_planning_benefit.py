@@ -83,6 +83,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
+import pytest
 
 from alberta_framework.steps.step6 import Step6DifferentialSARSAConfig
 from alberta_framework.steps.step7 import (
@@ -104,6 +105,8 @@ from alberta_framework.streams.closed_loop import (
     SwitchingTwoStateConfig,
     SwitchingTwoStateMDP,
 )
+
+pytestmark = [pytest.mark.development, pytest.mark.slow]
 
 SEEDS = jnp.arange(8, dtype=jnp.uint32)
 

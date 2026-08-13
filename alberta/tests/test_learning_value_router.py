@@ -20,6 +20,7 @@ from alberta_framework.core.learning_value_router import (
     LEARNING_VALUE_ROUTER_CONFIG_SCHEMA,
     MECHANISM_STATUS,
     AdaptationChangeLearningValueRoute,
+    CandidateUpdateAuditEvidenceRoute,
     ExplorationLearningValueRoute,
     LearningValueRouter,
     LearningValueRouterConfig,
@@ -42,6 +43,7 @@ _NAMES = (
     "change_probability",
     "safety_cost",
 )
+
 
 def _replace[T](value: T, **changes: object) -> T:
     """Use chex's immutable replacement method without losing static type."""
@@ -289,11 +291,20 @@ def test_routes_are_typed_masked_and_never_expose_a_generic_score() -> None:
     assert isinstance(result.model_memory_replay, ModelMemoryReplayLearningValueRoute)
     assert isinstance(result.adaptation_change, AdaptationChangeLearningValueRoute)
     assert isinstance(result.safety, SafetyLearningValueRoute)
-    assert isinstance(result.literal_gradient_joy_evidence, LiteralGradientJoyEvidenceRoute)
+    assert isinstance(
+        result.candidate_update_audit_evidence,
+        CandidateUpdateAuditEvidenceRoute,
+    )
+    assert LiteralGradientJoyEvidenceRoute is CandidateUpdateAuditEvidenceRoute
+    assert CandidateUpdateAuditEvidenceRoute.__name__ == (
+        "CandidateUpdateAuditEvidenceRoute"
+    )
     assert (
         result.candidate_update_audit_evidence
         is result.literal_gradient_joy_evidence
     )
+    assert "candidate_update_audit_evidence" in result.__dataclass_fields__
+    assert "literal_gradient_joy_evidence" not in result.__dataclass_fields__
     expected = _value()
     _assert_route_mask(
         result.paper_dg_actor,
@@ -324,13 +335,13 @@ def test_routes_are_typed_masked_and_never_expose_a_generic_score() -> None:
         expected,
     )
     _assert_route_mask(result.safety, {"safety_cost"}, expected)
-    _assert_route_mask(result.literal_gradient_joy_evidence, set(_NAMES), expected)
+    _assert_route_mask(result.candidate_update_audit_evidence, set(_NAMES), expected)
     assert bool(result.paper_dg_actor.ready)
     assert bool(result.exploration.ready)
     assert bool(result.model_memory_replay.ready)
     assert bool(result.adaptation_change.ready)
     assert bool(result.safety.ready)
-    assert bool(result.literal_gradient_joy_evidence.ready)
+    assert bool(result.candidate_update_audit_evidence.ready)
     assert not any(
         hasattr(result, name)
         for name in ("score", "value_score", "aggregate", "utility", "sparks_joy")
@@ -356,7 +367,7 @@ def test_unrelated_invalid_and_unavailable_channels_do_not_suppress_safety() -> 
     assert bool(result.safety.ready)
     assert bool(result.safety.availability.safety_cost)
     np.testing.assert_array_equal(result.safety.values.safety_cost, 0.5)
-    assert not bool(result.literal_gradient_joy_evidence.ready)
+    assert not bool(result.candidate_update_audit_evidence.ready)
     assert not bool(result.paper_dg_actor.ready)
     assert not bool(result.exploration.ready)
     assert not bool(result.adaptation_change.ready)
@@ -416,7 +427,7 @@ def test_paper_dg_delight_requires_prerequisites_and_exact_float32_identity() ->
     assert bool(missing_prerequisite.safety.ready)
 
 
-def test_change_availability_only_controls_adaptation_and_full_joy_routes() -> None:
+def test_change_availability_only_controls_adaptation_and_candidate_audit_routes() -> None:
     router = LearningValueRouter()
     _, result = router.route(
         router.init(),
@@ -426,7 +437,7 @@ def test_change_availability_only_controls_adaptation_and_full_joy_routes() -> N
     assert bool(result.exploration.ready)
     assert bool(result.model_memory_replay.ready)
     assert not bool(result.adaptation_change.ready)
-    assert not bool(result.literal_gradient_joy_evidence.ready)
+    assert not bool(result.candidate_update_audit_evidence.ready)
     assert bool(result.safety.ready)
     assert not bool(result.exploration.availability.change_probability)
     np.testing.assert_array_equal(result.exploration.values.change_probability, 0.0)
@@ -454,7 +465,7 @@ def test_each_channel_has_independent_finite_and_domain_validation(
     values = _value(**{field: invalid_value})
     _, result = router.route(router.init(), values, _availability())
     assert not bool(getattr(result.diagnostics.accepted, field))
-    assert not bool(result.literal_gradient_joy_evidence.ready)
+    assert not bool(result.candidate_update_audit_evidence.ready)
     consequentially_invalid = {field}
     if field in {"advantage", "action_surprisal"}:
         consequentially_invalid.add("delight")
@@ -485,7 +496,7 @@ def test_signed_channels_accept_negative_values_and_boundary_values_are_closed()
         safety_cost=16.0,
     )
     _, result = router.route(router.init(), values, _availability())
-    assert bool(result.literal_gradient_joy_evidence.ready)
+    assert bool(result.candidate_update_audit_evidence.ready)
     assert all(bool(getattr(result.diagnostics.domain_valid, name)) for name in _NAMES)
 
 
@@ -529,7 +540,7 @@ def test_normalization_uses_only_pre_update_state_and_reports_calibration() -> N
     assert int(state.channel_valid_counts[0]) == 3
     np.testing.assert_array_equal(state.channel_unavailable_counts[1:], 3)
     assert not bool(third.paper_dg_actor.ready)
-    assert not bool(third.literal_gradient_joy_evidence.ready)
+    assert not bool(third.candidate_update_audit_evidence.ready)
 
 
 def test_invalid_observation_does_not_enter_that_channels_normalization_state() -> None:
@@ -549,7 +560,7 @@ def test_invalid_observation_does_not_enter_that_channels_normalization_state() 
     np.testing.assert_array_equal(state.channel_means[0], 2.0)
     assert np.asarray(state.channel_means[7]) != before_safety_mean
     assert bool(result.safety.ready)
-    assert not bool(result.literal_gradient_joy_evidence.ready)
+    assert not bool(result.candidate_update_audit_evidence.ready)
 
 
 def test_normalization_is_clipped_and_outputs_are_stop_gradient() -> None:
@@ -642,14 +653,14 @@ def test_corrupt_dynamic_state_fails_all_routes_closed_and_remains_unchanged() -
     assert not bool(result.diagnostics.state_valid)
     assert not bool(result.diagnostics.normalization_state_updated)
     assert not bool(result.safety.ready)
-    assert not bool(result.literal_gradient_joy_evidence.ready)
+    assert not bool(result.candidate_update_audit_evidence.ready)
     for route in (
         result.paper_dg_actor,
         result.exploration,
         result.model_memory_replay,
         result.adaptation_change,
         result.safety,
-        result.literal_gradient_joy_evidence,
+        result.candidate_update_audit_evidence,
     ):
         for name in _NAMES:
             np.testing.assert_array_equal(getattr(route.values, name), 0.0)
@@ -701,25 +712,25 @@ def test_counter_capacity_freezes_calibration_but_preserves_typed_raw_safety() -
     assert not bool(accounting.counter_capacity_available)
 
 
-def test_full_joy_evidence_route_requires_all_eight_and_normalization_requires_history() -> None:
+def test_candidate_audit_evidence_route_requires_all_eight_and_history() -> None:
     router = LearningValueRouter()
     state = router.init()
     for _ in range(2):
         state, result = router.route(state, _value(), _availability())
-        assert bool(result.literal_gradient_joy_evidence.ready)
-        assert not bool(result.literal_gradient_joy_evidence.normalization_ready)
+        assert bool(result.candidate_update_audit_evidence.ready)
+        assert not bool(result.candidate_update_audit_evidence.normalization_ready)
     state, result = router.route(state, _value(), _availability())
-    assert bool(result.literal_gradient_joy_evidence.ready)
-    assert bool(result.literal_gradient_joy_evidence.normalization_ready)
-    assert not hasattr(result.literal_gradient_joy_evidence, "sparks_joy")
+    assert bool(result.candidate_update_audit_evidence.ready)
+    assert bool(result.candidate_update_audit_evidence.normalization_ready)
+    assert not hasattr(result.candidate_update_audit_evidence, "sparks_joy")
 
     _, incomplete = router.route(
         state,
         _value(),
         _availability(learning_progress=False),
     )
-    assert not bool(incomplete.literal_gradient_joy_evidence.ready)
-    assert not bool(incomplete.literal_gradient_joy_evidence.normalization_ready)
+    assert not bool(incomplete.candidate_update_audit_evidence.ready)
+    assert not bool(incomplete.candidate_update_audit_evidence.normalization_ready)
     assert bool(incomplete.safety.ready)
     assert bool(incomplete.paper_dg_actor.ready)
 

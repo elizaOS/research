@@ -1,0 +1,157 @@
+{
+ "evidence_policy": {
+  "development_only": true,
+  "evidence_class": "development_screening_diagnostic",
+  "scientific_promotion_allowed": false
+ },
+ "families": [
+  "input_permutation",
+  "scale_shift",
+  "recurrence"
+ ],
+ "geometry": {
+  "dim": 32,
+  "n_classes": 10,
+  "n_regimes": 12,
+  "regime_length": 500
+ },
+ "rows": [
+  {
+   "description": "norm+shift_reset+gate | lr=0.07885 weight_decay=0.0002681 norm_decay=0.9926 fast_decay=0.8619 shift_k=0.8943 utility_decay=0.9921 gate_beta=1.849",
+   "mean": 0.4728148082892099,
+   "name": "tuned_baseline",
+   "per_family": {
+    "input_permutation": 0.359333336353302,
+    "recurrence": 0.4177222152551015,
+    "scale_shift": 0.6413888732592264
+   }
+  },
+  {
+   "description": "norm+shift_reset+surprise_budget+hidden_rms | lr=0.03709 weight_decay=0.0001 norm_decay=0.9911 fast_decay=0.855 shift_k=0.7131 surprise_gain=0.8361 surprise_fast=0.9642 surprise_slow=0.9996",
+   "mean": 0.5282962918281555,
+   "name": "cand_0",
+   "per_family": {
+    "input_permutation": 0.38688889145851135,
+    "recurrence": 0.4822777807712555,
+    "scale_shift": 0.7157222032546997
+   }
+  },
+  {
+   "description": "norm+shift_reset+surprise_budget+hidden_rms | lr=0.08511 weight_decay=0.0004856 norm_decay=0.9959 fast_decay=0.8868 shift_k=0.7173 surprise_gain=0.9919 surprise_fast=0.9546 surprise_slow=0.9996",
+   "mean": 0.5025370319684347,
+   "name": "cand_1",
+   "per_family": {
+    "input_permutation": 0.3758888940016429,
+    "recurrence": 0.4494999945163727,
+    "scale_shift": 0.6822222073872884
+   }
+  },
+  {
+   "description": "norm+shift_reset+decay_to_init+surprise_budget+hidden_rms | lr=0.04385 weight_decay=0.008446 norm_decay=0.9646 fast_decay=0.9057 shift_k=0.6461 surprise_gain=0.552 surprise_fast=0.9656 surprise_slow=0.9996",
+   "mean": 0.5410185158252715,
+   "name": "cand_2",
+   "per_family": {
+    "input_permutation": 0.4342777729034424,
+    "recurrence": 0.48916666706403095,
+    "scale_shift": 0.6996111075083414
+   }
+  },
+  {
+   "description": "norm+shift_reset+decay_to_init+surprise_budget+hidden_rms | lr=0.07978 weight_decay=0.0001502 norm_decay=0.9831 fast_decay=0.7855 shift_k=0.8409 surprise_gain=0.6992 surprise_fast=0.9158 surprise_slow=0.9997",
+   "mean": 0.5117407341798147,
+   "name": "cand_3",
+   "per_family": {
+    "input_permutation": 0.38216666380564374,
+    "recurrence": 0.45172221461931866,
+    "scale_shift": 0.7013333241144816
+   }
+  },
+  {
+   "description": "norm+shift_reset+surprise_budget+hidden_rms | lr=0.1068 weight_decay=0.0009674 norm_decay=0.9669 fast_decay=0.7835 shift_k=0.8572 surprise_gain=0.6971 surprise_fast=0.9895 surprise_slow=0.9997",
+   "mean": 0.49868518114089966,
+   "name": "cand_4",
+   "per_family": {
+    "input_permutation": 0.3665555516878764,
+    "recurrence": 0.4495555559794108,
+    "scale_shift": 0.6799444357554117
+   }
+  },
+  {
+   "description": "norm+surprise_budget+hidden_rms | lr=0.07694 weight_decay=0.0006037 norm_decay=0.9366 surprise_gain=0.4617 surprise_fast=0.9526 surprise_slow=0.9999",
+   "mean": 0.5175370309087965,
+   "name": "cand_5",
+   "per_family": {
+    "input_permutation": 0.3903333346048991,
+    "recurrence": 0.4624444246292114,
+    "scale_shift": 0.699833333492279
+   }
+  },
+  {
+   "description": "norm+shift_reset+decay_to_init+surprise_budget+hidden_rms | lr=0.04798 weight_decay=0.0004554 norm_decay=0.954 fast_decay=0.8889 shift_k=1.357 surprise_gain=0.5404 surprise_fast=0.9394 surprise_slow=0.9997",
+   "mean": 0.5307592517799801,
+   "name": "cand_6",
+   "per_family": {
+    "input_permutation": 0.38394443194071454,
+    "recurrence": 0.485999991496404,
+    "scale_shift": 0.7223333319028219
+   }
+  },
+  {
+   "description": "norm+shift_reset+surprise_budget+hidden_rms | lr=0.06036 weight_decay=0.001232 norm_decay=0.971 fast_decay=0.8786 shift_k=0.7453 surprise_gain=0.9153 surprise_fast=0.9331 surprise_slow=0.9996",
+   "mean": 0.5318518479665121,
+   "name": "cand_7",
+   "per_family": {
+    "input_permutation": 0.4046666622161865,
+    "recurrence": 0.48333332935969037,
+    "scale_shift": 0.7075555523236593
+   }
+  },
+  {
+   "description": "norm+shift_reset+decay_to_init+surprise_budget+hidden_rms | lr=0.07034 weight_decay=0.0001 norm_decay=0.9881 fast_decay=0.8547 shift_k=0.9256 surprise_gain=0.25 surprise_fast=0.946 surprise_slow=0.9997",
+   "mean": 0.504037039147483,
+   "name": "cand_8",
+   "per_family": {
+    "input_permutation": 0.37166666984558105,
+    "recurrence": 0.44972222050031024,
+    "scale_shift": 0.6907222270965576
+   }
+  },
+  {
+   "description": "norm+shift_reset+surprise_budget+utility_shift_reset+hidden_rms | lr=0.09545 weight_decay=0.0001 norm_decay=0.99 fast_decay=0.8142 shift_k=0.7898 surprise_gain=0.6644 surprise_fast=0.99 surprise_slow=0.9996",
+   "mean": 0.4915740655528174,
+   "name": "cand_9",
+   "per_family": {
+    "input_permutation": 0.3485555450121562,
+    "recurrence": 0.4413333237171173,
+    "scale_shift": 0.6848333279291788
+   }
+  },
+  {
+   "description": "norm+decay_to_init+surprise_budget+w1_shift_reset+hidden_rms | lr=0.04512 weight_decay=0.0004369 norm_decay=0.9406 fast_decay=0.8795 shift_k=1.686 surprise_gain=0.5698 surprise_fast=0.9263 surprise_slow=0.9996",
+   "mean": 0.5314629607730442,
+   "name": "cand_10",
+   "per_family": {
+    "input_permutation": 0.39649999141693115,
+    "recurrence": 0.48383333285649616,
+    "scale_shift": 0.7140555580457052
+   }
+  },
+  {
+   "description": "norm+shift_reset+decay_to_init+surprise_budget+utility_shift_reset+w1_shift_reset+hidden_rms | lr=0.04171 weight_decay=0.0001 norm_decay=0.9661 fast_decay=0.8266 shift_k=1.546 surprise_gain=0.511 surprise_fast=0.9126 surprise_slow=0.9999",
+   "mean": 0.5358333322736951,
+   "name": "cand_11",
+   "per_family": {
+    "input_permutation": 0.41083332896232605,
+    "recurrence": 0.4799444377422333,
+    "scale_shift": 0.7167222301165262
+   }
+  }
+ ],
+ "schema": "alberta.rule_discovery.crossval_gauss.v1",
+ "seeds": [
+  201,
+  202,
+  203
+ ],
+ "source_search": "outputs/rule_discovery/search_v1.json"
+}

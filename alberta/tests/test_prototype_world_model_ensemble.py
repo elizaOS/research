@@ -350,7 +350,7 @@ def test_prototype_v2_ensemble_checkpoint_migrates_only_isolated_replay_state(
 
     restored_agent, restored_state = load_prototype_checkpoint(checkpoint)
     restored_world = cast(WorldModelEnsembleState, restored_state.world_model_state)
-    assert PROTOTYPE_CHECKPOINT_SCHEMA == "alberta.prototype_agent.v3"
+    assert PROTOTYPE_CHECKPOINT_SCHEMA == "alberta.prototype_agent.v13"
     assert restored_agent.to_config() == config
     _assert_tree_equal(restored_world.member_states, legacy_world.member_states)
     _assert_tree_equal(restored_world.residual_variances, legacy_world.residual_variances)

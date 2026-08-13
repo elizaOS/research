@@ -58,6 +58,7 @@ from alberta_framework.core.dual_replay import (
 )
 from alberta_framework.core.learning_signals import (
     LearningSignalAvailability,
+    LearningSignalCounterStatus,
     TypedLearningSignals,
 )
 from alberta_framework.core.world_model_ensemble import (
@@ -339,6 +340,7 @@ def _tree_equal(left: object, right: object) -> Array:
 def _zero_signals() -> TypedLearningSignals:
     zero = jnp.asarray(0.0, dtype=jnp.float32)
     false = jnp.asarray(False)
+    zero_words = jnp.zeros((2,), dtype=jnp.uint32)
     return TypedLearningSignals(
         epistemic_disagreement=zero,
         epistemic_surprise=zero,
@@ -355,6 +357,20 @@ def _zero_signals() -> TypedLearningSignals:
             normalized_residual=false,
             learning_progress=false,
             change_probability=false,
+        ),
+        counter_status=LearningSignalCounterStatus(
+            pre_step_words=zero_words,
+            post_step_words=zero_words,
+            pre_valid_words=zero_words,
+            post_valid_words=zero_words,
+            pre_invalid_words=zero_words,
+            post_invalid_words=zero_words,
+            lifetime_counter_valid=false,
+            lifetime_capacity_available=false,
+            state_valid=false,
+            event_recorded=false,
+            valid_event_recorded=false,
+            invalid_event_recorded=false,
         ),
     )
 
@@ -384,6 +400,30 @@ def _gate_signals(signals: TypedLearningSignals, available: Array) -> TypedLearn
             normalized_residual=available & source.normalized_residual,
             learning_progress=available & source.learning_progress,
             change_probability=available & source.change_probability,
+        ),
+        counter_status=signals.counter_status.replace(
+            post_step_words=jnp.where(
+                available,
+                signals.counter_status.post_step_words,
+                signals.counter_status.pre_step_words,
+            ),
+            post_valid_words=jnp.where(
+                available,
+                signals.counter_status.post_valid_words,
+                signals.counter_status.pre_valid_words,
+            ),
+            post_invalid_words=jnp.where(
+                available,
+                signals.counter_status.post_invalid_words,
+                signals.counter_status.pre_invalid_words,
+            ),
+            event_recorded=available & signals.counter_status.event_recorded,
+            valid_event_recorded=(
+                available & signals.counter_status.valid_event_recorded
+            ),
+            invalid_event_recorded=(
+                available & signals.counter_status.invalid_event_recorded
+            ),
         ),
     )
 

@@ -248,7 +248,10 @@ class TestConventionGameMechanics:
         r, _ = game.step(state, jnp.array(5), jnp.array(4))
         assert float(r) == 0.0
         # Jump to the second phase: offset 3 required.
-        state_b = state.replace(step_count=jnp.array(2000, dtype=jnp.int32))
+        state_b = state.replace(
+            step_count=jnp.array(2000, dtype=jnp.int32),
+            step_words=jnp.array((0, 2000), dtype=jnp.uint32),
+        )
         r, _ = game.step(state_b, jnp.array(7), jnp.array(4))
         assert float(r) == 1.0
         r, _ = game.step(state_b, jnp.array(7), jnp.array(7))
@@ -261,7 +264,10 @@ class TestConventionGameMechanics:
         assert ctx.observation_dim == 2
         state = ctx.init(jr.key(0))
         assert jnp.array_equal(ctx.observe(state), jnp.array([1.0, 0.0]))
-        state_b = state.replace(step_count=jnp.array(2500, dtype=jnp.int32))
+        state_b = state.replace(
+            step_count=jnp.array(2500, dtype=jnp.int32),
+            step_words=jnp.array((0, 2500), dtype=jnp.uint32),
+        )
         assert jnp.array_equal(ctx.observe(state_b), jnp.array([0.0, 1.0]))
 
     def test_run_shapes(self):

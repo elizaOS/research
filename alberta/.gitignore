@@ -16,4 +16,14 @@ outputs/forager/**/*.running
 outputs/upgd_ipmnist/reconstructed_openml_cache/
 outputs/upgd_label_emnist/openml_cache/
 outputs/forager/*/sources/
+# The causal-grid probe's pruned first-party tree must remain reconstructable
+# in a clean checkout.  Track only its immutable Alberta archive and receipts;
+# keep the much larger upstream source mirrors ignored.
+!outputs/forager/matched_current_qualification_2c3b214c_v1/sources/
+outputs/forager/matched_current_qualification_2c3b214c_v1/sources/*
+!outputs/forager/matched_current_qualification_2c3b214c_v1/sources/alberta/
+outputs/forager/matched_current_qualification_2c3b214c_v1/sources/alberta/*
+!outputs/forager/matched_current_qualification_2c3b214c_v1/sources/alberta/inventory.json
+!outputs/forager/matched_current_qualification_2c3b214c_v1/sources/alberta/snapshot-descriptor.json
+!outputs/forager/matched_current_qualification_2c3b214c_v1/sources/alberta/source.tar
 outputs/**/logs/

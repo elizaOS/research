@@ -43,15 +43,20 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from collections.abc import Mapping
 from typing import Any
 
 import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Bool, Float, Int, UInt
 
 _INT32_MAX = 2_147_483_647
+_UINT32_MAX = 2**32 - 1
+LEARNING_SIGNAL_STATE_SCHEMA = "alberta.learning-signal-estimator-state.v2"
+LEARNING_SIGNAL_LIFETIME_COUNTER_NBYTES = 36
+LEARNING_SIGNAL_LIFETIME_COUNTER_DELTA_NBYTES = 24
 
 
 def _saturating_increment(value: Array) -> Array:
@@ -64,6 +69,68 @@ def _saturating_counter_sum(left: Array, right: Array) -> Array:
     """Add non-negative int32 counters without overflowing."""
     maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
     return left + jnp.minimum(right, maximum - left)
+
+
+def _checked_lifetime_words_increment(
+    words: Array,
+) -> tuple[UInt[Array, " 2"], Bool[Array, ""]]:
+    """Propose one exact increment without wrapping the all-ones identity."""
+
+    if getattr(words, "shape", None) != (2,):
+        raise ValueError("learning-signal lifetime words must have shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("learning-signal lifetime words must have dtype uint32")
+    maximum = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+    capacity_available = ~jnp.all(words == maximum)
+    one = jnp.asarray(1, dtype=jnp.uint32)
+    low = words[1] + one
+    carry = (low == jnp.asarray(0, dtype=jnp.uint32)).astype(jnp.uint32)
+    proposed = jnp.stack((words[0] + carry, low))
+    return (
+        jnp.where(capacity_available, proposed, words).astype(jnp.uint32),
+        capacity_available,
+    )
+
+
+def _lifetime_counter_valid(words: Array, telemetry: Array) -> Bool[Array, ""]:
+    """Validate exact identity against saturating compatibility telemetry."""
+
+    if getattr(words, "shape", None) != (2,):
+        raise ValueError("learning-signal lifetime words must have shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("learning-signal lifetime words must have dtype uint32")
+    if getattr(telemetry, "shape", None) != ():
+        raise ValueError("learning-signal telemetry must be scalar")
+    if getattr(telemetry, "dtype", None) != jnp.dtype(jnp.int32):
+        raise TypeError("learning-signal telemetry must have dtype int32")
+    maximum_i32 = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    below_saturation = (words[0] == jnp.asarray(0, dtype=jnp.uint32)) & (
+        words[1] < jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+    )
+    return (telemetry >= 0) & jnp.where(
+        below_saturation,
+        telemetry == words[1].astype(jnp.int32),
+        telemetry == maximum_i32,
+    )
+
+
+def _checked_lifetime_words_sum(
+    left: Array,
+    right: Array,
+) -> tuple[UInt[Array, " 2"], Bool[Array, ""]]:
+    """Add exact word identities and report whether the sum overflowed."""
+
+    for name, words in (("left", left), ("right", right)):
+        if getattr(words, "shape", None) != (2,):
+            raise ValueError(f"learning-signal {name} words must have shape (2,)")
+        if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+            raise TypeError(f"learning-signal {name} words must have dtype uint32")
+    low = left[1] + right[1]
+    carry = (low < left[1]).astype(jnp.uint32)
+    high_without_carry = left[0] + right[0]
+    high = high_without_carry + carry
+    overflow = (high_without_carry < left[0]) | (high < high_without_carry)
+    return jnp.stack((high, low)).astype(jnp.uint32), ~overflow
 
 
 def _positive_finite(name: str, value: float) -> None:
@@ -115,7 +182,7 @@ class LearningSignalEstimatorConfig:
 
     def __post_init__(self) -> None:
         """Reject invalid static shapes, timescales, and safety bounds."""
-        _positive_integer("ensemble_size", self.ensemble_size, minimum=2)
+        _positive_integer("ensemble_size", self.ensemble_size)
         _positive_integer("target_dim", self.target_dim)
         _positive_integer("progress_warmup_steps", self.progress_warmup_steps, minimum=2)
         _positive_integer(
@@ -145,6 +212,7 @@ class LearningSignalEstimatorConfig:
         """Return a JSON-compatible configuration."""
         payload = dataclasses.asdict(self)
         payload["type"] = "LearningSignalEstimatorConfig"
+        payload["state_schema"] = LEARNING_SIGNAL_STATE_SCHEMA
         payload["development_only"] = True
         payload["accepted_scientific_evidence"] = False
         return payload
@@ -159,6 +227,9 @@ class LearningSignalEstimatorConfig:
         type_name = payload.pop("type", "LearningSignalEstimatorConfig")
         if type_name != "LearningSignalEstimatorConfig":
             raise ValueError("type must be LearningSignalEstimatorConfig")
+        state_schema = payload.pop("state_schema", None)
+        if state_schema != LEARNING_SIGNAL_STATE_SCHEMA:
+            raise ValueError("learning signal estimator state schema is unsupported")
         development_only = payload.pop("development_only", True)
         if development_only is not True:
             raise ValueError("learning signal estimator is development_only")
@@ -173,13 +244,15 @@ class LearningSignalResourceBudget:
     """Exact logical scalar and byte counts.
 
     Counts exclude transient compiler buffers and device-specific alignment.
-    Persistent state contains four int32 and five float32 scalars.  Output
-    contains eight float32 values and six boolean flags.
+    Persistent state contains four int32, six uint32, and five float32
+    scalars. Output contains eight float32 values, six availability flags,
+    six transaction flags, and six two-word counter snapshots.
     """
 
     input_float_scalars_per_step: int
     persistent_float32_scalars: int
     persistent_int32_scalars: int
+    persistent_uint32_scalars: int
     persistent_state_scalars: int
     persistent_state_bytes: int
     output_float32_scalars: int
@@ -199,6 +272,9 @@ class LearningSignalEstimatorState:
     step_count: Int[Array, ""]
     valid_count: Int[Array, ""]
     invalid_count: Int[Array, ""]
+    step_words: UInt[Array, " 2"]
+    valid_words: UInt[Array, " 2"]
+    invalid_words: UInt[Array, " 2"]
     calibration_count: Int[Array, ""]
     calibration_mean: Float[Array, ""]
     calibration_m2: Float[Array, ""]
@@ -220,6 +296,41 @@ class LearningSignalAvailability:
 
 
 @chex.dataclass(frozen=True)
+class LearningSignalStateCounterStatus:
+    """Exact validity and capacity of all persistent event partitions."""
+
+    step_words: UInt[Array, " 2"]
+    valid_words: UInt[Array, " 2"]
+    invalid_words: UInt[Array, " 2"]
+    step_counter_valid: Bool[Array, ""]
+    valid_counter_valid: Bool[Array, ""]
+    invalid_counter_valid: Bool[Array, ""]
+    partition_words_aligned: Bool[Array, ""]
+    lifetime_counter_valid: Bool[Array, ""]
+    step_capacity_available: Bool[Array, ""]
+    valid_capacity_available: Bool[Array, ""]
+    invalid_capacity_available: Bool[Array, ""]
+
+
+@chex.dataclass(frozen=True)
+class LearningSignalCounterStatus:
+    """Exact before/after partition identities for one observe attempt."""
+
+    pre_step_words: UInt[Array, " 2"]
+    post_step_words: UInt[Array, " 2"]
+    pre_valid_words: UInt[Array, " 2"]
+    post_valid_words: UInt[Array, " 2"]
+    pre_invalid_words: UInt[Array, " 2"]
+    post_invalid_words: UInt[Array, " 2"]
+    lifetime_counter_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    state_valid: Bool[Array, ""]
+    event_recorded: Bool[Array, ""]
+    valid_event_recorded: Bool[Array, ""]
+    invalid_event_recorded: Bool[Array, ""]
+
+
+@chex.dataclass(frozen=True)
 class TypedLearningSignals:
     """Separately typed signal values from one predict-before-update event."""
 
@@ -232,6 +343,7 @@ class TypedLearningSignals:
     instantaneous_change_probability: Float[Array, ""]
     change_probability: Float[Array, ""]
     availability: LearningSignalAvailability
+    counter_status: LearningSignalCounterStatus
 
 
 class LearningSignalEstimator:
@@ -258,11 +370,12 @@ class LearningSignalEstimator:
             input_float_scalars_per_step=input_scalars,
             persistent_float32_scalars=5,
             persistent_int32_scalars=4,
-            persistent_state_scalars=9,
-            persistent_state_bytes=36,
+            persistent_uint32_scalars=6,
+            persistent_state_scalars=15,
+            persistent_state_bytes=60,
             output_float32_scalars=8,
-            output_bool_scalars=6,
-            output_logical_bytes=38,
+            output_bool_scalars=12,
+            output_logical_bytes=92,
             trainable_scalars=0,
         )
 
@@ -270,16 +383,74 @@ class LearningSignalEstimator:
         """Return a zeroed fixed-shape state."""
         zero_float = jnp.asarray(0.0, dtype=jnp.float32)
         zero_int = jnp.asarray(0, dtype=jnp.int32)
+        zero_words = jnp.zeros((2,), dtype=jnp.uint32)
         return LearningSignalEstimatorState(
             step_count=zero_int,
             valid_count=zero_int,
             invalid_count=zero_int,
+            step_words=zero_words,
+            valid_words=zero_words,
+            invalid_words=zero_words,
             calibration_count=zero_int,
             calibration_mean=zero_float,
             calibration_m2=zero_float,
             fast_loss_ema=zero_float,
             slow_loss_ema=zero_float,
             sustained_change_probability=zero_float,
+        )
+
+    def counter_status(
+        self,
+        state: LearningSignalEstimatorState,
+    ) -> LearningSignalStateCounterStatus:
+        """Return exact partition alignment and independent capacities."""
+
+        self._validate_state_shapes(state)
+        partition_sum_words, partition_sum_available = (
+            _checked_lifetime_words_sum(state.valid_words, state.invalid_words)
+        )
+        step_counter_valid = _lifetime_counter_valid(
+            state.step_words,
+            state.step_count,
+        )
+        valid_counter_valid = _lifetime_counter_valid(
+            state.valid_words,
+            state.valid_count,
+        )
+        invalid_counter_valid = _lifetime_counter_valid(
+            state.invalid_words,
+            state.invalid_count,
+        )
+        partition_words_aligned = partition_sum_available & jnp.array_equal(
+            partition_sum_words,
+            state.step_words,
+        )
+        _, step_capacity_available = _checked_lifetime_words_increment(
+            state.step_words
+        )
+        _, valid_capacity_available = _checked_lifetime_words_increment(
+            state.valid_words
+        )
+        _, invalid_capacity_available = _checked_lifetime_words_increment(
+            state.invalid_words
+        )
+        return LearningSignalStateCounterStatus(
+            step_words=state.step_words,
+            valid_words=state.valid_words,
+            invalid_words=state.invalid_words,
+            step_counter_valid=step_counter_valid,
+            valid_counter_valid=valid_counter_valid,
+            invalid_counter_valid=invalid_counter_valid,
+            partition_words_aligned=partition_words_aligned,
+            lifetime_counter_valid=(
+                step_counter_valid
+                & valid_counter_valid
+                & invalid_counter_valid
+                & partition_words_aligned
+            ),
+            step_capacity_available=step_capacity_available,
+            valid_capacity_available=valid_capacity_available,
+            invalid_capacity_available=invalid_capacity_available,
         )
 
     @staticmethod
@@ -299,6 +470,11 @@ class LearningSignalEstimator:
             "invalid_count": state.invalid_count,
             "calibration_count": state.calibration_count,
         }
+        word_values = {
+            "step_words": state.step_words,
+            "valid_words": state.valid_words,
+            "invalid_words": state.invalid_words,
+        }
         float_values = {
             "calibration_mean": state.calibration_mean,
             "calibration_m2": state.calibration_m2,
@@ -310,14 +486,20 @@ class LearningSignalEstimator:
             array = jnp.asarray(value)
             if array.shape != ():
                 raise ValueError(f"state.{name} must be scalar")
-            if not jnp.issubdtype(array.dtype, jnp.integer):
-                raise ValueError(f"state.{name} must have an integer dtype")
+            if array.dtype != jnp.dtype(jnp.int32):
+                raise ValueError(f"state.{name} must have dtype int32")
+        for name, value in word_values.items():
+            array = jnp.asarray(value)
+            if array.shape != (2,):
+                raise ValueError(f"state.{name} must have shape (2,)")
+            if array.dtype != jnp.dtype(jnp.uint32):
+                raise ValueError(f"state.{name} must have dtype uint32")
         for name, value in float_values.items():
             array = jnp.asarray(value)
             if array.shape != ():
                 raise ValueError(f"state.{name} must be scalar")
-            if not jnp.issubdtype(array.dtype, jnp.inexact):
-                raise ValueError(f"state.{name} must have a floating dtype")
+            if array.dtype != jnp.dtype(jnp.float32):
+                raise ValueError(f"state.{name} must have dtype float32")
 
     def observe(
         self,
@@ -358,10 +540,10 @@ class LearningSignalEstimator:
         )
         loss = self._floating_array(jnp.asarray(observed_loss), (), name="observed_loss")
 
+        counter_status = self.counter_status(state)
+        lifetime_counter_valid = counter_status.lifetime_counter_valid
         state_valid = (
-            (state.step_count >= 0)
-            & (state.valid_count >= 0)
-            & (state.invalid_count >= 0)
+            lifetime_counter_valid
             & (
                 state.step_count
                 == _saturating_counter_sum(
@@ -399,7 +581,27 @@ class LearningSignalEstimator:
             & jnp.all(variances <= self._config.max_predicted_variance)
             & (loss <= self._config.max_observed_loss)
         )
-        event_valid = state_valid & input_valid
+        proposed_step_words, step_capacity_available = (
+            _checked_lifetime_words_increment(state.step_words)
+        )
+        proposed_valid_words, valid_capacity_available = (
+            _checked_lifetime_words_increment(state.valid_words)
+        )
+        proposed_invalid_words, invalid_capacity_available = (
+            _checked_lifetime_words_increment(state.invalid_words)
+        )
+        lifetime_capacity_available = step_capacity_available & jnp.where(
+            input_valid,
+            valid_capacity_available,
+            invalid_capacity_available,
+        )
+        valid_event_recorded = (
+            state_valid & input_valid & lifetime_capacity_available
+        )
+        invalid_event_recorded = (
+            state_valid & ~input_valid & lifetime_capacity_available
+        )
+        event_recorded = valid_event_recorded | invalid_event_recorded
 
         # Sanitizing before arithmetic prevents invalid branches from producing
         # NaNs/Infs that could escape through compiler transformations.
@@ -485,7 +687,9 @@ class LearningSignalEstimator:
         )
         learning_progress = slow_loss - fast_loss
         next_valid_count = _saturating_increment(state.valid_count)
-        progress_available = event_valid & (next_valid_count >= self._config.progress_warmup_steps)
+        progress_available = valid_event_recorded & (
+            next_valid_count >= self._config.progress_warmup_steps
+        )
 
         calibration_ready = state.calibration_count >= self._config.change_calibration_steps
         calibrating = ~calibration_ready
@@ -523,7 +727,7 @@ class LearningSignalEstimator:
             self._config.change_decay * state.sustained_change_probability
             + (1.0 - self._config.change_decay) * instantaneous_change_probability
         )
-        change_available = event_valid & calibration_ready
+        change_available = valid_event_recorded & calibration_ready
 
         zero = jnp.asarray(0.0, dtype=jnp.float32)
 
@@ -531,15 +735,20 @@ class LearningSignalEstimator:
             finite_value = jnp.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
             return jnp.where(available, finite_value, zero)
 
-        immediate_available = event_valid
+        immediate_available = valid_event_recorded
+        epistemic_available = (
+            immediate_available
+            if self._config.ensemble_size > 1
+            else jnp.asarray(False, dtype=jnp.bool_)
+        )
         signals = TypedLearningSignals(
             epistemic_disagreement=available_value(
                 epistemic_disagreement,
-                immediate_available,
+                epistemic_available,
             ),
             epistemic_surprise=available_value(
                 epistemic_surprise,
-                immediate_available,
+                epistemic_available,
             ),
             aleatoric_uncertainty=available_value(
                 aleatoric_uncertainty,
@@ -566,20 +775,49 @@ class LearningSignalEstimator:
                 change_available,
             ),
             availability=LearningSignalAvailability(
-                input_valid=event_valid,
-                epistemic=immediate_available,
+                input_valid=valid_event_recorded,
+                epistemic=epistemic_available,
                 aleatoric=immediate_available,
                 normalized_residual=immediate_available,
                 learning_progress=progress_available,
                 change_probability=change_available,
             ),
+            counter_status=LearningSignalCounterStatus(
+                pre_step_words=state.step_words,
+                post_step_words=jnp.where(
+                    event_recorded,
+                    proposed_step_words,
+                    state.step_words,
+                ),
+                pre_valid_words=state.valid_words,
+                post_valid_words=jnp.where(
+                    valid_event_recorded,
+                    proposed_valid_words,
+                    state.valid_words,
+                ),
+                pre_invalid_words=state.invalid_words,
+                post_invalid_words=jnp.where(
+                    invalid_event_recorded,
+                    proposed_invalid_words,
+                    state.invalid_words,
+                ),
+                lifetime_counter_valid=lifetime_counter_valid,
+                lifetime_capacity_available=lifetime_capacity_available,
+                state_valid=state_valid,
+                event_recorded=event_recorded,
+                valid_event_recorded=valid_event_recorded,
+                invalid_event_recorded=invalid_event_recorded,
+            ),
         )
 
-        valid_calibration_update = event_valid & calibrating
+        valid_calibration_update = valid_event_recorded & calibrating
         next_state_if_valid = LearningSignalEstimatorState(
             step_count=_saturating_increment(state.step_count),
             valid_count=next_valid_count,
             invalid_count=state.invalid_count,
+            step_words=proposed_step_words,
+            valid_words=proposed_valid_words,
+            invalid_words=state.invalid_words,
             calibration_count=jnp.where(
                 valid_calibration_update,
                 next_calibration_count,
@@ -607,6 +845,9 @@ class LearningSignalEstimator:
             step_count=_saturating_increment(state.step_count),
             valid_count=state.valid_count,
             invalid_count=_saturating_increment(state.invalid_count),
+            step_words=proposed_step_words,
+            valid_words=state.valid_words,
+            invalid_words=proposed_invalid_words,
             calibration_count=state.calibration_count,
             calibration_mean=state.calibration_mean,
             calibration_m2=state.calibration_m2,
@@ -615,10 +856,14 @@ class LearningSignalEstimator:
             sustained_change_probability=state.sustained_change_probability,
         )
         next_state = jax.tree_util.tree_map(
-            lambda valid_value, invalid_value, corrupt_value: jnp.where(
-                state_valid,
-                jnp.where(input_valid, valid_value, invalid_value),
-                corrupt_value,
+            lambda valid_value, invalid_value, current_value: jnp.where(
+                valid_event_recorded,
+                valid_value,
+                jnp.where(
+                    invalid_event_recorded,
+                    invalid_value,
+                    current_value,
+                ),
             ),
             next_state_if_valid,
             next_state_if_invalid_input,
@@ -679,11 +924,92 @@ class LearningSignalEstimator:
         )
 
 
+def learning_signal_lifetime_counter_nbytes() -> int:
+    """Return bytes occupied by telemetry plus all exact event partitions."""
+
+    return LEARNING_SIGNAL_LIFETIME_COUNTER_NBYTES
+
+
+def measure_learning_signal_state_nbytes(state: LearningSignalEstimatorState) -> int:
+    """Measure persistent JAX-array bytes in one signal-estimator state."""
+
+    return sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree.leaves(state)
+        if isinstance(leaf, Array)
+    )
+
+
+def migrate_legacy_learning_signal_state(
+    legacy_state: Any,
+) -> LearningSignalEstimatorState:
+    """Migrate a pre-v2 state only when all partition counts are exact."""
+
+    if isinstance(legacy_state, Mapping):
+        state_fields = dict(legacy_state)
+    elif dataclasses.is_dataclass(legacy_state) and not isinstance(legacy_state, type):
+        state_fields = {
+            field.name: getattr(legacy_state, field.name)
+            for field in dataclasses.fields(legacy_state)
+        }
+    else:
+        raise TypeError("legacy learning-signal state must be a mapping or dataclass")
+    current_names = {
+        field.name
+        for field in dataclasses.fields(LearningSignalEstimatorState)  # type: ignore[arg-type]
+    }
+    legacy_names = current_names - {"step_words", "valid_words", "invalid_words"}
+    supplied_names = set(state_fields)
+    if supplied_names != legacy_names:
+        missing = sorted(legacy_names - supplied_names)
+        extra = sorted(supplied_names - legacy_names)
+        raise ValueError(
+            "legacy learning-signal field manifest is not exact; "
+            f"missing={missing}, extra={extra}"
+        )
+    counts: dict[str, int] = {}
+    for name in ("step_count", "valid_count", "invalid_count", "calibration_count"):
+        value = jnp.asarray(state_fields[name])
+        if value.shape != () or value.dtype != jnp.dtype(jnp.int32):
+            raise TypeError(f"legacy learning-signal {name} must be scalar int32")
+        count = int(value)
+        if count < 0:
+            raise ValueError(f"negative legacy learning-signal {name} indicates wrap")
+        if count >= _INT32_MAX:
+            raise ValueError(f"saturated legacy learning-signal {name} is ambiguous")
+        counts[name] = count
+    if counts["step_count"] != counts["valid_count"] + counts["invalid_count"]:
+        raise ValueError("legacy learning-signal event partitions are not aligned")
+    if counts["calibration_count"] > counts["valid_count"]:
+        raise ValueError("legacy learning-signal calibration count exceeds valid count")
+    state_fields["step_words"] = jnp.asarray(
+        (0, counts["step_count"]),
+        dtype=jnp.uint32,
+    )
+    state_fields["valid_words"] = jnp.asarray(
+        (0, counts["valid_count"]),
+        dtype=jnp.uint32,
+    )
+    state_fields["invalid_words"] = jnp.asarray(
+        (0, counts["invalid_count"]),
+        dtype=jnp.uint32,
+    )
+    return LearningSignalEstimatorState(**state_fields)
+
+
 __all__ = [
+    "LEARNING_SIGNAL_LIFETIME_COUNTER_DELTA_NBYTES",
+    "LEARNING_SIGNAL_LIFETIME_COUNTER_NBYTES",
+    "LEARNING_SIGNAL_STATE_SCHEMA",
     "LearningSignalAvailability",
+    "LearningSignalCounterStatus",
     "LearningSignalEstimator",
     "LearningSignalEstimatorConfig",
     "LearningSignalEstimatorState",
     "LearningSignalResourceBudget",
+    "LearningSignalStateCounterStatus",
     "TypedLearningSignals",
+    "learning_signal_lifetime_counter_nbytes",
+    "measure_learning_signal_state_nbytes",
+    "migrate_legacy_learning_signal_state",
 ]

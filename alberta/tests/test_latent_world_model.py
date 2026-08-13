@@ -134,6 +134,8 @@ def test_latent_world_model_scan_loop_and_config_roundtrip() -> None:
     chex.assert_shape(result.reward_predictions, (3,))
     chex.assert_shape(result.surprises, (3,))
     chex.assert_shape(result.per_head_metrics, (3, 6, 3))
+    chex.assert_shape(result.updates_applied, (3,))
+    assert bool(jnp.all(result.updates_applied))
     chex.assert_tree_all_finite(result.prediction_errors)
 
 
@@ -409,4 +411,30 @@ def test_trainable_encoder_config_validation_fails_closed(
         **overrides,  # type: ignore[arg-type]
     )
     with pytest.raises(ValueError):
+        LatentWorldModel(config)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("overrides", "error_type"),
+    [
+        ({"gamma": math.nan}, ValueError),
+        ({"reward_scale": math.inf}, ValueError),
+        ({"observation_scale": (1.0, math.nan)}, ValueError),
+        ({"observation_dim": True}, TypeError),
+        ({"hidden_sizes": [8]}, TypeError),
+        ({"encoder_learning": 1}, TypeError),
+        ({"step_size": 0.0}, ValueError),
+        ({"sparsity": 1.1}, ValueError),
+        ({"leaky_relu_slope": -0.01}, ValueError),
+    ],
+)
+def test_latent_world_model_config_rejects_nonfinite_or_wrong_runtime_types(
+    overrides: dict[str, object],
+    error_type: type[Exception],
+) -> None:
+    payload: dict[str, object] = {"observation_dim": 2, "n_actions": 2}
+    payload.update(overrides)
+    config = LatentWorldModelConfig(**payload)  # type: ignore[arg-type]
+    with pytest.raises(error_type):
         LatentWorldModel(config)

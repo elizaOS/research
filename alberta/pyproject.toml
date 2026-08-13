@@ -92,6 +92,9 @@ alberta-foragax-open-screen = "alberta_framework.benchmarks.foragax_open_screen:
 alberta-forager-matched-campaign = "alberta_framework.benchmarks.forager_matched_campaign:main"
 alberta-forager-matched-qualification = "alberta_framework.benchmarks.forager_matched_qualification:main"
 alberta-forager-matched-sealed-evaluation = "alberta_framework.benchmarks.forager_matched_sealed_evaluation_campaign:main"
+alberta-forager-matched-v3-cpu-oci-build = "alberta_framework.benchmarks.forager_matched_v3_cpu_oci_build_publication:main"
+alberta-forager-matched-v3-cpu-oci-engineering-smoke = "alberta_framework.benchmarks.forager_matched_v3_cpu_oci_engineering_smoke:main"
+alberta-prototype-embodied-paired-development = "alberta_framework.benchmarks.prototype_embodied_paired_development:main"
 alberta-ia-evidence = "alberta_framework.evaluation.continual_ia_cli:main"
 alberta-multiagent-evidence = "alberta_framework.evaluation.continual_multiagent_cli:main"
 alberta-ftl-evidence = "alberta_framework.evaluation.ftl_decision_cli:main"
@@ -231,6 +234,16 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = "termcolor.*"
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "alberta_framework.benchmarks._foragax_open_screen_probe"
+disable_error_code = ["import-not-found", "unused-ignore"]
+
+# This immutable recovery receipt deliberately records two unequal literal
+# source hashes and validates that the mismatch remains present.
+[[tool.mypy.overrides]]
+module = "alberta_framework.evaluation.hidden_prototype_two_agent_continual_life_recovery_outcome"
+disable_error_code = ["comparison-overlap"]
 
 # Benchmarks use dynamic dm_env/bsuite/haiku types that mypy can't fully resolve
 [[tool.mypy.overrides]]

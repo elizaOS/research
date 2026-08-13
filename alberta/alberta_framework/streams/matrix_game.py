@@ -41,6 +41,8 @@ so results isolate representational retention but do not establish autonomous
 state construction, feature discovery, or causal intelligence amplification.
 """
 
+import dataclasses
+import functools
 from dataclasses import dataclass
 from typing import Literal
 
@@ -49,14 +51,126 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Float, Int, PRNGKeyArray
+from jaxtyping import Bool, Float, Int, PRNGKeyArray, UInt
 
 from alberta_framework.core.average_reward import (
+    DIFFERENTIAL_SARSA_LIFETIME_COUNTER_DELTA_NBYTES,
     DifferentialSARSAAgent,
     DifferentialSARSAState,
 )
 
 FeatureMode = Literal["plain", "context"]
+
+_INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
+
+# ``step_count`` remains a four-byte compatibility/diagnostic field.  These
+# eight bytes are the exact schedule authority added to the dynamic state.
+CONVENTION_GAME_EXACT_CLOCK_NBYTES = 8
+CONVENTION_GAME_EXACT_CLOCK_DELTA_NBYTES = 8
+
+CONVENTION_GAME_RUNNER_STATE_SCHEMA = "alberta.convention-game-runner-state.v1"
+CONVENTION_GAME_RUNNER_EXACT_IDENTITY_NBYTES = (
+    CONVENTION_GAME_EXACT_CLOCK_NBYTES
+    + 2 * DIFFERENTIAL_SARSA_LIFETIME_COUNTER_DELTA_NBYTES
+)
+
+
+def _checked_words_increment(
+    words: Array,
+) -> tuple[UInt[Array, " 2"], Bool[Array, ""]]:
+    """Propose one exact uint64-word increment without all-ones wrap."""
+
+    array = jnp.asarray(words)
+    if array.shape != (2,):
+        raise ValueError("convention-game step_words must have shape (2,)")
+    if array.dtype != jnp.dtype(jnp.uint32):
+        raise TypeError("convention-game step_words must have dtype uint32")
+    maximum = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+    capacity_available = ~jnp.all(array == maximum)
+    low = array[1] + jnp.asarray(1, dtype=jnp.uint32)
+    carry = (low == jnp.asarray(0, dtype=jnp.uint32)).astype(jnp.uint32)
+    proposed = jnp.stack((array[0] + carry, low)).astype(jnp.uint32)
+    return jnp.where(capacity_available, proposed, array), capacity_available
+
+
+def _words_to_int32_telemetry(words: Array) -> Int[Array, ""]:
+    """Project an exact identity to saturating non-negative telemetry."""
+
+    array = jnp.asarray(words)
+    if array.shape != (2,):
+        raise ValueError("convention-game step_words must have shape (2,)")
+    if array.dtype != jnp.dtype(jnp.uint32):
+        raise TypeError("convention-game step_words must have dtype uint32")
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    below_saturation = (array[0] == jnp.asarray(0, dtype=jnp.uint32)) & (
+        array[1] < jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+    )
+    return jnp.where(below_saturation, array[1].astype(jnp.int32), maximum)
+
+
+def _clock_valid(words: Array, telemetry: Array) -> Bool[Array, ""]:
+    """Authenticate exact schedule words against compatibility telemetry."""
+
+    projected = _words_to_int32_telemetry(words)
+    count = jnp.asarray(telemetry)
+    if count.shape != ():
+        raise ValueError("convention-game step_count must be scalar")
+    if count.dtype != jnp.dtype(jnp.int32):
+        raise TypeError("convention-game step_count must have dtype int32")
+    return (count >= 0) & (count == projected)
+
+
+def _divmod_words_by_positive_int32(
+    words: Array,
+    divisor: int,
+) -> tuple[UInt[Array, " 2"], UInt[Array, ""]]:
+    """Divide a two-word unsigned identity by a positive signed-int32 value.
+
+    JAX commonly runs with x64 disabled, so casting the clock to ``uint64`` is
+    not a portable exact implementation.  This fixed 64-round long division
+    uses only uint32 operations.  Because ``divisor <= INT32_MAX``, doubling a
+    remainder cannot overflow uint32.
+    """
+
+    array = jnp.asarray(words)
+    if array.shape != (2,):
+        raise ValueError("convention-game schedule words must have shape (2,)")
+    if array.dtype != jnp.dtype(jnp.uint32):
+        raise TypeError("convention-game schedule words must have dtype uint32")
+    if type(divisor) is not int or not 1 <= divisor <= _INT32_MAX:
+        raise ValueError("schedule divisor must be a positive signed-int32 integer")
+
+    divisor_u = jnp.asarray(divisor, dtype=jnp.uint32)
+    zero = jnp.asarray(0, dtype=jnp.uint32)
+    one = jnp.asarray(1, dtype=jnp.uint32)
+
+    def divide_bit(
+        index: int,
+        carry: tuple[Array, Array, Array],
+    ) -> tuple[Array, Array, Array]:
+        quotient_high, quotient_low, remainder = carry
+        bit_index = jnp.asarray(63 - index, dtype=jnp.int32)
+        from_high = bit_index >= 32
+        shift = jnp.where(from_high, bit_index - 32, bit_index)
+        source = jnp.where(from_high, array[0], array[1])
+        bit = (source >> shift.astype(jnp.uint32)) & one
+
+        doubled = remainder + remainder + bit
+        quotient_bit = doubled >= divisor_u
+        next_remainder = jnp.where(quotient_bit, doubled - divisor_u, doubled)
+
+        next_high = (quotient_high << one) | (quotient_low >> jnp.uint32(31))
+        next_low = (quotient_low << one) | quotient_bit.astype(jnp.uint32)
+        return next_high, next_low, next_remainder
+
+    high, low, remainder = jax.lax.fori_loop(
+        0,
+        64,
+        divide_bit,
+        (zero, zero, zero),
+    )
+    return jnp.stack((high, low)).astype(jnp.uint32), remainder.astype(jnp.uint32)
 
 
 @dataclass(frozen=True)
@@ -82,13 +196,18 @@ class ConventionGameConfig:
 
     def __post_init__(self) -> None:
         """Validate the configuration."""
-        if self.n_actions < 2:
+        if type(self.n_actions) is not int or not 2 <= self.n_actions <= _INT32_MAX:
             raise ValueError("n_actions must be at least 2")
-        if self.phase_length < 1:
-            raise ValueError("phase_length must be positive")
-        if len(self.offsets) < 1:
-            raise ValueError("offsets must be non-empty")
-        if any(not 0 <= o < self.n_actions for o in self.offsets):
+        if (
+            type(self.phase_length) is not int
+            or not 1 <= self.phase_length <= _INT32_MAX
+        ):
+            raise ValueError("phase_length must be a positive signed-int32 integer")
+        if not isinstance(self.offsets, tuple) or not 1 <= len(self.offsets) <= _INT32_MAX:
+            raise ValueError("offsets must be a non-empty tuple")
+        if any(type(offset) is not int for offset in self.offsets):
+            raise ValueError("every offset must be a non-boolean integer")
+        if any(not 0 <= offset < self.n_actions for offset in self.offsets):
             raise ValueError("every offset must lie in [0, n_actions)")
         if self.feature_mode not in ("plain", "context"):
             raise ValueError("feature_mode must be plain or context")
@@ -110,13 +229,42 @@ class ConventionGameState:
 
     Attributes:
         key: Game RNG key (kept for stochastic variants).
-        step_count: Global step counter (drives the rule schedule).
+        step_count: Saturating signed-int32 compatibility telemetry.
+        step_words: Exact big-endian uint32 schedule identity.  This is the
+            only authority used to select phases and rules.
         last_actions: The previous joint action, shape ``(2,)``.
     """
 
     key: PRNGKeyArray
     step_count: Int[Array, ""]
+    step_words: UInt[Array, " 2"]
     last_actions: Int[Array, " 2"]
+
+
+@chex.dataclass(frozen=True)
+class ConventionGameStepResult:
+    """Fail-closed result of one convention-game transition attempt."""
+
+    reward: Float[Array, ""]
+    state: ConventionGameState
+    rule_index: Int[Array, ""]
+    pre_step_words: UInt[Array, " 2"]
+    post_step_words: UInt[Array, " 2"]
+    lifetime_counter_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    state_valid: Bool[Array, ""]
+    input_valid: Bool[Array, ""]
+    update_applied: Bool[Array, ""]
+
+
+def measure_convention_game_state_nbytes(state: ConventionGameState) -> int:
+    """Measure persistent JAX-array bytes in one convention-game state."""
+
+    total = 0
+    for leaf in jax.tree.leaves(state):
+        if isinstance(leaf, Array):
+            total += int(leaf.size) * int(leaf.dtype.itemsize)
+    return total
 
 
 class RecurringConventionGame:
@@ -139,19 +287,134 @@ class RecurringConventionGame:
 
     def init(self, key: Array) -> ConventionGameState:
         """Initialize with an arbitrary previous joint action."""
+        self._require_key_contract(key)
         return ConventionGameState(
             key=key,
             step_count=jnp.array(0, dtype=jnp.int32),
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
             last_actions=jnp.zeros((2,), dtype=jnp.int32),
         )
 
+    @staticmethod
+    def _require_key_contract(key: Array) -> None:
+        """Reject malformed scalar PRNG keys before any state is created."""
+
+        try:
+            key_words = jnp.asarray(jr.key_data(key))
+        except (TypeError, ValueError) as error:
+            raise TypeError("convention-game key must be a scalar PRNG key") from error
+        if key_words.shape != (2,) or key_words.dtype != jnp.dtype(jnp.uint32):
+            raise TypeError("convention-game key must be a scalar PRNG key")
+
+    def _require_state_contract(self, state: ConventionGameState) -> None:
+        """Validate fixed state shapes and dtypes (safe during JAX tracing)."""
+
+        self._require_key_contract(state.key)
+        _checked_words_increment(state.step_words)
+        count = jnp.asarray(state.step_count)
+        if count.shape != ():
+            raise ValueError("convention-game step_count must be scalar")
+        if count.dtype != jnp.dtype(jnp.int32):
+            raise TypeError("convention-game step_count must have dtype int32")
+        actions = jnp.asarray(state.last_actions)
+        if actions.shape != (2,):
+            raise ValueError("convention-game last_actions must have shape (2,)")
+        if actions.dtype != jnp.dtype(jnp.int32):
+            raise TypeError("convention-game last_actions must have dtype int32")
+
+    def _state_values_valid(self, state: ConventionGameState) -> Bool[Array, ""]:
+        """Authenticate dynamic state values without reading telemetry as time."""
+
+        return _clock_valid(state.step_words, state.step_count) & jnp.all(
+            (state.last_actions >= 0) & (state.last_actions < self._config.n_actions)
+        )
+
+    @staticmethod
+    def _require_action_contract(action: Array, *, name: str) -> Int[Array, ""]:
+        raw = jnp.asarray(action)
+        if raw.shape != ():
+            raise ValueError(f"convention-game {name} must be scalar")
+        if raw.dtype != jnp.dtype(jnp.int32):
+            raise TypeError(f"convention-game {name} must have dtype int32")
+        return raw
+
+    @staticmethod
+    def _legacy_scalar_to_words(step: Array) -> tuple[Array, Array]:
+        """Convert only a non-negative unsaturated scalar compatibility input."""
+
+        raw = jnp.asarray(step)
+        if raw.shape != ():
+            raise ValueError("legacy convention-game step must be scalar")
+        if raw.dtype not in (jnp.dtype(jnp.int32), jnp.dtype(jnp.uint32)):
+            raise TypeError("legacy convention-game step must have dtype int32 or uint32")
+        valid = jnp.asarray(True, dtype=jnp.bool_)
+        if raw.dtype == jnp.dtype(jnp.int32):
+            # INT32_MAX is the compatibility field's saturation sentinel: it
+            # could denote this exact step or any later one, so the scalar
+            # surface must not invent a history for it.
+            valid = (raw >= 0) & (raw < _INT32_MAX)
+            low = jnp.maximum(raw, jnp.asarray(0, dtype=jnp.int32)).astype(jnp.uint32)
+        else:
+            valid = raw < jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+            low = raw
+        return jnp.stack((jnp.asarray(0, dtype=jnp.uint32), low)), valid
+
+    def phase_words_of(self, step_words: Array) -> UInt[Array, " 2"]:
+        """Return the exact phase ordinal for an exact two-word step identity."""
+
+        quotient, _ = _divmod_words_by_positive_int32(
+            step_words,
+            self._config.phase_length,
+        )
+        return quotient
+
+    def _rule_of_words(self, step_words: Array) -> Int[Array, ""]:
+        """Select the active rule using only the exact schedule identity."""
+
+        # The common case needs one 64-bit modular reduction.  The fallback
+        # avoids constraining otherwise valid configs whose full cycle is
+        # larger than signed int32.
+        cycle_length = self._config.phase_length * self._config.n_rules
+        if cycle_length <= _INT32_MAX:
+            _, within_cycle = _divmod_words_by_positive_int32(step_words, cycle_length)
+            return (within_cycle // self._config.phase_length).astype(jnp.int32)
+        phase_words = self.phase_words_of(step_words)
+        _, rule = _divmod_words_by_positive_int32(phase_words, self._config.n_rules)
+        return rule.astype(jnp.int32)
+
     def rule_of(self, step: Array) -> Array:
-        """Index into ``offsets`` of the rule active at *step*."""
-        return ((step // self._config.phase_length) % self._config.n_rules).astype(jnp.int32)
+        """Index into ``offsets`` of the rule active at an exact step.
+
+        A uint32 array of shape ``(2,)`` is the exact surface.  A scalar
+        int32/uint32 remains accepted for backward-compatible short-horizon
+        diagnostics; negative signed values fail closed to ``-1`` and a
+        saturated scalar is never interpreted as later history.
+        """
+
+        raw = jnp.asarray(step)
+        if raw.shape == (2,):
+            if raw.dtype != jnp.dtype(jnp.uint32):
+                raise TypeError("exact convention-game step must have dtype uint32")
+            words = raw
+            valid = jnp.asarray(True, dtype=jnp.bool_)
+        else:
+            words, valid = self._legacy_scalar_to_words(raw)
+        rule = self._rule_of_words(words)
+        return jnp.where(valid, rule, jnp.asarray(-1, dtype=jnp.int32))
 
     def phase_index_of(self, step: Array) -> Array:
-        """Ordinal of the phase at *step* (0, 1, 2, ... across the run)."""
-        return (step // self._config.phase_length).astype(jnp.int32)
+        """Saturating telemetry for the exact phase ordinal at *step*."""
+
+        raw = jnp.asarray(step)
+        if raw.shape == (2,):
+            if raw.dtype != jnp.dtype(jnp.uint32):
+                raise TypeError("exact convention-game step must have dtype uint32")
+            words = raw
+            valid = jnp.asarray(True, dtype=jnp.bool_)
+        else:
+            words, valid = self._legacy_scalar_to_words(raw)
+        telemetry = _words_to_int32_telemetry(self.phase_words_of(words))
+        return jnp.where(valid, telemetry, jnp.asarray(-1, dtype=jnp.int32))
 
     def observe(self, state: ConventionGameState) -> Array:
         """Build the (shared) observation from the current game state.
@@ -159,52 +422,386 @@ class RecurringConventionGame:
         Both agents receive the same observation: the active rule as a
         one-hot context (``"context"``), or a bare constant (``"plain"``).
         """
+        self._require_state_contract(state)
+        state_valid = self._state_values_valid(state)
         if self._config.feature_mode == "plain":
-            return jnp.ones((1,), dtype=jnp.float32)
-        rule = self.rule_of(state.step_count)
-        return jax.nn.one_hot(rule, self._config.n_rules, dtype=jnp.float32)
+            candidate = jnp.ones((1,), dtype=jnp.float32)
+        else:
+            rule = self._rule_of_words(state.step_words)
+            candidate = jax.nn.one_hot(rule, self._config.n_rules, dtype=jnp.float32)
+        return jnp.where(state_valid, candidate, jnp.zeros_like(candidate))
+
+    def step_result(
+        self,
+        state: ConventionGameState,
+        action_0: Array,
+        action_1: Array,
+    ) -> ConventionGameStepResult:
+        """Attempt one transition, rolling back every leaf on any rejection."""
+
+        self._require_state_contract(state)
+        action_0_i = self._require_action_contract(action_0, name="action_0")
+        action_1_i = self._require_action_contract(action_1, name="action_1")
+        proposed_words, capacity_available = _checked_words_increment(state.step_words)
+        counter_valid = _clock_valid(state.step_words, state.step_count)
+        state_valid = self._state_values_valid(state)
+        input_valid = (
+            (action_0_i >= 0)
+            & (action_0_i < self._config.n_actions)
+            & (action_1_i >= 0)
+            & (action_1_i < self._config.n_actions)
+        )
+        update_applied = state_valid & input_valid & capacity_available
+
+        rule = self._rule_of_words(state.step_words)
+        offset = self._offsets[rule]
+        hit = ((action_0_i - action_1_i) % self._config.n_actions) == offset
+        candidate_reward = hit.astype(jnp.float32)
+        proposed_actions = jnp.stack((action_0_i, action_1_i)).astype(jnp.int32)
+        next_state = ConventionGameState(
+            key=state.key,
+            step_count=jnp.where(
+                update_applied,
+                _words_to_int32_telemetry(proposed_words),
+                state.step_count,
+            ),
+            step_words=jnp.where(update_applied, proposed_words, state.step_words),
+            last_actions=jnp.where(update_applied, proposed_actions, state.last_actions),
+        )
+        return ConventionGameStepResult(
+            reward=jnp.where(
+                update_applied,
+                candidate_reward,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ),
+            state=next_state,
+            rule_index=jnp.where(
+                update_applied,
+                rule,
+                jnp.asarray(-1, dtype=jnp.int32),
+            ),
+            pre_step_words=state.step_words,
+            post_step_words=next_state.step_words,
+            lifetime_counter_valid=counter_valid,
+            lifetime_capacity_available=capacity_available,
+            state_valid=state_valid,
+            input_valid=input_valid,
+            update_applied=update_applied,
+        )
 
     def step(
         self, state: ConventionGameState, action_0: Array, action_1: Array
     ) -> tuple[Array, ConventionGameState]:
         """Apply the joint action; return the common reward and next state."""
-        rule = self.rule_of(state.step_count)
-        offset = self._offsets[rule]
-        hit = ((action_0 - action_1) % self._config.n_actions) == offset
-        reward = hit.astype(jnp.float32)
-        new_state = ConventionGameState(
-            key=state.key,
-            step_count=state.step_count + 1,
-            last_actions=jnp.stack([action_0, action_1]).astype(jnp.int32),
-        )
-        return reward, new_state
+        result = self.step_result(state, action_0, action_1)
+        return result.reward, result.state
+
+
+@chex.dataclass(frozen=True)
+class ConventionGameRunnerState:
+    """Complete resumable state for the game and both learning agents.
+
+    The environment's ``step_words`` is the schedule authority.  Both learner
+    identities must equal it before and after every committed joint update.
+    The runner owns no fourth clock and therefore cannot drift independently
+    of the three states it composes.
+    """
+
+    environment_state: ConventionGameState
+    agent_0_state: DifferentialSARSAState
+    agent_1_state: DifferentialSARSAState
+
+
+@dataclass(frozen=True)
+class ConventionGameRunnerResourceBudget:
+    """Exact persistent-state accounting for one concrete runner state."""
+
+    state_schema: str
+    environment_state_nbytes: int
+    agent_0_state_nbytes: int
+    agent_1_state_nbytes: int
+    environment_exact_identity_nbytes: int
+    learner_exact_identity_nbytes: int
+    exact_identity_nbytes: int
+    state_nbytes: int
+
+
+@chex.dataclass(frozen=True)
+class ConventionGameRunnerStepResult:
+    """Result of one staged environment/two-learner transaction attempt."""
+
+    state: ConventionGameRunnerState
+    reward: Float[Array, ""]
+    actions: Int[Array, " 2"]
+    rule_index: Int[Array, ""]
+    pre_step_words: UInt[Array, " 2"]
+    post_step_words: UInt[Array, " 2"]
+    environment_update_applied: Bool[Array, ""]
+    learner_updates_applied: Bool[Array, " 2"]
+    runner_state_valid: Bool[Array, ""]
+    child_counters_aligned: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    input_valid: Bool[Array, ""]
+    candidate_state_finite: Bool[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
 class ConventionGameRunResult:
-    """Result of :func:`run_matrix_game`.
+    """Resumable result of :func:`run_matrix_game`.
 
     Attributes:
         rewards: Common reward per step, shape ``(num_steps,)``.
         actions: Joint actions per step, shape ``(num_steps, 2)``.
-        agent_states: Final per-agent learner states.
+        state: Complete final environment/two-agent runner state.
+        updates_applied: Whether each attempted joint transaction committed.
+        pre_step_words: Exact environment identity before every attempt.
+        post_step_words: Exact committed environment identity after every
+            attempt; equal to the pre-identity when the attempt is refused.
     """
 
     rewards: Float[Array, " num_steps"]
     actions: Int[Array, "num_steps 2"]
-    agent_states: tuple[DifferentialSARSAState, DifferentialSARSAState]
+    state: ConventionGameRunnerState
+    updates_applied: Bool[Array, " num_steps"]
+    environment_updates_applied: Bool[Array, " num_steps"]
+    learner_updates_applied: Bool[Array, "num_steps 2"]
+    runner_states_valid: Bool[Array, " num_steps"]
+    child_counters_aligned: Bool[Array, " num_steps"]
+    candidate_states_finite: Bool[Array, " num_steps"]
+    pre_step_words: UInt[Array, "num_steps 2"]
+    post_step_words: UInt[Array, "num_steps 2"]
+
+    @property
+    def environment_state(self) -> ConventionGameState:
+        """Final environment state (compatibility/readability view)."""
+
+        return self.state.environment_state
+
+    @property
+    def agent_states(
+        self,
+    ) -> tuple[DifferentialSARSAState, DifferentialSARSAState]:
+        """Final learner states in the historical tuple surface."""
+
+        return self.state.agent_0_state, self.state.agent_1_state
+
+
+def _persistent_state_nbytes(value: object) -> int:
+    """Count persistent array bytes, excluding host-only timing metadata."""
+
+    if isinstance(value, Array):
+        return int(value.size) * int(value.dtype.itemsize)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return sum(
+            _persistent_state_nbytes(getattr(value, field.name))
+            for field in dataclasses.fields(value)
+            if field.name not in {"birth_timestamp", "uptime_s"}
+        )
+    if isinstance(value, (tuple, list)):
+        return sum(_persistent_state_nbytes(item) for item in value)
+    return 0
+
+
+def measure_convention_game_runner_state_nbytes(
+    state: ConventionGameRunnerState,
+) -> int:
+    """Measure persistent learning-state bytes in a full runner state."""
+
+    return _persistent_state_nbytes(state)
+
+
+def convention_game_runner_resource_budget(
+    state: ConventionGameRunnerState,
+) -> ConventionGameRunnerResourceBudget:
+    """Return exact component and joint bytes for one runner state."""
+
+    environment_nbytes = _persistent_state_nbytes(state.environment_state)
+    agent_0_nbytes = _persistent_state_nbytes(state.agent_0_state)
+    agent_1_nbytes = _persistent_state_nbytes(state.agent_1_state)
+    return ConventionGameRunnerResourceBudget(
+        state_schema=CONVENTION_GAME_RUNNER_STATE_SCHEMA,
+        environment_state_nbytes=environment_nbytes,
+        agent_0_state_nbytes=agent_0_nbytes,
+        agent_1_state_nbytes=agent_1_nbytes,
+        environment_exact_identity_nbytes=CONVENTION_GAME_EXACT_CLOCK_NBYTES,
+        learner_exact_identity_nbytes=(
+            2 * DIFFERENTIAL_SARSA_LIFETIME_COUNTER_DELTA_NBYTES
+        ),
+        exact_identity_nbytes=CONVENTION_GAME_RUNNER_EXACT_IDENTITY_NBYTES,
+        state_nbytes=environment_nbytes + agent_0_nbytes + agent_1_nbytes,
+    )
+
+
+def _floating_tree_finite(tree: object) -> Bool[Array, ""]:
+    """Require every floating/complex state leaf to be finite."""
+
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for leaf in jax.tree.leaves(tree):
+        if isinstance(leaf, Array) and jnp.issubdtype(leaf.dtype, jnp.inexact):
+            valid = valid & jnp.all(jnp.isfinite(leaf))
+    return valid
+
+
+def init_matrix_game_runner(
+    agent: DifferentialSARSAAgent,
+    game: RecurringConventionGame,
+    key: Array,
+) -> ConventionGameRunnerState:
+    """Initialize and prime both learners at exact environment identity zero."""
+
+    if agent.config.n_actions != game.config.n_actions:
+        raise ValueError("agent and convention game must have the same n_actions")
+    game_key, agent_0_key, agent_1_key = jr.split(key, 3)
+    environment_state = game.init(game_key)
+    observation = game.observe(environment_state)
+    agent_0_state, _ = agent.start(
+        agent.init(game.observation_dim, agent_0_key),
+        observation,
+    )
+    agent_1_state, _ = agent.start(
+        agent.init(game.observation_dim, agent_1_key),
+        observation,
+    )
+    return ConventionGameRunnerState(
+        environment_state=environment_state,
+        agent_0_state=agent_0_state,
+        agent_1_state=agent_1_state,
+    )
+
+
+@functools.partial(jax.jit, static_argnums=(0, 1))
+def step_matrix_game_runner(
+    agent: DifferentialSARSAAgent,
+    game: RecurringConventionGame,
+    state: ConventionGameRunnerState,
+) -> ConventionGameRunnerStepResult:
+    """Stage and atomically commit one environment/two-learner transition."""
+
+    environment = state.environment_state
+    agent_0_state = state.agent_0_state
+    agent_1_state = state.agent_1_state
+    actions = jnp.stack(
+        (agent_0_state.last_action, agent_1_state.last_action)
+    ).astype(jnp.int32)
+    child_counters_aligned = (
+        jnp.all(environment.step_words == agent_0_state.step_words)
+        & jnp.all(environment.step_words == agent_1_state.step_words)
+    )
+    state_finite = _floating_tree_finite(state)
+
+    environment_result = game.step_result(
+        environment,
+        actions[0],
+        actions[1],
+    )
+    next_observation = game.observe(environment_result.state)
+    agent_0_result = agent.update(
+        agent_0_state,
+        environment_result.reward,
+        next_observation,
+    )
+    agent_1_result = agent.update(
+        agent_1_state,
+        environment_result.reward,
+        next_observation,
+    )
+    learner_updates_applied = jnp.stack(
+        (agent_0_result.update_applied, agent_1_result.update_applied)
+    ).astype(jnp.bool_)
+
+    candidate_state = ConventionGameRunnerState(
+        environment_state=environment_result.state,
+        agent_0_state=agent_0_result.state,
+        agent_1_state=agent_1_result.state,
+    )
+    candidate_counters_aligned = (
+        jnp.all(
+            environment_result.state.step_words
+            == agent_0_result.state.step_words
+        )
+        & jnp.all(
+            environment_result.state.step_words
+            == agent_1_result.state.step_words
+        )
+    )
+    runner_state_valid = (
+        child_counters_aligned
+        & state_finite
+        & environment_result.state_valid
+        & agent_0_result.state_valid
+        & agent_1_result.state_valid
+    )
+    lifetime_capacity_available = (
+        environment_result.lifetime_capacity_available
+        & agent_0_result.lifetime_capacity_available
+        & agent_1_result.lifetime_capacity_available
+    )
+    input_valid = (
+        environment_result.input_valid
+        & agent_0_result.input_valid
+        & agent_1_result.input_valid
+    )
+    candidate_state_finite = (
+        _floating_tree_finite(candidate_state)
+        & agent_0_result.candidate_state_finite
+        & agent_1_result.candidate_state_finite
+    )
+    update_applied = (
+        runner_state_valid
+        & lifetime_capacity_available
+        & input_valid
+        & environment_result.update_applied
+        & jnp.all(learner_updates_applied)
+        & candidate_counters_aligned
+        & candidate_state_finite
+    )
+    committed_state = jax.lax.cond(
+        update_applied,
+        lambda _: candidate_state,
+        lambda _: state,
+        operand=None,
+    )
+    return ConventionGameRunnerStepResult(
+        state=committed_state,
+        reward=jnp.where(
+            update_applied,
+            environment_result.reward,
+            jnp.asarray(0.0, dtype=jnp.float32),
+        ),
+        actions=actions,
+        rule_index=jnp.where(
+            update_applied,
+            environment_result.rule_index,
+            jnp.asarray(-1, dtype=jnp.int32),
+        ),
+        pre_step_words=environment.step_words,
+        post_step_words=committed_state.environment_state.step_words,
+        environment_update_applied=environment_result.update_applied,
+        learner_updates_applied=learner_updates_applied,
+        runner_state_valid=runner_state_valid,
+        child_counters_aligned=child_counters_aligned,
+        lifetime_capacity_available=lifetime_capacity_available,
+        input_valid=input_valid,
+        candidate_state_finite=candidate_state_finite,
+        update_applied=update_applied,
+    )
 
 
 def run_matrix_game(
     agent: DifferentialSARSAAgent,
     game: RecurringConventionGame,
     num_steps: int,
-    key: Array,
+    key: Array | None = None,
+    *,
+    initial_state: ConventionGameRunnerState | None = None,
 ) -> ConventionGameRunResult:
-    """Run two independent copies of *agent* through the recurring game.
+    """Run or resume two independent learners in the recurring game.
 
     Both agents share the same architecture/config but hold independent
-    states, seeds, and experience — self-play without weight sharing.
+    states, seeds, and experience.  Exactly one initialization authority is
+    required: ``key`` starts a fresh run, while ``initial_state`` resumes a
+    prior result without reinitializing or replaying history.
 
     Args:
         agent: The differential SARSA agent template (for continual-memory
@@ -212,47 +809,85 @@ def run_matrix_game(
             docstring).
         game: The recurring convention game.
         num_steps: Number of joint steps.
-        key: RNG key (split between the game and both agents).
+        key: RNG key for a fresh run.
+        initial_state: Complete state returned by an earlier run.
 
     Returns:
         :class:`ConventionGameRunResult` with per-step rewards and actions.
     """
-    k_game, k_a0, k_a1 = jr.split(key, 3)
-    g_state = game.init(k_game)
-    obs = game.observe(g_state)
-    st_0, _ = agent.start(agent.init(game.observation_dim, k_a0), obs)
-    st_1, _ = agent.start(agent.init(game.observation_dim, k_a1), obs)
+    if type(num_steps) is not int or not 0 <= num_steps <= _INT32_MAX:
+        raise ValueError("num_steps must be a non-negative signed-int32 integer")
+    if (key is None) == (initial_state is None):
+        raise ValueError("provide exactly one of key or initial_state")
+    state = (
+        init_matrix_game_runner(agent, game, key)
+        if key is not None
+        else initial_state
+    )
+    if state is None:  # Narrowing guard for static type checkers.
+        raise ValueError("matrix-game runner initialization state is unavailable")
 
     def step_fn(
-        carry: tuple[
-            ConventionGameState,
-            DifferentialSARSAState,
-            DifferentialSARSAState,
-        ],
+        carry: ConventionGameRunnerState,
         _: Array,
     ) -> tuple[
+        ConventionGameRunnerState,
         tuple[
-            ConventionGameState,
-            DifferentialSARSAState,
-            DifferentialSARSAState,
+            Array,
+            Array,
+            Array,
+            Array,
+            Array,
+            Array,
+            Array,
+            Array,
+            Array,
+            Array,
         ],
-        tuple[Array, Array],
     ]:
-        g_st, s0, s1 = carry
-        a0, a1 = s0.last_action, s1.last_action
-        reward, g_st = game.step(g_st, a0, a1)
-        next_obs = game.observe(g_st)
-        s0 = agent.update(s0, reward, next_obs).state
-        s1 = agent.update(s1, reward, next_obs).state
-        return (g_st, s0, s1), (reward, jnp.stack([a0, a1]))
+        result = step_matrix_game_runner(agent, game, carry)
+        return result.state, (
+            result.reward,
+            result.actions,
+            result.update_applied,
+            result.environment_update_applied,
+            result.learner_updates_applied,
+            result.runner_state_valid,
+            result.child_counters_aligned,
+            result.candidate_state_finite,
+            result.pre_step_words,
+            result.post_step_words,
+        )
 
-    (g_state, st_0, st_1), (rewards, actions) = jax.lax.scan(
-        step_fn, (g_state, st_0, st_1), jnp.arange(num_steps)
+    final_state, outputs = jax.lax.scan(
+        step_fn,
+        state,
+        jnp.arange(num_steps, dtype=jnp.int32),
     )
+    (
+        rewards,
+        actions,
+        updates_applied,
+        environment_updates_applied,
+        learner_updates_applied,
+        runner_states_valid,
+        child_counters_aligned,
+        candidate_states_finite,
+        pre_step_words,
+        post_step_words,
+    ) = outputs
     return ConventionGameRunResult(
         rewards=rewards,
         actions=actions.astype(jnp.int32),
-        agent_states=(st_0, st_1),
+        state=final_state,
+        updates_applied=updates_applied,
+        environment_updates_applied=environment_updates_applied,
+        learner_updates_applied=learner_updates_applied,
+        runner_states_valid=runner_states_valid,
+        child_counters_aligned=child_counters_aligned,
+        candidate_states_finite=candidate_states_finite,
+        pre_step_words=pre_step_words,
+        post_step_words=post_step_words,
     )
 
 

@@ -7,6 +7,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import pytest
 
 from alberta_framework.core.continual_backprop import (
     CBPLearningResult,
@@ -578,3 +579,11 @@ class TestConfigRoundtrip:
         rebuilt = CBPMultiHeadMLPLearner.from_config(cfg)
         cfg2 = rebuilt.to_config()
         assert cfg2 == cfg
+
+    def test_wrong_state_schema_is_rejected(self):
+        learner = CBPMultiHeadMLPLearner(n_heads=2, hidden_sizes=(8,))
+        config = learner.to_config()
+        config["state_schema"] = "alberta.multi-head-mlp-state.invalid"
+
+        with pytest.raises(ValueError, match="Unsupported MultiHeadMLP state schema"):
+            CBPMultiHeadMLPLearner.from_config(config)

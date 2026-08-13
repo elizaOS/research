@@ -26,6 +26,7 @@ import dataclasses
 import functools
 import math
 import time
+from collections.abc import Mapping
 from typing import Any, cast
 
 import chex
@@ -33,18 +34,65 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int, UInt
 
 from alberta_framework.core.multi_head_learner import MultiHeadMLPLearner, MultiHeadMLPState
 from alberta_framework.core.optimizers import Autostep, AutostepParamState, optimizer_from_config
 
 _INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
+DIFFERENTIAL_SARSA_STATE_SCHEMA = "alberta.differential-sarsa-state.v2"
+DIFFERENTIAL_SARSA_LIFETIME_COUNTER_NBYTES = 12
+DIFFERENTIAL_SARSA_LIFETIME_COUNTER_DELTA_NBYTES = 8
 
 
 def _saturating_int32_increment(value: Array) -> Array:
     maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
     counter = jnp.asarray(value, dtype=jnp.int32)
     return jnp.minimum(jnp.maximum(counter, 0), maximum - 1) + 1
+
+
+def _checked_lifetime_words_increment(
+    words: Array,
+) -> tuple[UInt[Array, " 2"], Bool[Array, ""]]:
+    """Propose the next exact transition identity without all-ones wrap."""
+
+    if getattr(words, "shape", None) != (2,):
+        raise ValueError("differential SARSA lifetime words must have shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("differential SARSA lifetime words must have dtype uint32")
+    maximum = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+    capacity_available = ~jnp.all(words == maximum)
+    one = jnp.asarray(1, dtype=jnp.uint32)
+    low = words[1] + one
+    carry = (low == jnp.asarray(0, dtype=jnp.uint32)).astype(jnp.uint32)
+    proposed = jnp.stack((words[0] + carry, low))
+    return (
+        jnp.where(capacity_available, proposed, words).astype(jnp.uint32),
+        capacity_available,
+    )
+
+
+def _lifetime_counter_valid(words: Array, telemetry: Array) -> Bool[Array, ""]:
+    """Validate the exact identity against saturating compatibility telemetry."""
+
+    if getattr(words, "shape", None) != (2,):
+        raise ValueError("differential SARSA lifetime words must have shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("differential SARSA lifetime words must have dtype uint32")
+    if getattr(telemetry, "shape", None) != ():
+        raise ValueError("differential SARSA step_count must be scalar")
+    if getattr(telemetry, "dtype", None) != jnp.dtype(jnp.int32):
+        raise TypeError("differential SARSA step_count must have dtype int32")
+    maximum_i32 = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    below_saturation = (words[0] == jnp.asarray(0, dtype=jnp.uint32)) & (
+        words[1] < jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+    )
+    return (telemetry >= 0) & jnp.where(
+        below_saturation,
+        telemetry == words[1].astype(jnp.int32),
+        telemetry == maximum_i32,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1357,6 +1405,7 @@ class DifferentialSARSAState:
     epsilon: Float[Array, ""]
     rng_key: Array
     step_count: Int[Array, ""]
+    step_words: UInt[Array, " 2"]
     birth_timestamp: float = 0.0
     uptime_s: float = 0.0
 
@@ -1371,6 +1420,14 @@ class DifferentialSARSAUpdateResult:
     td_error: Float[Array, ""]
     average_reward: Float[Array, ""]
     reward: Float[Array, ""]
+    pre_step_words: UInt[Array, " 2"]
+    post_step_words: UInt[Array, " 2"]
+    lifetime_counter_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    state_valid: Bool[Array, ""]
+    input_valid: Bool[Array, ""]
+    candidate_state_finite: Bool[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -1382,6 +1439,7 @@ class DifferentialSARSAArrayResult:
     td_errors: Float[Array, " num_steps"]
     average_rewards: Float[Array, " num_steps"]
     actions: Int[Array, " num_steps"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 class DifferentialSARSAAgent:
@@ -1409,15 +1467,27 @@ class DifferentialSARSAAgent:
         """Serialize this agent to a dictionary."""
         return {
             "type": "DifferentialSARSAAgent",
+            "state_schema": DIFFERENTIAL_SARSA_STATE_SCHEMA,
             "config": self._config.to_config(),
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> DifferentialSARSAAgent:
+    def from_config(cls, config: Mapping[str, Any]) -> DifferentialSARSAAgent:
         """Reconstruct an agent from :meth:`to_config` output."""
-        config = dict(config)
-        config.pop("type", None)
-        return cls(DifferentialSARSAConfig.from_config(config["config"]))
+        payload = dict(config)
+        if set(payload) != {"type", "state_schema", "config"}:
+            raise ValueError(
+                "differential SARSA agent config must contain exactly "
+                "type, state_schema, and config"
+            )
+        if payload["type"] != "DifferentialSARSAAgent":
+            raise ValueError("differential SARSA agent config type is invalid")
+        if payload["state_schema"] != DIFFERENTIAL_SARSA_STATE_SCHEMA:
+            raise ValueError("differential SARSA state schema is unsupported")
+        nested = payload["config"]
+        if not isinstance(nested, Mapping):
+            raise ValueError("differential SARSA nested config must be a mapping")
+        return cls(DifferentialSARSAConfig.from_config(dict(nested)))
 
     def init(
         self,
@@ -1443,8 +1513,90 @@ class DifferentialSARSAAgent:
             epsilon=jnp.array(cfg.epsilon_start, dtype=jnp.float32),
             rng_key=key,
             step_count=jnp.array(0, dtype=jnp.int32),
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
             birth_timestamp=time.time(),
             uptime_s=0.0,
+        )
+
+    def _require_state_contract(self, state: DifferentialSARSAState) -> int:
+        """Validate fixed shapes/dtypes and return the deployed feature width."""
+
+        q_weights = jnp.asarray(state.q_weights)
+        if q_weights.ndim != 2 or q_weights.shape[0] != self._config.n_actions:
+            raise ValueError(
+                "differential SARSA q_weights must have shape "
+                "(n_actions, feature_dim)"
+            )
+        feature_dim = q_weights.shape[1]
+        if feature_dim < 1:
+            raise ValueError("differential SARSA feature_dim must be positive")
+        float_contracts = (
+            ("q_weights", state.q_weights, (self._config.n_actions, feature_dim)),
+            ("q_bias", state.q_bias, (self._config.n_actions,)),
+            (
+                "q_trace_weights",
+                state.q_trace_weights,
+                (self._config.n_actions, feature_dim),
+            ),
+            ("q_trace_bias", state.q_trace_bias, (self._config.n_actions,)),
+            ("average_reward", state.average_reward, ()),
+            ("last_observation", state.last_observation, (feature_dim,)),
+            ("epsilon", state.epsilon, ()),
+        )
+        for name, value, shape in float_contracts:
+            array = jnp.asarray(value)
+            if array.shape != shape:
+                raise ValueError(f"differential SARSA {name} must have shape {shape}")
+            if array.dtype != jnp.dtype(jnp.float32):
+                raise TypeError(f"differential SARSA {name} must have dtype float32")
+        for name, value in (
+            ("last_action", state.last_action),
+            ("step_count", state.step_count),
+        ):
+            array = jnp.asarray(value)
+            if array.shape != ():
+                raise ValueError(f"differential SARSA {name} must be scalar")
+            if array.dtype != jnp.dtype(jnp.int32):
+                raise TypeError(f"differential SARSA {name} must have dtype int32")
+        _checked_lifetime_words_increment(state.step_words)
+        key_words = jnp.asarray(jr.key_data(state.rng_key))
+        if key_words.shape != (2,) or key_words.dtype != jnp.dtype(jnp.uint32):
+            raise TypeError("differential SARSA rng_key must be a scalar PRNG key")
+        return feature_dim
+
+    def _state_values_valid(self, state: DifferentialSARSAState) -> Bool[Array, ""]:
+        """Return dynamic validity excluding the separately reported clock."""
+
+        return (
+            jnp.all(jnp.isfinite(state.q_weights))
+            & jnp.all(jnp.isfinite(state.q_bias))
+            & jnp.all(jnp.isfinite(state.q_trace_weights))
+            & jnp.all(jnp.isfinite(state.q_trace_bias))
+            & jnp.isfinite(state.average_reward)
+            & jnp.all(jnp.isfinite(state.last_observation))
+            & jnp.isfinite(state.epsilon)
+            & (state.epsilon >= 0.0)
+            & (state.epsilon <= 1.0)
+            & (state.last_action >= 0)
+            & (state.last_action < self._config.n_actions)
+            & jnp.isfinite(jnp.asarray(state.birth_timestamp, dtype=jnp.float32))
+            & jnp.isfinite(jnp.asarray(state.uptime_s, dtype=jnp.float32))
+            & (jnp.asarray(state.uptime_s, dtype=jnp.float32) >= 0.0)
+        )
+
+    @staticmethod
+    def _candidate_finite(state: DifferentialSARSAState) -> Bool[Array, ""]:
+        """Require every floating candidate leaf to be finite."""
+
+        checks: list[Array] = []
+        for leaf in jax.tree.leaves(state):
+            value = jnp.asarray(leaf)
+            if jnp.issubdtype(value.dtype, jnp.inexact):
+                checks.append(jnp.all(jnp.isfinite(value)))
+        return (
+            jnp.all(jnp.stack(checks))
+            if checks
+            else jnp.asarray(True, dtype=jnp.bool_)
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -1555,20 +1707,75 @@ class DifferentialSARSAAgent:
                 ``1.0`` preserves the original continuing-task behavior.
         """
         cfg = self._config
+        feature_dim = self._require_state_contract(state)
+        raw_next_observation = jnp.asarray(next_observation)
+        if raw_next_observation.shape != (feature_dim,):
+            raise ValueError(
+                "differential SARSA next_observation must have shape "
+                f"({feature_dim},)"
+            )
+        if not (
+            jnp.issubdtype(raw_next_observation.dtype, jnp.floating)
+            or jnp.issubdtype(raw_next_observation.dtype, jnp.integer)
+        ):
+            raise TypeError("differential SARSA next_observation must be real numeric")
+        next_observation_f = raw_next_observation.astype(jnp.float32)
+        raw_reward = jnp.squeeze(jnp.asarray(reward))
+        if raw_reward.shape != ():
+            raise ValueError("differential SARSA reward must squeeze to a scalar")
+        if not (
+            jnp.issubdtype(raw_reward.dtype, jnp.floating)
+            or jnp.issubdtype(raw_reward.dtype, jnp.integer)
+        ):
+            raise TypeError("differential SARSA reward must be real numeric")
+        reward_s = raw_reward.astype(jnp.float32)
+        raw_discount = jnp.squeeze(jnp.asarray(discount))
+        if raw_discount.shape != ():
+            raise ValueError("differential SARSA discount must squeeze to a scalar")
+        if not (
+            jnp.issubdtype(raw_discount.dtype, jnp.floating)
+            or jnp.issubdtype(raw_discount.dtype, jnp.integer)
+        ):
+            raise TypeError("differential SARSA discount must be real numeric")
+        discount_s = raw_discount.astype(jnp.float32)
+        proposed_step_words, lifetime_capacity_available = (
+            _checked_lifetime_words_increment(state.step_words)
+        )
+        lifetime_counter_valid = _lifetime_counter_valid(
+            state.step_words,
+            state.step_count,
+        )
         if next_action is None:
-            selected_next_action, key = self.select_action(state, next_observation)
+            selected_next_action, key = self.select_action(state, next_observation_f)
+            action_contract_valid = jnp.asarray(True, dtype=jnp.bool_)
         else:
-            selected_next_action = jnp.asarray(next_action, dtype=jnp.int32)
+            raw_next_action = jnp.asarray(next_action)
+            if raw_next_action.shape != ():
+                raise ValueError("differential SARSA next_action must be scalar")
+            if raw_next_action.dtype != jnp.dtype(jnp.int32):
+                raise TypeError("differential SARSA next_action must have dtype int32")
+            selected_next_action = raw_next_action
             key = state.rng_key
+            action_contract_valid = (selected_next_action >= 0) & (
+                selected_next_action < cfg.n_actions
+            )
 
         alpha = jnp.asarray(cfg.q_step_size, dtype=jnp.float32)
         beta = jnp.asarray(cfg.average_reward_step_size, dtype=jnp.float32)
         lamda = jnp.asarray(cfg.trace_decay, dtype=jnp.float32)
-        reward_s = jnp.squeeze(jnp.asarray(reward, dtype=jnp.float32))
-        discount_s = jnp.squeeze(jnp.asarray(discount, dtype=jnp.float32))
+        state_values_valid = self._state_values_valid(state)
+        state_valid = lifetime_counter_valid & state_values_valid
+        input_valid = (
+            jnp.isfinite(reward_s)
+            & jnp.all(jnp.isfinite(next_observation_f))
+            & jnp.isfinite(discount_s)
+            & (discount_s >= 0.0)
+            & (discount_s <= 1.0)
+            & action_contract_valid
+        )
 
         q_prev_all = self.q_values(state, state.last_observation)
-        q_next_all = self.q_values(state, next_observation)
+        q_next_all = self.q_values(state, next_observation_f)
         q_prev = q_prev_all[state.last_action]
         q_next = q_next_all[selected_next_action]
         td_error = reward_s - state.average_reward + discount_s * q_next - q_prev
@@ -1596,25 +1803,55 @@ class DifferentialSARSAAgent:
             lambda: state.epsilon,
         )
         new_average_reward = state.average_reward + beta * td_error
-        new_state = state.replace(
+        proposed_state = state.replace(
             q_weights=state.q_weights + alpha * td_error * traces,
             q_bias=state.q_bias + alpha * td_error * bias_traces,
             q_trace_weights=traces,
             q_trace_bias=bias_traces,
             average_reward=new_average_reward,
-            last_observation=next_observation,
+            last_observation=next_observation_f,
             last_action=selected_next_action,
             epsilon=new_epsilon,
             rng_key=key,
             step_count=new_step_count,
+            step_words=proposed_step_words,
+        )
+        candidate_state_finite = self._candidate_finite(proposed_state)
+        update_available = (
+            state_valid
+            & input_valid
+            & lifetime_capacity_available
+            & candidate_state_finite
+        )
+        new_state = jax.lax.cond(
+            update_available,
+            lambda _: proposed_state,
+            lambda _: state,
+            operand=None,
         )
         return DifferentialSARSAUpdateResult(
             state=new_state,
-            action=selected_next_action,
-            q_values=q_next_all,
-            td_error=td_error,
-            average_reward=new_average_reward,
-            reward=reward_s,
+            action=jnp.where(update_available, selected_next_action, state.last_action),
+            q_values=jnp.where(update_available, q_next_all, jnp.zeros_like(q_next_all)),
+            td_error=jnp.where(
+                update_available,
+                td_error,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ),
+            average_reward=new_state.average_reward,
+            reward=jnp.where(
+                update_available,
+                reward_s,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ),
+            pre_step_words=state.step_words,
+            post_step_words=new_state.step_words,
+            lifetime_counter_valid=lifetime_counter_valid,
+            lifetime_capacity_available=lifetime_capacity_available,
+            state_valid=state_valid,
+            input_valid=input_valid,
+            candidate_state_finite=candidate_state_finite,
+            update_applied=update_available,
         )
 
 
@@ -1640,7 +1877,7 @@ def run_differential_sarsa_from_arrays(
     def _scan_fn(
         carry: DifferentialSARSAState,
         inputs: tuple[Array, Array, Array],
-    ) -> tuple[DifferentialSARSAState, tuple[Array, Array, Array, Array]]:
+    ) -> tuple[DifferentialSARSAState, tuple[Array, Array, Array, Array, Array]]:
         reward, next_observation, discount = inputs
         result = agent.update(
             carry,
@@ -1653,19 +1890,83 @@ def run_differential_sarsa_from_arrays(
             result.td_error,
             result.average_reward,
             result.action,
+            result.update_applied,
         )
 
-    final_state, (q_values, td_errors, average_rewards, actions) = jax.lax.scan(
+    final_state, (
+        q_values,
+        td_errors,
+        average_rewards,
+        actions,
+        updates_applied,
+    ) = jax.lax.scan(
         _scan_fn,
         state,
         (rewards, next_observations, discounts),
     )
     elapsed = time.time() - start
-    final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)
+    if bool(jax.device_get(jnp.any(updates_applied))):
+        final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)
     return DifferentialSARSAArrayResult(
         state=final_state,
         q_values=q_values,
         td_errors=td_errors,
         average_rewards=average_rewards,
         actions=actions,
+        updates_applied=updates_applied,
     )
+
+
+def differential_sarsa_lifetime_counter_nbytes() -> int:
+    """Return bytes occupied by compatibility telemetry plus exact identity."""
+
+    return DIFFERENTIAL_SARSA_LIFETIME_COUNTER_NBYTES
+
+
+def measure_differential_sarsa_state_nbytes(state: DifferentialSARSAState) -> int:
+    """Measure persistent JAX-array bytes in one differential SARSA state."""
+
+    return sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree.leaves(state)
+        if isinstance(leaf, Array)
+    )
+
+
+def migrate_legacy_differential_sarsa_state(
+    legacy_state: Any,
+) -> DifferentialSARSAState:
+    """Migrate a pre-v2 state only when its int32 clock is unambiguous."""
+
+    if isinstance(legacy_state, Mapping):
+        fields = dict(legacy_state)
+    elif dataclasses.is_dataclass(legacy_state) and not isinstance(legacy_state, type):
+        fields = {
+            field.name: getattr(legacy_state, field.name)
+            for field in dataclasses.fields(legacy_state)
+        }
+    else:
+        raise TypeError("legacy differential SARSA state must be a mapping or dataclass")
+    current_names = {
+        field.name
+        for field in dataclasses.fields(DifferentialSARSAState)  # type: ignore[arg-type]
+    }
+    legacy_names = current_names - {"step_words"}
+    supplied_names = set(fields)
+    if supplied_names != legacy_names:
+        missing = sorted(legacy_names - supplied_names)
+        extra = sorted(supplied_names - legacy_names)
+        raise ValueError(
+            "legacy differential SARSA field manifest is not exact; "
+            f"missing={missing}, extra={extra}"
+        )
+    step_count = jnp.asarray(fields["step_count"])
+    if step_count.shape != () or step_count.dtype != jnp.dtype(jnp.int32):
+        raise TypeError("legacy differential SARSA step_count must be scalar int32")
+    step = int(step_count)
+    if step < 0:
+        raise ValueError("negative legacy differential SARSA step_count indicates wrap")
+    if step >= _INT32_MAX:
+        raise ValueError("saturated legacy differential SARSA step_count is ambiguous")
+    fields["step_words"] = jnp.asarray((0, step), dtype=jnp.uint32)
+    return DifferentialSARSAState(**fields)

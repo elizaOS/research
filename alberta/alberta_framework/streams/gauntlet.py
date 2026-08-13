@@ -1,9 +1,10 @@
 # mypy: disable-error-code="call-arg"
 """The Alberta Gauntlet: a unified continual-learning diagnostic stream.
 
-One composite, scan-compatible experience stream whose phase program exercises
-every core Alberta Plan property in sequence, with *task recurrence* so that
-remembering, forgetting, and re-acquisition become measurable scalars:
+One composite, scan-compatible supervised experience stream whose phase program
+exercises a compact set of continual-representation properties in sequence,
+with *task recurrence* so that remembering, forgetting, and re-acquisition
+become measurable scalars:
 
 ======= ==================================== =====================================
 Segment Regime                               Property probed
@@ -48,9 +49,14 @@ Everything here is pure JAX: the stream is a ``ScanStream``, the runner is a
 single ``jax.lax.scan`` per seed and ``jax.vmap`` across seeds.
 """
 
-from collections.abc import Callable
+from __future__ import annotations
+
+import dataclasses
+import math
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 import chex
 import jax
@@ -59,10 +65,102 @@ import jax.random as jr
 from jax import Array
 from jaxtyping import Float, Int, PRNGKeyArray
 
+from alberta_framework.core.checkpoints import (
+    load_checkpoint,
+    load_checkpoint_metadata,
+    save_checkpoint,
+)
 from alberta_framework.core.types import TimeStep
 from alberta_framework.streams.base import ScanStream
 
 NUM_SEGMENTS = 9
+
+_INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
+
+LIFETIME_GAUNTLET_CONFIG_SCHEMA = "alberta.lifetime-gauntlet-config.v2"
+LIFETIME_GAUNTLET_STATE_SCHEMA = "alberta.lifetime-gauntlet-state.v2"
+LIFETIME_GAUNTLET_CHECKPOINT_SCHEMA = "alberta.lifetime-gauntlet-checkpoint.v2"
+_LEGACY_LIFETIME_GAUNTLET_CHECKPOINT_SCHEMA = "alberta.lifetime-gauntlet-checkpoint.v1"
+LIFETIME_GAUNTLET_CLOCK_NBYTES = 12
+LIFETIME_GAUNTLET_CLOCK_DELTA_NBYTES = 8
+
+
+def _require_array(
+    value: Any,
+    *,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: jnp.dtype,
+) -> Array:
+    array = jnp.asarray(value)
+    if array.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {array.shape}")
+    if array.dtype != dtype:
+        raise TypeError(f"{name} must have dtype {dtype}, got {array.dtype}")
+    return array
+
+
+def _checked_lifetime_words_increment(words: Array) -> tuple[Array, Array]:
+    _require_array(
+        words,
+        name="lifetime gauntlet step_words",
+        shape=(2,),
+        dtype=jnp.dtype(jnp.uint32),
+    )
+    maximum = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+    available = ~jnp.all(words == maximum)
+    low = words[1] + jnp.asarray(1, dtype=jnp.uint32)
+    carry = (low == jnp.asarray(0, dtype=jnp.uint32)).astype(jnp.uint32)
+    candidate = jnp.stack((words[0] + carry, low)).astype(jnp.uint32)
+    return jnp.where(available, candidate, words), available
+
+
+def _lifetime_words_to_int32(words: Array) -> Array:
+    saturated = (words[0] > jnp.asarray(0, dtype=jnp.uint32)) | (
+        words[1] >= jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+    )
+    return jnp.where(
+        saturated,
+        jnp.asarray(_INT32_MAX, dtype=jnp.int32),
+        words[1].astype(jnp.int32),
+    )
+
+
+def _divmod_lifetime_words(words: Array, divisor: int | Array) -> tuple[Array, Array]:
+    """Exact 64-by-32 long division for schedule identities and phases."""
+    divisor_array = jnp.asarray(divisor, dtype=jnp.uint32)
+
+    def body(index: Array, carry: tuple[Array, Array, Array]) -> tuple[Array, Array, Array]:
+        remainder, quotient_high, quotient_low = carry
+        in_high = index < 32
+        bit_index = jnp.asarray(31, dtype=jnp.int32) - jnp.mod(index, 32)
+        source = jnp.where(in_high, words[0], words[1])
+        bit = jnp.bitwise_and(
+            jnp.right_shift(source, bit_index.astype(jnp.uint32)),
+            jnp.asarray(1, dtype=jnp.uint32),
+        )
+        doubled = remainder + remainder + bit
+        subtract = doubled >= divisor_array
+        remainder = jnp.where(subtract, doubled - divisor_array, doubled)
+        mask = jnp.left_shift(
+            jnp.asarray(1, dtype=jnp.uint32), bit_index.astype(jnp.uint32)
+        )
+        quotient_high = jnp.where(
+            in_high & subtract,
+            jnp.bitwise_or(quotient_high, mask),
+            quotient_high,
+        )
+        quotient_low = jnp.where(
+            (~in_high) & subtract,
+            jnp.bitwise_or(quotient_low, mask),
+            quotient_low,
+        )
+        return remainder, quotient_high, quotient_low
+
+    zero = jnp.asarray(0, dtype=jnp.uint32)
+    remainder, high, low = jax.lax.fori_loop(0, 64, body, (zero, zero, zero))
+    return jnp.stack((high, low)).astype(jnp.uint32), remainder
 
 SEGMENT_NAMES = (
     "stationary_a",
@@ -120,12 +218,37 @@ class GauntletConfig:
 
     def __post_init__(self) -> None:
         """Validate the configuration."""
-        if self.relevant_dim < 2 or self.relevant_dim % 2 != 0:
+        if (
+            isinstance(self.relevant_dim, bool)
+            or not isinstance(self.relevant_dim, int)
+            or self.relevant_dim < 2
+            or self.relevant_dim % 2 != 0
+        ):
             raise ValueError("relevant_dim must be an even integer >= 2")
-        if self.irrelevant_dim < 0:
+        if (
+            isinstance(self.irrelevant_dim, bool)
+            or not isinstance(self.irrelevant_dim, int)
+            or self.irrelevant_dim < 0
+        ):
             raise ValueError("irrelevant_dim must be non-negative")
-        if self.segment_length < 1:
+        if (
+            isinstance(self.segment_length, bool)
+            or not isinstance(self.segment_length, int)
+            or self.segment_length < 1
+        ):
             raise ValueError("segment_length must be positive")
+        for name in (
+            "noise_std",
+            "feature_std",
+            "scale_factor",
+            "drift_rate",
+            "context_noise_std",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be a finite real number")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
         if self.noise_std < 0.0 or self.feature_std <= 0.0:
             raise ValueError("noise_std must be >= 0 and feature_std > 0")
         if self.scale_factor <= 0.0 or self.drift_rate < 0.0:
@@ -387,6 +510,68 @@ class LifetimeState:
     w_fresh: Float[Array, " input_dim"]
     w_c: Float[Array, " input_dim"]
     w_d: Float[Array, " input_dim"]
+    step_words: Array | None = None
+
+    def __post_init__(self) -> None:
+        """Migrate an omitted unsaturated compatibility clock at construction."""
+        if self.step_words is None:
+            if self.step_count is None:
+                # JAX tree transformations construct a transient all-None
+                # placeholder before unflattening real leaves.
+                return
+            count_array = jnp.asarray(self.step_count)
+            if count_array.shape != () or count_array.dtype != jnp.dtype(jnp.int32):
+                raise TypeError("legacy lifetime-gauntlet step_count must be scalar int32")
+            count = int(count_array)
+            if count < 0 or count >= _INT32_MAX:
+                raise ValueError("legacy lifetime-gauntlet step_count is ambiguous")
+            object.__setattr__(
+                self,
+                "step_words",
+                jnp.asarray((0, count), dtype=jnp.uint32),
+            )
+
+
+@chex.dataclass(frozen=True)
+class LifetimeGauntletStepResult:
+    """One lifetime-stream proposal with explicit atomic commit status."""
+
+    timestep: TimeStep
+    state: LifetimeState
+    pre_step_words: Array
+    post_step_words: Array
+    cycle_words: Array
+    sub_segment: Array
+    segment_step: Array
+    scaled_cycle: Array
+    state_valid: Array
+    candidate_state_valid: Array
+    input_valid: Array
+    output_valid: Array
+    lifetime_capacity_available: Array
+    update_applied: Array
+    update_rejected: Array
+
+
+@dataclass(frozen=True)
+class LifetimeGauntletResourceBudget:
+    """Exact persistent-resource contract for one lifetime stream."""
+
+    state_nbytes: int
+    exact_clock_nbytes: int
+    exact_clock_delta_nbytes: int
+    trainable_scalars: int = 0
+    replay_capacity: int = 0
+
+    def to_dict(self) -> dict[str, int | str]:
+        return {
+            "type": type(self).__name__,
+            "state_nbytes": self.state_nbytes,
+            "exact_clock_nbytes": self.exact_clock_nbytes,
+            "exact_clock_delta_nbytes": self.exact_clock_delta_nbytes,
+            "trainable_scalars": self.trainable_scalars,
+            "replay_capacity": self.replay_capacity,
+        }
 
 
 class LifetimeGauntletStream:
@@ -433,8 +618,20 @@ class LifetimeGauntletStream:
                 0 of every N-th cycle (0 disables it).
         """
         self._config = config or GauntletConfig()
-        if scale_cycle_period < 0:
+        if (
+            isinstance(scale_cycle_period, bool)
+            or not isinstance(scale_cycle_period, int)
+            or scale_cycle_period < 0
+        ):
             raise ValueError("scale_cycle_period must be non-negative")
+        cycle_length = self.SUB_SEGMENTS * self._config.segment_length
+        if cycle_length > _INT32_MAX:
+            raise ValueError("lifetime gauntlet cycle length must fit in int32")
+        if (
+            scale_cycle_period > 0
+            and cycle_length * scale_cycle_period > _INT32_MAX
+        ):
+            raise ValueError("scale stress schedule period must fit in int32")
         self._scale_period = scale_cycle_period
         # Reuse GauntletStream's task-drawing convention.
         self._proto = GauntletStream(self._config)
@@ -454,6 +651,117 @@ class LifetimeGauntletStream:
         """Steps per cycle (four sub-segments)."""
         return self.SUB_SEGMENTS * self._config.segment_length
 
+    @property
+    def scale_cycle_period(self) -> int:
+        """Bounded cycle cadence of the scale stressor."""
+        return self._scale_period
+
+    @property
+    def resource_budget(self) -> LifetimeGauntletResourceBudget:
+        """Return exact persistent-state and clock accounting."""
+        return LifetimeGauntletResourceBudget(
+            state_nbytes=measure_lifetime_gauntlet_state_nbytes(self.init(jr.key(0))),
+            exact_clock_nbytes=LIFETIME_GAUNTLET_CLOCK_NBYTES,
+            exact_clock_delta_nbytes=LIFETIME_GAUNTLET_CLOCK_DELTA_NBYTES,
+        )
+
+    def to_config(self) -> dict[str, Any]:
+        """Serialize the finite schedule under strict v2 schemas."""
+        return {
+            "type": type(self).__name__,
+            "config_schema": LIFETIME_GAUNTLET_CONFIG_SCHEMA,
+            "state_schema": LIFETIME_GAUNTLET_STATE_SCHEMA,
+            "gauntlet_config": dataclasses.asdict(self._config),
+            "scale_cycle_period": self._scale_period,
+        }
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> LifetimeGauntletStream:
+        """Strictly reconstruct a v2 lifetime stream."""
+        values = dict(config)
+        expected = {
+            "type",
+            "config_schema",
+            "state_schema",
+            "gauntlet_config",
+            "scale_cycle_period",
+        }
+        if set(values) != expected:
+            raise ValueError("lifetime-gauntlet config fields are invalid")
+        if values.pop("type") != cls.__name__:
+            raise ValueError("lifetime-gauntlet config type is unsupported")
+        if values.pop("config_schema") != LIFETIME_GAUNTLET_CONFIG_SCHEMA:
+            raise ValueError("lifetime-gauntlet config schema is unsupported")
+        if values.pop("state_schema") != LIFETIME_GAUNTLET_STATE_SCHEMA:
+            raise ValueError("lifetime-gauntlet state schema is unsupported")
+        raw_gauntlet = values.pop("gauntlet_config")
+        if not isinstance(raw_gauntlet, Mapping):
+            raise ValueError("lifetime-gauntlet nested config is invalid")
+        gauntlet_fields = {field.name for field in dataclasses.fields(GauntletConfig)}
+        if set(raw_gauntlet) != gauntlet_fields:
+            raise ValueError("lifetime-gauntlet nested config fields are invalid")
+        return cls(GauntletConfig(**dict(raw_gauntlet)), **values)
+
+    def _require_state_contract(self, state: LifetimeState) -> None:
+        """Require every v2 fixed-shape state leaf."""
+        for name, value in (
+            ("w_fresh", state.w_fresh),
+            ("w_c", state.w_c),
+            ("w_d", state.w_d),
+        ):
+            _require_array(
+                value,
+                name=f"lifetime gauntlet {name}",
+                shape=(self._config.input_dim,),
+                dtype=jnp.dtype(jnp.float32),
+            )
+        _require_array(
+            state.step_count,
+            name="lifetime gauntlet step_count",
+            shape=(),
+            dtype=jnp.dtype(jnp.int32),
+        )
+        _require_array(
+            cast(Array, state.step_words),
+            name="lifetime gauntlet step_words",
+            shape=(2,),
+            dtype=jnp.dtype(jnp.uint32),
+        )
+        key_data = jr.key_data(state.key)
+        if key_data.shape != (2,) or key_data.dtype != jnp.dtype(jnp.uint32):
+            raise TypeError("lifetime gauntlet key must be a scalar JAX PRNG key")
+
+    def state_is_valid(self, state: LifetimeState) -> Array:
+        """Authenticate exact time and finite persistent task weights."""
+        self._require_state_contract(state)
+        words = cast(Array, state.step_words)
+        return (
+            (state.step_count == _lifetime_words_to_int32(words))
+            & jnp.all(jnp.isfinite(state.w_fresh))
+            & jnp.all(jnp.isfinite(state.w_c))
+            & jnp.all(jnp.isfinite(state.w_d))
+        )
+
+    def _schedule_position(
+        self, words: Array
+    ) -> tuple[Array, Array, Array, Array]:
+        """Derive exact cycle identity and bounded phases from exact time."""
+        cycle_words, cycle_step = _divmod_lifetime_words(words, self.cycle_length)
+        sub = jnp.floor_divide(
+            cycle_step, jnp.asarray(self._config.segment_length, dtype=jnp.uint32)
+        ).astype(jnp.int32)
+        segment_step = jnp.mod(
+            cycle_step, jnp.asarray(self._config.segment_length, dtype=jnp.uint32)
+        ).astype(jnp.int32)
+        if self._scale_period > 0:
+            _scale_quotient, cycle_mod = _divmod_lifetime_words(
+                cycle_words, self._scale_period
+            )
+            scaled = (cycle_mod == self._scale_period - 1) & (sub == 0)
+        else:
+            scaled = jnp.asarray(False, dtype=jnp.bool_)
+        return cycle_words, sub, segment_step, scaled
+
     def init(self, key: Array) -> LifetimeState:
         """Initialize the persistent tasks and the first fresh task."""
         key, k_c, k_d, k_f = jr.split(key, 4)
@@ -463,27 +771,53 @@ class LifetimeGauntletStream:
             w_fresh=self._proto._draw_task_weights(k_f),
             w_c=self._proto._draw_task_weights(k_c),
             w_d=self._proto._draw_task_weights(k_d),
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
         )
 
     def sub_segment_of(self, step: Array) -> Array:
         """Sub-segment id (0-3) at *step*."""
-        return ((step // self._config.segment_length) % self.SUB_SEGMENTS).astype(jnp.int32)
+        step_array = jnp.asarray(step)
+        if step_array.shape == (2,) and step_array.dtype == jnp.dtype(jnp.uint32):
+            return self._schedule_position(step_array)[1]
+        return ((step_array // self._config.segment_length) % self.SUB_SEGMENTS).astype(
+            jnp.int32
+        )
 
     def cycle_of(self, step: Array) -> Array:
         """Cycle ordinal at *step*."""
-        return (step // self.cycle_length).astype(jnp.int32)
+        step_array = jnp.asarray(step)
+        if step_array.shape == (2,) and step_array.dtype == jnp.dtype(jnp.uint32):
+            cycle_words = self._schedule_position(step_array)[0]
+            return _lifetime_words_to_int32(cycle_words)
+        return (step_array // self.cycle_length).astype(jnp.int32)
 
     def step(self, state: LifetimeState, idx: Array) -> tuple[TimeStep, LifetimeState]:
         """Generate one step of the repeating lifetime program."""
-        del idx
+        result = self.step_result(state, idx)
+        return result.timestep, result.state
+
+    def step_result(self, state: LifetimeState, idx: Array) -> LifetimeGauntletStepResult:
+        """Stage and atomically commit one exact lifetime-program event."""
+        self._require_state_contract(state)
+        idx_array = jnp.asarray(idx)
+        if idx_array.shape != ():
+            raise ValueError(f"idx must be scalar, got shape {idx_array.shape}")
+        if not (
+            jnp.issubdtype(idx_array.dtype, jnp.integer)
+            or jnp.issubdtype(idx_array.dtype, jnp.floating)
+        ):
+            raise TypeError("idx must have an integer or floating dtype")
+        input_valid = jnp.isfinite(idx_array)
         cfg = self._config
-        step_count = state.step_count
-        sub = self.sub_segment_of(step_count)
+        words = cast(Array, state.step_words)
+        state_valid = self.state_is_valid(state)
+        proposed_words, lifetime_capacity_available = _checked_lifetime_words_increment(words)
+        cycle_words, sub, segment_step, scaled_cycle = self._schedule_position(words)
         key, k_fresh, k_x, k_ctx, k_noise = jr.split(state.key, 5)
 
         # Redraw the fresh task at the start of sub-segments 0 and 2.
         at_fresh_boundary = jnp.logical_and(
-            step_count % cfg.segment_length == 0,
+            segment_step == 0,
             jnp.logical_or(sub == 0, sub == 2),
         )
         w_fresh = jnp.where(
@@ -493,11 +827,7 @@ class LifetimeGauntletStream:
         )
 
         # Input scale stressor on sub-segment 0 of every scale-period cycle.
-        cycle = self.cycle_of(step_count)
         if self._scale_period > 0:
-            scaled_cycle = jnp.logical_and(
-                cycle % self._scale_period == self._scale_period - 1, sub == 0
-            )
             scale = jnp.where(scaled_cycle, cfg.scale_factor, 1.0)
         else:
             scale = jnp.array(1.0)
@@ -513,14 +843,158 @@ class LifetimeGauntletStream:
         ctx = ctx_table[sub] + cfg.context_noise_std * jr.normal(k_ctx, (2,), dtype=jnp.float32)
 
         observation = jnp.concatenate([x, ctx])
-        new_state = LifetimeState(
+        candidate_state = LifetimeState(
             key=key,
-            step_count=step_count + 1,
+            step_count=_lifetime_words_to_int32(proposed_words),
             w_fresh=w_fresh,
             w_c=state.w_c,
             w_d=state.w_d,
+            step_words=proposed_words,
         )
-        return TimeStep(observation=observation, target=jnp.atleast_1d(target)), new_state
+        candidate_state_valid = self.state_is_valid(candidate_state)
+        output_valid = jnp.all(jnp.isfinite(observation)) & jnp.isfinite(target)
+        update_applied = (
+            state_valid
+            & input_valid
+            & output_valid
+            & lifetime_capacity_available
+            & candidate_state_valid
+        )
+        new_state = cast(
+            LifetimeState,
+            jax.tree.map(
+                lambda proposed, current: jnp.where(update_applied, proposed, current),
+                candidate_state,
+                state,
+            ),
+        )
+        timestep = TimeStep(
+            observation=jnp.where(
+                update_applied,
+                observation,
+                jnp.full_like(observation, jnp.nan),
+            ),
+            target=jnp.where(
+                update_applied,
+                jnp.atleast_1d(target),
+                jnp.full((1,), jnp.nan, dtype=jnp.float32),
+            ),
+        )
+        return LifetimeGauntletStepResult(
+            timestep=timestep,
+            state=new_state,
+            pre_step_words=words,
+            post_step_words=cast(Array, new_state.step_words),
+            cycle_words=cycle_words,
+            sub_segment=sub,
+            segment_step=segment_step,
+            scaled_cycle=scaled_cycle,
+            state_valid=state_valid,
+            candidate_state_valid=candidate_state_valid,
+            input_valid=input_valid,
+            output_valid=output_valid,
+            lifetime_capacity_available=lifetime_capacity_available,
+            update_applied=update_applied,
+            update_rejected=~update_applied,
+        )
+
+
+def measure_lifetime_gauntlet_state_nbytes(state: LifetimeState) -> int:
+    """Measure every persistent JAX-array byte in one lifetime state."""
+    return sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree.leaves(state)
+        if isinstance(leaf, Array)
+    )
+
+
+def migrate_legacy_lifetime_gauntlet_state(
+    legacy_state: Any,
+    *,
+    stream: LifetimeGauntletStream,
+) -> LifetimeState:
+    """Migrate only an exact unsaturated pre-v2 lifetime clock."""
+    if isinstance(legacy_state, Mapping):
+        fields = dict(legacy_state)
+    elif dataclasses.is_dataclass(legacy_state) and not isinstance(legacy_state, type):
+        fields = {
+            field.name: getattr(legacy_state, field.name)
+            for field in dataclasses.fields(legacy_state)
+        }
+    else:
+        raise TypeError("legacy lifetime-gauntlet state must be a mapping or dataclass")
+    expected = {"key", "step_count", "w_fresh", "w_c", "w_d"}
+    if set(fields) != expected:
+        raise ValueError("legacy lifetime-gauntlet state fields are invalid")
+    count_array = _require_array(
+        fields["step_count"],
+        name="legacy lifetime-gauntlet step_count",
+        shape=(),
+        dtype=jnp.dtype(jnp.int32),
+    )
+    count = int(count_array)
+    if count < 0:
+        raise ValueError("negative legacy lifetime-gauntlet step_count indicates wrap")
+    if count >= _INT32_MAX:
+        raise ValueError("saturated legacy lifetime-gauntlet step_count is ambiguous")
+    fields["step_words"] = jnp.asarray((0, count), dtype=jnp.uint32)
+    migrated = LifetimeState(**fields)
+    stream._require_state_contract(migrated)
+    if not bool(jax.device_get(stream.state_is_valid(migrated))):
+        raise ValueError("legacy lifetime-gauntlet state violates the v2 contract")
+    return migrated
+
+
+def save_lifetime_gauntlet_checkpoint(
+    stream: LifetimeGauntletStream,
+    state: LifetimeState,
+    path: str | Path,
+) -> None:
+    """Persist one structurally and dynamically valid v2 lifetime state."""
+    stream._require_state_contract(state)
+    if not bool(jax.device_get(stream.state_is_valid(state))):
+        raise ValueError("lifetime-gauntlet checkpoint state is invalid")
+    save_checkpoint(
+        state,
+        path,
+        metadata={
+            "schema": LIFETIME_GAUNTLET_CHECKPOINT_SCHEMA,
+            "stream_config": stream.to_config(),
+            "memory_accounting": stream.resource_budget.to_dict(),
+        },
+    )
+
+
+def load_lifetime_gauntlet_checkpoint(
+    path: str | Path,
+) -> tuple[LifetimeGauntletStream, LifetimeState]:
+    """Restore only a strict exact-clock v2 lifetime checkpoint."""
+    metadata = load_checkpoint_metadata(path)
+    expected = {"schema", "stream_config", "memory_accounting"}
+    if set(metadata) != expected:
+        raise ValueError("lifetime-gauntlet checkpoint metadata fields are invalid")
+    schema = metadata.get("schema")
+    if schema == _LEGACY_LIFETIME_GAUNTLET_CHECKPOINT_SCHEMA:
+        raise ValueError(
+            "legacy lifetime-gauntlet checkpoint lacks exact step_words; "
+            "migrate its state and resave it"
+        )
+    if schema != LIFETIME_GAUNTLET_CHECKPOINT_SCHEMA:
+        raise ValueError("lifetime-gauntlet checkpoint schema is unsupported")
+    raw_config = metadata.get("stream_config")
+    if not isinstance(raw_config, Mapping):
+        raise ValueError("lifetime-gauntlet checkpoint stream_config is invalid")
+    stream = LifetimeGauntletStream.from_config(raw_config)
+    restored, restored_metadata = load_checkpoint(stream.init(jr.key(0)), path)
+    if restored_metadata != metadata:
+        raise ValueError("lifetime-gauntlet checkpoint metadata changed between reads")
+    state = cast(LifetimeState, restored)
+    stream._require_state_contract(state)
+    if not bool(jax.device_get(stream.state_is_valid(state))):
+        raise ValueError("restored lifetime-gauntlet state is invalid")
+    if stream.resource_budget.to_dict() != metadata.get("memory_accounting"):
+        raise ValueError("lifetime-gauntlet checkpoint resource contract does not match")
+    return stream, state
 
 
 def lifetime_scorecard(

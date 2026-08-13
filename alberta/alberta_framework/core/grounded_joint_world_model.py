@@ -45,12 +45,60 @@ import jax.random as jr
 import numpy as np
 import numpy.typing as npt
 from jax import Array
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Bool, Float, Int, UInt
 
-_CHECKPOINT_SCHEMA = "alberta.grounded_joint_world_model.v2"
+GROUNDED_JOINT_WORLD_STATE_SCHEMA = "alberta.grounded-joint-world-state.v3"
+GROUNDED_JOINT_WORLD_LIFETIME_COUNTER_NBYTES = 12
+GROUNDED_JOINT_WORLD_LIFETIME_COUNTER_DELTA_NBYTES = 8
+_CHECKPOINT_SCHEMA = "alberta.grounded_joint_world_model.v3"
+_LEGACY_CHECKPOINT_SCHEMA = "alberta.grounded_joint_world_model.v2"
 _INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
 _FLOAT32_MAX = float(np.finfo(np.float32).max)
 _FLOAT32_TINY = float(np.finfo(np.float32).tiny)
+
+
+def _saturating_int32_increment(value: Array) -> Int[Array, ""]:
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    counter = jnp.asarray(value, dtype=jnp.int32)
+    return jnp.minimum(jnp.maximum(counter, 0), maximum - 1) + 1
+
+
+def _checked_lifetime_words_increment(
+    words: Array,
+) -> tuple[UInt[Array, " 2"], Bool[Array, ""]]:
+    if getattr(words, "shape", None) != (2,):
+        raise ValueError("grounded-world lifetime words must have shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("grounded-world lifetime words must have dtype uint32")
+    maximum = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+    capacity_available = ~jnp.all(words == maximum)
+    low = words[1] + jnp.asarray(1, dtype=jnp.uint32)
+    carry = (low == jnp.asarray(0, dtype=jnp.uint32)).astype(jnp.uint32)
+    proposed = jnp.stack((words[0] + carry, low))
+    return (
+        jnp.where(capacity_available, proposed, words).astype(jnp.uint32),
+        capacity_available,
+    )
+
+
+def _lifetime_counter_valid(words: Array, telemetry: Array) -> Bool[Array, ""]:
+    if getattr(words, "shape", None) != (2,):
+        raise ValueError("grounded-world lifetime words must have shape (2,)")
+    if getattr(words, "dtype", None) != jnp.dtype(jnp.uint32):
+        raise TypeError("grounded-world lifetime words must have dtype uint32")
+    if getattr(telemetry, "shape", None) != ():
+        raise ValueError("grounded-world update_count must be scalar")
+    if getattr(telemetry, "dtype", None) != jnp.dtype(jnp.int32):
+        raise TypeError("grounded-world update_count must have dtype int32")
+    below_saturation = (words[0] == jnp.asarray(0, dtype=jnp.uint32)) & (
+        words[1] < jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+    )
+    return (telemetry >= 0) & jnp.where(
+        below_saturation,
+        telemetry == words[1].astype(jnp.int32),
+        telemetry == jnp.asarray(_INT32_MAX, dtype=jnp.int32),
+    )
 
 
 def _positive_int(value: Any, *, name: str) -> None:
@@ -263,6 +311,7 @@ class GroundedJointWorldModelState:
     weights: Float[Array, "joint_actions target_dim representation_dim"]
     bias: Float[Array, "joint_actions target_dim"]
     update_count: Int[Array, ""]
+    update_words: UInt[Array, " 2"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -276,11 +325,13 @@ class GroundedJointWorldResourceBudget:
     allocated_float32_scalars: int
     trainable_float32_scalars: int
     administrative_int32_scalars: int
+    administrative_uint32_scalars: int
     state_nbytes: int
     computed_parameter_gradient_float32_scalars_per_update: int
     learned_float32_scalars_touched_per_update: int
     applied_trainable_float32_scalars_per_update: int
     administrative_int32_scalars_touched_per_update: int
+    administrative_uint32_scalars_touched_per_update: int
     replay_capacity: int
 
     def to_dict(self) -> dict[str, int]:
@@ -341,6 +392,7 @@ class GroundedJointWorldDiagnostics:
     """Fail-closed verdicts for one attempted transition."""
 
     state_valid: Bool[Array, ""]
+    lifetime_counter_valid: Bool[Array, ""]
     input_valid: Bool[Array, ""]
     capacity_available: Bool[Array, ""]
     prediction_valid: Bool[Array, ""]
@@ -392,6 +444,9 @@ class GroundedJointWorldUpdateResult:
     proposed_bias_row_bit_change_mask: Bool[Array, " joint_actions"]
     executed_weight_row_delta_norm_by_head: Float[Array, " target_dim"]
     executed_bias_row_delta_by_head: Float[Array, " target_dim"]
+    pre_update_words: UInt[Array, " 2"]
+    post_update_words: UInt[Array, " 2"]
+    update_applied: Bool[Array, ""]
     diagnostics: GroundedJointWorldDiagnostics
 
 
@@ -451,6 +506,7 @@ class GroundedJointWorldModel:
             trainable = allocated
             applied = full_row
         administrative = 1
+        exact_words = 2
         return GroundedJointWorldResourceBudget(
             representation_dim=cfg.representation_dim,
             target_observation_dim=cfg.target_observation_dim,
@@ -459,11 +515,13 @@ class GroundedJointWorldModel:
             allocated_float32_scalars=allocated,
             trainable_float32_scalars=trainable,
             administrative_int32_scalars=administrative,
-            state_nbytes=4 * (allocated + administrative),
+            administrative_uint32_scalars=exact_words,
+            state_nbytes=4 * (allocated + administrative + exact_words),
             computed_parameter_gradient_float32_scalars_per_update=full_row,
             learned_float32_scalars_touched_per_update=applied,
             applied_trainable_float32_scalars_per_update=applied,
             administrative_int32_scalars_touched_per_update=1,
+            administrative_uint32_scalars_touched_per_update=2,
             replay_capacity=0,
         )
 
@@ -471,6 +529,7 @@ class GroundedJointWorldModel:
         """Serialize the complete model construction."""
         return {
             "type": type(self).__name__,
+            "state_schema": GROUNDED_JOINT_WORLD_STATE_SCHEMA,
             "config": self._config.to_config(),
         }
 
@@ -481,11 +540,13 @@ class GroundedJointWorldModel:
     ) -> GroundedJointWorldModel:
         """Strictly reconstruct from :meth:`to_config` output."""
         payload = dict(config)
-        if set(payload) != {"type", "config"}:
+        if set(payload) != {"type", "state_schema", "config"}:
             raise ValueError("model config fields do not match the serialized schema")
         type_name = payload["type"]
         if type_name != cls.__name__:
             raise ValueError(f"unexpected model type: {type_name!r}")
+        if payload["state_schema"] != GROUNDED_JOINT_WORLD_STATE_SCHEMA:
+            raise ValueError("grounded joint-world state schema is unsupported")
         nested = payload["config"]
         if not isinstance(nested, Mapping):
             raise ValueError("model config must contain a config mapping")
@@ -510,6 +571,7 @@ class GroundedJointWorldModel:
                 dtype=jnp.float32,
             ),
             update_count=jnp.asarray(0, dtype=jnp.int32),
+            update_words=jnp.zeros((2,), dtype=jnp.uint32),
         )
 
     def _validate_state_static_contract(self, state: GroundedJointWorldModelState) -> None:
@@ -534,6 +596,12 @@ class GroundedJointWorldModel:
             shape=(),
             dtype=jnp.int32,
         )
+        _static_array_contract(
+            state.update_words,
+            name="state.update_words",
+            shape=(2,),
+            dtype=jnp.uint32,
+        )
 
     def _state_valid(self, state: GroundedJointWorldModelState) -> Array:
         bound = jnp.asarray(self._config.max_parameter_magnitude, dtype=jnp.float32)
@@ -542,8 +610,7 @@ class GroundedJointWorldModel:
             & jnp.all(jnp.abs(state.weights) <= bound)
             & jnp.all(jnp.isfinite(state.bias))
             & jnp.all(jnp.abs(state.bias) <= bound)
-            & (state.update_count >= 0)
-            & (state.update_count <= _INT32_MAX)
+            & _lifetime_counter_valid(state.update_words, state.update_count)
         )
         if self._config.feature_path_mode == "row_bias_only":
             return valid & jnp.all(state.weights == 0.0)
@@ -879,12 +946,14 @@ class GroundedJointWorldModel:
         state: GroundedJointWorldModelState,
         *,
         state_valid: Array,
+        lifetime_counter_valid: Array,
         input_valid: Array,
         capacity_available: Array,
     ) -> GroundedJointWorldUpdateResult:
         false = jnp.asarray(False, dtype=jnp.bool_)
         diagnostics = GroundedJointWorldDiagnostics(
             state_valid=state_valid,
+            lifetime_counter_valid=lifetime_counter_valid,
             input_valid=input_valid,
             capacity_available=capacity_available,
             prediction_valid=false,
@@ -940,6 +1009,9 @@ class GroundedJointWorldModel:
                 (self.target_dim,),
                 dtype=jnp.float32,
             ),
+            pre_update_words=state.update_words,
+            post_update_words=state.update_words,
+            update_applied=false,
             diagnostics=diagnostics,
         )
 
@@ -964,13 +1036,19 @@ class GroundedJointWorldModel:
             reward,
             discount,
         )
+        proposed_update_words, capacity_available = (
+            _checked_lifetime_words_increment(state.update_words)
+        )
+        lifetime_counter_valid = _lifetime_counter_valid(
+            state.update_words,
+            state.update_count,
+        )
         state_valid = self._state_valid(state)
         input_valid = self._prediction_input_valid(rep, focal, partner) & self._target_input_valid(
             next_obs,
             rew,
             disc,
         )
-        capacity_available = state.update_count < _INT32_MAX
         can_attempt = state_valid & input_valid & capacity_available
 
         def do_update(_: None) -> GroundedJointWorldUpdateResult:
@@ -1008,7 +1086,8 @@ class GroundedJointWorldModel:
             candidate_state = GroundedJointWorldModelState(
                 weights=state.weights.at[joint_index].set(candidate_weight_row),
                 bias=state.bias.at[joint_index].set(candidate_bias_row),
-                update_count=state.update_count + 1,
+                update_count=_saturating_int32_increment(state.update_count),
+                update_words=proposed_update_words,
             )
             proposed_weight_row_bit_change_mask = jnp.any(
                 jax.lax.bitcast_convert_type(candidate_state.weights, jnp.uint32)
@@ -1053,6 +1132,7 @@ class GroundedJointWorldModel:
             )
             diagnostics = GroundedJointWorldDiagnostics(
                 state_valid=state_valid,
+                lifetime_counter_valid=lifetime_counter_valid,
                 input_valid=input_valid,
                 capacity_available=capacity_available,
                 prediction_valid=score.prediction.valid,
@@ -1148,6 +1228,9 @@ class GroundedJointWorldModel:
                     executed_bias_row_delta_by_head,
                     0.0,
                 ),
+                pre_update_words=state.update_words,
+                post_update_words=next_state.update_words,
+                update_applied=applied,
                 diagnostics=diagnostics,
             )
 
@@ -1159,6 +1242,7 @@ class GroundedJointWorldModel:
                 lambda _: self._rejected_update(
                     state,
                     state_valid=state_valid,
+                    lifetime_counter_valid=lifetime_counter_valid,
                     input_valid=input_valid,
                     capacity_available=capacity_available,
                 ),
@@ -1187,6 +1271,7 @@ class GroundedJointWorldModel:
                     dtype=np.float32,
                 ).tolist(),
                 "update_count": int(state.update_count),
+                "update_words": [int(word) for word in state.update_words],
             },
         }
 
@@ -1195,18 +1280,35 @@ class GroundedJointWorldModel:
         cls,
         checkpoint: Mapping[str, Any],
     ) -> tuple[GroundedJointWorldModel, GroundedJointWorldModelState]:
-        """Strictly reconstruct a model/state pair from a v2 checkpoint."""
+        """Strictly reconstruct v3, or migrate one unambiguous v2 checkpoint."""
         if set(checkpoint) != {"schema", "model", "state"}:
-            raise ValueError("checkpoint fields do not match the v2 schema")
-        if checkpoint.get("schema") != _CHECKPOINT_SCHEMA:
+            raise ValueError("checkpoint fields do not match the supported schema")
+        checkpoint_schema = checkpoint.get("schema")
+        if checkpoint_schema not in {_CHECKPOINT_SCHEMA, _LEGACY_CHECKPOINT_SCHEMA}:
             raise ValueError("unexpected grounded joint-world checkpoint schema")
         model_payload = checkpoint.get("model")
         state_payload = checkpoint.get("state")
         if not isinstance(model_payload, Mapping) or not isinstance(state_payload, Mapping):
             raise ValueError("checkpoint must contain model and state mappings")
-        if set(state_payload) != {"weights", "bias", "update_count"}:
-            raise ValueError("checkpoint state fields do not match the v2 schema")
-        model = cls.from_config(model_payload)
+        legacy_v2 = checkpoint_schema == _LEGACY_CHECKPOINT_SCHEMA
+        expected_state_fields = (
+            {"weights", "bias", "update_count"}
+            if legacy_v2
+            else {"weights", "bias", "update_count", "update_words"}
+        )
+        if set(state_payload) != expected_state_fields:
+            raise ValueError("checkpoint state fields do not match its schema")
+        if legacy_v2:
+            if set(model_payload) != {"type", "config"}:
+                raise ValueError("legacy v2 model fields do not match its schema")
+            if model_payload.get("type") != cls.__name__:
+                raise ValueError(f"unexpected model type: {model_payload.get('type')!r}")
+            legacy_config = model_payload.get("config")
+            if not isinstance(legacy_config, Mapping):
+                raise ValueError("legacy v2 model config must be a mapping")
+            model = cls(GroundedJointWorldModelConfig.from_config(legacy_config))
+        else:
+            model = cls.from_config(model_payload)
         cfg = model.config
         expected_weights_shape = (
             cfg.joint_action_count,
@@ -1235,15 +1337,93 @@ class GroundedJointWorldModel:
         update_count = state_payload["update_count"]
         if type(update_count) is not int or not 0 <= update_count <= _INT32_MAX:
             raise ValueError("checkpoint update_count must be an int32-range integer")
+        if legacy_v2:
+            if update_count >= _INT32_MAX:
+                raise ValueError("saturated legacy v2 update_count is ambiguous")
+            update_words = (0, update_count)
+        else:
+            raw_words = state_payload["update_words"]
+            if (
+                type(raw_words) is not list
+                or len(raw_words) != 2
+                or any(type(word) is not int for word in raw_words)
+                or any(word < 0 or word > _UINT32_MAX for word in raw_words)
+            ):
+                raise ValueError(
+                    "checkpoint update_words must be two JSON uint32 integers"
+                )
+            update_words = (raw_words[0], raw_words[1])
         state = GroundedJointWorldModelState(
             weights=jnp.asarray(weights, dtype=jnp.float32),
             bias=jnp.asarray(bias, dtype=jnp.float32),
             update_count=jnp.asarray(update_count, dtype=jnp.int32),
+            update_words=jnp.asarray(update_words, dtype=jnp.uint32),
         )
+        if not bool(jax.device_get(model._state_valid(state))):
+            raise ValueError("checkpoint lifetime counters or parameters are invalid")
         return model, state
 
 
+def grounded_joint_world_lifetime_counter_nbytes() -> int:
+    """Return bytes occupied by compatibility telemetry plus exact identity."""
+
+    return GROUNDED_JOINT_WORLD_LIFETIME_COUNTER_NBYTES
+
+
+def measure_grounded_joint_world_state_nbytes(
+    state: GroundedJointWorldModelState,
+) -> int:
+    """Measure persistent JAX-array bytes in one grounded-world state."""
+
+    return sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree.leaves(state)
+        if isinstance(leaf, Array)
+    )
+
+
+def migrate_legacy_grounded_joint_world_state(
+    legacy_state: Any,
+) -> GroundedJointWorldModelState:
+    """Migrate one exact pre-v3 state whose int32 clock is unambiguous."""
+
+    if isinstance(legacy_state, Mapping):
+        fields = dict(legacy_state)
+    elif dataclasses.is_dataclass(legacy_state) and not isinstance(legacy_state, type):
+        fields = {
+            field.name: getattr(legacy_state, field.name)
+            for field in dataclasses.fields(legacy_state)
+        }
+    else:
+        raise TypeError("legacy grounded-world state must be a mapping or dataclass")
+    current_names = {
+        field.name
+        for field in dataclasses.fields(GroundedJointWorldModelState)  # type: ignore[arg-type]
+    }
+    legacy_names = current_names - {"update_words"}
+    if set(fields) != legacy_names:
+        missing = sorted(legacy_names - set(fields))
+        extra = sorted(set(fields) - legacy_names)
+        raise ValueError(
+            "legacy grounded-world field manifest is not exact; "
+            f"missing={missing}, extra={extra}"
+        )
+    count = jnp.asarray(fields["update_count"])
+    if count.shape != () or count.dtype != jnp.dtype(jnp.int32):
+        raise TypeError("legacy grounded-world update_count must be scalar int32")
+    count_value = int(count)
+    if count_value < 0:
+        raise ValueError("negative legacy grounded-world update_count indicates wrap")
+    if count_value >= _INT32_MAX:
+        raise ValueError("saturated legacy grounded-world update_count is ambiguous")
+    fields["update_words"] = jnp.asarray((0, count_value), dtype=jnp.uint32)
+    return GroundedJointWorldModelState(**fields)
+
+
 __all__ = [
+    "GROUNDED_JOINT_WORLD_LIFETIME_COUNTER_DELTA_NBYTES",
+    "GROUNDED_JOINT_WORLD_LIFETIME_COUNTER_NBYTES",
+    "GROUNDED_JOINT_WORLD_STATE_SCHEMA",
     "GroundedJointWorldDiagnostics",
     "GroundedJointWorldInputGradient",
     "GroundedJointWorldModel",
@@ -1252,4 +1432,7 @@ __all__ = [
     "GroundedJointWorldPrediction",
     "GroundedJointWorldResourceBudget",
     "GroundedJointWorldUpdateResult",
+    "grounded_joint_world_lifetime_counter_nbytes",
+    "measure_grounded_joint_world_state_nbytes",
+    "migrate_legacy_grounded_joint_world_state",
 ]

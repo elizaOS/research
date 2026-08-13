@@ -34,6 +34,9 @@ from alberta_framework.core.prototype_agent import (
     load_prototype_checkpoint,
     save_prototype_checkpoint,
 )
+from alberta_framework.core.stomp_owner_finalization import (
+    stomp_owner_finalization_trace_valid,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -130,8 +133,12 @@ def test_config_is_strict_and_resource_budget_is_explicit() -> None:
     assert budget.max_model_matrix_vector_products_per_call == 6
     assert budget.max_base_value_forward_calls_per_call == 12
     assert budget.max_base_value_backward_calls_per_call == 3
+    assert budget.nested_exact_lifetime_identity_bytes == 8
+    assert budget.lifetime_identity_bits == 64
+    assert budget.telemetry_saturation == 2_147_483_647
+    assert budget.max_nested_update_verdicts_per_call == 3
     assert budget.stomp_self_audits_per_call == 1
-    assert budget.max_diagnostic_payload_bytes_per_call == 191
+    assert budget.max_diagnostic_payload_bytes_per_call == 268
 
     wide_agent = STOMPAgent(_stomp_config(n_options=65))
     with pytest.raises(ValueError, match="diagnostic slot ceiling"):
@@ -220,6 +227,58 @@ def test_partial_completion_support_excludes_the_unsupported_candidate() -> None
         np.array([True, False]),
     )
     assert int(diagnostics.selected_option_indices[0]) == 0
+
+
+def test_cold_mask_excludes_candidate_model_and_successor_max_head() -> None:
+    agent = STOMPAgent(_stomp_config())
+    state = _supported_state(agent, targets=(1.0, 1.0e6))
+    mask = jnp.asarray((True, True, True, False), dtype=jnp.bool_)
+    weights = list(state.base_learner_state.head_params.weights)
+    weights[3] = jnp.full_like(weights[3], 1.0e6)
+    dominant_cold = state.replace(
+        base_learner_state=state.base_learner_state.replace(
+            head_params=state.base_learner_state.head_params.replace(
+                weights=tuple(weights)
+            )
+        )
+    )
+    weights[3] = jnp.full_like(weights[3], -1.0e6)
+    suppressed_cold = state.replace(
+        base_learner_state=state.base_learner_state.replace(
+            head_params=state.base_learner_state.head_params.replace(
+                weights=tuple(weights)
+            )
+        ),
+        option_models=state.option_models.replace(
+            env_return_ema=state.option_models.env_return_ema.at[1].set(-1.0e6)
+        ),
+    )
+    controller = OptionSearchControl(agent)
+
+    dominant = controller.apply(
+        dominant_cold,
+        ANCHOR,
+        extended_action_mask=mask,
+    )
+    suppressed = controller.apply(
+        suppressed_cold,
+        ANCHOR,
+        extended_action_mask=mask,
+    )
+
+    np.testing.assert_array_equal(
+        dominant.diagnostics.completion_supported[0],
+        np.asarray((True, False)),
+    )
+    assert int(dominant.diagnostics.selected_option_indices[0]) == 0
+    chex.assert_trees_all_equal(
+        dominant.diagnostics.candidate_targets[:, 0],
+        suppressed.diagnostics.candidate_targets[:, 0],
+    )
+    chex.assert_trees_all_equal(
+        dominant.diagnostics.selected_option_indices,
+        suppressed.diagnostics.selected_option_indices,
+    )
 
 
 def test_highest_supported_bellman_residual_is_applied_to_its_option_head() -> None:
@@ -411,22 +470,27 @@ def test_negative_counters_are_atomic_noops(counter_owner: str) -> None:
     assert int(result.diagnostics.applied_count) == 0
 
 
-def test_base_step_counter_capacity_prevents_int32_wraparound() -> None:
+def test_exact_base_clock_continues_after_int32_telemetry_saturates() -> None:
     agent = STOMPAgent(_stomp_config())
     state = _supported_state(agent)
     state = state.replace(
         base_learner_state=state.base_learner_state.replace(
-            step_count=jnp.asarray(2_147_483_647, dtype=jnp.int32)
+            step_count=jnp.asarray(2_147_483_647, dtype=jnp.int32),
+            step_words=jnp.asarray([0, 2_147_483_647], dtype=jnp.uint32),
         )
     )
 
     result = OptionSearchControl(agent).apply(state, ANCHOR)
 
-    chex.assert_trees_all_equal(result.state, state)
     assert bool(result.diagnostics.state_counters_valid)
-    assert not bool(result.diagnostics.base_update_capacity_available)
-    assert not bool(result.diagnostics.planner_inputs_valid)
-    assert int(result.diagnostics.applied_count) == 0
+    assert bool(result.diagnostics.base_update_capacity_available)
+    assert bool(result.diagnostics.planner_inputs_valid)
+    assert int(result.diagnostics.applied_count) == 1
+    chex.assert_trees_all_equal(
+        result.state.base_learner_state.step_words,
+        jnp.asarray([0, 2_147_483_648], dtype=jnp.uint32),
+    )
+    assert int(result.state.base_learner_state.step_count) == 2_147_483_647
 
 
 def test_outer_rng_or_action_ownership_corruption_is_an_atomic_noop() -> None:
@@ -603,6 +667,7 @@ def test_prototype_checkpoint_preserves_option_search_config(tmp_path: Path) -> 
     chex.assert_trees_all_equal(restored_state, state)
 
 
+@pytest.mark.slow
 def test_prototype_applies_search_at_next_decision_observation() -> None:
     option_search = OptionSearchControlConfig(backup_budget=1)
     config = PrototypeAgentConfig(
@@ -639,6 +704,12 @@ def test_prototype_applies_search_at_next_decision_observation() -> None:
     searched = search_agent.update_transition(state, transition)
     baseline = baseline_agent.update_transition(state, transition)
 
+    assert bool(
+        stomp_owner_finalization_trace_valid(
+            searched.oak_owner_finalization_trace
+        )
+    )
+    assert int(searched.oak_option_search_learner_updates) == 1
     diagnostics = searched.option_search_control_diagnostics
     assert diagnostics is not None
     chex.assert_trees_all_equal(

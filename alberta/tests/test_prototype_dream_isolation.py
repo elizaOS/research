@@ -17,7 +17,11 @@ from alberta_framework.core.options import STOMPConfig, SubtaskSpec
 from alberta_framework.core.prototype_agent import (
     PrototypeAgent,
     PrototypeAgentConfig,
+    PrototypeTransition,
     _sample_one_hot_dream_observation,
+)
+from alberta_framework.core.stomp_owner_finalization import (
+    stomp_owner_finalization_trace_valid,
 )
 from alberta_framework.core.world_model import ActionConditionedWorldModelConfig
 
@@ -123,8 +127,9 @@ class _DiagnosticOak:
         _discount: Any,
         *,
         enable_option_planning: bool,
+        extended_action_mask: Any,
     ) -> Any:
-        del enable_option_planning
+        del enable_option_planning, extended_action_mask
         return SimpleNamespace(state=state, td_error=reward)
 
 
@@ -387,3 +392,99 @@ def test_accepted_dreams_only_change_base_learner_state() -> None:
         )
     )
     chex.assert_trees_all_equal(normalized, oak_state)
+
+
+def test_dream_bootstrap_is_invariant_to_dominant_cold_head_and_model() -> None:
+    agent = PrototypeAgent(_dream_config())
+    state = agent.start(agent.init(jr.key(33)), OBS)
+    assert agent._buffer is not None
+    buffer_state = agent._buffer.add(state.buffer_state, OBS)
+    source = state.oak_state.stomp_state
+    weights = list(source.base_learner_state.head_params.weights)
+    weights[2] = jnp.full_like(weights[2], 1.0e6)
+    dominant = source.replace(
+        base_learner_state=source.base_learner_state.replace(
+            head_params=source.base_learner_state.head_params.replace(
+                weights=tuple(weights)
+            )
+        ),
+        option_models=source.option_models.replace(
+            n_completions=jnp.asarray((1,), dtype=jnp.int32),
+            env_return_ema=jnp.asarray((1.0e6,), dtype=jnp.float32),
+        ),
+    )
+    weights[2] = jnp.full_like(weights[2], -1.0e6)
+    suppressed = source.replace(
+        base_learner_state=source.base_learner_state.replace(
+            head_params=source.base_learner_state.head_params.replace(
+                weights=tuple(weights)
+            )
+        ),
+        option_models=source.option_models.replace(
+            n_completions=jnp.asarray((1,), dtype=jnp.int32),
+            env_return_ema=jnp.asarray((-1.0e6,), dtype=jnp.float32),
+        ),
+    )
+    mask = jnp.asarray((True, True, False), dtype=jnp.bool_)
+    dominant_result, dominant_errors = agent._run_dreams(
+        state.oak_state.replace(stomp_state=dominant),
+        state.world_model_state,
+        buffer_state,
+        jr.key(91),
+        mask,
+    )
+    suppressed_result, suppressed_errors = agent._run_dreams(
+        state.oak_state.replace(stomp_state=suppressed),
+        state.world_model_state,
+        buffer_state,
+        jr.key(91),
+        mask,
+    )
+
+    chex.assert_trees_all_equal(dominant_errors, suppressed_errors)
+    for head_index in (0, 1):
+        chex.assert_trees_all_equal(
+            dominant_result.stomp_state.base_learner_state.head_params.weights[
+                head_index
+            ],
+            suppressed_result.stomp_state.base_learner_state.head_params.weights[
+                head_index
+            ],
+        )
+        chex.assert_trees_all_equal(
+            dominant_result.stomp_state.base_learner_state.head_params.biases[
+                head_index
+            ],
+            suppressed_result.stomp_state.base_learner_state.head_params.biases[
+                head_index
+            ],
+        )
+
+
+def test_prototype_dyna_trace_reports_real_and_imagined_work_separately() -> None:
+    agent = PrototypeAgent(_dream_config())
+    state = agent.start(agent.init(jr.key(44)), OBS)
+    next_observation = jnp.asarray((0.25, 0.75), dtype=jnp.float32)
+    result = agent.update_transition(
+        state,
+        PrototypeTransition(
+            observation=state.current_raw_observation,
+            action=state.current_action,
+            decision_id=state.current_decision_id,
+            reward=jnp.asarray(0.5, dtype=jnp.float32),
+            discount=jnp.asarray(0.9, dtype=jnp.float32),
+            terminated=jnp.asarray(False, dtype=jnp.bool_),
+            truncated=jnp.asarray(False, dtype=jnp.bool_),
+            next_observation=next_observation,
+            next_decision_observation=next_observation,
+        ),
+        extended_action_mask=jnp.asarray((True, True, False), dtype=jnp.bool_),
+    )
+
+    assert bool(stomp_owner_finalization_trace_valid(result.oak_owner_finalization_trace))
+    assert int(result.oak_real_stomp_update_evaluations) == 1
+    assert int(result.oak_imagined_stomp_update_evaluations) == N_DREAMS
+    assert int(result.oak_total_stomp_update_evaluations) == 1 + N_DREAMS
+    assert int(
+        result.oak_owner_finalization_trace.stages[2].learner_updates_applied
+    ) <= N_DREAMS

@@ -202,6 +202,7 @@ class TestOptionTerminationGrounding:
             executing_option=jnp.array(0, dtype=jnp.int32),
             base_last_action=option_action,
             option_start_obs=observations[0],
+            option_last_intra_action=state.last_primitive_action,
             option_cumreward=jnp.array(0.0, dtype=jnp.float32),
             option_env_cumreward=jnp.array(0.0, dtype=jnp.float32),
             option_baseline_mass=jnp.array(0.0, dtype=jnp.float32),

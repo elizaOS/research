@@ -20,15 +20,19 @@ so the whole loop JIT-compiles; the ``*_batched`` variants ``jax.vmap`` the
 same loop over seeds for multi-seed experiments.
 """
 
+import dataclasses
 import functools
+import math
 import time
+from collections.abc import Mapping
 from typing import Any, Protocol, TypeVar, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float, Int, UInt
 
 from alberta_framework.core.initializers import sparse_init
 from alberta_framework.core.normalizers import (
@@ -40,6 +44,7 @@ from alberta_framework.core.normalizers import (
 from alberta_framework.core.optimizers import (
     LMS,
     TDIDBD,
+    AutoTDIDBD,
     Bounder,
     Optimizer,
     TDOptimizer,
@@ -52,9 +57,7 @@ from alberta_framework.core.types import (
     BatchedMLPResult,
     IDBDParamState,
     IDBDState,
-    LearnerState,
     LMSState,
-    MLPLearnerState,
     MLPParams,
     NormalizerHistory,
     NormalizerTrackingConfig,
@@ -65,10 +68,231 @@ from alberta_framework.core.types import (
     StepSizeTrackingConfig,
     Target,
     TDIDBDState,
-    TDLearnerState,
     TDTimeStep,
 )
+from alberta_framework.core.types import (
+    LearnerState as LegacyLearnerState,
+)
+from alberta_framework.core.types import (
+    MLPLearnerState as LegacyMLPLearnerState,
+)
+from alberta_framework.core.types import (
+    TDLearnerState as LegacyTDLearnerState,
+)
 from alberta_framework.streams.base import ScanStream
+
+LINEAR_LEARNER_CONFIG_SCHEMA = "alberta.linear-learner.config.v2"
+LINEAR_LEARNER_STATE_SCHEMA = "alberta.linear-learner.state.v2"
+MLP_LEARNER_CONFIG_SCHEMA = "alberta.mlp-learner.config.v2"
+MLP_LEARNER_STATE_SCHEMA = "alberta.mlp-learner.state.v2"
+TD_LINEAR_LEARNER_CONFIG_SCHEMA = "alberta.td-linear-learner.config.v2"
+TD_LINEAR_LEARNER_STATE_SCHEMA = "alberta.td-linear-learner.state.v2"
+TRUE_ONLINE_TD_CONFIG_SCHEMA = "alberta.true-online-td.config.v2"
+TRUE_ONLINE_TD_STATE_SCHEMA = "alberta.true-online-td.state.v2"
+
+LEARNER_EXACT_LIFETIME_IDENTITY_NBYTES = 8
+LEARNER_LIFETIME_COUNTER_NBYTES = 12
+
+_INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
+
+
+def _require_positive_feature_dim(feature_dim: int) -> None:
+    if type(feature_dim) is not int or feature_dim <= 0 or feature_dim > _INT32_MAX:
+        raise ValueError(f"feature_dim must be a strict integer in [1, {_INT32_MAX}]")
+
+
+def _require_finite_config_float(
+    value: Any,
+    *,
+    name: str,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    minimum_inclusive: bool = True,
+) -> None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{name} must be a real scalar")
+    parsed = float(value)
+    with np.errstate(over="ignore", invalid="ignore"):
+        narrowed = float(np.float32(parsed))
+    if not math.isfinite(parsed) or not math.isfinite(narrowed):
+        raise ValueError(f"{name} must be finite in float32")
+    if minimum is not None:
+        if minimum_inclusive and narrowed < minimum:
+            raise ValueError(f"{name} must be at least {minimum}")
+        if not minimum_inclusive and narrowed <= minimum:
+            raise ValueError(f"{name} must be greater than {minimum}")
+    if maximum is not None and narrowed > maximum:
+        raise ValueError(f"{name} must be at most {maximum}")
+
+
+def _require_array_contract(
+    value: Any,
+    *,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: Any,
+) -> Array:
+    array = jnp.asarray(value)
+    if array.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {array.shape}")
+    expected_dtype = jnp.dtype(dtype)
+    if array.dtype != expected_dtype:
+        raise TypeError(f"{name} must have dtype {expected_dtype}, got {array.dtype}")
+    return array
+
+
+def _require_real_source(
+    value: Any,
+    *,
+    name: str,
+    shapes: tuple[tuple[int, ...], ...],
+) -> Array:
+    array = jnp.asarray(value)
+    if array.shape not in shapes:
+        raise ValueError(f"{name} must have one of shapes {shapes}, got {array.shape}")
+    if not (
+        jnp.issubdtype(array.dtype, jnp.floating)
+        or jnp.issubdtype(array.dtype, jnp.integer)
+    ):
+        raise TypeError(f"{name} must have a real numeric dtype")
+    return array.astype(jnp.float32)
+
+
+def _require_prng_key(value: Any, *, name: str) -> Array:
+    array = jnp.asarray(value)
+    if array.shape == () and jnp.issubdtype(array.dtype, jax.dtypes.prng_key):
+        data = jax.random.key_data(array)
+        if data.shape == (2,) and data.dtype == jnp.uint32:
+            return array
+    if array.shape == (2,) and array.dtype == jnp.uint32:
+        return array
+    raise ValueError(f"{name} must be one two-word Threefry JAX PRNG key")
+
+
+def _checked_lifetime_words_increment(
+    words: Array,
+) -> tuple[UInt[Array, " 2"], Bool[Array, ""]]:
+    """Propose an exact uint64-word successor without wrapping all-ones."""
+
+    _require_array_contract(words, name="step_words", shape=(2,), dtype=jnp.uint32)
+    maximum = jnp.asarray(_UINT32_MAX, dtype=jnp.uint32)
+    capacity_available = ~jnp.all(words == maximum)
+    low = words[1] + jnp.asarray(1, dtype=jnp.uint32)
+    carry = (low == jnp.asarray(0, dtype=jnp.uint32)).astype(jnp.uint32)
+    proposed = jnp.stack((words[0] + carry, low)).astype(jnp.uint32)
+    return jnp.where(capacity_available, proposed, words), capacity_available
+
+
+def _words_to_saturating_int32(words: Array) -> Int[Array, ""]:
+    _require_array_contract(words, name="step_words", shape=(2,), dtype=jnp.uint32)
+    below_saturation = (words[0] == jnp.asarray(0, dtype=jnp.uint32)) & (
+        words[1] < jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
+    )
+    return jnp.where(
+        below_saturation,
+        words[1].astype(jnp.int32),
+        jnp.asarray(_INT32_MAX, dtype=jnp.int32),
+    )
+
+
+def _lifetime_counter_valid(words: Array, telemetry: Array) -> Bool[Array, ""]:
+    _require_array_contract(telemetry, name="step_count", shape=(), dtype=jnp.int32)
+    return (telemetry >= 0) & (telemetry == _words_to_saturating_int32(words))
+
+
+def _floating_tree_is_finite(tree: Any) -> Bool[Array, ""]:
+    valid = jnp.asarray(True)
+    for leaf in jax.tree_util.tree_leaves(tree):
+        array = jnp.asarray(leaf)
+        if jnp.issubdtype(array.dtype, jnp.inexact):
+            valid = valid & jnp.all(jnp.isfinite(array))
+    return valid
+
+
+def _require_tree_contract(value: Any, template: Any, *, name: str) -> None:
+    value_leaves, value_structure = jax.tree_util.tree_flatten(value)
+    template_leaves, template_structure = jax.tree_util.tree_flatten(template)
+    if str(value_structure) != str(template_structure):
+        raise TypeError(f"{name} structure does not match the configured component")
+    for index, (leaf, expected) in enumerate(zip(value_leaves, template_leaves, strict=True)):
+        array = jnp.asarray(leaf)
+        expected_array = jnp.asarray(expected)
+        if array.shape != expected_array.shape:
+            raise ValueError(
+                f"{name} leaf {index} must have shape {expected_array.shape}, got {array.shape}"
+            )
+        if array.dtype != expected_array.dtype:
+            raise TypeError(
+                f"{name} leaf {index} must have dtype {expected_array.dtype}, got {array.dtype}"
+            )
+
+
+def _select_state(candidate: Any, source: Any, commit: Array) -> Any:
+    return jax.tree_util.tree_map(
+        lambda new, old: jnp.where(commit, new, old),
+        candidate,
+        source,
+    )
+
+
+def _tree_nbytes(tree: Any) -> int:
+    return sum(np.asarray(jax.device_get(leaf)).nbytes for leaf in jax.tree_util.tree_leaves(tree))
+
+
+def _legacy_counter_words(step_count: Any, *, label: str) -> UInt[Array, " 2"]:
+    counter = np.asarray(step_count)
+    if counter.shape != () or counter.dtype != np.dtype(np.int32):
+        raise TypeError(f"{label}.step_count must be a scalar int32")
+    value = int(counter)
+    if value < 0:
+        raise ValueError(f"{label}.step_count cannot be negative")
+    return jnp.asarray((0, value), dtype=jnp.uint32)
+
+
+@chex.dataclass(frozen=True)
+class LearnerState(LegacyLearnerState):
+    """Versioned linear state with an exact 64-bit lifetime identity."""
+
+    step_words: UInt[Array, " 2"] = None  # type: ignore[assignment]
+
+
+@chex.dataclass(frozen=True)
+class MLPLearnerState(LegacyMLPLearnerState):
+    """Versioned MLP state with an exact 64-bit lifetime identity."""
+
+    step_words: UInt[Array, " 2"] = None  # type: ignore[assignment]
+
+
+@chex.dataclass(frozen=True)
+class TDLearnerState(LegacyTDLearnerState):
+    """Versioned TD-linear state with an exact 64-bit lifetime identity."""
+
+    step_words: UInt[Array, " 2"] = None  # type: ignore[assignment]
+
+
+@dataclasses.dataclass(frozen=True)
+class LearnerResourceBudget:
+    """Exact initialized-state and per-update accounting for a learner."""
+
+    learner_type: str
+    feature_dim: int
+    trainable_float32_scalars: int
+    optimizer_state_nbytes: int
+    normalizer_state_nbytes: int
+    trace_state_nbytes: int
+    utility_state_nbytes: int
+    lifecycle_counter_nbytes: int
+    state_nbytes: int
+    lifetime_identity_bits: int
+    telemetry_saturation: int
+    max_updates_per_call: int
+    replay_capacity: int
+
+    def to_dict(self) -> dict[str, int | str]:
+        """Return a JSON-compatible exact resource record."""
+
+        return dataclasses.asdict(self)
 
 # Type variable for TD stream state
 StateT = TypeVar("StateT")
@@ -87,6 +311,67 @@ AnyOptimizer = (
 AnyTDOptimizer = TDOptimizer[TDIDBDState] | TDOptimizer[AutoTDIDBDState]
 
 
+def _td_optimizer_to_config(optimizer: AnyTDOptimizer) -> dict[str, Any]:
+    if isinstance(optimizer, TDIDBD):
+        return {
+            "type": "TDIDBD",
+            "initial_step_size": optimizer._initial_step_size,
+            "meta_step_size": optimizer._meta_step_size,
+            "trace_decay": optimizer._trace_decay,
+            "use_semi_gradient": optimizer._use_semi_gradient,
+        }
+    if isinstance(optimizer, AutoTDIDBD):
+        return {
+            "type": "AutoTDIDBD",
+            "initial_step_size": optimizer._initial_step_size,
+            "meta_step_size": optimizer._meta_step_size,
+            "trace_decay": optimizer._trace_decay,
+            "normalizer_decay": optimizer._normalizer_decay,
+        }
+    raise TypeError("TD learner optimizer type is unsupported")
+
+
+def _td_optimizer_from_config(config: Any) -> AnyTDOptimizer:
+    if not isinstance(config, Mapping):
+        raise TypeError("TD optimizer config must be a mapping")
+    payload = dict(config)
+    type_name = payload.get("type")
+    expected = (
+        {"type", "initial_step_size", "meta_step_size", "trace_decay", "use_semi_gradient"}
+        if type_name == "TDIDBD"
+        else {"type", "initial_step_size", "meta_step_size", "trace_decay", "normalizer_decay"}
+        if type_name == "AutoTDIDBD"
+        else set()
+    )
+    if not expected or set(payload) != expected:
+        raise ValueError("TD optimizer config fields or type are unsupported")
+    payload.pop("type")
+    for field in ("initial_step_size", "meta_step_size"):
+        _require_finite_config_float(
+            payload[field],
+            name=f"optimizer.{field}",
+            minimum=0.0,
+            minimum_inclusive=False,
+        )
+    _require_finite_config_float(
+        payload["trace_decay"],
+        name="optimizer.trace_decay",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    if type_name == "TDIDBD":
+        if type(payload["use_semi_gradient"]) is not bool:
+            raise ValueError("optimizer.use_semi_gradient must be a strict boolean")
+        return TDIDBD(**payload)
+    _require_finite_config_float(
+        payload["normalizer_decay"],
+        name="optimizer.normalizer_decay",
+        minimum=0.0,
+        minimum_inclusive=False,
+    )
+    return AutoTDIDBD(**payload)
+
+
 @chex.dataclass(frozen=True)
 class UpdateResult:
     """Result of a learner update step.
@@ -103,6 +388,15 @@ class UpdateResult:
     prediction: Prediction
     error: Float[Array, ""]
     metrics: Array
+    pre_step_words: UInt[Array, " 2"]
+    proposed_step_words: UInt[Array, " 2"]
+    post_step_words: UInt[Array, " 2"]
+    lifetime_counter_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    source_state_valid: Bool[Array, ""]
+    input_valid: Bool[Array, ""]
+    candidate_state_valid: Bool[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -121,6 +415,15 @@ class MLPUpdateResult:
     prediction: Prediction
     error: Float[Array, ""]
     metrics: Array
+    pre_step_words: UInt[Array, " 2"]
+    proposed_step_words: UInt[Array, " 2"]
+    post_step_words: UInt[Array, " 2"]
+    lifetime_counter_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    source_state_valid: Bool[Array, ""]
+    input_valid: Bool[Array, ""]
+    candidate_state_valid: Bool[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 class LinearLearner:
@@ -170,6 +473,134 @@ class LinearLearner:
         """The feature normalizer, or None if normalization is disabled."""
         return self._normalizer
 
+    def to_config(self) -> dict[str, Any]:
+        """Serialize a strict versioned learner configuration."""
+
+        return {
+            "schema": LINEAR_LEARNER_CONFIG_SCHEMA,
+            "type": "LinearLearner",
+            "state_schema": LINEAR_LEARNER_STATE_SCHEMA,
+            "optimizer": self._optimizer.to_config(),
+            "normalizer": (
+                self._normalizer.to_config() if self._normalizer is not None else None
+            ),
+        }
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> "LinearLearner":
+        """Reconstruct only the exact current configuration schema."""
+
+        from alberta_framework.core.normalizers import normalizer_from_config
+        from alberta_framework.core.optimizers import optimizer_from_config
+
+        if not isinstance(config, Mapping):
+            raise TypeError("linear learner config must be a mapping")
+        payload = dict(config)
+        expected = {"schema", "type", "state_schema", "optimizer", "normalizer"}
+        if set(payload) != expected:
+            if "schema" not in payload:
+                raise ValueError("legacy linear learner config requires explicit migration")
+            raise ValueError("linear learner config fields do not match v2")
+        if payload.pop("schema") != LINEAR_LEARNER_CONFIG_SCHEMA:
+            raise ValueError("linear learner config schema is unsupported")
+        if payload.pop("type") != "LinearLearner":
+            raise ValueError("linear learner config type is unsupported")
+        if payload.pop("state_schema") != LINEAR_LEARNER_STATE_SCHEMA:
+            raise ValueError("linear learner state schema is unsupported")
+        optimizer_config = payload.pop("optimizer")
+        if not isinstance(optimizer_config, dict):
+            raise TypeError("linear learner optimizer config must be a dictionary")
+        normalizer_config = payload.pop("normalizer")
+        if normalizer_config is not None and not isinstance(normalizer_config, dict):
+            raise TypeError("linear learner normalizer config must be a dictionary or null")
+        optimizer = optimizer_from_config(optimizer_config)
+        normalizer = (
+            normalizer_from_config(normalizer_config)
+            if normalizer_config is not None
+            else None
+        )
+        return cls(optimizer=cast(AnyOptimizer, optimizer), normalizer=normalizer)
+
+    def _require_state_contract(self, state: LearnerState) -> int:
+        if not isinstance(state, LearnerState):
+            if isinstance(state, LegacyLearnerState):
+                raise TypeError("legacy linear state requires explicit migration")
+            raise TypeError("state must be a LearnerState")
+        weights = jnp.asarray(state.weights)
+        if weights.ndim != 1 or weights.shape[0] <= 0:
+            raise ValueError("state.weights must be a nonempty vector")
+        feature_dim = weights.shape[0]
+        _require_array_contract(
+            state.weights,
+            name="state.weights",
+            shape=(feature_dim,),
+            dtype=jnp.float32,
+        )
+        _require_array_contract(state.bias, name="state.bias", shape=(), dtype=jnp.float32)
+        _require_array_contract(
+            state.step_count,
+            name="state.step_count",
+            shape=(),
+            dtype=jnp.int32,
+        )
+        _require_array_contract(
+            state.step_words,
+            name="state.step_words",
+            shape=(2,),
+            dtype=jnp.uint32,
+        )
+        _require_tree_contract(
+            state.optimizer_state,
+            self._optimizer.init(feature_dim),
+            name="state.optimizer_state",
+        )
+        if self._normalizer is None:
+            if state.normalizer_state is not None:
+                raise TypeError(
+                    "state.normalizer_state must be null when normalization is disabled"
+                )
+        else:
+            if state.normalizer_state is None:
+                raise TypeError("state.normalizer_state is required by the configured normalizer")
+            _require_tree_contract(
+                state.normalizer_state,
+                self._normalizer.init(feature_dim),
+                name="state.normalizer_state",
+            )
+        return feature_dim
+
+    def state_is_valid(self, state: LearnerState) -> Bool[Array, ""]:
+        """Return dynamic validity after enforcing the static state contract."""
+
+        self._require_state_contract(state)
+        return (
+            _floating_tree_is_finite(state)
+            & _lifetime_counter_valid(state.step_words, state.step_count)
+            & (jnp.asarray(state.uptime_s) >= 0.0)
+        )
+
+    def resource_budget(self, feature_dim: int) -> LearnerResourceBudget:
+        """Return exact initialized-state accounting for this configuration."""
+
+        state = self.init(feature_dim)
+        optimizer_nbytes = _tree_nbytes(state.optimizer_state)
+        normalizer_nbytes = _tree_nbytes(state.normalizer_state)
+        return LearnerResourceBudget(
+            learner_type="LinearLearner",
+            feature_dim=feature_dim,
+            trainable_float32_scalars=feature_dim + 1,
+            optimizer_state_nbytes=optimizer_nbytes,
+            normalizer_state_nbytes=normalizer_nbytes,
+            trace_state_nbytes=0,
+            utility_state_nbytes=0,
+            lifecycle_counter_nbytes=LEARNER_LIFETIME_COUNTER_NBYTES,
+            state_nbytes=_tree_nbytes(state),
+            lifetime_identity_bits=64,
+            telemetry_saturation=_INT32_MAX,
+            max_updates_per_call=1,
+            replay_capacity=0,
+        )
+
     def init(self, feature_dim: int) -> LearnerState:
         """Initialize learner state.
 
@@ -179,6 +610,7 @@ class LinearLearner:
         Returns:
             Initial learner state with zero weights and bias
         """
+        _require_positive_feature_dim(feature_dim)
         optimizer_state = self._optimizer.init(feature_dim)
 
         normalizer_state = None
@@ -193,6 +625,7 @@ class LinearLearner:
             step_count=jnp.array(0, dtype=jnp.int32),
             birth_timestamp=time.time(),
             uptime_s=0.0,
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
         )
 
     def predict(self, state: LearnerState, observation: Observation) -> Prediction:
@@ -205,7 +638,13 @@ class LinearLearner:
         Returns:
             Scalar prediction ``y = w @ x + b``
         """
-        return jnp.atleast_1d(jnp.dot(state.weights, observation) + state.bias)
+        feature_dim = self._require_state_contract(state)
+        obs = _require_real_source(
+            observation,
+            name="observation",
+            shapes=((feature_dim,),),
+        )
+        return jnp.atleast_1d(jnp.dot(state.weights, obs) + state.bias)
 
     def update(
         self,
@@ -230,27 +669,32 @@ class LinearLearner:
         Returns:
             UpdateResult with new state, prediction, error, and metrics
         """
-        new_normalizer_state = state.normalizer_state
-        obs = observation
-        if self._normalizer is not None and state.normalizer_state is not None:
-            obs, new_normalizer_state = self._normalizer.normalize(
-                state.normalizer_state, observation
-            )
-
-        prediction = self.predict(
-            LearnerState(
-                weights=state.weights,
-                bias=state.bias,
-                optimizer_state=state.optimizer_state,
-                normalizer_state=new_normalizer_state,
-                step_count=state.step_count,
-                birth_timestamp=state.birth_timestamp,
-                uptime_s=state.uptime_s,
-            ),
-            obs,
+        feature_dim = self._require_state_contract(state)
+        obs = _require_real_source(
+            observation,
+            name="observation",
+            shapes=((feature_dim,),),
+        )
+        checked_target = _require_real_source(
+            target,
+            name="target",
+            shapes=((), (1,)),
+        )
+        source_state_valid = self.state_is_valid(state)
+        input_valid = jnp.all(jnp.isfinite(obs)) & jnp.all(jnp.isfinite(checked_target))
+        proposed_words, lifetime_capacity_available = _checked_lifetime_words_increment(
+            state.step_words
         )
 
-        error = jnp.squeeze(target) - jnp.squeeze(prediction)
+        new_normalizer_state = state.normalizer_state
+        if self._normalizer is not None and state.normalizer_state is not None:
+            obs, new_normalizer_state = self._normalizer.normalize(
+                state.normalizer_state, obs
+            )
+
+        prediction = jnp.atleast_1d(jnp.dot(state.weights, obs) + state.bias)
+
+        error = jnp.squeeze(checked_target) - jnp.squeeze(prediction)
 
         opt_update = self._optimizer.update(
             state.optimizer_state,
@@ -261,14 +705,15 @@ class LinearLearner:
         new_weights = state.weights + opt_update.weight_delta
         new_bias = state.bias + opt_update.bias_delta
 
-        new_state = LearnerState(
+        candidate_state = LearnerState(
             weights=new_weights,
             bias=new_bias,
             optimizer_state=opt_update.new_state,
             normalizer_state=new_normalizer_state,
-            step_count=state.step_count + 1,
+            step_count=_words_to_saturating_int32(proposed_words),
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
+            step_words=proposed_words,
         )
 
         # Pack metrics as array for scan compatibility
@@ -277,20 +722,41 @@ class LinearLearner:
 
         if self._normalizer is not None and new_normalizer_state is not None:
             normalizer_mean_var = jnp.mean(new_normalizer_state.var)
-            metrics = jnp.array(
+            candidate_metrics = jnp.array(
                 [squared_error, error, mean_step_size, normalizer_mean_var],
                 dtype=jnp.float32,
             )
         else:
-            metrics = jnp.array(
+            candidate_metrics = jnp.array(
                 [squared_error, error, mean_step_size], dtype=jnp.float32
             )
+
+        candidate_state_valid = self.state_is_valid(candidate_state)
+        update_applied = (
+            source_state_valid
+            & input_valid
+            & lifetime_capacity_available
+            & candidate_state_valid
+        )
+        new_state = _select_state(candidate_state, state, update_applied)
+        metrics = jnp.where(update_applied, candidate_metrics, jnp.zeros_like(candidate_metrics))
 
         return UpdateResult(
             state=new_state,
             prediction=prediction,
             error=jnp.atleast_1d(error),
             metrics=metrics,
+            pre_step_words=state.step_words,
+            proposed_step_words=proposed_words,
+            post_step_words=new_state.step_words,
+            lifetime_counter_valid=_lifetime_counter_valid(
+                state.step_words, state.step_count
+            ),
+            lifetime_capacity_available=lifetime_capacity_available,
+            source_state_valid=source_state_valid,
+            input_valid=input_valid,
+            candidate_state_valid=candidate_state_valid,
+            update_applied=update_applied,
         )
 
 
@@ -875,6 +1341,37 @@ class MLPLearner:
             neuron_utility_decay: EMA decay for neuron utility (default 0.99).
                 Higher values track slower, smoother utility signals.
         """
+        if not isinstance(hidden_sizes, tuple) or not hidden_sizes:
+            raise ValueError("hidden_sizes must be a nonempty tuple")
+        for index, width in enumerate(hidden_sizes):
+            if type(width) is not int or width <= 0 or width > _INT32_MAX:
+                raise ValueError(
+                    f"hidden_sizes[{index}] must be a strict integer in [1, {_INT32_MAX}]"
+                )
+        _require_finite_config_float(
+            step_size,
+            name="step_size",
+            minimum=0.0,
+            minimum_inclusive=False,
+        )
+        _require_finite_config_float(gamma, name="gamma", minimum=0.0, maximum=1.0)
+        _require_finite_config_float(lamda, name="lamda", minimum=0.0, maximum=1.0)
+        _require_finite_config_float(sparsity, name="sparsity", minimum=0.0, maximum=1.0)
+        _require_finite_config_float(
+            leaky_relu_slope,
+            name="leaky_relu_slope",
+            minimum=0.0,
+        )
+        _require_finite_config_float(
+            neuron_utility_decay,
+            name="neuron_utility_decay",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        if type(use_layer_norm) is not bool:
+            raise ValueError("use_layer_norm must be a strict boolean")
+        if type(track_neuron_utility) is not bool:
+            raise ValueError("track_neuron_utility must be a strict boolean")
         self._hidden_sizes = hidden_sizes
         self._optimizer: AnyOptimizer = optimizer or LMS(step_size=step_size)
         self._head_optimizer: AnyOptimizer | None = head_optimizer
@@ -1022,7 +1519,9 @@ class MLPLearner:
             the learner via ``from_config()``.
         """
         config: dict[str, Any] = {
+            "schema": MLP_LEARNER_CONFIG_SCHEMA,
             "type": "MLPLearner",
+            "state_schema": MLP_LEARNER_STATE_SCHEMA,
             "hidden_sizes": list(self._hidden_sizes),
             "optimizer": self._optimizer.to_config(),
             "bounder": self._bounder.to_config() if self._bounder is not None else None,
@@ -1043,7 +1542,7 @@ class MLPLearner:
         return config
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "MLPLearner":
+    def from_config(cls, config: Mapping[str, Any]) -> "MLPLearner":
         """Reconstruct learner from a config dict.
 
         Args:
@@ -1058,24 +1557,204 @@ class MLPLearner:
             optimizer_from_config,
         )
 
-        config = dict(config)
-        config.pop("type", None)
+        if not isinstance(config, Mapping):
+            raise TypeError("MLP learner config must be a mapping")
+        payload = dict(config)
+        expected = {
+            "schema",
+            "type",
+            "state_schema",
+            "hidden_sizes",
+            "optimizer",
+            "bounder",
+            "normalizer",
+            "head_optimizer",
+            "sparsity",
+            "leaky_relu_slope",
+            "use_layer_norm",
+            "gamma",
+            "lamda",
+            "track_neuron_utility",
+            "neuron_utility_decay",
+        }
+        if set(payload) != expected:
+            if "schema" not in payload:
+                raise ValueError("legacy MLP learner config requires explicit migration")
+            missing = sorted(expected - set(payload))
+            extra = sorted(set(payload) - expected)
+            raise ValueError(
+                f"MLP learner config fields do not match v2; missing={missing}, extra={extra}"
+            )
+        if payload.pop("schema") != MLP_LEARNER_CONFIG_SCHEMA:
+            raise ValueError("MLP learner config schema is unsupported")
+        if payload.pop("type") != "MLPLearner":
+            raise ValueError("MLP learner config type is unsupported")
+        if payload.pop("state_schema") != MLP_LEARNER_STATE_SCHEMA:
+            raise ValueError("MLP learner state schema is unsupported")
 
-        optimizer = optimizer_from_config(config.pop("optimizer"))
-        bounder_cfg = config.pop("bounder", None)
+        optimizer_cfg = payload.pop("optimizer")
+        if not isinstance(optimizer_cfg, dict):
+            raise TypeError("MLP learner optimizer config must be a dictionary")
+        optimizer = optimizer_from_config(optimizer_cfg)
+        bounder_cfg = payload.pop("bounder")
+        if bounder_cfg is not None and not isinstance(bounder_cfg, dict):
+            raise TypeError("MLP learner bounder config must be a dictionary or null")
         bounder = bounder_from_config(bounder_cfg) if bounder_cfg is not None else None
-        normalizer_cfg = config.pop("normalizer", None)
+        normalizer_cfg = payload.pop("normalizer")
+        if normalizer_cfg is not None and not isinstance(normalizer_cfg, dict):
+            raise TypeError("MLP learner normalizer config must be a dictionary or null")
         normalizer = normalizer_from_config(normalizer_cfg) if normalizer_cfg is not None else None
-        head_opt_cfg = config.pop("head_optimizer", None)
+        head_opt_cfg = payload.pop("head_optimizer")
+        if head_opt_cfg is not None and not isinstance(head_opt_cfg, dict):
+            raise TypeError("MLP head optimizer config must be a dictionary or null")
         head_optimizer = optimizer_from_config(head_opt_cfg) if head_opt_cfg is not None else None
 
+        hidden_sizes = payload.pop("hidden_sizes")
+        if not isinstance(hidden_sizes, list):
+            raise TypeError("MLP hidden_sizes must be a list in serialized config")
+
         return cls(
-            hidden_sizes=tuple(config.pop("hidden_sizes")),
-            optimizer=optimizer,
+            hidden_sizes=tuple(hidden_sizes),
+            optimizer=cast(AnyOptimizer, optimizer),
             bounder=bounder,
             normalizer=normalizer,
-            head_optimizer=head_optimizer,
-            **config,
+            head_optimizer=cast(AnyOptimizer | None, head_optimizer),
+            **payload,
+        )
+
+    def _require_state_contract(self, state: MLPLearnerState) -> int:
+        if not isinstance(state, MLPLearnerState):
+            if isinstance(state, LegacyMLPLearnerState):
+                raise TypeError("legacy MLP state requires explicit migration")
+            raise TypeError("state must be an MLPLearnerState")
+        weights = state.params.weights
+        biases = state.params.biases
+        n_layers = len(self._hidden_sizes) + 1
+        if len(weights) != n_layers or len(biases) != n_layers:
+            raise ValueError("state.params layer count does not match the learner architecture")
+        first = jnp.asarray(weights[0])
+        if first.ndim != 2 or first.shape[1] <= 0:
+            raise ValueError("state.params.weights[0] must have a positive input width")
+        feature_dim = first.shape[1]
+        layer_sizes = (feature_dim, *self._hidden_sizes, 1)
+        if len(state.traces) != 2 * n_layers:
+            raise ValueError("state.traces must contain one weight and bias trace per layer")
+        if len(state.optimizer_states) != 2 * n_layers:
+            raise ValueError("state.optimizer_states must contain one state per parameter")
+        for index in range(n_layers):
+            weight_shape = (layer_sizes[index + 1], layer_sizes[index])
+            bias_shape = (layer_sizes[index + 1],)
+            _require_array_contract(
+                weights[index],
+                name=f"state.params.weights[{index}]",
+                shape=weight_shape,
+                dtype=jnp.float32,
+            )
+            _require_array_contract(
+                biases[index],
+                name=f"state.params.biases[{index}]",
+                shape=bias_shape,
+                dtype=jnp.float32,
+            )
+            _require_array_contract(
+                state.traces[2 * index],
+                name=f"state.traces[{2 * index}]",
+                shape=weight_shape,
+                dtype=jnp.float32,
+            )
+            _require_array_contract(
+                state.traces[2 * index + 1],
+                name=f"state.traces[{2 * index + 1}]",
+                shape=bias_shape,
+                dtype=jnp.float32,
+            )
+            optimizer = (
+                self._head_optimizer
+                if self._head_optimizer is not None and index == n_layers - 1
+                else self._optimizer
+            )
+            _require_tree_contract(
+                state.optimizer_states[2 * index],
+                optimizer.init_for_shape(weight_shape),
+                name=f"state.optimizer_states[{2 * index}]",
+            )
+            _require_tree_contract(
+                state.optimizer_states[2 * index + 1],
+                optimizer.init_for_shape(bias_shape),
+                name=f"state.optimizer_states[{2 * index + 1}]",
+            )
+        if self._normalizer is None:
+            if state.normalizer_state is not None:
+                raise TypeError(
+                    "state.normalizer_state must be null when normalization is disabled"
+                )
+        else:
+            if state.normalizer_state is None:
+                raise TypeError("state.normalizer_state is required by the configured normalizer")
+            _require_tree_contract(
+                state.normalizer_state,
+                self._normalizer.init(feature_dim),
+                name="state.normalizer_state",
+            )
+        if self._track_neuron_utility:
+            if state.neuron_utility is None or len(state.neuron_utility) != len(
+                self._hidden_sizes
+            ):
+                raise ValueError("state.neuron_utility does not match the hidden architecture")
+            for index, width in enumerate(self._hidden_sizes):
+                _require_array_contract(
+                    state.neuron_utility[index],
+                    name=f"state.neuron_utility[{index}]",
+                    shape=(width,),
+                    dtype=jnp.float32,
+                )
+        elif state.neuron_utility is not None:
+            raise TypeError("state.neuron_utility must be null when utility tracking is disabled")
+        _require_array_contract(
+            state.step_count,
+            name="state.step_count",
+            shape=(),
+            dtype=jnp.int32,
+        )
+        _require_array_contract(
+            state.step_words,
+            name="state.step_words",
+            shape=(2,),
+            dtype=jnp.uint32,
+        )
+        return feature_dim
+
+    def state_is_valid(self, state: MLPLearnerState) -> Bool[Array, ""]:
+        """Return dynamic validity after enforcing the static state contract."""
+
+        self._require_state_contract(state)
+        return (
+            _floating_tree_is_finite(state)
+            & _lifetime_counter_valid(state.step_words, state.step_count)
+            & (jnp.asarray(state.uptime_s) >= 0.0)
+        )
+
+    def resource_budget(self, feature_dim: int) -> LearnerResourceBudget:
+        """Return exact initialized-state accounting for this architecture."""
+
+        state = self.init(feature_dim, jax.random.key(0))
+        trainable = sum(array.size for array in state.params.weights) + sum(
+            array.size for array in state.params.biases
+        )
+        return LearnerResourceBudget(
+            learner_type="MLPLearner",
+            feature_dim=feature_dim,
+            trainable_float32_scalars=trainable,
+            optimizer_state_nbytes=_tree_nbytes(state.optimizer_states),
+            normalizer_state_nbytes=_tree_nbytes(state.normalizer_state),
+            trace_state_nbytes=_tree_nbytes(state.traces),
+            utility_state_nbytes=_tree_nbytes(state.neuron_utility),
+            lifecycle_counter_nbytes=LEARNER_LIFETIME_COUNTER_NBYTES,
+            state_nbytes=_tree_nbytes(state),
+            lifetime_identity_bits=64,
+            telemetry_saturation=_INT32_MAX,
+            max_updates_per_call=1,
+            replay_capacity=0,
         )
 
     def init(self, feature_dim: int, key: Array) -> MLPLearnerState:
@@ -1088,6 +1767,8 @@ class MLPLearner:
         Returns:
             Initial MLP learner state with sparse weights and zero biases
         """
+        _require_positive_feature_dim(feature_dim)
+        key = _require_prng_key(key, name="key")
         # Build layer sizes: [feature_dim, hidden1, hidden2, ..., 1]
         layer_sizes = [feature_dim, *self._hidden_sizes, 1]
 
@@ -1143,6 +1824,7 @@ class MLPLearner:
             step_count=jnp.array(0, dtype=jnp.int32),
             birth_timestamp=time.time(),
             uptime_s=0.0,
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
         )
 
     @staticmethod
@@ -1194,10 +1876,16 @@ class MLPLearner:
         Returns:
             Scalar prediction
         """
+        feature_dim = self._require_state_contract(state)
+        obs = _require_real_source(
+            observation,
+            name="observation",
+            shapes=((feature_dim,),),
+        )
         y = self._forward(
             state.params.weights,
             state.params.biases,
-            observation,
+            obs,
             self._leaky_relu_slope,
             self._use_layer_norm,
         )
@@ -1231,9 +1919,27 @@ class MLPLearner:
         Returns:
             MLPUpdateResult with new state, prediction, error, and metrics
         """
-        target_scalar = jnp.squeeze(target)
+        feature_dim = self._require_state_contract(state)
+        checked_observation = _require_real_source(
+            observation,
+            name="observation",
+            shapes=((feature_dim,),),
+        )
+        checked_target = _require_real_source(
+            target,
+            name="target",
+            shapes=((), (1,)),
+        )
+        source_state_valid = self.state_is_valid(state)
+        input_valid = jnp.all(jnp.isfinite(checked_observation)) & jnp.all(
+            jnp.isfinite(checked_target)
+        )
+        proposed_words, lifetime_capacity_available = _checked_lifetime_words_increment(
+            state.step_words
+        )
+        target_scalar = jnp.squeeze(checked_target)
 
-        obs = observation
+        obs = checked_observation
         new_normalizer_state = state.normalizer_state
         if self._normalizer is not None and state.normalizer_state is not None:
             obs, new_normalizer_state = self._normalizer.normalize(
@@ -1323,35 +2029,57 @@ class MLPLearner:
                 for i in range(len(self._hidden_sizes))
             )
 
-        new_state = MLPLearnerState(
+        candidate_state = MLPLearnerState(
             params=new_params,
             optimizer_states=tuple(new_opt_states),
             traces=tuple(new_traces),
             normalizer_state=new_normalizer_state,
             neuron_utility=new_neuron_utility,
-            step_count=state.step_count + 1,
+            step_count=_words_to_saturating_int32(proposed_words),
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
+            step_words=proposed_words,
         )
 
         squared_error = error**2
 
         if self._normalizer is not None and new_normalizer_state is not None:
             normalizer_mean_var = jnp.mean(new_normalizer_state.var)
-            metrics = jnp.array(
+            candidate_metrics = jnp.array(
                 [squared_error, error, bounding_metric, normalizer_mean_var],
                 dtype=jnp.float32,
             )
         else:
-            metrics = jnp.array(
+            candidate_metrics = jnp.array(
                 [squared_error, error, bounding_metric], dtype=jnp.float32
             )
+
+        candidate_state_valid = self.state_is_valid(candidate_state)
+        update_applied = (
+            source_state_valid
+            & input_valid
+            & lifetime_capacity_available
+            & candidate_state_valid
+        )
+        new_state = _select_state(candidate_state, state, update_applied)
+        metrics = jnp.where(update_applied, candidate_metrics, jnp.zeros_like(candidate_metrics))
 
         return MLPUpdateResult(
             state=new_state,
             prediction=prediction,
             error=jnp.atleast_1d(error),
             metrics=metrics,
+            pre_step_words=state.step_words,
+            proposed_step_words=proposed_words,
+            post_step_words=new_state.step_words,
+            lifetime_counter_valid=_lifetime_counter_valid(
+                state.step_words, state.step_count
+            ),
+            lifetime_capacity_available=lifetime_capacity_available,
+            source_state_valid=source_state_valid,
+            input_valid=input_valid,
+            candidate_state_valid=candidate_state_valid,
+            update_applied=update_applied,
         )
 
 
@@ -1599,6 +2327,15 @@ class TDUpdateResult:
     prediction: Prediction
     td_error: Float[Array, ""]
     metrics: Float[Array, " 4"]
+    pre_step_words: UInt[Array, " 2"]
+    proposed_step_words: UInt[Array, " 2"]
+    post_step_words: UInt[Array, " 2"]
+    lifetime_counter_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    source_state_valid: Bool[Array, ""]
+    input_valid: Bool[Array, ""]
+    candidate_state_valid: Bool[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 class TDLinearLearner:
@@ -1626,6 +2363,103 @@ class TDLinearLearner:
             optimizer: TD optimizer for weight updates. Defaults to TDIDBD()
         """
         self._optimizer: AnyTDOptimizer = optimizer or TDIDBD()
+        if not isinstance(self._optimizer, TDIDBD | AutoTDIDBD):
+            raise TypeError("optimizer must be TDIDBD or AutoTDIDBD")
+
+    def to_config(self) -> dict[str, Any]:
+        """Serialize a strict versioned TD learner configuration."""
+
+        return {
+            "schema": TD_LINEAR_LEARNER_CONFIG_SCHEMA,
+            "type": "TDLinearLearner",
+            "state_schema": TD_LINEAR_LEARNER_STATE_SCHEMA,
+            "optimizer": _td_optimizer_to_config(self._optimizer),
+        }
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> "TDLinearLearner":
+        """Reconstruct only the exact current TD learner schema."""
+
+        if not isinstance(config, Mapping):
+            raise TypeError("TD learner config must be a mapping")
+        payload = dict(config)
+        expected = {"schema", "type", "state_schema", "optimizer"}
+        if set(payload) != expected:
+            if "schema" not in payload:
+                raise ValueError("legacy TD learner config requires explicit migration")
+            raise ValueError("TD learner config fields do not match v2")
+        if payload.pop("schema") != TD_LINEAR_LEARNER_CONFIG_SCHEMA:
+            raise ValueError("TD learner config schema is unsupported")
+        if payload.pop("type") != "TDLinearLearner":
+            raise ValueError("TD learner config type is unsupported")
+        if payload.pop("state_schema") != TD_LINEAR_LEARNER_STATE_SCHEMA:
+            raise ValueError("TD learner state schema is unsupported")
+        return cls(optimizer=_td_optimizer_from_config(payload.pop("optimizer")))
+
+    def _require_state_contract(self, state: TDLearnerState) -> int:
+        if not isinstance(state, TDLearnerState):
+            if isinstance(state, LegacyTDLearnerState):
+                raise TypeError("legacy TD state requires explicit migration")
+            raise TypeError("state must be a TDLearnerState")
+        weights = jnp.asarray(state.weights)
+        if weights.ndim != 1 or weights.shape[0] <= 0:
+            raise ValueError("state.weights must be a nonempty vector")
+        feature_dim = weights.shape[0]
+        _require_array_contract(
+            state.weights,
+            name="state.weights",
+            shape=(feature_dim,),
+            dtype=jnp.float32,
+        )
+        _require_array_contract(state.bias, name="state.bias", shape=(), dtype=jnp.float32)
+        _require_array_contract(
+            state.step_count,
+            name="state.step_count",
+            shape=(),
+            dtype=jnp.int32,
+        )
+        _require_array_contract(
+            state.step_words,
+            name="state.step_words",
+            shape=(2,),
+            dtype=jnp.uint32,
+        )
+        _require_tree_contract(
+            state.optimizer_state,
+            self._optimizer.init(feature_dim),
+            name="state.optimizer_state",
+        )
+        return feature_dim
+
+    def state_is_valid(self, state: TDLearnerState) -> Bool[Array, ""]:
+        """Return dynamic validity after enforcing the static state contract."""
+
+        self._require_state_contract(state)
+        return (
+            _floating_tree_is_finite(state)
+            & _lifetime_counter_valid(state.step_words, state.step_count)
+            & (jnp.asarray(state.uptime_s) >= 0.0)
+        )
+
+    def resource_budget(self, feature_dim: int) -> LearnerResourceBudget:
+        """Return exact initialized-state accounting for this TD learner."""
+
+        state = self.init(feature_dim)
+        return LearnerResourceBudget(
+            learner_type="TDLinearLearner",
+            feature_dim=feature_dim,
+            trainable_float32_scalars=feature_dim + 1,
+            optimizer_state_nbytes=_tree_nbytes(state.optimizer_state),
+            normalizer_state_nbytes=0,
+            trace_state_nbytes=0,
+            utility_state_nbytes=0,
+            lifecycle_counter_nbytes=LEARNER_LIFETIME_COUNTER_NBYTES,
+            state_nbytes=_tree_nbytes(state),
+            lifetime_identity_bits=64,
+            telemetry_saturation=_INT32_MAX,
+            max_updates_per_call=1,
+            replay_capacity=0,
+        )
 
     def init(self, feature_dim: int) -> TDLearnerState:
         """Initialize TD learner state.
@@ -1636,6 +2470,7 @@ class TDLinearLearner:
         Returns:
             Initial TD learner state with zero weights and bias
         """
+        _require_positive_feature_dim(feature_dim)
         optimizer_state = self._optimizer.init(feature_dim)
 
         return TDLearnerState(
@@ -1645,6 +2480,7 @@ class TDLinearLearner:
             step_count=jnp.array(0, dtype=jnp.int32),
             birth_timestamp=time.time(),
             uptime_s=0.0,
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
         )
 
     def predict(self, state: TDLearnerState, observation: Observation) -> Prediction:
@@ -1657,7 +2493,13 @@ class TDLinearLearner:
         Returns:
             Scalar value prediction ``V(s) = w @ phi(s) + b``
         """
-        return jnp.atleast_1d(jnp.dot(state.weights, observation) + state.bias)
+        feature_dim = self._require_state_contract(state)
+        obs = _require_real_source(
+            observation,
+            name="observation",
+            shapes=((feature_dim,),),
+        )
+        return jnp.atleast_1d(jnp.dot(state.weights, obs) + state.bias)
 
     def update(
         self,
@@ -1685,12 +2527,45 @@ class TDLinearLearner:
         Returns:
             TDUpdateResult with new state, prediction, TD error, and metrics
         """
-        prediction = self.predict(state, observation)
-        next_prediction = self.predict(state, next_observation)
+        feature_dim = self._require_state_contract(state)
+        obs = _require_real_source(
+            observation,
+            name="observation",
+            shapes=((feature_dim,),),
+        )
+        next_obs = _require_real_source(
+            next_observation,
+            name="next_observation",
+            shapes=((feature_dim,),),
+        )
+        checked_reward = _require_real_source(
+            reward,
+            name="reward",
+            shapes=((), (1,)),
+        )
+        checked_gamma = _require_real_source(
+            gamma,
+            name="gamma",
+            shapes=((), (1,)),
+        )
+        source_state_valid = self.state_is_valid(state)
+        gamma_scalar = jnp.squeeze(checked_gamma)
+        input_valid = (
+            jnp.all(jnp.isfinite(obs))
+            & jnp.all(jnp.isfinite(next_obs))
+            & jnp.all(jnp.isfinite(checked_reward))
+            & jnp.isfinite(gamma_scalar)
+            & (gamma_scalar >= 0.0)
+            & (gamma_scalar <= 1.0)
+        )
+        proposed_words, lifetime_capacity_available = _checked_lifetime_words_increment(
+            state.step_words
+        )
+        prediction = jnp.atleast_1d(jnp.dot(state.weights, obs) + state.bias)
+        next_prediction = jnp.atleast_1d(jnp.dot(state.weights, next_obs) + state.bias)
 
-        gamma_scalar = jnp.squeeze(gamma)
         td_error = (
-            jnp.squeeze(reward)
+            jnp.squeeze(checked_reward)
             + gamma_scalar * jnp.squeeze(next_prediction)
             - jnp.squeeze(prediction)
         )
@@ -1698,43 +2573,65 @@ class TDLinearLearner:
         opt_update = self._optimizer.update(
             state.optimizer_state,
             td_error,
-            observation,
-            next_observation,
-            gamma,
+            obs,
+            next_obs,
+            checked_gamma,
         )
 
         new_weights = state.weights + opt_update.weight_delta
         new_bias = state.bias + opt_update.bias_delta
 
-        new_state = TDLearnerState(
+        candidate_state = TDLearnerState(
             weights=new_weights,
             bias=new_bias,
             optimizer_state=opt_update.new_state,
-            step_count=state.step_count + 1,
+            step_count=_words_to_saturating_int32(proposed_words),
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
+            step_words=proposed_words,
         )
 
         # Pack metrics as array for scan compatibility
         squared_td_error = td_error**2
         mean_step_size = opt_update.metrics.get("mean_step_size", 0.0)
         mean_elig_trace = opt_update.metrics.get("mean_eligibility_trace", 0.0)
-        metrics = jnp.array(
+        candidate_metrics = jnp.array(
             [squared_td_error, td_error, mean_step_size, mean_elig_trace],
             dtype=jnp.float32,
         )
+
+        candidate_state_valid = self.state_is_valid(candidate_state)
+        update_applied = (
+            source_state_valid
+            & input_valid
+            & lifetime_capacity_available
+            & candidate_state_valid
+        )
+        new_state = _select_state(candidate_state, state, update_applied)
+        metrics = jnp.where(update_applied, candidate_metrics, jnp.zeros_like(candidate_metrics))
 
         return TDUpdateResult(
             state=new_state,
             prediction=prediction,
             td_error=jnp.atleast_1d(td_error),
             metrics=metrics,
+            pre_step_words=state.step_words,
+            proposed_step_words=proposed_words,
+            post_step_words=new_state.step_words,
+            lifetime_counter_valid=_lifetime_counter_valid(
+                state.step_words, state.step_count
+            ),
+            lifetime_capacity_available=lifetime_capacity_available,
+            source_state_valid=source_state_valid,
+            input_valid=input_valid,
+            candidate_state_valid=candidate_state_valid,
+            update_applied=update_applied,
         )
 
 
 @chex.dataclass(frozen=True)
 class TrueOnlineTDState:
-    """State for True Online TD(lambda) with Dutch traces."""
+    """State for True Online TD(lambda) with an exact lifetime identity."""
 
     weights: Float[Array, " feature_dim"]
     bias: Float[Array, ""]
@@ -1744,6 +2641,7 @@ class TrueOnlineTDState:
     step_count: Array = None  # type: ignore[assignment]
     birth_timestamp: float = 0.0
     uptime_s: float = 0.0
+    step_words: UInt[Array, " 2"] = None  # type: ignore[assignment]
 
 
 @chex.dataclass(frozen=True)
@@ -1759,6 +2657,15 @@ class TrueOnlineTDUpdateResult:
     next_prediction: Prediction
     td_error: Float[Array, ""]
     metrics: Float[Array, " 4"]
+    pre_step_words: UInt[Array, " 2"]
+    proposed_step_words: UInt[Array, " 2"]
+    post_step_words: UInt[Array, " 2"]
+    lifetime_counter_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    source_state_valid: Bool[Array, ""]
+    input_valid: Bool[Array, ""]
+    candidate_state_valid: Bool[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 class TrueOnlineTDLearner:
@@ -1777,11 +2684,120 @@ class TrueOnlineTDLearner:
 
     def __init__(self, step_size: float = 0.05, trace_decay: float = 0.9):
         """Initialize the learner."""
+        _require_finite_config_float(
+            step_size,
+            name="step_size",
+            minimum=0.0,
+            minimum_inclusive=False,
+        )
+        _require_finite_config_float(
+            trace_decay,
+            name="trace_decay",
+            minimum=0.0,
+            maximum=1.0,
+        )
         self._step_size = step_size
         self._trace_decay = trace_decay
 
+    def to_config(self) -> dict[str, Any]:
+        """Serialize a strict versioned learner configuration."""
+
+        return {
+            "schema": TRUE_ONLINE_TD_CONFIG_SCHEMA,
+            "type": "TrueOnlineTDLearner",
+            "state_schema": TRUE_ONLINE_TD_STATE_SCHEMA,
+            "step_size": self._step_size,
+            "trace_decay": self._trace_decay,
+        }
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> "TrueOnlineTDLearner":
+        """Reconstruct only the exact current configuration schema."""
+
+        if not isinstance(config, Mapping):
+            raise TypeError("true-online TD config must be a mapping")
+        payload = dict(config)
+        expected = {"schema", "type", "state_schema", "step_size", "trace_decay"}
+        if set(payload) != expected:
+            if "schema" not in payload:
+                raise ValueError("legacy true-online TD config requires explicit migration")
+            raise ValueError("true-online TD config fields do not match v2")
+        if payload.pop("schema") != TRUE_ONLINE_TD_CONFIG_SCHEMA:
+            raise ValueError("true-online TD config schema is unsupported")
+        if payload.pop("type") != "TrueOnlineTDLearner":
+            raise ValueError("true-online TD config type is unsupported")
+        if payload.pop("state_schema") != TRUE_ONLINE_TD_STATE_SCHEMA:
+            raise ValueError("true-online TD state schema is unsupported")
+        return cls(**payload)
+
+    def _require_state_contract(self, state: TrueOnlineTDState) -> int:
+        if not isinstance(state, TrueOnlineTDState):
+            raise TypeError("state must be a TrueOnlineTDState")
+        weights = jnp.asarray(state.weights)
+        if weights.ndim != 1 or weights.shape[0] <= 0:
+            raise ValueError("state.weights must be a nonempty vector")
+        feature_dim = weights.shape[0]
+        fields = {
+            "weights": (state.weights, (feature_dim,), jnp.float32),
+            "bias": (state.bias, (), jnp.float32),
+            "eligibility_traces": (
+                state.eligibility_traces,
+                (feature_dim,),
+                jnp.float32,
+            ),
+            "bias_eligibility_trace": (
+                state.bias_eligibility_trace,
+                (),
+                jnp.float32,
+            ),
+            "v_old": (state.v_old, (), jnp.float32),
+            "step_count": (state.step_count, (), jnp.int32),
+            "step_words": (state.step_words, (2,), jnp.uint32),
+        }
+        for name, (value, shape, dtype) in fields.items():
+            _require_array_contract(
+                value,
+                name=f"state.{name}",
+                shape=shape,
+                dtype=dtype,
+            )
+        return feature_dim
+
+    def state_is_valid(self, state: TrueOnlineTDState) -> Bool[Array, ""]:
+        """Return dynamic validity after enforcing the static state contract."""
+
+        self._require_state_contract(state)
+        return (
+            _floating_tree_is_finite(state)
+            & _lifetime_counter_valid(state.step_words, state.step_count)
+            & (jnp.asarray(state.uptime_s) >= 0.0)
+        )
+
+    def resource_budget(self, feature_dim: int) -> LearnerResourceBudget:
+        """Return exact initialized-state accounting for True Online TD."""
+
+        state = self.init(feature_dim)
+        return LearnerResourceBudget(
+            learner_type="TrueOnlineTDLearner",
+            feature_dim=feature_dim,
+            trainable_float32_scalars=feature_dim + 1,
+            optimizer_state_nbytes=0,
+            normalizer_state_nbytes=0,
+            trace_state_nbytes=_tree_nbytes(
+                (state.eligibility_traces, state.bias_eligibility_trace, state.v_old)
+            ),
+            utility_state_nbytes=0,
+            lifecycle_counter_nbytes=LEARNER_LIFETIME_COUNTER_NBYTES,
+            state_nbytes=_tree_nbytes(state),
+            lifetime_identity_bits=64,
+            telemetry_saturation=_INT32_MAX,
+            max_updates_per_call=1,
+            replay_capacity=0,
+        )
+
     def init(self, feature_dim: int) -> TrueOnlineTDState:
         """Initialize learner state."""
+        _require_positive_feature_dim(feature_dim)
         return TrueOnlineTDState(
             weights=jnp.zeros(feature_dim, dtype=jnp.float32),
             bias=jnp.array(0.0, dtype=jnp.float32),
@@ -1791,12 +2807,19 @@ class TrueOnlineTDLearner:
             step_count=jnp.array(0, dtype=jnp.int32),
             birth_timestamp=time.time(),
             uptime_s=0.0,
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(self, state: TrueOnlineTDState, observation: Observation) -> Prediction:
         """Compute scalar value prediction."""
-        return jnp.atleast_1d(jnp.dot(state.weights, observation) + state.bias)
+        feature_dim = self._require_state_contract(state)
+        obs = _require_real_source(
+            observation,
+            name="observation",
+            shapes=((feature_dim,),),
+        )
+        return jnp.atleast_1d(jnp.dot(state.weights, obs) + state.bias)
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def update(
@@ -1808,18 +2831,51 @@ class TrueOnlineTDLearner:
         gamma: Array,
     ) -> TrueOnlineTDUpdateResult:
         """Apply one True Online TD(lambda) update."""
+        feature_dim = self._require_state_contract(state)
+        obs = _require_real_source(
+            observation,
+            name="observation",
+            shapes=((feature_dim,),),
+        )
+        next_obs = _require_real_source(
+            next_observation,
+            name="next_observation",
+            shapes=((feature_dim,),),
+        )
+        checked_reward = _require_real_source(
+            reward,
+            name="reward",
+            shapes=((), (1,)),
+        )
+        checked_gamma = _require_real_source(
+            gamma,
+            name="gamma",
+            shapes=((), (1,)),
+        )
+        source_state_valid = self.state_is_valid(state)
+        proposed_words, lifetime_capacity_available = _checked_lifetime_words_increment(
+            state.step_words
+        )
         alpha = jnp.asarray(self._step_size, dtype=jnp.float32)
         lamda = jnp.asarray(self._trace_decay, dtype=jnp.float32)
-        gamma_scalar = jnp.squeeze(gamma).astype(jnp.float32)
+        gamma_scalar = jnp.squeeze(checked_gamma)
+        input_valid = (
+            jnp.all(jnp.isfinite(obs))
+            & jnp.all(jnp.isfinite(next_obs))
+            & jnp.all(jnp.isfinite(checked_reward))
+            & jnp.isfinite(gamma_scalar)
+            & (gamma_scalar >= 0.0)
+            & (gamma_scalar <= 1.0)
+        )
 
-        value = jnp.squeeze(self.predict(state, observation))
-        next_value = jnp.squeeze(self.predict(state, next_observation))
-        td_error = jnp.squeeze(reward) + gamma_scalar * next_value - value
+        value = jnp.dot(state.weights, obs) + state.bias
+        next_value = jnp.dot(state.weights, next_obs) + state.bias
+        td_error = jnp.squeeze(checked_reward) + gamma_scalar * next_value - value
 
-        trace_dot = jnp.dot(state.eligibility_traces, observation)
+        trace_dot = jnp.dot(state.eligibility_traces, obs)
         trace_dot = trace_dot + state.bias_eligibility_trace
         trace_scale = 1.0 - alpha * gamma_scalar * lamda * trace_dot
-        new_traces = gamma_scalar * lamda * state.eligibility_traces + trace_scale * observation
+        new_traces = gamma_scalar * lamda * state.eligibility_traces + trace_scale * obs
         new_bias_trace = gamma_scalar * lamda * state.bias_eligibility_trace + trace_scale
 
         correction = value - state.v_old
@@ -1827,7 +2883,7 @@ class TrueOnlineTDLearner:
         new_weights = (
             state.weights
             + update_scale * new_traces
-            - alpha * correction * observation
+            - alpha * correction * obs
         )
         new_bias = (
             state.bias
@@ -1839,17 +2895,18 @@ class TrueOnlineTDLearner:
         stored_traces = jnp.where(terminal, jnp.zeros_like(new_traces), new_traces)
         stored_bias_trace = jnp.where(terminal, 0.0, new_bias_trace)
         new_v_old = jnp.where(terminal, 0.0, next_value)
-        new_state = TrueOnlineTDState(
+        candidate_state = TrueOnlineTDState(
             weights=new_weights,
             bias=new_bias,
             eligibility_traces=stored_traces,
             bias_eligibility_trace=stored_bias_trace,
             v_old=new_v_old,
-            step_count=state.step_count + 1,
+            step_count=_words_to_saturating_int32(proposed_words),
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
+            step_words=proposed_words,
         )
-        metrics = jnp.array(
+        candidate_metrics = jnp.array(
             [
                 td_error**2,
                 td_error,
@@ -1858,12 +2915,32 @@ class TrueOnlineTDLearner:
             ],
             dtype=jnp.float32,
         )
+        candidate_state_valid = self.state_is_valid(candidate_state)
+        update_applied = (
+            source_state_valid
+            & input_valid
+            & lifetime_capacity_available
+            & candidate_state_valid
+        )
+        new_state = _select_state(candidate_state, state, update_applied)
+        metrics = jnp.where(update_applied, candidate_metrics, jnp.zeros_like(candidate_metrics))
         return TrueOnlineTDUpdateResult(
             state=new_state,
             prediction=jnp.atleast_1d(value),
             next_prediction=jnp.atleast_1d(next_value),
             td_error=jnp.atleast_1d(td_error),
             metrics=metrics,
+            pre_step_words=state.step_words,
+            proposed_step_words=proposed_words,
+            post_step_words=new_state.step_words,
+            lifetime_counter_valid=_lifetime_counter_valid(
+                state.step_words, state.step_count
+            ),
+            lifetime_capacity_available=lifetime_capacity_available,
+            source_state_valid=source_state_valid,
+            input_valid=input_valid,
+            candidate_state_valid=candidate_state_valid,
+            update_applied=update_applied,
         )
 
 
@@ -1975,3 +3052,192 @@ def run_true_online_td_loop[StreamStateT](
         uptime_s=final_learner.uptime_s + elapsed
     )
     return final_learner, metrics
+
+
+def measure_learner_state_nbytes(state: Any) -> int:
+    """Measure the exact bytes of all persistent PyTree leaves in ``state``."""
+
+    return _tree_nbytes(state)
+
+
+def _legacy_state_fields(raw_state: Any, legacy_type: type[Any], *, label: str) -> dict[str, Any]:
+    expected = {field.name for field in dataclasses.fields(legacy_type)}
+    if type(raw_state) is legacy_type:
+        fields = {name: getattr(raw_state, name) for name in expected}
+    elif isinstance(raw_state, Mapping):
+        fields = dict(raw_state)
+    else:
+        raise TypeError(f"{label} must be an exact legacy state or mapping")
+    if set(fields) != expected:
+        missing = sorted(expected - set(fields))
+        extra = sorted(set(fields) - expected)
+        raise ValueError(
+            f"{label} fields do not match legacy schema; missing={missing}, extra={extra}"
+        )
+    return fields
+
+
+def migrate_legacy_linear_learner_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Migrate the exact schema-less linear learner payload to v2."""
+
+    if not isinstance(config, Mapping):
+        raise TypeError("legacy linear learner config must be a mapping")
+    payload = dict(config)
+    if set(payload) != {"type", "optimizer", "normalizer"}:
+        raise ValueError("legacy linear learner config fields are unsupported")
+    migrated = {
+        "schema": LINEAR_LEARNER_CONFIG_SCHEMA,
+        "state_schema": LINEAR_LEARNER_STATE_SCHEMA,
+        **payload,
+    }
+    LinearLearner.from_config(migrated)
+    return migrated
+
+
+def migrate_legacy_mlp_learner_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Migrate the exact pre-v2 MLP payload without accepting partial records."""
+
+    if not isinstance(config, Mapping):
+        raise TypeError("legacy MLP learner config must be a mapping")
+    payload = dict(config)
+    expected = {
+        "type",
+        "hidden_sizes",
+        "optimizer",
+        "bounder",
+        "normalizer",
+        "head_optimizer",
+        "sparsity",
+        "leaky_relu_slope",
+        "use_layer_norm",
+        "gamma",
+        "lamda",
+        "track_neuron_utility",
+        "neuron_utility_decay",
+    }
+    if set(payload) != expected:
+        raise ValueError("legacy MLP learner config fields are unsupported")
+    migrated = {
+        "schema": MLP_LEARNER_CONFIG_SCHEMA,
+        "state_schema": MLP_LEARNER_STATE_SCHEMA,
+        **payload,
+    }
+    MLPLearner.from_config(migrated)
+    return migrated
+
+
+def migrate_legacy_td_linear_learner_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Migrate the exact schema-less TD-linear learner payload to v2."""
+
+    if not isinstance(config, Mapping):
+        raise TypeError("legacy TD learner config must be a mapping")
+    payload = dict(config)
+    if set(payload) != {"type", "optimizer"}:
+        raise ValueError("legacy TD learner config fields are unsupported")
+    migrated = {
+        "schema": TD_LINEAR_LEARNER_CONFIG_SCHEMA,
+        "state_schema": TD_LINEAR_LEARNER_STATE_SCHEMA,
+        **payload,
+    }
+    TDLinearLearner.from_config(migrated)
+    return migrated
+
+
+def migrate_legacy_true_online_td_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Migrate the exact schema-less True Online TD payload to v2."""
+
+    if not isinstance(config, Mapping):
+        raise TypeError("legacy true-online TD config must be a mapping")
+    payload = dict(config)
+    if set(payload) != {"type", "step_size", "trace_decay"}:
+        raise ValueError("legacy true-online TD config fields are unsupported")
+    migrated = {
+        "schema": TRUE_ONLINE_TD_CONFIG_SCHEMA,
+        "state_schema": TRUE_ONLINE_TD_STATE_SCHEMA,
+        **payload,
+    }
+    TrueOnlineTDLearner.from_config(migrated)
+    return migrated
+
+
+def migrate_legacy_linear_learner_state(
+    learner: LinearLearner,
+    state: LegacyLearnerState | Mapping[str, Any],
+) -> LearnerState:
+    """Migrate a structurally exact, nonnegative legacy linear state."""
+
+    if not isinstance(learner, LinearLearner):
+        raise TypeError("learner must be a LinearLearner")
+    fields = _legacy_state_fields(state, LegacyLearnerState, label="legacy linear state")
+    fields["step_words"] = _legacy_counter_words(
+        fields["step_count"], label="legacy linear state"
+    )
+    migrated = LearnerState(**fields)
+    learner._require_state_contract(migrated)
+    if not bool(jax.device_get(learner.state_is_valid(migrated))):
+        raise ValueError("legacy linear state is not dynamically valid")
+    return migrated
+
+
+def migrate_legacy_mlp_learner_state(
+    learner: MLPLearner,
+    state: LegacyMLPLearnerState | Mapping[str, Any],
+) -> MLPLearnerState:
+    """Migrate a structurally exact, nonnegative legacy MLP state."""
+
+    if not isinstance(learner, MLPLearner):
+        raise TypeError("learner must be an MLPLearner")
+    fields = _legacy_state_fields(state, LegacyMLPLearnerState, label="legacy MLP state")
+    fields["step_words"] = _legacy_counter_words(
+        fields["step_count"], label="legacy MLP state"
+    )
+    migrated = MLPLearnerState(**fields)
+    learner._require_state_contract(migrated)
+    if not bool(jax.device_get(learner.state_is_valid(migrated))):
+        raise ValueError("legacy MLP state is not dynamically valid")
+    return migrated
+
+
+def migrate_legacy_td_linear_learner_state(
+    learner: TDLinearLearner,
+    state: LegacyTDLearnerState | Mapping[str, Any],
+) -> TDLearnerState:
+    """Migrate a structurally exact, nonnegative legacy TD-linear state."""
+
+    if not isinstance(learner, TDLinearLearner):
+        raise TypeError("learner must be a TDLinearLearner")
+    fields = _legacy_state_fields(state, LegacyTDLearnerState, label="legacy TD state")
+    fields["step_words"] = _legacy_counter_words(
+        fields["step_count"], label="legacy TD state"
+    )
+    migrated = TDLearnerState(**fields)
+    learner._require_state_contract(migrated)
+    if not bool(jax.device_get(learner.state_is_valid(migrated))):
+        raise ValueError("legacy TD state is not dynamically valid")
+    return migrated
+
+
+def migrate_legacy_true_online_td_state(
+    learner: TrueOnlineTDLearner,
+    state: Mapping[str, Any],
+) -> TrueOnlineTDState:
+    """Migrate the exact mapping form of the pre-v2 True Online TD state."""
+
+    if not isinstance(learner, TrueOnlineTDLearner):
+        raise TypeError("learner must be a TrueOnlineTDLearner")
+    if not isinstance(state, Mapping):
+        raise TypeError("legacy true-online TD state must be a mapping")
+    fields = dict(state)
+    expected = {field.name for field in dataclasses.fields(TrueOnlineTDState)} - {
+        "step_words"
+    }
+    if set(fields) != expected:
+        raise ValueError("legacy true-online TD state fields are unsupported")
+    fields["step_words"] = _legacy_counter_words(
+        fields["step_count"], label="legacy true-online TD state"
+    )
+    migrated = TrueOnlineTDState(**fields)
+    learner._require_state_contract(migrated)
+    if not bool(jax.device_get(learner.state_is_valid(migrated))):
+        raise ValueError("legacy true-online TD state is not dynamically valid")
+    return migrated

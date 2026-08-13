@@ -31,8 +31,8 @@ import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
 
-from alberta_framework.core.learners import LinearLearner
-from alberta_framework.core.types import LearnerState, TimeStep
+from alberta_framework.core.learners import LearnerState, LinearLearner
+from alberta_framework.core.types import TimeStep
 
 if TYPE_CHECKING:
     import gymnasium

@@ -2,11 +2,13 @@
 """Development-only matched benchmarks for Delightful Policy Gradient.
 
 This module evaluates the paper-specific actor-sample gate, never the separate
-Prototype ``sparks_joy`` candidate-update audit.  It reports Kondo selection
+Prototype candidate-update safety audit (whose older API retains a historical
+``sparks_joy`` alias).  It reports Kondo selection
 accounting: a deterministic post-hoc counterfactual that replays the paper's
 delight-price selection rule over each fully executed trace and accounts, per
-learning-value channel, the backward work a real Kondo gate would have run
-versus skipped.  Actual Kondo compute gating remains unimplemented here.
+learning-value channel, the backward work a Kondo actor consumer would have run
+versus skipped after the gate proposed admission. Actual Kondo compute gating
+remains unimplemented here.
 Every actor, critic, and average-reward update in every life is executed in
 full and no compiled backward work is skipped, so ``KONDO_IMPLEMENTED`` stays
 ``False`` — the implemented-Kondo bar (see
@@ -107,7 +109,7 @@ _EXCLUDED_CLAIMS = (
     "Delightful Policy Gradient performance improvement",
     "Kondo compute savings",
     "continuous-control validity",
-    "Prototype sparks_joy audit validity",
+    "Prototype candidate-update audit validity",
 )
 _INTERPRETATION = (
     "calculation and matched development diagnostics only; no thresholds or "
@@ -1056,7 +1058,8 @@ def _kondo_selection_accounting(
     rationales = {
         "actor": (
             "paper-defined delight is a per-sample policy-gradient statistic; "
-            "the Kondo gate decides whether the actor backward pass runs"
+            "the Kondo gate proposes admission and its actor consumer decides "
+            "whether the backward pass actually runs"
         ),
         "critic": (
             "critic prediction losses remain outside the policy-gradient "

@@ -15,23 +15,27 @@ pass through the trunk regardless of the number of heads.
 Reference: Elsayed et al. 2024, "Streaming Deep Reinforcement Learning Finally Works"
 """
 
+import dataclasses
 import functools
 import math
 import time
+from collections.abc import Mapping
 from typing import Any
 
 import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float, UInt
 
 from alberta_framework.core.initializers import sparse_init
 from alberta_framework.core.normalizers import (
     AnyNormalizerState,
-    EMANormalizerState,
     Normalizer,
-    WelfordNormalizerState,
+    _checked_lifetime_words_increment,
+    _lifetime_counter_valid,
+    _saturating_int32_counter_increment,
+    migrate_legacy_normalizer_state,
 )
 from alberta_framework.core.optimizers import (
     LMS,
@@ -48,6 +52,12 @@ from alberta_framework.core.types import (
     ObGDState,
     TraceMode,
 )
+
+MULTI_HEAD_MLP_STATE_SCHEMA = "alberta.multi-head-mlp-state.v2"
+MULTI_HEAD_LIFETIME_COUNTER_NBYTES = 12
+MULTI_HEAD_LIFETIME_COUNTER_DELTA_NBYTES = 8
+
+_INT32_MAX = 2**31 - 1
 
 
 def _extract_mean_step_size(
@@ -67,6 +77,17 @@ def _extract_mean_step_size(
         # LMSState
         return opt_state.step_size
     return jnp.array(0.0, dtype=jnp.float32)
+
+
+def _floating_tree_is_finite(tree: object) -> Bool[Array, ""]:
+    """Return whether every floating/complex persistent leaf is finite."""
+
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for leaf in jax.tree.leaves(tree):
+        array = jnp.asarray(leaf)
+        if jnp.issubdtype(array.dtype, jnp.inexact):
+            valid = valid & jnp.all(jnp.isfinite(array))
+    return valid
 
 
 # =============================================================================
@@ -99,7 +120,12 @@ class MultiHeadMLPState:
         hidden_unit_utilities: EMA utility diagnostics for each hidden layer,
             shape ``(hidden_sizes[layer],)``. Empty for linear models.
         normalizer_state: Optional online feature normalizer state
-        step_count: Scalar step counter
+        step_count: Saturating int32 compatibility telemetry.
+        step_words: Exact big-endian ``[high, low]`` uint32 lifetime identity.
+        birth_timestamp: Host-only lifecycle metadata. This legacy Python
+            float is not part of the persistent JAX learning-state bit
+            contract because JIT coerces dynamic scalar leaves.
+        uptime_s: Host-only timing metadata with the same limitation.
     """
 
     trunk_params: MLPParams
@@ -113,8 +139,21 @@ class MultiHeadMLPState:
     hidden_unit_utilities: tuple[Array, ...] = ()
     normalizer_state: AnyNormalizerState | None = None
     step_count: Array = None  # type: ignore[assignment]
+    step_words: UInt[Array, " 2"] = None  # type: ignore[assignment]
     birth_timestamp: float = 0.0
     uptime_s: float = 0.0
+
+
+@chex.dataclass(frozen=True)
+class _MultiHeadCounterStatus:
+    """Preflight facts for one atomic learner/normalizer transaction."""
+
+    proposed_step_words: UInt[Array, " 2"]
+    lifetime_counter_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    normalizer_counter_aligned: Bool[Array, ""]
+    normalizer_estimator_capacity_available: Bool[Array, ""]
+    update_available: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -129,6 +168,18 @@ class MultiHeadMLPUpdateResult:
             Columns: ``[squared_error, raw_error, mean_step_size]``.
             NaN for inactive heads.
         trunk_bounding_metric: Scalar trunk bounding metric
+        lifetime_counter_valid: Whether the outer and nested counter state was
+            structurally valid before this transaction.
+        lifetime_capacity_available: Whether all exact word clocks had room.
+        normalizer_counter_aligned: Whether the configured normalizer clock
+            matched the learner clock.
+        normalizer_estimator_capacity_available: Whether the configured
+            estimator could honestly accept another sample.
+        update_applied: Whether the complete learner transaction committed.
+            In addition to the counter/normalizer preflight, source state,
+            inputs, and the staged candidate must be finite. NaN targets are
+            the sole allowed non-finite input and continue to mean an inactive
+            head.
     """
 
     state: MultiHeadMLPState
@@ -136,6 +187,13 @@ class MultiHeadMLPUpdateResult:
     errors: Float[Array, " n_heads"]
     per_head_metrics: Float[Array, "n_heads 3"]
     trunk_bounding_metric: Float[Array, ""]
+    pre_step_words: UInt[Array, " 2"]
+    post_step_words: UInt[Array, " 2"]
+    lifetime_counter_valid: Bool[Array, ""]
+    lifetime_capacity_available: Bool[Array, ""]
+    normalizer_counter_aligned: Bool[Array, ""]
+    normalizer_estimator_capacity_available: Bool[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -146,10 +204,13 @@ class MultiHeadLearningResult:
         state: Final multi-head MLP learner state
         per_head_metrics: Per-head metrics over time,
             shape ``(num_steps, n_heads, 3)``
+        updates_applied: Per-event transaction verdicts. A false entry means
+            the scan carried the preceding persistent state unchanged.
     """
 
     state: MultiHeadMLPState
     per_head_metrics: Float[Array, "num_steps n_heads 3"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 @chex.dataclass(frozen=True)
@@ -160,10 +221,12 @@ class BatchedMultiHeadResult:
         states: Batched multi-head MLP learner states
         per_head_metrics: Per-head metrics,
             shape ``(n_seeds, num_steps, n_heads, 3)``
+        updates_applied: Per-seed, per-event transaction verdicts.
     """
 
     states: MultiHeadMLPState
     per_head_metrics: Float[Array, "n_seeds num_steps n_heads 3"]
+    updates_applied: Bool[Array, "n_seeds num_steps"]
 
 
 # =============================================================================
@@ -255,9 +318,7 @@ class MultiHeadMLPLearner:
         bounder: Bounder | None = None,
         gamma: float = 0.0,
         lamda: float = 0.0,
-        normalizer: (
-            Normalizer[EMANormalizerState] | Normalizer[WelfordNormalizerState] | None
-        ) = None,
+        normalizer: Normalizer[Any] | None = None,
         sparsity: float = 0.9,
         leaky_relu_slope: float = 0.01,
         use_layer_norm: bool = True,
@@ -347,9 +408,7 @@ class MultiHeadMLPLearner:
         return self._n_heads
 
     @property
-    def normalizer(
-        self,
-    ) -> Normalizer[EMANormalizerState] | Normalizer[WelfordNormalizerState] | None:
+    def normalizer(self) -> Normalizer[Any] | None:
         """The feature normalizer, or None if normalization is disabled."""
         return self._normalizer
 
@@ -362,6 +421,7 @@ class MultiHeadMLPLearner:
         """
         config: dict[str, Any] = {
             "type": "MultiHeadMLPLearner",
+            "state_schema": MULTI_HEAD_MLP_STATE_SCHEMA,
             "n_heads": self._n_heads,
             "hidden_sizes": list(self._hidden_sizes),
             "optimizer": self._optimizer.to_config(),
@@ -405,6 +465,11 @@ class MultiHeadMLPLearner:
 
         config = dict(config)
         config.pop("type", None)
+        state_schema = config.pop("state_schema", MULTI_HEAD_MLP_STATE_SCHEMA)
+        if state_schema != MULTI_HEAD_MLP_STATE_SCHEMA:
+            raise ValueError(
+                f"Unsupported MultiHeadMLP state schema: {state_schema!r}"
+            )
 
         optimizer = optimizer_from_config(config.pop("optimizer"))
         bounder_cfg = config.pop("bounder", None)
@@ -520,6 +585,7 @@ class MultiHeadMLPLearner:
             ),
             normalizer_state=normalizer_state,
             step_count=jnp.array(0, dtype=jnp.int32),
+            step_words=jnp.zeros((2,), dtype=jnp.uint32),
             birth_timestamp=time.time(),
             uptime_s=0.0,
         )
@@ -591,6 +657,64 @@ class MultiHeadMLPLearner:
         """
         return jnp.squeeze(head_w @ hidden + head_b)
 
+    def _counter_status(
+        self,
+        state: MultiHeadMLPState,
+    ) -> _MultiHeadCounterStatus:
+        """Validate the outer clock and optional normalizer clock alignment."""
+
+        proposed_words, outer_capacity = _checked_lifetime_words_increment(
+            state.step_words
+        )
+        outer_valid = _lifetime_counter_valid(
+            state.step_words,
+            state.step_count,
+        )
+        aligned = jnp.asarray(True, dtype=jnp.bool_)
+        nested_valid = jnp.asarray(True, dtype=jnp.bool_)
+        nested_lifetime_capacity = jnp.asarray(True, dtype=jnp.bool_)
+        nested_estimator_capacity = jnp.asarray(True, dtype=jnp.bool_)
+        if self._normalizer is None:
+            if state.normalizer_state is not None:
+                raise ValueError(
+                    "state has normalizer_state but learner has no normalizer"
+                )
+        else:
+            if state.normalizer_state is None:
+                raise ValueError(
+                    "learner has a normalizer but state.normalizer_state is absent"
+                )
+            nested_status = self._normalizer.counter_status(
+                state.normalizer_state
+            )
+            aligned = jnp.all(
+                state.normalizer_state.sample_count_words == state.step_words
+            )
+            nested_valid = nested_status.counter_valid
+            nested_lifetime_capacity = (
+                nested_status.lifetime_capacity_available
+            )
+            nested_estimator_capacity = (
+                nested_status.estimator_capacity_available
+            )
+        counter_valid = outer_valid & nested_valid & aligned
+        lifetime_capacity = outer_capacity & nested_lifetime_capacity
+        update_available = (
+            counter_valid
+            & lifetime_capacity
+            & nested_estimator_capacity
+        )
+        return _MultiHeadCounterStatus(
+            proposed_step_words=proposed_words,
+            lifetime_counter_valid=counter_valid,
+            lifetime_capacity_available=lifetime_capacity,
+            normalizer_counter_aligned=aligned,
+            normalizer_estimator_capacity_available=(
+                nested_estimator_capacity
+            ),
+            update_available=update_available,
+        )
+
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(self, state: MultiHeadMLPState, observation: Array) -> Array:
         """Compute predictions from all heads.
@@ -651,8 +775,19 @@ class MultiHeadMLPLearner:
         Returns:
             MultiHeadMLPUpdateResult with updated state, predictions,
             errors, and per-head metrics
+
+        The learner and configured normalizer form one clock transaction. A
+        validity, alignment, estimator-horizon, or uint64-capacity failure
+        prevents the nested update call and preserves every persistent JAX
+        learning/counter leaf. Host-only timing floats are legacy metadata and
+        are outside that bit-exact contract.
         """
         n_heads = self._n_heads
+        counter_status = self._counter_status(state)
+        source_state_finite = _floating_tree_is_finite(state)
+        inputs_valid = jnp.all(jnp.isfinite(observation)) & jnp.all(
+            jnp.isfinite(targets) | jnp.isnan(targets)
+        )
         gamma_lamda = jnp.array(self._gamma * self._lamda, dtype=jnp.float32)
         replacing = self._trace_mode == TraceMode.REPLACING
 
@@ -664,8 +799,23 @@ class MultiHeadMLPLearner:
         obs = observation
         new_normalizer_state = state.normalizer_state
         if self._normalizer is not None and state.normalizer_state is not None:
-            obs, new_normalizer_state = self._normalizer.normalize(
-                state.normalizer_state, observation
+            normalizer = self._normalizer
+            normalizer_state = state.normalizer_state
+
+            def update_normalizer(_: None) -> tuple[Array, AnyNormalizerState]:
+                return normalizer.normalize(normalizer_state, observation)
+
+            def preserve_normalizer(_: None) -> tuple[Array, AnyNormalizerState]:
+                return (
+                    normalizer.normalize_only(normalizer_state, observation),
+                    normalizer_state,
+                )
+
+            obs, new_normalizer_state = jax.lax.cond(
+                counter_status.update_available,
+                update_normalizer,
+                preserve_normalizer,
+                operand=None,
             )
 
         # 3. Forward trunk via VJP
@@ -896,7 +1046,7 @@ class MultiHeadMLPLearner:
             biases=tuple(new_head_biases),
         )
 
-        new_state = MultiHeadMLPState(
+        proposed_state = MultiHeadMLPState(
             trunk_params=new_trunk_params,
             head_params=new_head_params,
             trunk_optimizer_states=tuple(new_trunk_opt_states),
@@ -905,9 +1055,22 @@ class MultiHeadMLPLearner:
             head_traces=tuple(new_head_traces_list),
             hidden_unit_utilities=tuple(new_hidden_unit_utilities),
             normalizer_state=new_normalizer_state,
-            step_count=state.step_count + 1,
+            step_count=_saturating_int32_counter_increment(state.step_count),
+            step_words=counter_status.proposed_step_words,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
+        )
+        candidate_state_finite = _floating_tree_is_finite(proposed_state)
+        update_applied = (
+            counter_status.update_available
+            & source_state_finite
+            & inputs_valid
+            & candidate_state_finite
+        )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: proposed_state,
+            lambda: state,
         )
 
         per_head_metrics = jnp.stack(per_head_metrics_list)  # (n_heads, 3)
@@ -918,6 +1081,21 @@ class MultiHeadMLPLearner:
             errors=errors_arr,
             per_head_metrics=per_head_metrics,
             trunk_bounding_metric=trunk_bounding_metric,
+            pre_step_words=state.step_words,
+            post_step_words=new_state.step_words,
+            lifetime_counter_valid=(
+                counter_status.lifetime_counter_valid
+            ),
+            lifetime_capacity_available=(
+                counter_status.lifetime_capacity_available
+            ),
+            normalizer_counter_aligned=(
+                counter_status.normalizer_counter_aligned
+            ),
+            normalizer_estimator_capacity_available=(
+                counter_status.normalizer_estimator_capacity_available
+            ),
+            update_applied=update_applied,
         )
 
 
@@ -951,6 +1129,96 @@ def multi_head_metrics_to_dicts(
     return output
 
 
+def multi_head_lifetime_counter_nbytes(*, has_normalizer: bool) -> int:
+    """Return exact bytes occupied by aligned learner lifetime counters."""
+
+    return MULTI_HEAD_LIFETIME_COUNTER_NBYTES * (2 if has_normalizer else 1)
+
+
+def measure_multi_head_mlp_state_nbytes(state: MultiHeadMLPState) -> int:
+    """Measure persistent JAX-array bytes in one concrete learner state."""
+
+    return sum(
+        int(leaf.size) * int(leaf.dtype.itemsize)
+        for leaf in jax.tree.leaves(state)
+        if isinstance(leaf, Array)
+    )
+
+
+def _host_field_mapping(legacy_state: Any) -> dict[str, Any]:
+    """Return a shallow host mapping for an old state dataclass."""
+
+    if isinstance(legacy_state, Mapping):
+        return dict(legacy_state)
+    if dataclasses.is_dataclass(legacy_state) and not isinstance(legacy_state, type):
+        return {
+            field.name: getattr(legacy_state, field.name)
+            for field in dataclasses.fields(legacy_state)
+        }
+    raise TypeError("legacy MultiHeadMLP state must be a mapping or dataclass")
+
+
+def _legacy_normalizer_type(legacy_state: Any) -> str:
+    fields = _host_field_mapping(legacy_state)
+    names = set(fields)
+    if "p" in names:
+        return "WelfordNormalizer"
+    if "decay" in names:
+        return "EMANormalizer"
+    if "momentum" in names:
+        return "StreamingBatchNormalizer"
+    raise ValueError("legacy normalizer field manifest does not identify its type")
+
+
+def migrate_legacy_multi_head_mlp_state(
+    legacy_state: Any,
+) -> MultiHeadMLPState:
+    """Migrate one exact pre-v2 learner state on the host.
+
+    Negative or saturated int32 counters are rejected because the old clock
+    could wrap and cannot authenticate a unique lifetime.  When a normalizer
+    is present, its independently migrated sample identity must equal the
+    learner identity before either clock is accepted.
+    """
+
+    fields = _host_field_mapping(legacy_state)
+    current_names = {
+        field.name
+        for field in dataclasses.fields(MultiHeadMLPState)
+    }
+    legacy_names = current_names - {"step_words"}
+    supplied_names = set(fields)
+    if supplied_names != legacy_names:
+        missing = sorted(legacy_names - supplied_names)
+        extra = sorted(supplied_names - legacy_names)
+        raise ValueError(
+            "legacy MultiHeadMLP field manifest is not exact; "
+            f"missing={missing}, extra={extra}"
+        )
+    step_array = jnp.asarray(fields["step_count"])
+    if step_array.shape != () or step_array.dtype != jnp.dtype(jnp.int32):
+        raise TypeError("legacy MultiHeadMLP step_count must be scalar int32")
+    step = int(step_array)
+    if step < 0:
+        raise ValueError("negative legacy MultiHeadMLP step_count indicates wrap")
+    if step >= _INT32_MAX:
+        raise ValueError("saturated legacy MultiHeadMLP step_count is ambiguous")
+
+    legacy_normalizer = fields["normalizer_state"]
+    if legacy_normalizer is not None:
+        normalizer_state = migrate_legacy_normalizer_state(
+            legacy_normalizer,
+            normalizer_type=_legacy_normalizer_type(legacy_normalizer),
+        )
+        if int(normalizer_state.sample_count) != step:
+            raise ValueError(
+                "legacy learner and normalizer sample counters are not aligned"
+            )
+        fields["normalizer_state"] = normalizer_state
+    fields["step_words"] = jnp.asarray((0, step), dtype=jnp.uint32)
+    return MultiHeadMLPState(**fields)
+
+
 # =============================================================================
 # Learning Loops
 # =============================================================================
@@ -982,14 +1250,14 @@ def run_multi_head_learning_loop(
 
     def step_fn(
         carry: MultiHeadMLPState, inputs: tuple[Array, Array]
-    ) -> tuple[MultiHeadMLPState, Array]:
+    ) -> tuple[MultiHeadMLPState, tuple[Array, Array]]:
         l_state = carry
         obs, tgt = inputs
         result = learner.update(l_state, obs, tgt)
-        return result.state, result.per_head_metrics
+        return result.state, (result.per_head_metrics, result.update_applied)
 
     t0 = time.time()
-    final_state, per_head_metrics = jax.lax.scan(
+    final_state, (per_head_metrics, updates_applied) = jax.lax.scan(
         step_fn, state, (observations, targets)
     )
     elapsed = time.time() - t0
@@ -998,6 +1266,7 @@ def run_multi_head_learning_loop(
     return MultiHeadLearningResult(
         state=final_state,
         per_head_metrics=per_head_metrics,
+        updates_applied=updates_applied,
     )
 
 
@@ -1026,15 +1295,15 @@ def run_multi_head_learning_loop_batched(
     """
     feature_dim = observations.shape[1]
 
-    def single_run(key: Array) -> tuple[MultiHeadMLPState, Array]:
+    def single_run(key: Array) -> tuple[MultiHeadMLPState, Array, Array]:
         init_state = learner.init(feature_dim, key)
         result = run_multi_head_learning_loop(
             learner, init_state, observations, targets
         )
-        return result.state, result.per_head_metrics
+        return result.state, result.per_head_metrics, result.updates_applied
 
     t0 = time.time()
-    batched_states, batched_metrics = jax.vmap(single_run)(keys)
+    batched_states, batched_metrics, updates_applied = jax.vmap(single_run)(keys)
     elapsed = time.time() - t0
     batched_states = batched_states.replace(  # type: ignore[attr-defined]
         uptime_s=batched_states.uptime_s + elapsed
@@ -1043,4 +1312,23 @@ def run_multi_head_learning_loop_batched(
     return BatchedMultiHeadResult(
         states=batched_states,
         per_head_metrics=batched_metrics,
+        updates_applied=updates_applied,
     )
+
+
+__all__ = [
+    "MULTI_HEAD_LIFETIME_COUNTER_DELTA_NBYTES",
+    "MULTI_HEAD_LIFETIME_COUNTER_NBYTES",
+    "MULTI_HEAD_MLP_STATE_SCHEMA",
+    "BatchedMultiHeadResult",
+    "MultiHeadLearningResult",
+    "MultiHeadMLPLearner",
+    "MultiHeadMLPState",
+    "MultiHeadMLPUpdateResult",
+    "measure_multi_head_mlp_state_nbytes",
+    "migrate_legacy_multi_head_mlp_state",
+    "multi_head_lifetime_counter_nbytes",
+    "multi_head_metrics_to_dicts",
+    "run_multi_head_learning_loop",
+    "run_multi_head_learning_loop_batched",
+]
