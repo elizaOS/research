@@ -1,0 +1,115 @@
+{
+  "name": "@elizaos/plugin-tonypi",
+  "description": "Drives Hiwonder TonyPi / TonyPi Pro via stock RPCServer :9030, with optional bruhOS skill enhancement.",
+  "version": "2.0.3-beta.7",
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "packageType": "plugin",
+  "platform": "node",
+  "license": "MIT",
+  "author": "ElizaOS",
+  "keywords": [
+    "plugin",
+    "elizaos",
+    "robot",
+    "robotics",
+    "tonypi",
+    "hiwonder"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/elizaos/elizaos"
+  },
+  "homepage": "https://elizaos.ai",
+  "bugs": {
+    "url": "https://github.com/elizaos/elizaos/issues"
+  },
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "eliza-source": {
+        "types": "./src/index.ts",
+        "import": "./src/index.ts",
+        "default": "./src/index.ts"
+      },
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "bridge",
+    "README.md",
+    "package.json",
+    "build.config.ts"
+  ],
+  "elizaos": {
+    "plugin": {
+      "capabilities": [
+        "robot",
+        "tonypi"
+      ]
+    }
+  },
+  "dependencies": {
+    "@elizaos/core": "2.0.3-beta.7"
+  },
+  "peerDependencies": {
+    "zod": "^3.23.8 || ^4.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.5",
+    "@types/node": "^25.0.3",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.4"
+  },
+  "scripts": {
+    "build": "bun run build.ts",
+    "clean": "node ../../packages/scripts/rm-path-recursive.mjs dist .turbo",
+    "lint": "bunx @biomejs/biome check --write --unsafe .",
+    "lint:check": "bunx @biomejs/biome check .",
+    "typecheck": "tsgo --noEmit",
+    "test": "vitest run"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "agentConfig": {
+    "pluginType": "elizaos:plugin:1.0.0",
+    "pluginParameters": {
+      "ELIZA_TONYPI_RPC_URL": {
+        "type": "string",
+        "description": "HTTP URL for the stock TonyPi RPCServer (e.g. http://192.168.149.1:9030)"
+      },
+      "ELIZA_TONYPI_HOST": {
+        "type": "string",
+        "description": "TonyPi host; port defaults to 9030"
+      },
+      "ELIZA_BRUHOS_URL": {
+        "type": "string",
+        "description": "Optional bruhOS skill API base URL (progressive enhancement; e.g. http://192.168.149.1:9040)"
+      },
+      "ELIZA_BRUHOS_HOST": {
+        "type": "string",
+        "description": "Optional bruhOS host; port defaults to 9040"
+      },
+      "ELIZA_BRUHOS_AUTO": {
+        "type": "string",
+        "description": "If true/1 and ELIZA_TONYPI_HOST is set, probe bruhOS on the same host:9040"
+      }
+    }
+  },
+  "eliza": {
+    "platforms": [
+      "node"
+    ],
+    "runtime": "node",
+    "platformDetails": {
+      "node": "Node.js only (platform: node)"
+    }
+  }
+}

@@ -27,6 +27,7 @@ alberta/        ASI (Alberta Framework) — JAX continual-RL (The Alberta Plan);
                 policies. Git submodule of github.com/elizaOS/asi, mounted here so
                 robot/'s editable `../alberta` dependency keeps resolving
 plugin-ainex/   @elizaos/plugin-ainex — elizaOS plugin driving the Hiwonder AiNex humanoid via the robot bridge
+plugin-tonypi/  @elizaos/plugin-tonypi — elizaOS plugin for Hiwonder TonyPi / Pro; stock RPCServer :9030 + optional bruhOS skills (not a robot/ profile)
 docs/           chip/ track, robot.mdx embodiment doc, tee-native/ security design notes
 .github/workflows/  CI: typescript · robot (light lane) · e1-chip-fast
                     (per-PR make lint typecheck) · e1-chip (heavy Docker regression,
@@ -44,6 +45,10 @@ docs/           chip/ track, robot.mdx embodiment doc, tee-native/ security desi
   there); bump the submodule pointer here to pull changes in.
 - **plugin-ainex/** — TypeScript elizaOS plugin; `bun run build`. Depends on the
   `eliza_robot` bridge (`python -m eliza_robot.bridge.server`).
+- **plugin-tonypi/** — TypeScript elizaOS plugin. JSON-RPC HTTP client to the
+  stock on-robot `RPCServer.py` (port 9030), same transport as the bruhOS app.
+  Optional bruhOS skill API (`ELIZA_BRUHOS_URL`) is progressive enhancement —
+  stock TonyPi / Pro work without it. Not an `eliza_robot` backend.
 
 ## Conventions
 
