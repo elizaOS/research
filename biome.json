@@ -10,6 +10,7 @@
     "ignoreUnknown": true,
     "includes": [
       "plugin-ainex/**/*.ts",
+      "plugin-tonypi/**/*.ts",
       "robot/src/**/*.ts",
       "!**/dist",
       "!**/node_modules",

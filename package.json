@@ -2,10 +2,11 @@
   "name": "@elizaos/research",
   "private": true,
   "type": "module",
-  "description": "elizaOS research monorepo: chip, robot, alberta, and the AiNex plugin. This root defines a Bun workspace over the self-contained TypeScript surfaces (plugin-ainex, robot) and pins the shared toolchain (TypeScript, Biome, Vitest).",
+  "description": "elizaOS research monorepo: chip, robot, alberta, and the AiNex / TonyPi plugins. This root defines a Bun workspace over the self-contained TypeScript surfaces (plugin-ainex, plugin-tonypi, robot) and pins the shared toolchain (TypeScript, Biome, Vitest).",
   "license": "MIT",
   "workspaces": [
     "plugin-ainex",
+    "plugin-tonypi",
     "robot"
   ],
   "scripts": {
